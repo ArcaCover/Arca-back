@@ -1,0 +1,23 @@
+{
+  "name": "@arca/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/server.js",
+  "scripts": {
+    "dev": "tsx --conditions=development watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@arca/questions": "*",
+    "@arca/scoring": "*",
+    "@hono/node-server": "^1.13.7",
+    "@supabase/supabase-js": "^2.47.0",
+    "hono": "^4.6.14",
+    "jose": "^5.9.6",
+    "playwright": "^1.49.1",
+    "zod": "^3.25.0",
+    "@arca/contracts": "*"
+  }
+}

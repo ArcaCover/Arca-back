@@ -1,3 +1,8 @@
+#private
+private/
+.claude/
+
+
 # Logs
 logs
 *.log
