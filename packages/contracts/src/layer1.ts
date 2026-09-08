@@ -1,111 +1,79 @@
-import { Confidence, PracticeArea, Tier } from '@arca/scoring';
 import { z } from 'zod';
+import { SourceStatus, WebsiteData, AttorneyMatch } from './sources.js';
 
-export const SignalCategory = z.enum(['governance', 'tech', 'regulatory', 'content']);
-export const SignalType = z.enum(['positive', 'warning', 'negative', 'neutral']);
-
-/** Una señal tal como la consume el frontend: ya traducida a puntos y texto. */
-export const Signal = z.object({
-  id: z.string(),
-  category: SignalCategory,
-  type: SignalType,
-  title: z.string(),
-  detail: z.string(),
-  points: z.number(),
-  max_points: z.number(),
-});
-export type Signal = z.infer<typeof Signal>;
-
-export const LegalPlatform = z.enum(['clio', 'practicepanther', 'mycase']);
-export type LegalPlatform = z.infer<typeof LegalPlatform>;
-
-export const EmailProvider = z.enum(['google', 'microsoft', 'other']);
-export type EmailProvider = z.infer<typeof EmailProvider>;
-
-export const Layer1Firm = z.object({
-  name: z.string().nullable(),
-  domain: z.string(),
-  city: z.string().nullable(),
-  state: z.string().nullable(),
-  attorneys_count: z.number().int().nullable(),
-  practice_areas: z.array(PracticeArea),
-  primary_practice: PracticeArea.nullable(),
-});
-export type Layer1Firm = z.infer<typeof Layer1Firm>;
-
-/** Hechos crudos detectados por el pipeline. Alimentan tanto el pre-score como las preguntas. */
-export const Layer1Observations = z.object({
-  website_found: z.boolean(),
-  pages_scraped: z.array(z.string()),
-  ai_policy_found: z.boolean(),
-  ai_policy_url: z.string().nullable(),
-  ai_in_services: z.boolean(),
-  blog_ai_content: z.boolean(),
-  job_posts_ai: z.boolean(),
-  legal_platform: LegalPlatform.nullable(),
-  email_provider: EmailProvider.nullable(),
-  dmarc_configured: z.boolean(),
-  bar_verified: z.boolean(),
-  bar_check: z.string(),
-  /** Derivada: hay SaaS de por medio, así que aplica preguntar por residencia de datos. */
-  cloud_tools_detected: z.boolean(),
-});
-export type Layer1Observations = z.infer<typeof Layer1Observations>;
-
-/** Traza de cada paso, para diagnosticar por qué bajó la confianza de un scan. */
-export const PipelineStep = z.object({
-  step: z.string(),
-  status: z.enum(['ok', 'failed', 'timeout', 'skipped']),
-  duration_ms: z.number(),
-  error: z.string().nullable(),
-});
-export type PipelineStep = z.infer<typeof PipelineStep>;
-
+export const Tier = z.enum(['FORTRESS', 'FORTIFIED', 'GUARDED', 'EXPOSED', 'CRITICAL', 'UNKNOWN']);
+export const Decision = z.enum(['AUTO_BIND', 'AUTO_BIND_CONDITIONAL', 'REFERRAL', 'REFERRAL_SENIOR', 'DECLINE', 'UNKNOWN']);
+export const ScanStatus = z.enum(['RUNNING', 'COMPLETED', 'PARTIAL', 'FAILED']);
+const nullableNumber = z.number().finite().nullable();
+export const Rule = z.object({ id: z.string(), points: nullableNumber, reason: z.string() }).strict();
+export const Category = z.object({
+  score: z.number().min(0).max(35).nullable(), max: z.number().positive(),
+  status: z.enum(['KNOWN', 'PARTIAL', 'UNKNOWN']), rules: z.array(Rule),
+}).strict();
 export const PreScore = z.object({
-  value: z.number(),
-  tier: Tier,
-  confidence: Confidence,
-  signals_detected: z.number().int(),
-  points_earned: z.number(),
-  /** Solo suma el máximo de las señales efectivamente chequeadas. */
-  points_possible: z.number(),
-});
+  total: z.number().min(0).max(100).nullable(),
+  categories: z.object({ aiGovernance: Category, professionalStanding: Category, reputation: Category, firmMaturity: Category }).strict(),
+  tier: Tier, decision: Decision,
+  confidence: z.enum(['HIGH', 'MEDIUM', 'LOW']),
+  overrides: z.array(z.object({ id: z.string(), decision: Decision, reason: z.string() }).strict()),
+  flags: z.array(z.string()),
+}).strict();
 export type PreScore = z.infer<typeof PreScore>;
-
-export const QuickReport = z.object({
-  summary: z.string(),
-  top_strengths: z.array(z.string()),
-  top_risks: z.array(z.string()),
-});
-export type QuickReport = z.infer<typeof QuickReport>;
-
-/**
- * Salida del pipeline de Capa 1. Es un contrato de datos plano a propósito: el día que el
- * pipeline se mueva a un servicio Python, esto es lo que viaja por HTTP sin tocar nada más.
- */
+export const Signals = z.object({
+  website: z.object({
+    W1_aiPolicy: z.object({ found: z.boolean().nullable(), depth: z.string().nullable(), points: nullableNumber }).strict(),
+    W2_aiInServices: z.object({ found: z.boolean().nullable(), tools: z.array(z.string()).nullable(), points: nullableNumber }).strict(),
+    W3_aiDisclosure: z.object({ found: z.boolean().nullable(), points: nullableNumber }).strict(),
+    W4_aiBlog: z.object({ found: z.boolean().nullable(), count: nullableNumber, points: nullableNumber }).strict(),
+    W5_teamSize: nullableNumber, W5a_teamPageQuality: z.string().nullable(),
+    W6_privacyPolicy: z.object({ found: z.boolean().nullable(), mentionsClientData: z.boolean().nullable(), points: nullableNumber }).strict(),
+    W7_websiteQuality: z.string().nullable(), W8_firmEstablished: nullableNumber,
+    W9_practiceAreas: z.array(z.string()).nullable(),
+  }).strict(),
+  bar: z.object({
+    B1_allActive: z.boolean().nullable(), B2_worstDisciplinary: z.string().nullable(),
+    B3_consistency: nullableNumber, B4_avgExperience: nullableNumber,
+    attorneys: z.array(AttorneyMatch).nullable(),
+  }).strict(),
+  avvo: z.object({
+    A1_avgRating: nullableNumber, A2_practiceAreas: z.array(z.string()).nullable(),
+    A3_avgReviewRating: nullableNumber, A3_totalReviews: nullableNumber,
+    A5_avgEndorsements: nullableNumber, A6_hasAwards: z.boolean().nullable(),
+  }).strict(),
+}).strict();
+export type Signals = z.infer<typeof Signals>;
+const multiplier = z.object({ value: z.number().positive(), known: z.boolean() });
+export const Multipliers = z.object({
+  practiceArea: multiplier.extend({ area: z.string().nullable() }).strict(),
+  jurisdiction: multiplier.extend({ state: z.string().nullable() }).strict(),
+  size: multiplier.extend({ teamSize: nullableNumber }).strict(),
+}).strict();
 export const Layer1Result = z.object({
-  domain: z.string(),
-  firm: Layer1Firm,
-  pre_score: PreScore,
-  signals: z.array(Signal),
-  observations: Layer1Observations,
-  quick_report: QuickReport,
-  steps: z.array(PipelineStep),
-  duration_ms: z.number(),
-});
+  canonicalDomain: z.string().min(1), preScore: PreScore,
+  signals: Signals, multipliers: Multipliers,
+  sources: z.object({ website: SourceStatus, bar: SourceStatus, avvo: SourceStatus }).strict(),
+  meta: z.object({ scanDurationMs: z.number().int().nonnegative(), cached: z.boolean(), completedAt: z.string().datetime() }).strict(),
+}).strict();
 export type Layer1Result = z.infer<typeof Layer1Result>;
-
-export const Layer1Input = z.object({
-  domain: z.string(),
-  /** Correlaciona la evidencia y el run record con el scan en el MemoryStore. */
-  scan_id: z.string().optional(),
-});
-export type Layer1Input = z.infer<typeof Layer1Input>;
-
-/**
- * Puerto del pipeline. Hoy solo existe InProcessPipeline; mañana un HttpPipeline que hace
- * POST a un servicio aparte implementa esta misma firma y nada más cambia.
- */
+export type ScanStatus = z.infer<typeof ScanStatus>;
+export type PipelineResult = { status: Exclude<ScanStatus, 'RUNNING'>; result: Layer1Result };
 export interface Layer1Pipeline {
-  run(input: Layer1Input): Promise<Layer1Result>;
+  run(input: { scanId: string; canonicalDomain: string }): Promise<PipelineResult>;
 }
+export const DomainResolution = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('RESOLVED'), canonicalDomain: z.string().min(1),
+    source: z.enum(['request', 'email']), reason: z.literal(null) }).strict(),
+  z.object({ status: z.literal('UNRESOLVED'), canonicalDomain: z.literal(null),
+    source: z.enum(['request', 'email']).nullable(), reason: z.enum(['INVALID_DOMAIN', 'PERSONAL_EMAIL', 'DOMAIN_UNAVAILABLE']) }).strict(),
+]);
+export type DomainResolution = z.infer<typeof DomainResolution>;
+export interface DomainResolver {
+  resolve(input: { domain?: string; email: string }): Promise<DomainResolution>;
+}
+export type ScoringInput = {
+  website: z.infer<typeof WebsiteData> | null;
+  bar: z.infer<typeof AttorneyMatch>[] | null;
+  avvo: z.infer<typeof AttorneyMatch>[] | null;
+  sources: Layer1Result['sources'];
+  now: string;
+};

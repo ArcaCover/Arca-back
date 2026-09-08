@@ -1,131 +1,47 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import type {
-  AssessmentRecord,
-  AssessmentRepository,
-  FirmRecord,
-  FirmRepository,
-  FirmUpsert,
-  LeadRecord,
-  LeadRepository,
-  Repositories,
-  ScanRecord,
-  ScanRepository,
-} from './types.js';
+import type { SourceName } from '@arca/contracts';
+import type { ScanRepository, ScanRecord, RawRecord } from './types.js';
 
-/** Cliente con SERVICE_ROLE_KEY: el backend es el único que toca las tablas en Fase 1. */
-export function createSupabaseClient(url: string, serviceRoleKey: string): SupabaseClient {
-  return createClient(url, serviceRoleKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-}
-
-/** Convierte un error de PostgREST en algo que se pueda leer en un log. */
-function fail(operation: string, error: { message: string; code?: string }): never {
-  throw new Error(`supabase ${operation} failed: ${error.message}${error.code ? ` (${error.code})` : ''}`);
-}
-
-class SupabaseFirmRepository implements FirmRepository {
+export class SupabaseRepository implements ScanRepository {
   constructor(private readonly client: SupabaseClient) {}
-
-  async upsertByDomain(firm: FirmUpsert): Promise<FirmRecord> {
-    // onConflict en domain: reescanear una firma actualiza sus datos en vez de duplicarla.
-    const { data, error } = await this.client
-      .from('firms')
-      .upsert({ ...firm, updated_at: new Date().toISOString() }, { onConflict: 'domain' })
-      .select()
-      .single();
-    if (error) fail('firms.upsert', error);
-    return data as FirmRecord;
+  async create(scan: ScanRecord) {
+    const { error } = await this.client.from('scans').insert(scan);
+    if (error) throw new Error('Unable to create scan', { cause: error });
+  }
+  async get(scanId: string): Promise<ScanRecord | null> {
+    const { data, error } = await this.client.from('scans').select('*').eq('scan_id', scanId).maybeSingle();
+    if (error) throw new Error('Unable to read scan', { cause: error });
+    return data;
+  }
+  async complete(scanId: string, update: Pick<ScanRecord, 'status' | 'result' | 'completed_at' | 'duration_ms'>) {
+    const { data, error } = await this.client.from('scans').update(update).eq('scan_id', scanId).select('scan_id').single();
+    if (error || !data) throw new Error('Unable to complete scan', { cause: error });
+  }
+  async cached(domain: string, since: string): Promise<ScanRecord | null> {
+    const { data, error } = await this.client.from('scans').select('*').eq('canonical_domain', domain)
+      .eq('cached', false).eq('status', 'COMPLETED').gte('completed_at', since)
+      .order('completed_at', { ascending: false }).limit(1).maybeSingle();
+    if (error) throw new Error('Unable to read cache', { cause: error });
+    return data;
+  }
+  async saveRaw(record: RawRecord) {
+    const { error } = await this.client.from('scan_raw_data').insert(record);
+    if (error) throw new Error('Unable to save evidence', { cause: error });
+  }
+  async latestRaw(domain: string, source: SourceName): Promise<RawRecord | null> {
+    const { data, error } = await this.client.from('scan_raw_data').select('*, scans!inner(canonical_domain)')
+      .eq('scans.canonical_domain', domain).eq('source', source).order('fetched_at', { ascending: false }).limit(1).maybeSingle();
+    if (error) throw new Error('Unable to read evidence', { cause: error });
+    return data;
+  }
+  async recoverInterrupted(before: string) {
+    const { error } = await this.client.from('scans').update({ status: 'FAILED', completed_at: new Date().toISOString() })
+      .eq('status', 'RUNNING').lt('created_at', before);
+    if (error) throw new Error('Unable to recover interrupted scans', { cause: error });
   }
 }
-
-class SupabaseLeadRepository implements LeadRepository {
-  constructor(private readonly client: SupabaseClient) {}
-
-  async capture(lead: Pick<LeadRecord, 'email' | 'domain' | 'firm_id' | 'source'>): Promise<LeadRecord> {
-    const { data, error } = await this.client
-      .from('leads')
-      .upsert(
-        { ...lead, status: 'email_captured', last_activity_at: new Date().toISOString() },
-        { onConflict: 'email,domain' },
-      )
-      .select()
-      .single();
-    if (error) fail('leads.capture', error);
-    return data as LeadRecord;
-  }
-
-  async updateProgress(
-    id: string,
-    changes: Partial<Pick<LeadRecord, 'status' | 'firm_id' | 'pre_score' | 'composite_score'>>,
-  ): Promise<void> {
-    const { error } = await this.client
-      .from('leads')
-      .update({ ...changes, last_activity_at: new Date().toISOString() })
-      .eq('id', id);
-    if (error) fail('leads.updateProgress', error);
-  }
-
-  async findByDomain(domain: string): Promise<LeadRecord | null> {
-    const { data, error } = await this.client
-      .from('leads')
-      .select()
-      .ilike('domain', domain)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (error) fail('leads.findByDomain', error);
-    return (data as LeadRecord | null) ?? null;
-  }
-}
-
-class SupabaseScanRepository implements ScanRepository {
-  constructor(private readonly client: SupabaseClient) {}
-
-  async create(scan: Omit<ScanRecord, 'created_at'>): Promise<ScanRecord> {
-    const { data, error } = await this.client.from('scans').insert(scan).select().single();
-    if (error) fail('scans.create', error);
-    return data as ScanRecord;
-  }
-
-  async findById(id: string): Promise<ScanRecord | null> {
-    const { data, error } = await this.client.from('scans').select().eq('id', id).maybeSingle();
-    if (error) fail('scans.findById', error);
-    return (data as ScanRecord | null) ?? null;
-  }
-}
-
-class SupabaseAssessmentRepository implements AssessmentRepository {
-  constructor(private readonly client: SupabaseClient) {}
-
-  async create(assessment: Omit<AssessmentRecord, 'id' | 'created_at'>): Promise<AssessmentRecord> {
-    const { data, error } = await this.client
-      .from('assessments')
-      .insert(assessment)
-      .select()
-      .single();
-    if (error) fail('assessments.create', error);
-    return data as AssessmentRecord;
-  }
-
-  async findByScanId(scanId: string): Promise<AssessmentRecord | null> {
-    const { data, error } = await this.client
-      .from('assessments')
-      .select()
-      .eq('scan_id', scanId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (error) fail('assessments.findByScanId', error);
-    return (data as AssessmentRecord | null) ?? null;
-  }
-}
-
-export function createSupabaseRepositories(client: SupabaseClient): Repositories {
-  return {
-    firms: new SupabaseFirmRepository(client),
-    leads: new SupabaseLeadRepository(client),
-    scans: new SupabaseScanRepository(client),
-    assessments: new SupabaseAssessmentRepository(client),
-  };
+export function createRepository(url: string, key: string) {
+  return new SupabaseRepository(createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false },
+    global: { fetch: (input, init) => fetch(input, { ...init,
+      signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000) }) } }));
 }

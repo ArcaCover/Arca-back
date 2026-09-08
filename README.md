@@ -1,137 +1,127 @@
-# ARCA — Score Engine API (Fase 1)
+# ARCA — Layer 1
 
-Backend del Score Engine de ARCA: recibe el dominio de una firma de abogados, corre el pipeline
-de Capa 1, adapta el cuestionario de Capa 2 y devuelve score, tier, decisión de suscripción y
-tres opciones de precio.
+Backend TypeScript que evalúa evidencia pública de una firma por dominio: website, Florida Bar y Avvo.
+Implementa el handbook del 4 de septiembre de 2026 y las decisiones confirmadas por el usuario.
+Las diferencias y sus motivos se concentran en [DN-01](docs/design-notes/DN-01-layer1-handbook-resolution.md).
 
-## Requisitos
+## Ejecutar localmente
 
-- Node 20+
-- [Supabase CLI](https://supabase.com/docs/guides/cli) para las migraciones
-- Chromium de Playwright (solo para correr scans reales; los tests no lo necesitan)
+Requiere Node.js 22 y npm. Desde la raíz:
 
-## Levantar en local
-
-```bash
-npm install
-npx playwright install chromium     # solo si vas a escanear dominios reales
-cp .env.example .env.local          # completar SUPABASE_* y SESSION_TOKEN_SECRET
+```powershell
+npm ci
+Copy-Item .env.example .env.local
+# Asignar SESSION_TOKEN_SECRET en .env.local: un secreto aleatorio de al menos 32 caracteres.
 npm run dev
 ```
 
-El servidor queda en `http://localhost:8080`. `GET /health` responde `{ "status": "ok" }`.
+`.env.example` activa `MOCK_MODE=true`: usa persistencia en memoria y fixtures locales,
+sin credenciales externas ni llamadas pagadas. Datos y caché desaparecen al reiniciar.
+Swagger está en http://localhost:8080/docs.
 
-Las variables se validan al arrancar: si falta alguna, el proceso falla con el detalle de cuál.
-
-## Migraciones
-
-El schema se versiona en git. Nunca editar tablas desde el dashboard de Supabase.
-
-```bash
-npm run db:new nombre_de_la_migracion   # crea supabase/migrations/<timestamp>_nombre.sql
-npm run db:push                         # aplica las pendientes
+```powershell
+$scan = Invoke-RestMethod http://localhost:8080/scan -Method Post -ContentType 'application/json' -Body '{"email":"owner@robust.arca.example"}'
+Invoke-RestMethod "http://localhost:8080/scan/$($scan.scanId)" -Headers @{ Authorization = "Bearer $($scan.sessionToken)" }
 ```
 
-Las cuatro tablas de esta fase son `firms`, `leads`, `scans` y `assessments`. Todas quedan con
-RLS habilitado y sin políticas: el backend entra con `SERVICE_ROLE_KEY` y `anon` no lee nada.
-Cada migración lleva un `-- TODO RLS` con lo que falta definir antes de exponer el anon key.
-
-## Tests
-
-```bash
-npm test                # toda la suite
-npm run test:coverage   # cobertura de packages/scoring y packages/questions
-```
-
-No hay tests que salgan a internet: el flujo completo corre contra un sitio HTML servido en
-`localhost` desde `apps/api/tests/fixtures/site.ts`.
-
-## Endpoints
-
-| Método | Ruta | Auth |
+| Dominio mock | Score | Resultado relevante |
 | --- | --- | --- |
-| `POST` | `/api/v1/scan` | pública, con rate limit de 5/min y 20/hora por IP |
-| `GET` | `/api/v1/scan/{scan_id}` | `Authorization: Bearer <session_token>` |
-| `GET` | `/api/v1/assessment/{scan_id}/questions` | `Authorization: Bearer <session_token>` |
-| `POST` | `/api/v1/assessment/{scan_id}/submit` | `Authorization: Bearer <session_token>` |
+| robust.arca.example | 84 | FORTRESS |
+| minimal.arca.example | 25 | EXPOSED; evidencia incompleta |
+| sanctioned.arca.example | 74 | FORTIFIED; decisión REFERRAL_SENIOR por sanción reciente |
 
-`POST /scan` devuelve un `session_token` (JWT HS256, 24h) que contiene solo el `scan_id`. Los
-demás endpoints lo exigen y verifican que corresponda al scan de la ruta: un token válido de otro
-scan devuelve 401.
+Los fixtures están en `apps/api/mocks`; la sanción reciente se fecha al cargar el escenario.
 
-## Estructura
+## Contrato HTTP
 
+`Request → DomainResolution → Assessment`. `email` es obligatorio; `domain` es opcional.
+Se prioriza el dominio explícito normalizado. En su ausencia, se intenta resolver el dominio
+de un email corporativo. Se exige DNS público utilizable; esto no verifica propiedad.
+Email personal sin dominio explícito, dominio inválido o resolución fallida producen
+`canonicalDomain: null` y `assessment: null`, sin crear ni ejecutar un scan.
+Una vez resuelta la identidad, el email no interviene en señales, score ni multipliers.
+
+| Método | Ruta | Comportamiento |
+| --- | --- | --- |
+| POST | `/scan` | 202 RUNNING con scanId y sessionToken; 200 con assessment cacheado o UNRESOLVED sin assessment |
+| GET | `/scan/:scanId` | Polling con Bearer JWT de 24 horas vinculado al scan y solicitante |
+| GET | `/openapi.json` | Contrato generado OpenAPI 3.1 |
+| GET | `/docs` | Swagger UI |
+| GET | `/health` | Salud del proceso |
+
+COMPLETED, PARTIAL y FAILED son terminales: detener polling en cualquiera.
+El resultado separa `preScore.tier` de `preScore.decision`; los overrides solo restringen la decisión.
+Los campos desconocidos siguen siendo null. Una categoría completamente desconocida tiene score null;
+los parciales suman únicamente reglas evaluables y muestran estado y flags de cobertura.
+`sources.status` indica éxito técnico, `dataStatus` indica presencia de datos.
+La confianza HIGH/MEDIUM/LOW corresponde al número de fuentes técnicamente completas, no certifica veracidad.
+
+La caché dura 24 horas por dominio canónico y solo reutiliza scans COMPLETED originales.
+Cada reutilización crea un registro y token propios, conserva la fecha de evidencia y no renueva el TTL.
+Los límites en memoria son 10 solicitudes por IP/hora y 3 por email/hora.
+
+## Reglas
+
+| Categoría | Máximo |
+| --- | --- |
+| AI Governance | 35 |
+| Professional Standing | 30 |
+| Reputation | 20 |
+| Firm Maturity | 15 |
+
+Firm Maturity concede hasta 3 puntos por cada uno: website robusto, privacidad de datos del cliente,
+equipo detallado, firma con más de diez años y áreas consistentes. Se eliminó W10 (tipo de email).
+Se mantienen las penalizaciones observables de las tablas y los límites por categoría.
+Las áreas se normalizan y se comparan con Jaccard ≥0.8. Los directorios usan una muestra estable
+de hasta 15 abogados; el denominador de consistencia es el número consultado.
+Las fechas de sanción usan aniversarios de calendario, no años de 365 días.
+Los multipliers permanecen en el resultado; desconocido devuelve 1.0 con `known: false`.
+Su aplicación comercial queda señalada para revisión en DN-01.
+
+## Fuentes reales y despliegue
+
+Usar `MOCK_MODE=false`, configurar Supabase, OpenAI y Apify según `.env.example`, e instalar Chromium:
+
+```powershell
+npx playwright install chromium
+npm run build
+node apps/api/dist/server.js
 ```
-packages/scoring/      función pura de scoring y pricing — sin I/O, sin reloj, sin red
-packages/questions/    banco de preguntas + lógica adaptativa, también pura
-packages/contracts/    tipos Zod compartidos y los dos puertos (Layer1Pipeline, MemoryStore)
-apps/api/              handlers HTTP, pipeline de Capa 1 y repositorios de Supabase
-supabase/migrations/   schema versionado
+
+Website: Playwright, máximo 20 páginas y profundidad 2; robots y resolución pública fijada al socket.
+Extracción estructurada GPT-4o-mini, con caché del análisis por hash de contenido y versión.
+Directorios: `scrapers_lat/florida-bar-lawyers-scraper` y `solidcode/avvo-scraper` mediante Apify.
+Las respuestas originales disponibles se guardan con hash SHA-256 antes de devolver el resultado.
+El pipeline reserva 5 segundos de sus 55 segundos para persistencia y cancela fuentes al agotar su plazo.
+Si no puede persistir evidencia, el scan termina FAILED en vez de publicar un resultado sin respaldo.
+La escritura de estado HTTP tiene además el timeout de Supabase de 5 segundos.
+El servidor recupera scans RUNNING interrumpidos al arrancar y periódicamente.
+
+El baseline `supabase/migrations/20260908151940_create_layer1.sql` crea `scans` y `scan_raw_data`
+en una base vacía. Activa RLS, restringe acceso directo de anon/authenticated y concede acceso al service role.
+No adapta una base con tablas antiguas. Para un Supabase local nuevo (requiere Docker):
+
+```powershell
+npx supabase start
+npx supabase db reset --local
 ```
 
-`packages/scoring` no importa nada del resto: se puede ejecutar con un objeto de respuestas y
-devuelve siempre lo mismo. Ahí vive la fórmula de prima, así que cualquier cambio necesita su test.
+El Dockerfile incluye Node 22 y Chromium. Configurar variables en el proveedor al desplegar.
+Mantener secretos solo en backend y CORS con orígenes exactos.
+`TRUST_PROXY_HOPS=0` utiliza la conexión directa; configurar otro valor solo para una topología conocida
+sin acceso directo que eluda el proxy. El rate limiter y la ejecución en proceso requieren una sola instancia;
+escalar horizontalmente necesita almacenamiento compartido para límites y coordinación de trabajos.
 
-## Los dos puertos
+## Validación
 
-Toda la parte de agentes y de memoria vive detrás de una interfaz. Hoy hay una sola
-implementación de cada una, y las dos están pensadas para poder salir del proceso sin tocar
-handlers ni scoring.
-
-### `Layer1Pipeline` → posible servicio HTTP
-
-```ts
-interface Layer1Pipeline {
-  run(input: { domain: string; scan_id?: string }): Promise<Layer1Result>;
-}
+```powershell
+npm run build
+npm test
+npm run test:coverage
 ```
 
-Implementación actual: `InProcessPipeline` (`apps/api/src/pipeline/`), que hace scraping con
-Playwright, análisis por keywords, DNS y fingerprinting de tech stack dentro del mismo proceso.
-
-`Layer1Result` es un objeto plano validado con Zod: sin clases, sin `Date`, sin funciones. Eso es
-a propósito — es exactamente lo que viajaría como body de un POST.
-
-**Para mover el pipeline a un servicio aparte (por ejemplo, Python):**
-
-1. Agregar `HttpPipeline implements Layer1Pipeline` que haga `POST /run` al servicio y valide la
-   respuesta con `Layer1Result.parse()`.
-2. Cambiar qué implementación se instancia en `apps/api/src/server.ts`.
-3. Nada más. Los handlers reciben `Layer1Pipeline` por constructor y el scoring nunca vio el
-   pipeline.
-
-El servicio remoto tiene que devolver el mismo shape que valida `Layer1Result`; el `parse()` en el
-borde es lo que evita que una diferencia de contrato se filtre al scoring.
-
-### `MemoryStore` → MongoDB
-
-```ts
-interface MemoryStore {
-  saveEvidence(scanId: string, items: EvidenceItem[]): Promise<void>;
-  saveRunRecord(scanId: string, record: RunRecord): Promise<void>;
-}
-```
-
-Implementación actual: `NoopMemoryStore`, que loguea a stdout en desarrollo y no persiste nada.
-El pipeline ya llama a los dos métodos en los puntos correctos: la evidencia cruda del scraping y
-del DNS después de recolectarla, y el run record al cerrar el scan.
-
-**Para conectar el Memory System cuando esté definido el diseño de Mongo:**
-
-1. Agregar el driver y `MongoMemoryStore implements MemoryStore`.
-2. Instanciarlo en `apps/api/src/server.ts` y pasarlo al pipeline, que lo recibe inyectado.
-3. Nada más.
-
-`EvidenceItem` y `RunRecord` también son JSON plano (los timestamps son strings ISO), así que
-sirven igual para Mongo que para un servicio HTTP intermedio.
-
-No hay ningún dato de memoria escrito en Supabase ni ninguna dependencia de MongoDB en el
-`package.json`. Esa separación es la que hace que conectar Mongo después sea un archivo nuevo y
-no una migración de datos.
-
-## Fuera de alcance en esta fase
-
-Auth de usuarios, magic links, Stripe, endpoints de broker/admin/partnership, organizaciones,
-generación de PDF, RAG, change detection, scrapers de bar associations y dashboard. El bar check
-devuelve `bar_verified: false` con `bar_check: "manual_pending"` y sus 8 puntos no entran al
-máximo posible del pre-score.
+Las pruebas cubren matemáticas, incertidumbre, identidad, sesiones, caché, límites, pipeline,
+proveedores simulados, Chromium real con transporte de fixtures y el SQL/RLS en PostgreSQL embebido (PGlite).
+La prueba de crawling necesita Chromium instalado. Los tests no consumen APIs pagadas.
+El modo real, una base remota y el despliegue requieren validación con sus credenciales e infraestructura.
+Los documentos históricos de `private` se conservan sin cambios.

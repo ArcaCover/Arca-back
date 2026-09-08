@@ -1,81 +1,32 @@
-import { randomUUID } from 'node:crypto';
-import type {
-  AssessmentRecord,
-  AssessmentRepository,
-  FirmRecord,
-  FirmRepository,
-  FirmUpsert,
-  LeadRecord,
-  LeadRepository,
-  Repositories,
-  ScanRecord,
-  ScanRepository,
-} from './types.js';
+import type { ScanRepository, ScanRecord, RawRecord } from './types.js';
+import type { SourceName } from '@arca/contracts';
 
-/**
- * Implementación en memoria de los mismos puertos. Existe para el test de integración: permite
- * ejercitar los handlers completos sin una instancia de Supabase corriendo.
- */
-export class InMemoryRepositories implements Repositories {
-  readonly firmsByDomain = new Map<string, FirmRecord>();
-  readonly leadsById = new Map<string, LeadRecord>();
-  readonly scansById = new Map<string, ScanRecord>();
-  readonly assessmentsByScanId = new Map<string, AssessmentRecord>();
-
-  readonly firms: FirmRepository = {
-    upsertByDomain: async (firm: FirmUpsert) => {
-      const existing = this.firmsByDomain.get(firm.domain);
-      const record: FirmRecord = { id: existing?.id ?? randomUUID(), ...firm };
-      this.firmsByDomain.set(firm.domain, record);
-      return record;
-    },
-  };
-
-  readonly leads: LeadRepository = {
-    capture: async (lead) => {
-      const key = `${lead.email.toLowerCase()}|${lead.domain.toLowerCase()}`;
-      const existing = [...this.leadsById.values()].find(
-        (l) => `${l.email.toLowerCase()}|${l.domain.toLowerCase()}` === key,
-      );
-      const record: LeadRecord = existing ?? {
-        id: randomUUID(),
-        ...lead,
-        status: 'email_captured',
-        pre_score: null,
-        composite_score: null,
-      };
-      this.leadsById.set(record.id, { ...record, firm_id: lead.firm_id });
-      return this.leadsById.get(record.id)!;
-    },
-    updateProgress: async (id, changes) => {
-      const existing = this.leadsById.get(id);
-      if (existing) this.leadsById.set(id, { ...existing, ...changes });
-    },
-    findByDomain: async (domain) =>
-      [...this.leadsById.values()].find(
-        (l) => l.domain.toLowerCase() === domain.toLowerCase(),
-      ) ?? null,
-  };
-
-  readonly scans: ScanRepository = {
-    create: async (scan) => {
-      const record: ScanRecord = { ...scan, created_at: new Date().toISOString() };
-      this.scansById.set(record.id, record);
-      return record;
-    },
-    findById: async (id) => this.scansById.get(id) ?? null,
-  };
-
-  readonly assessments: AssessmentRepository = {
-    create: async (assessment) => {
-      const record: AssessmentRecord = {
-        id: randomUUID(),
-        ...assessment,
-        created_at: new Date().toISOString(),
-      };
-      this.assessmentsByScanId.set(record.scan_id, record);
-      return record;
-    },
-    findByScanId: async (scanId) => this.assessmentsByScanId.get(scanId) ?? null,
-  };
+export class InMemoryRepository implements ScanRepository {
+  readonly scans = new Map<string, ScanRecord>();
+  readonly raw: RawRecord[] = [];
+  async create(scan: ScanRecord) {
+    if (this.scans.has(scan.scan_id)) throw new Error('Duplicate scan');
+    this.scans.set(scan.scan_id, structuredClone(scan));
+  }
+  async get(scanId: string) { return structuredClone(this.scans.get(scanId) ?? null); }
+  async complete(scanId: string, update: Pick<ScanRecord, 'status' | 'result' | 'completed_at' | 'duration_ms'>) {
+    const scan = this.scans.get(scanId);
+    if (!scan) throw new Error('Scan not found');
+    Object.assign(scan, structuredClone(update));
+  }
+  async cached(domain: string, since: string) {
+    return structuredClone([...this.scans.values()].filter(s => s.canonical_domain === domain && !s.cached &&
+      s.status === 'COMPLETED' && s.completed_at !== null && s.completed_at >= since)
+      .sort((a, b) => b.completed_at!.localeCompare(a.completed_at!))[0] ?? null);
+  }
+  async saveRaw(record: RawRecord) { this.raw.push(structuredClone(record)); }
+  async latestRaw(domain: string, source: SourceName) {
+    return structuredClone(this.raw.filter(r => r.source === source && this.scans.get(r.scan_id)?.canonical_domain === domain)
+      .sort((a, b) => b.fetched_at.localeCompare(a.fetched_at))[0] ?? null);
+  }
+  async recoverInterrupted(before: string) {
+    for (const scan of this.scans.values()) if (scan.status === 'RUNNING' && scan.created_at < before) {
+      scan.status = 'FAILED'; scan.completed_at = new Date().toISOString();
+    }
+  }
 }

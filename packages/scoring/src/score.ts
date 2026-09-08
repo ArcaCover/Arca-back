@@ -1,101 +1,90 @@
-import { QUESTION_SCORING, DOMAIN_WEIGHTS, canonicalAnswer } from './answer-scores.js';
-import type { QuestionScoring } from './answer-scores.js';
-import type { AssessmentResponse, Confidence, DomainKey, DomainScore } from './types.js';
+import { Layer1Result, unknownWebsite, type ScoringInput, type AttorneyMatch, type Signals, type PreScore } from '@arca/contracts';
+import { aiGovernance, reputation, professionalStanding, firmMaturity } from './categories.js';
+import { mean, sum, allKnownTrue, anyKnownTrue, tierForScore, decisionForTier, restrictDecision } from './math.js';
+import { disciplinaryEvidence, yearsSince } from './discipline.js';
+import { normalizeAreas, jaccard, PRACTICE_AREAS } from './areas.js';
 
-/** Pesos Capa 1 / Capa 2 según la confianza del scan. */
-export const LAYER_WEIGHTS: Record<Confidence, { layer1: number; layer2: number }> = {
-  HIGH: { layer1: 0.25, layer2: 0.75 },
-  MEDIUM: { layer1: 0.2, layer2: 0.8 },
-  LOW: { layer1: 0.1, layer2: 0.9 },
-};
-
-export type QuestionPoints = {
-  question_id: string;
-  domain: DomainKey;
-  earned: number;
-  possible: number;
-  /** false cuando la respuesta saca la pregunta del cálculo (ej: Q2.1 = "none"). */
-  applicable: boolean;
-};
-
-function toArray(answer: string | string[]): string[] {
-  return Array.isArray(answer) ? answer : [answer];
+function uniqueMatches(matches: AttorneyMatch[] | null): AttorneyMatch[] | null {
+  if (matches === null) return null;
+  const seen = new Set<string>();
+  return matches.map(match => {
+    if (!match.attorney) return match;
+    const person = match.attorney;
+    const key = person.barNumber ?? person.profileUrl ?? person.name.toLowerCase();
+    if (seen.has(key)) return { ...match, attorney: null, matchConfidence: 'no_match' as const, ambiguous: true };
+    seen.add(key); return match;
+  });
 }
-
-/** Puntos de una sola respuesta según su tipo de scoring. Nunca devuelve negativos. */
-export function scoreQuestion(question: QuestionScoring, answer: string | string[]): QuestionPoints {
-  const answers = toArray(answer).map((a) => canonicalAnswer(question, a));
-  const base = { question_id: question.id, domain: question.domain, possible: question.max_points };
-
-  if (question.not_applicable_answers?.some((na) => answers.includes(na))) {
-    return { ...base, earned: 0, possible: 0, applicable: false };
-  }
-
-  const s = question.scoring;
-  if (s.kind === 'single') {
-    const earned = s.points[answers[0] ?? ''] ?? 0;
-    return { ...base, earned, applicable: true };
-  }
-  if (s.kind === 'accumulate') {
-    const valid = answers.filter((a) => s.valid_options.includes(a));
-    const earned = Math.min(valid.length * s.points_per_option, question.max_points);
-    return { ...base, earned, applicable: true };
-  }
-  // penalty: parte del máximo y descuenta por cada incidente declarado.
-  const deducted = answers.reduce((sum, a) => sum + (s.penalties[a] ?? 0), 0);
-  return { ...base, earned: Math.max(0, s.base - deducted), applicable: true };
-}
-
-/** Umbrales de semáforo por dominio; el handbook solo muestra good/warning en sus ejemplos. */
-function domainStatus(score: number): DomainScore['status'] {
-  if (score >= 70) return 'good';
-  if (score >= 50) return 'warning';
-  return 'critical';
-}
-
-export type DomainBreakdown = {
-  domain_scores: Record<DomainKey, DomainScore>;
-  question_points: QuestionPoints[];
-  deep_score: number;
-};
-
-/**
- * Score por dominio y deep_score. El denominador de cada dominio son solo las preguntas
- * efectivamente respondidas: saltar una pregunta no debe penalizar a la firma.
- */
-export function scoreDomains(responses: AssessmentResponse[]): DomainBreakdown {
-  const question_points: QuestionPoints[] = [];
-
-  for (const response of responses) {
-    const question = QUESTION_SCORING[response.question_id];
-    if (!question) continue; // ids desconocidos se ignoran en vez de romper el cálculo
-    question_points.push(scoreQuestion(question, response.answer));
-  }
-
-  const domain_scores = {} as Record<DomainKey, DomainScore>;
-  let weighted_sum = 0;
-  let weight_present = 0;
-
-  for (const domain of Object.keys(DOMAIN_WEIGHTS) as DomainKey[]) {
-    const inDomain = question_points.filter((p) => p.domain === domain && p.applicable);
-    const possible = inDomain.reduce((sum, p) => sum + p.possible, 0);
-    const earned = inDomain.reduce((sum, p) => sum + p.earned, 0);
-    const weight = DOMAIN_WEIGHTS[domain];
-
-    if (possible === 0) continue; // dominio sin preguntas aplicables: se excluye y su peso se reparte
-    const score = Math.round((earned / possible) * 100);
-    domain_scores[domain] = { score, status: domainStatus(score), points_earned: earned, points_possible: possible, weight };
-    weighted_sum += score * weight;
-    weight_present += weight;
-  }
-
-  // Renormaliza sobre los dominios presentes para que deep_score siga siendo 0-100.
-  const deep_score = weight_present === 0 ? 0 : Math.round(weighted_sum / weight_present);
-  return { domain_scores, question_points, deep_score };
-}
-
-/** composite = pre_score × peso_capa1 + deep_score × peso_capa2. */
-export function compositeScore(pre_score: number, deep_score: number, confidence: Confidence): number {
-  const w = LAYER_WEIGHTS[confidence];
-  return Math.round(pre_score * w.layer1 + deep_score * w.layer2);
+export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore' | 'signals' | 'multipliers'> {
+  const usable = (name: keyof ScoringInput['sources']) => ['ok', 'partial'].includes(input.sources[name].status);
+  const website = (usable('website') ? input.website : null) ?? unknownWebsite();
+  const bar = uniqueMatches(usable('bar') ? input.bar : null), avvo = uniqueMatches(usable('avvo') ? input.avvo : null);
+  const barPeople = bar?.map(match => match.attorney) ?? [];
+  const avvoPeople = avvo?.map(match => match.attorney) ?? [];
+  const allActive = allKnownTrue(barPeople.map(person => !person || person.barStatus === null || person.barStatus === 'UNKNOWN' ? null : person.barStatus === 'active'));
+  const searched = input.sources.bar.attorneysSearched;
+  // Failed or ambiguous name lookups do not assert absence from the registry.
+  const consistency = input.sources.bar.status === 'ok' && searched != null && searched > 0 &&
+    bar !== null && bar.every(match => match.matchConfidence !== 'firm_fallback' && !match.ambiguous)
+    ? barPeople.filter(Boolean).length / searched : null;
+  const experience = mean(barPeople.map(person => yearsSince(person?.admissionDate ?? null, input.now)));
+  const avvoAreasKnown = avvoPeople.some(person => person?.practiceAreas !== null && person?.practiceAreas !== undefined);
+  const avvoAreas = avvoAreasKnown ? normalizeAreas(avvoPeople.flatMap(person => person?.practiceAreas ?? [])) : null;
+  const agreement = jaccard(website.practice_areas, avvoAreas);
+  const disciplinary = disciplinaryEvidence(bar, avvo, input.now);
+  const rep = {
+    rating: mean(avvoPeople.map(person => person?.avvoRating ?? null)),
+    reviewRating: mean(avvoPeople.map(person => person?.reviewCount === 0 ? null : person?.averageReviewRating ?? null)),
+    reviewCount: sum(avvoPeople.map(person => person?.reviewCount ?? null)),
+    endorsements: mean(avvoPeople.map(person => person?.endorsementCount ?? null)),
+    awards: anyKnownTrue(avvoPeople.map(person => person?.awards === null || !person ? null : person.awards.length > 0)),
+  };
+  const categories = {
+    aiGovernance: aiGovernance(website),
+    professionalStanding: professionalStanding({ allActive, cleanRecord: disciplinary.cleanRecord, consistency,
+      experience, sanctionPenalty: disciplinary.penalty }),
+    reputation: reputation(rep), firmMaturity: firmMaturity(website, agreement, input.now),
+  };
+  const total = sum(Object.values(categories).map(category => category.score));
+  const tier = tierForScore(total);
+  const okSources = Object.values(input.sources).filter(source => source.status === 'ok').length;
+  const flags: string[] = [];
+  if (Object.values(input.sources).some(source => source.status !== 'ok')) flags.push('INCOMPLETE_SOURCES');
+  if (barPeople.some(person => !person || person.admissionDate === null || person.barStatus === null || person.barStatus === 'UNKNOWN') ||
+    avvoPeople.some(person => !person || [person.avvoRating, person.reviewCount, person.averageReviewRating,
+      person.endorsementCount, person.awards, person.practiceAreas].some(value => value === null))) flags.push('PARTIAL_ATTORNEY_DATA');
+  if (consistency !== null && consistency < .5) flags.push('LOW_BAR_CONSISTENCY');
+  if (Object.values(categories).some(category => category.status !== 'KNOWN')) flags.push('INCOMPLETE_EVIDENCE');
+  if (disciplinary.uncertain) flags.push('DISCIPLINARY_DETAILS_UNKNOWN');
+  if ([...(bar ?? []), ...(avvo ?? [])].some(match => match.ambiguous)) flags.push('AMBIGUOUS_IDENTITY_MATCH');
+  if (barPeople.some(person => person && ['inactive', 'retired', 'deceased'].includes(person.barStatus ?? ''))) flags.push('NON_ACTIVE_ATTORNEY');
+  const preScore: PreScore = { total, categories, tier, decision: restrictDecision(decisionForTier(tier), disciplinary.overrides),
+    confidence: okSources === 3 ? 'HIGH' : okSources === 2 ? 'MEDIUM' : 'LOW', overrides: disciplinary.overrides, flags };
+  const points = (category: keyof typeof categories, id: string) => categories[category].rules.find(rule => rule.id === id)?.points ?? null;
+  const signals: Signals = {
+    website: {
+      W1_aiPolicy: { found: website.ai_policy.depth === null ? null : ['comprehensive', 'basic'].includes(website.ai_policy.depth), depth: website.ai_policy.depth, points: points('aiGovernance', 'W1') },
+      W2_aiInServices: { found: website.ai_in_services.found, tools: website.ai_in_services.tools_mentioned, points: points('aiGovernance', 'W2') },
+      W3_aiDisclosure: { found: website.ai_disclosure.found, points: points('aiGovernance', 'W3') },
+      W4_aiBlog: { found: website.ai_blog_posts.found, count: website.ai_blog_posts.count, points: points('aiGovernance', 'W4') },
+      W5_teamSize: website.team_size, W5a_teamPageQuality: website.team_page_quality,
+      W6_privacyPolicy: { found: website.privacy_policy.found, mentionsClientData: website.privacy_policy.mentions_client_data, points: points('firmMaturity', 'W6') },
+      W7_websiteQuality: website.website_quality, W8_firmEstablished: website.firm_established_year, W9_practiceAreas: normalizeAreas(website.practice_areas),
+    },
+    bar: { B1_allActive: allActive, B2_worstDisciplinary: disciplinary.worstSeverity,
+      B3_consistency: consistency, B4_avgExperience: experience, attorneys: bar },
+    avvo: { A1_avgRating: rep.rating, A2_practiceAreas: avvoAreas, A3_avgReviewRating: rep.reviewRating,
+      A3_totalReviews: rep.reviewCount, A5_avgEndorsements: rep.endorsements, A6_hasAwards: rep.awards },
+  };
+  // Avvo takes precedence on disagreement; all known labels remain in signals for audit.
+  const areas = avvoAreas?.length ? avvoAreas : normalizeAreas(website.practice_areas);
+  const candidates = PRACTICE_AREAS.filter(item => areas?.includes(item.area)).sort((a, b) => b.value - a.value || a.area.localeCompare(b.area));
+  const selected = candidates[0];
+  const size = website.team_size;
+  const sizeKnown = size !== null && size >= 1;
+  return { preScore, signals, multipliers: {
+    practiceArea: { area: selected?.area ?? null, value: selected?.value ?? 1, known: selected !== undefined },
+    jurisdiction: { state: barPeople.some(Boolean) ? 'FL' : null, value: barPeople.some(Boolean) ? 1.25 : 1, known: barPeople.some(Boolean) },
+    size: { teamSize: size, known: sizeKnown, value: !sizeKnown ? 1 : size === 1 ? .9 : size <= 5 ? 1 : size <= 15 ? 1.1 : size <= 30 ? 1.2 : 1.3 },
+  } };
 }

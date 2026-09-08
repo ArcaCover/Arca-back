@@ -13,5 +13,5 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": { "build": "tsc -b" },
-  "dependencies": { "zod": "^3.25.0" }
+  "dependencies": { "@arca/contracts": "*", "zod": "^3.25.0" }
 }

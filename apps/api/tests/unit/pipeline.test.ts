@@ -1,139 +1,98 @@
-import { describe, expect, it } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { InProcessPipeline } from '../../src/pipeline/in-process-pipeline.js';
-import type { FetchedPage, PageFetcher } from '../../src/pipeline/page-fetcher.js';
-import type { DnsLookup } from '../../src/pipeline/steps/dns.js';
-import { RecordingMemoryStore, healthyDns } from '../fixtures/deps.js';
-import { LocalSiteFetcher, startTestSite, UnreachableFetcher } from '../fixtures/site.js';
+import { mockSources } from '../../src/pipeline/mock-sources.js';
+import { InMemoryRepository } from '../../src/repositories/in-memory.js';
+import { createApp } from '../../src/http/app.js';
+import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
+import type { SourceResult, AttorneyMatch } from '@arca/contracts';
 
-/** Fetcher que nunca resuelve: sirve para verificar que el timeout del paso corta. */
-class HangingFetcher implements PageFetcher {
-  async fetch(): Promise<FetchedPage> {
-    return new Promise(() => {});
-  }
-  async close(): Promise<void> {}
-}
-
-const failingDns: DnsLookup = {
-  resolveMx: async () => {
-    throw new Error('SERVFAIL');
-  },
-  resolveTxt: async () => {
-    throw new Error('SERVFAIL');
-  },
-};
-
-describe('resiliencia del pipeline', () => {
-  it('un paso que falla baja la confianza pero no aborta el scan', async () => {
-    const site = await startTestSite();
-    try {
-      const pipeline = new InProcessPipeline({
-        fetcher: new LocalSiteFetcher(site.port),
-        dns: failingDns,
-        memoryStore: new RecordingMemoryStore(),
-      });
-
-      const result = await pipeline.run({ domain: 'firm.com', scan_id: 'scan-1' });
-
-      // DNS falló, pero las señales del sitio siguen contando.
-      expect(result.observations.ai_policy_found).toBe(true);
-      expect(result.observations.email_provider).toBeNull();
-      expect(result.signals.some((s) => s.id === 'dmarc')).toBe(false);
-      expect(result.pre_score.value).toBeGreaterThan(0);
-    } finally {
-      await site.close();
-    }
+const failed = (): Promise<SourceResult<AttorneyMatch[]>> => Promise.resolve({ data: null, rawContent: null,
+  status: { status: 'error', dataStatus: 'UNKNOWN', durationMs: 0 } });
+describe('three-source orchestration', () => {
+  it('bounds raw persistence and refuses to return an unpersisted assessment', async () => {
+    const repository = new InMemoryRepository();
+    vi.spyOn(repository, 'saveRaw').mockImplementation(() => new Promise(() => {}));
+    const pipeline = new InProcessPipeline({ ...mockSources(), repository, timeoutMs: 50 });
+    await expect(pipeline.run({ scanId: 'sc_storage', canonicalDomain: 'robust.arca.example' })).rejects.toThrow('persistence deadline');
   });
-
-  it('un sitio caído deja website_found en false y sigue con DNS', async () => {
-    const pipeline = new InProcessPipeline({
-      fetcher: new UnreachableFetcher(),
-      dns: healthyDns,
-      memoryStore: new RecordingMemoryStore(),
+  it('runs the full mock scan and stores all three raw source records', async () => {
+    const repository = new InMemoryRepository();
+    const pipeline = new InProcessPipeline({ ...mockSources(), repository });
+    const start = Date.now();
+    const result = await pipeline.run({ scanId: 'sc_mock', canonicalDomain: 'robust.arca.example' });
+    expect(result.status).toBe('COMPLETED');
+    expect(result.result.preScore.total).toBe(84);
+    expect(result.result.preScore.confidence).toBe('HIGH');
+    expect(repository.raw.map(record => record.source).sort()).toEqual(['avvo', 'bar', 'website']);
+    expect(repository.raw.every(record => /^[a-f0-9]{64}$/.test(record.content_hash))).toBe(true);
+    expect(Date.now() - start).toBeLessThan(5000);
+  });
+  it('starts the directories together after website extraction', async () => {
+    const sources = mockSources(); let barStarted = false, avvoStarted = false;
+    const pipeline = new InProcessPipeline({ repository: new InMemoryRepository(), website: sources.website,
+      bar: { run: async query => { barStarted = true; expect(query.names).toEqual(['Jane Smith']); await Promise.resolve(); expect(avvoStarted).toBe(true); return failed(); } },
+      avvo: { run: async () => { avvoStarted = true; expect(barStarted).toBe(true); return failed(); } },
     });
-
-    const result = await pipeline.run({ domain: 'down.com', scan_id: 'scan-2' });
-
-    expect(result.observations.website_found).toBe(false);
-    expect(result.observations.email_provider).toBe('google');
-    expect(result.pre_score.confidence).toBe('LOW');
-    expect(result.steps.find((s) => s.step === 'scrape')?.status).toBe('ok');
+    expect((await pipeline.run({ scanId: 'sc_parallel', canonicalDomain: 'robust.arca.example' })).status).toBe('PARTIAL');
   });
-
-  it('corta un paso colgado por timeout y lo registra', async () => {
-    const pipeline = new InProcessPipeline({
-      fetcher: new HangingFetcher(),
-      dns: healthyDns,
-      memoryStore: new RecordingMemoryStore(),
-      stepTimeoutMs: 50,
-    });
-
-    const result = await pipeline.run({ domain: 'slow.com', scan_id: 'scan-3' });
-
-    expect(result.steps.find((s) => s.step === 'scrape')?.status).toBe('timeout');
-    expect(result.observations.website_found).toBe(false);
-    expect(result.pre_score.confidence).toBe('LOW');
+  it('has MEDIUM technical confidence with one failed source', async () => {
+    const pipeline = new InProcessPipeline({ ...mockSources(), avvo: { run: failed }, repository: new InMemoryRepository() });
+    const result = await pipeline.run({ scanId: 'sc_partial', canonicalDomain: 'robust.arca.example' });
+    expect(result.status).toBe('PARTIAL');
+    expect(result.result.preScore.confidence).toBe('MEDIUM');
+    expect(result.result.signals.avvo.A1_avgRating).toBeNull();
   });
-
-  it('salta los pasos restantes cuando se agota el presupuesto global', async () => {
-    let clock = 0;
-    const pipeline = new InProcessPipeline({
-      fetcher: new UnreachableFetcher(),
-      dns: healthyDns,
-      memoryStore: new RecordingMemoryStore(),
-      globalBudgetMs: 10,
-      // Cada lectura del reloj avanza 100ms: el presupuesto se agota tras la primera fase.
-      now: () => (clock += 100),
-    });
-
-    const result = await pipeline.run({ domain: 'budget.com', scan_id: 'scan-4' });
-    const skipped = result.steps.filter((s) => s.status === 'skipped').map((s) => s.step);
-
-    expect(skipped).toContain('nlp');
-    expect(skipped).toContain('tech_stack');
+  it('retains a partial assessment with only one usable source', async () => {
+    const pipeline = new InProcessPipeline({ ...mockSources(), avvo: { run: failed }, bar: { run: failed }, repository: new InMemoryRepository() });
+    const result = await pipeline.run({ scanId: 'sc_single', canonicalDomain: 'robust.arca.example' });
+    expect(result.status).toBe('PARTIAL');
+    expect(result.result.preScore.confidence).toBe('LOW');
   });
-});
-
-describe('contrato de salida', () => {
-  it('el Layer1Result serializa a JSON sin pérdida', async () => {
-    const site = await startTestSite();
-    try {
-      const pipeline = new InProcessPipeline({
-        fetcher: new LocalSiteFetcher(site.port),
-        dns: healthyDns,
-        memoryStore: new RecordingMemoryStore(),
-      });
-      const result = await pipeline.run({ domain: 'firm.com', scan_id: 'scan-5' });
-      expect(JSON.parse(JSON.stringify(result))).toEqual(result);
-    } finally {
-      await site.close();
-    }
+  it('uses a firm fallback after website failure without inventing attorneys', async () => {
+    const run = vi.fn(failed);
+    const pipeline = new InProcessPipeline({ website: { run: async () => { throw new Error('Website unavailable'); } },
+      bar: { run }, avvo: { run }, repository: new InMemoryRepository() });
+    const result = await pipeline.run({ scanId: 'sc_failed', canonicalDomain: 'smithlaw.com' });
+    expect(run).toHaveBeenCalledWith({ canonicalDomain: 'smithlaw.com', names: [], firmName: 'smithlaw', state: 'FL' }, expect.any(AbortSignal));
+    expect(result.status).toBe('FAILED');
+    expect(result.result.preScore.total).toBeNull();
   });
-
-  it('el bar check queda pendiente de revisión manual', async () => {
-    const pipeline = new InProcessPipeline({
-      fetcher: new UnreachableFetcher(),
-      dns: healthyDns,
-      memoryStore: new RecordingMemoryStore(),
-    });
-    const result = await pipeline.run({ domain: 'firm.com' });
-
-    expect(result.observations.bar_verified).toBe(false);
-    expect(result.observations.bar_check).toBe('manual_pending');
-    expect(result.steps.find((s) => s.step === 'bar_check')?.status).toBe('skipped');
+  it('enforces the global deadline even if an adapter ignores cancellation', async () => {
+    const signalSeen: AbortSignal[] = [];
+    const pipeline = new InProcessPipeline({ website: { run: (_domain, signal) => { signalSeen.push(signal); return new Promise(() => {}); } },
+      bar: { run: failed }, avvo: { run: failed }, repository: new InMemoryRepository(), timeoutMs: 25 });
+    const start = Date.now();
+    const result = await pipeline.run({ scanId: 'sc_timeout', canonicalDomain: 'firm.com' });
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(result.status).toBe('FAILED');
+    expect(result.result.sources.website.status).toBe('timeout');
+    expect(signalSeen[0]?.aborted).toBe(true);
   });
-
-  it('entrega evidencia y run record aun cuando el scan sale degradado', async () => {
-    const memory = new RecordingMemoryStore();
-    const pipeline = new InProcessPipeline({
-      fetcher: new UnreachableFetcher(),
-      dns: failingDns,
-      memoryStore: memory,
-    });
-
-    await pipeline.run({ domain: 'firm.com', scan_id: 'scan-6' });
-
-    expect(memory.runs).toHaveLength(1);
-    expect(memory.runs[0]?.record.confidence).toBe('LOW');
-    expect(memory.evidence[0]?.scanId).toBe('scan-6');
+  it('rejects a missing canonical domain at the pipeline boundary too', async () => {
+    const pipeline = new InProcessPipeline({ ...mockSources(), repository: new InMemoryRepository() });
+    await expect(pipeline.run({ scanId: 'sc_bad', canonicalDomain: '' })).rejects.toThrow('canonical domain');
+  });
+  it('runs all three local mock scenarios', async () => {
+    const pipeline = new InProcessPipeline({ ...mockSources(), repository: new InMemoryRepository() });
+    const minimal = await pipeline.run({ scanId: 'sc_minimal', canonicalDomain: 'minimal.arca.example' });
+    const sanctioned = await pipeline.run({ scanId: 'sc_sanctioned', canonicalDomain: 'sanctioned.arca.example' });
+    expect(minimal.result.preScore.total).toBe(25);
+    expect(sanctioned.result.preScore.total).toBe(74);
+    expect(sanctioned.result.preScore.decision).toBe('REFERRAL_SENIOR');
+  });
+  it('returns the same domain assessment for corporate and personal requesters', async () => {
+    const repository = new InMemoryRepository();
+    const { app, drain } = createApp({ repository, pipeline: new InProcessPipeline({ ...mockSources(), repository }),
+      domainResolver: new PublicDomainResolver(async () => {}), sessionSecret: 's'.repeat(40), corsOrigins: [], clientIp: () => 'local' });
+    const post = (email: string) => app.request('/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ domain: 'robust.arca.example', email }) });
+    const first = await (await post('owner@robust.arca.example')).json();
+    await drain();
+    const firstAssessment = (await (await app.request(`/scan/${first.scanId}`, { headers: { Authorization: `Bearer ${first.sessionToken}` } })).json()).assessment;
+    const second = await (await post('user@gmail.com')).json();
+    expect(second.cached).toBe(true);
+    expect(second.assessment.preScore).toEqual(firstAssessment.preScore);
+    expect(second.assessment.signals).toEqual(firstAssessment.signals);
+    expect(second.assessment).not.toHaveProperty('email');
   });
 });

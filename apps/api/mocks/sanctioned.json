@@ -1,0 +1,127 @@
+{
+  "website": {
+    "ai_policy": {
+      "found": true,
+      "depth": "basic",
+      "text_excerpt": "We maintain internal AI guidelines."
+    },
+    "ai_in_services": {
+      "found": true,
+      "tools_mentioned": [
+        "Harvey"
+      ],
+      "integration_depth": "supplementary"
+    },
+    "ai_disclosure": {
+      "found": false,
+      "text_excerpt": "We do not currently disclose AI use to clients."
+    },
+    "ai_blog_posts": {
+      "found": true,
+      "count": 2,
+      "titles": [
+        "Responsible AI",
+        "AI education"
+      ]
+    },
+    "practice_areas": [
+      "Immigration"
+    ],
+    "team_members": [
+      {
+        "full_name": "Jane Smith",
+        "title": "Attorney"
+      }
+    ],
+    "team_size": 1,
+    "team_page_quality": "detailed",
+    "office_count": 1,
+    "privacy_policy": {
+      "found": true,
+      "mentions_client_data": true
+    },
+    "website_quality": "robust",
+    "firm_established_year": 2005,
+    "firm_name": "Example Law"
+  },
+  "bar": [
+    {
+      "searchedName": "Jane Smith",
+      "matchConfidence": "exact",
+      "attorney": {
+        "name": "Jane Smith",
+        "city": "Miami",
+        "firmName": "Example Law",
+        "barNumber": "fixture-123",
+        "barStatus": "active",
+        "admissionDate": "2008-05-15",
+        "hasDisciplinaryHistory": true,
+        "disciplinaryActions": [
+          {
+            "severity": "public_reprimand",
+            "date": "$RECENT_SANCTION_DATE",
+            "description": "Confirmed mock sanction"
+          }
+        ],
+        "activeInvestigation": false,
+        "avvoRating": null,
+        "practiceAreas": null,
+        "reviewCount": null,
+        "averageReviewRating": null,
+        "endorsementCount": null,
+        "awards": null,
+        "profileUrl": null
+      },
+      "ambiguous": false
+    }
+  ],
+  "avvo": [
+    {
+      "searchedName": "Jane Smith",
+      "matchConfidence": "exact",
+      "attorney": {
+        "name": "Jane Smith",
+        "city": "Miami",
+        "firmName": "Example Law",
+        "barNumber": "fixture-123",
+        "barStatus": "active",
+        "admissionDate": "2008-05-15",
+        "hasDisciplinaryHistory": false,
+        "disciplinaryActions": [],
+        "activeInvestigation": false,
+        "avvoRating": 8.5,
+        "practiceAreas": [
+          "Immigration law"
+        ],
+        "reviewCount": 20,
+        "averageReviewRating": 4.5,
+        "endorsementCount": 5,
+        "awards": [],
+        "profileUrl": null
+      },
+      "ambiguous": false
+    }
+  ],
+  "sources": {
+    "website": {
+      "status": "ok",
+      "dataStatus": "PRESENT",
+      "durationMs": 1,
+      "pagesCrawled": 6
+    },
+    "bar": {
+      "status": "ok",
+      "dataStatus": "PRESENT",
+      "durationMs": 1,
+      "attorneysSearched": 1,
+      "attorneysFound": 1
+    },
+    "avvo": {
+      "status": "ok",
+      "dataStatus": "PRESENT",
+      "durationMs": 1,
+      "attorneysSearched": 1,
+      "attorneysFound": 1
+    }
+  }
+}

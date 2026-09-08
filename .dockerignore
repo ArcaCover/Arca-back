@@ -1,0 +1,9 @@
+.git
+node_modules
+**/dist
+**/*.tsbuildinfo
+.env*
+private
+coverage
+docs
+supabase/.temp

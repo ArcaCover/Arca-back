@@ -1,0 +1,116 @@
+{
+  "website": {
+    "ai_policy": {
+      "found": null,
+      "depth": null,
+      "text_excerpt": null
+    },
+    "ai_in_services": {
+      "found": null,
+      "tools_mentioned": null,
+      "integration_depth": null
+    },
+    "ai_disclosure": {
+      "found": null,
+      "text_excerpt": null
+    },
+    "ai_blog_posts": {
+      "found": null,
+      "count": null,
+      "titles": null
+    },
+    "practice_areas": [
+      "Immigration"
+    ],
+    "team_members": [
+      {
+        "full_name": "Jane Smith",
+        "title": "Attorney"
+      }
+    ],
+    "team_size": 1,
+    "team_page_quality": "names_only",
+    "office_count": null,
+    "privacy_policy": {
+      "found": false,
+      "mentions_client_data": null
+    },
+    "website_quality": "minimal",
+    "firm_established_year": 2005,
+    "firm_name": "Example Law"
+  },
+  "bar": [
+    {
+      "searchedName": "Jane Smith",
+      "matchConfidence": "exact",
+      "attorney": {
+        "name": "Jane Smith",
+        "city": "Miami",
+        "firmName": "Example Law",
+        "barNumber": "fixture-123",
+        "barStatus": "active",
+        "admissionDate": "2019-05-15",
+        "hasDisciplinaryHistory": null,
+        "disciplinaryActions": null,
+        "activeInvestigation": false,
+        "avvoRating": null,
+        "practiceAreas": null,
+        "reviewCount": null,
+        "averageReviewRating": null,
+        "endorsementCount": null,
+        "awards": null,
+        "profileUrl": null
+      },
+      "ambiguous": false
+    }
+  ],
+  "avvo": [
+    {
+      "searchedName": "Jane Smith",
+      "matchConfidence": "exact",
+      "attorney": {
+        "name": "Jane Smith",
+        "city": "Miami",
+        "firmName": "Example Law",
+        "barNumber": "fixture-123",
+        "barStatus": "active",
+        "admissionDate": "2008-05-15",
+        "hasDisciplinaryHistory": null,
+        "disciplinaryActions": null,
+        "activeInvestigation": false,
+        "avvoRating": 5.5,
+        "practiceAreas": [
+          "Immigration"
+        ],
+        "reviewCount": 2,
+        "averageReviewRating": 4,
+        "endorsementCount": 0,
+        "awards": [],
+        "profileUrl": null
+      },
+      "ambiguous": false
+    }
+  ],
+  "sources": {
+    "website": {
+      "status": "ok",
+      "dataStatus": "PRESENT",
+      "durationMs": 1,
+      "pagesCrawled": 6
+    },
+    "bar": {
+      "status": "ok",
+      "dataStatus": "PRESENT",
+      "durationMs": 1,
+      "attorneysSearched": 1,
+      "attorneysFound": 1
+    },
+    "avvo": {
+      "status": "ok",
+      "dataStatus": "PRESENT",
+      "durationMs": 1,
+      "attorneysSearched": 1,
+      "attorneysFound": 1
+    }
+  }
+}
