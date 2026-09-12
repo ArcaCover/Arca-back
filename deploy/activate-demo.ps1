@@ -10,11 +10,12 @@ if ($ImageTag -notmatch '^[0-9a-f]{7,40}$') { throw 'ImageTag must be a Git comm
 $image = "${RepositoryUri}:$ImageTag"
 $parameterFile = New-TemporaryFile
 try {
-  @{ commands = @("sudo /opt/arca/deploy/deploy-image.sh '$image' '$Region'") } |
-    ConvertTo-Json -Compress | Set-Content -LiteralPath $parameterFile -Encoding utf8NoBOM
+  $json = @{ commands = @("sudo /opt/arca/deploy/deploy-image.sh '$image' '$Region'") } | ConvertTo-Json -Compress
+  # Written through .NET because Set-Content's utf8NoBOM does not exist in Windows PowerShell 5.1.
+  [System.IO.File]::WriteAllText($parameterFile.FullName, $json, (New-Object System.Text.UTF8Encoding($false)))
   $commandId = aws ssm send-command --region $Region --instance-ids $InstanceId `
     --document-name AWS-RunShellScript --comment "Activate ARCA $ImageTag" `
-    --parameters "file://$parameterFile" --query 'Command.CommandId' --output text
+    --parameters "file://$($parameterFile.FullName)" --query 'Command.CommandId' --output text
   if (-not $commandId) { throw 'SSM did not return a command id' }
   aws ssm wait command-executed --region $Region --command-id $commandId --instance-id $InstanceId
   aws ssm get-command-invocation --region $Region --command-id $commandId --instance-id $InstanceId `

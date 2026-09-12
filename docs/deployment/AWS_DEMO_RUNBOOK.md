@@ -105,6 +105,20 @@ $InstanceId = '<InstanceId output>'
 
 The script refuses a dirty tree or a tag different from the current Git SHA.
 
+Windows PowerShell 5.1 cannot complete the ECR login: the token reaches `docker login` corrupted and
+the registry answers HTTP 400. Until that is resolved, run the login and push from a POSIX shell and
+then activate separately:
+
+```bash
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <registry>
+docker push <RepositoryUri>:<sha>
+```
+
+```powershell
+./deploy/activate-demo.ps1 -Region $AwsRegion -RepositoryUri $RepositoryUri `
+  -InstanceId $InstanceId -ImageTag '<sha>'
+```
+
 ## 6. Non-paid HTTPS smoke checks
 
 After DNS and TLS are active:
