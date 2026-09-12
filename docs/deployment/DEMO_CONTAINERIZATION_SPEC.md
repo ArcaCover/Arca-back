@@ -36,7 +36,8 @@ jobs and rate limits in process, so one replica is also the correct consistency 
 - Multi-stage, non-root production `Dockerfile` with pinned Node 22 base digest and Playwright Chromium.
 - `compose.yaml` with private API networking, health checks, read-only filesystems, bounded logs and
   pinned Caddy image digest.
-- `deploy/Caddyfile` for automatic HTTPS, compression, a 32 KiB request limit and security headers.
+- `deploy/Caddyfile` for automatic HTTPS, compression, a 32 KiB request limit, security headers and
+  basic auth on the documentation routes.
 - `.env.demo.example` with placeholders only.
 - `scripts/container-smoke.mjs` for local mock-only container validation.
 - `infra/aws` CDK application for ECR, one-AZ VPC, EC2, encrypted gp3 disk, Elastic IP, security
@@ -78,6 +79,8 @@ Required values in `/opt/arca/.env.demo`:
 | --- | --- |
 | `ARCA_IMAGE` | Immutable ECR URI tagged with the deployed Git SHA |
 | `DEMO_HOSTNAME` | Public DNS hostname pointing to the Elastic IP |
+| `DOCS_AUTH_USER` | Basic-auth user for `/docs` and `/openapi.json` |
+| `DOCS_AUTH_HASH` | bcrypt hash produced by `caddy hash-password` |
 | `NODE_ENV` | `production` |
 | `PORT` | `8080` |
 | `SOURCE_MODE` | `live` |
@@ -113,7 +116,8 @@ Before the first public demo:
 1. The local container smoke test passes without external APIs.
 2. CDK synth and diff are reviewed before deploy.
 3. DNS resolves to the Elastic IP and Caddy provisions HTTPS.
-4. `/health`, `/openapi.json`, `/docs`, request validation and scan-token authorization pass over HTTPS.
+4. `/health`, request validation and scan-token authorization pass over HTTPS; `/docs` and
+   `/openapi.json` return HTTP 401 without credentials and render with them.
 5. Supabase persistence and cache pass using the deployed API.
 6. One pre-approved live law-firm scan completes with run IDs, duration and reported cost recorded.
 7. Repeating that domain proves the 24-hour cache without paid provider calls.

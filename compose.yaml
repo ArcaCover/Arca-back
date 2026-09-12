@@ -33,6 +33,8 @@ services:
     image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
     environment:
       DEMO_HOSTNAME: ${DEMO_HOSTNAME:?Set DEMO_HOSTNAME to the public DNS name}
+      DOCS_AUTH_USER: ${DOCS_AUTH_USER:?Set DOCS_AUTH_USER to the documentation user}
+      DOCS_AUTH_HASH: ${DOCS_AUTH_HASH:?Set DOCS_AUTH_HASH to a bcrypt hash from caddy hash-password}
     ports:
       - "80:80"
       - "443:443"

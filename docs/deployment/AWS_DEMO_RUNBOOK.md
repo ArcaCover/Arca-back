@@ -78,6 +78,13 @@ sudoedit /opt/arca/.env.demo
 Set the real Supabase and Apify values, generate a unique session secret, set the final hostname and
 leave `WEBSITE_EVIDENCE_PROVIDER=rules`. Do not paste these values into tickets, logs or SSM Run Command.
 
+Generate the documentation basic-auth hash in the same session and set `DOCS_AUTH_USER` and
+`DOCS_AUTH_HASH`. The command prompts for the password; it is never passed as an argument:
+
+```bash
+docker run --rm -it caddy:2.10.2-alpine caddy hash-password
+```
+
 ## 5. Publish the current commit
 
 From the clean local checkout:
@@ -99,9 +106,13 @@ After DNS and TLS are active:
 
 ```powershell
 Invoke-RestMethod "https://$DemoHostname/health"
-Invoke-WebRequest "https://$DemoHostname/openapi.json" -UseBasicParsing
-Invoke-WebRequest "https://$DemoHostname/docs" -UseBasicParsing
+$DocsAuth = Get-Credential -UserName arca -Message "Documentation basic auth"
+Invoke-WebRequest "https://$DemoHostname/openapi.json" -Authentication Basic -Credential $DocsAuth -UseBasicParsing
+Invoke-WebRequest "https://$DemoHostname/docs" -Authentication Basic -Credential $DocsAuth -UseBasicParsing
 ```
+
+Confirm that `/docs` and `/openapi.json` return HTTP 401 without credentials, and that requests sent to
+the Elastic IP instead of the hostname never reach the API.
 
 Verify that an invalid body returns HTTP 400 and an unauthenticated scan read returns HTTP 401. Do not
 submit the final valid live scan until its external cost is explicitly approved.
