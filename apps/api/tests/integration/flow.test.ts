@@ -12,6 +12,23 @@ const secret = 's'.repeat(40);
 const post = (email = 'user@firm.com') => new Request('http://localhost/scan', { method: 'POST',
   headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, domain: 'firm.com' }) });
 describe('asynchronous scan API', () => {
+  it('allows only the configured local and production frontend origins', async () => {
+    const { app } = createApp({ domainResolver, repository: new InMemoryRepository(), pipeline: { run: vi.fn() },
+      sessionSecret: secret, corsOrigins: ['http://localhost:3000', 'https://arcacover.com'], clientIp: () => '127.0.0.1' });
+    for (const origin of ['http://localhost:3000', 'https://arcacover.com']) {
+      const response = await app.request('/health', { headers: { Origin: origin } });
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe(origin);
+    }
+    const preflight = await app.request('/scan', { method: 'OPTIONS', headers: {
+      Origin: 'https://arcacover.com', 'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'authorization, content-type',
+    } });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get('Access-Control-Allow-Origin')).toBe('https://arcacover.com');
+    expect(preflight.headers.get('Access-Control-Allow-Headers')).toBe('Content-Type,Authorization');
+    const rejected = await app.request('/health', { headers: { Origin: 'https://example.com' } });
+    expect(rejected.headers.has('Access-Control-Allow-Origin')).toBe(false);
+  });
   it('returns 202 before completion and supports authenticated terminal polling', async () => {
     let resolve!: (result: PipelineResult) => void;
     const promise = new Promise<PipelineResult>(r => { resolve = r; });
@@ -29,7 +46,8 @@ describe('asynchronous scan API', () => {
     await drain();
     const final = PollResponse.parse(await (await app.request(`/scan/${body.scanId}`, { headers })).json());
     expect(final.status).toBe('PARTIAL');
-    expect(final.assessment?.preScore.total).toBeNull();
+    expect(final.result?.preScore.total).toBe(0);
+    expect(final.result).toMatchObject({ scanId: body.scanId, domain: 'firm.com', email: 'user@firm.com' });
     const wrongToken = await issueSessionToken('sc_other', 'user@firm.com', secret);
     expect((await app.request(`/scan/${body.scanId}`, { headers: { Authorization: `Bearer ${wrongToken}` } })).status).toBe(401);
   });
@@ -37,7 +55,7 @@ describe('asynchronous scan API', () => {
     const repository = new InMemoryRepository();
     const now = Date.now();
     const oldTime = new Date(now - 86300000).toISOString();
-    const original = fixtureResult();
+    const original = fixtureResult('sc_original', 'original@firm.com');
     original.meta.completedAt = oldTime;
     await repository.create({ id: randomUUID(), scan_id: 'sc_original', canonical_domain: 'firm.com', email: 'original@firm.com',
       domain_resolution: { status: 'RESOLVED', canonicalDomain: 'firm.com', source: 'request', reason: null },
@@ -49,9 +67,9 @@ describe('asynchronous scan API', () => {
     expect(response.status).toBe(200);
     const body = ScanResponse.parse(await response.json());
     expect(body.cached).toBe(true);
-    expect(body.assessment).not.toHaveProperty('email');
-    expect(body.assessment?.preScore).toEqual(original.preScore);
-    expect(body.assessment?.meta.completedAt).toBe(oldTime);
+    expect(body.result?.email).toBe('second@gmail.com');
+    expect(body.result?.preScore).toEqual(original.preScore);
+    expect(body.result?.meta.completedAt).toBe(oldTime);
     expect(body.scanId).not.toBe('sc_original');
     expect(JSON.stringify(body)).not.toContain('original@firm.com');
     expect(run).not.toHaveBeenCalled();
@@ -66,12 +84,31 @@ describe('asynchronous scan API', () => {
     await drain();
     const response = await app.request(`/scan/${body.scanId}`, { headers: { Authorization: `Bearer ${body.sessionToken}` } });
     expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ status: 'FAILED', assessment: null });
+    expect(await response.json()).toEqual({ scanId: body.scanId, status: 'FAILED', cached: false });
+  });
+  it('coalesces simultaneous scans for the same domain', async () => {
+    let resolve!: (result: PipelineResult) => void;
+    const pending = new Promise<PipelineResult>(done => { resolve = done; });
+    const run = vi.fn(() => pending);
+    const repository = new InMemoryRepository();
+    const { app, drain } = createApp({ domainResolver, repository, pipeline: { run }, sessionSecret: secret,
+      corsOrigins: [], clientIp: () => '127.0.0.1' });
+    const first = ScanResponse.parse(await (await app.request(post('first@firm.com'))).json());
+    await Promise.resolve();
+    const second = ScanResponse.parse(await (await app.request(post('second@firm.com'))).json());
+    resolve({ status: 'PARTIAL', result: fixtureResult() });
+    await drain();
+    expect(run).toHaveBeenCalledTimes(1);
+    expect((await repository.get(first.scanId))?.result?.meta.reusedEvidence).toBe(false);
+    expect((await repository.get(second.scanId))?.result?.meta.reusedEvidence).toBe(true);
   });
   it('documents only the current scan contract', async () => {
     const { app } = createApp({ domainResolver, repository: new InMemoryRepository(), pipeline: { run: vi.fn() }, sessionSecret: secret, corsOrigins: [], clientIp: () => '127.0.0.1' });
     const document = await (await app.request('/openapi.json')).json();
     expect(Object.keys(document.paths).sort()).toEqual(['/scan', '/scan/{scanId}']);
+    expect(document.paths['/scan'].post.description).toContain('Cache identity is the normalized domain');
+    expect(document.paths['/scan'].post.responses['200'].description).toContain('Domain cache hit');
+    expect(document.paths['/scan'].post.responses['202'].description).toContain('Fresh scan started');
     expect(document.paths['/scan/{scanId}'].get.security).toEqual([{ sessionToken: [] }]);
     expect((await app.request('/docs')).status).toBe(200);
   });

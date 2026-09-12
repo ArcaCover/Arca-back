@@ -36,29 +36,41 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
     rating: mean(avvoPeople.map(person => person?.avvoRating ?? null)),
     reviewRating: mean(avvoPeople.map(person => person?.reviewCount === 0 ? null : person?.averageReviewRating ?? null)),
     reviewCount: sum(avvoPeople.map(person => person?.reviewCount ?? null)),
-    endorsements: mean(avvoPeople.map(person => person?.endorsementCount ?? null)),
-    awards: anyKnownTrue(avvoPeople.map(person => person?.awards === null || !person ? null : person.awards.length > 0)),
+    awards: anyKnownTrue(avvoPeople.map(person => !person ? null : person.awardsCount != null ? person.awardsCount > 0 :
+      person.awards === null ? null : person.awards.length > 0)),
   };
+  const awardCount = sum(avvoPeople.map(person => person?.awardsCount ?? (person?.awards?.length ?? null)));
+  const topAward = avvoPeople.map(person => person?.topAward ?? person?.awards?.[0] ?? null).find(value => value !== null) ?? null;
+  const ratingLevels = avvoPeople.map(person => person?.avvoRatingLevel ?? null).filter((value): value is string => value !== null);
+  const ratingLevel = ratingLevels.length && new Set(ratingLevels).size === 1 ? ratingLevels[0]! : null;
+  const disciplined = anyKnownTrue(avvoPeople.map(person => person?.hasDisciplinaryHistory ?? null));
   const categories = {
     aiGovernance: aiGovernance(website),
     professionalStanding: professionalStanding({ allActive, cleanRecord: disciplinary.cleanRecord, consistency,
       experience, sanctionPenalty: disciplinary.penalty }),
     reputation: reputation(rep), firmMaturity: firmMaturity(website, agreement, input.now),
   };
-  const total = sum(Object.values(categories).map(category => category.score));
+  const activeInvestigation = disciplinary.overrides.some(override => override.id === 'ACTIVE_INVESTIGATION');
+  const total = activeInvestigation ? 0 : sum(Object.values(categories).map(category => category.score));
   const tier = tierForScore(total);
   const okSources = Object.values(input.sources).filter(source => source.status === 'ok').length;
   const flags: string[] = [];
   if (Object.values(input.sources).some(source => source.status !== 'ok')) flags.push('INCOMPLETE_SOURCES');
   if (barPeople.some(person => !person || person.admissionDate === null || person.barStatus === null || person.barStatus === 'UNKNOWN') ||
     avvoPeople.some(person => !person || [person.avvoRating, person.reviewCount, person.averageReviewRating,
-      person.endorsementCount, person.awards, person.practiceAreas].some(value => value === null))) flags.push('PARTIAL_ATTORNEY_DATA');
+      person.awardsCount ?? person.awards, person.practiceAreas].some(value => value === null))) flags.push('PARTIAL_ATTORNEY_DATA');
   if (consistency !== null && consistency < .5) flags.push('LOW_BAR_CONSISTENCY');
   if (Object.values(categories).some(category => category.status !== 'KNOWN')) flags.push('INCOMPLETE_EVIDENCE');
   if (disciplinary.uncertain) flags.push('DISCIPLINARY_DETAILS_UNKNOWN');
   if ([...(bar ?? []), ...(avvo ?? [])].some(match => match.ambiguous)) flags.push('AMBIGUOUS_IDENTITY_MATCH');
   if (barPeople.some(person => person && ['inactive', 'retired', 'deceased'].includes(person.barStatus ?? ''))) flags.push('NON_ACTIVE_ATTORNEY');
-  const preScore: PreScore = { total, categories, tier, decision: restrictDecision(decisionForTier(tier), disciplinary.overrides),
+  const providerCost = Object.values(input.sources).reduce((total, source) => total + (source.costUsd ?? 0), 0);
+  if (providerCost > 1) flags.push('PROVIDER_COST_OVER_BUDGET');
+  const assessmentStatus = Object.values(categories).every(category => category.status === 'KNOWN') &&
+    !flags.includes('AMBIGUOUS_IDENTITY_MATCH') ? 'SUFFICIENT' as const : 'INSUFFICIENT_EVIDENCE' as const;
+  if (assessmentStatus === 'INSUFFICIENT_EVIDENCE') flags.push('COMMERCIAL_DECISION_BLOCKED');
+  const decision = restrictDecision(assessmentStatus === 'SUFFICIENT' ? decisionForTier(tier) : 'UNKNOWN', disciplinary.overrides);
+  const preScore: PreScore = { total, categories, tier, decision, assessmentStatus,
     confidence: okSources === 3 ? 'HIGH' : okSources === 2 ? 'MEDIUM' : 'LOW', overrides: disciplinary.overrides, flags };
   const points = (category: keyof typeof categories, id: string) => categories[category].rules.find(rule => rule.id === id)?.points ?? null;
   const signals: Signals = {
@@ -73,8 +85,9 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
     },
     bar: { B1_allActive: allActive, B2_worstDisciplinary: disciplinary.worstSeverity,
       B3_consistency: consistency, B4_avgExperience: experience, attorneys: bar },
-    avvo: { A1_avgRating: rep.rating, A2_practiceAreas: avvoAreas, A3_avgReviewRating: rep.reviewRating,
-      A3_totalReviews: rep.reviewCount, A5_avgEndorsements: rep.endorsements, A6_hasAwards: rep.awards },
+    avvo: { A1_avgRating: rep.rating, A1_ratingLevel: ratingLevel, A2_practiceAreas: avvoAreas,
+      A3_avgReviewRating: rep.reviewRating, A3_totalReviews: rep.reviewCount, A6_hasAwards: rep.awards,
+      A6_awardsCount: awardCount, A6_topAward: topAward, A8_disciplined: disciplined },
   };
   // Avvo takes precedence on disagreement; all known labels remain in signals for audit.
   const areas = avvoAreas?.length ? avvoAreas : normalizeAreas(website.practice_areas);

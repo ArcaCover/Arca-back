@@ -1,5 +1,5 @@
 import type { ScanRepository, ScanRecord, RawRecord } from './types.js';
-import type { SourceName } from '@arca/contracts';
+import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
 
 export class InMemoryRepository implements ScanRepository {
   readonly scans = new Map<string, ScanRecord>();
@@ -16,6 +16,7 @@ export class InMemoryRepository implements ScanRepository {
   }
   async cached(domain: string, since: string) {
     return structuredClone([...this.scans.values()].filter(s => s.canonical_domain === domain && !s.cached &&
+      s.result?.meta.contractVersion === LAYER1_CONTRACT_VERSION &&
       s.status === 'COMPLETED' && s.completed_at !== null && s.completed_at >= since)
       .sort((a, b) => b.completed_at!.localeCompare(a.completed_at!))[0] ?? null);
   }

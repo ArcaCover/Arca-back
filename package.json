@@ -17,6 +17,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:container": "node scripts/container-smoke.mjs",
     "db:new": "supabase migration new",
     "db:push": "supabase db push"
     ,"db:verify": "tsx --conditions=development apps/api/scripts/verify-supabase.ts"

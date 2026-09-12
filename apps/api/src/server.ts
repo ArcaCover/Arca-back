@@ -7,7 +7,8 @@ import { createApp } from './http/app.js';
 import { InMemoryRepository } from './repositories/in-memory.js';
 import { createRepository } from './repositories/supabase.js';
 import { InProcessPipeline } from './pipeline/in-process-pipeline.js';
-import { RagWebsiteSource } from './pipeline/website-source.js';
+import { WebsiteExtractionSource } from './pipeline/website-source.js';
+import { OpenAIEvidenceProvider, RuleBasedEvidenceProvider } from './pipeline/website-evidence-provider.js';
 import { ApifyClient } from './pipeline/apify-client.js';
 import { ApifyDirectorySource } from './pipeline/directories.js';
 import { PublicDomainResolver } from './pipeline/domain-resolution.js';
@@ -18,16 +19,20 @@ if (existsSync(envPath)) loadEnvFile(envPath);
 const env = loadEnv();
 const repository = env.storageBackend === 'memory' ? new InMemoryRepository() : createRepository(env.SUPABASE_URL!, env.supabaseKey!);
 await repository.recoverInterrupted(new Date(Date.now() - 60_000).toISOString());
+const websiteEvidenceProvider = env.WEBSITE_EVIDENCE_PROVIDER === 'openai'
+  ? new OpenAIEvidenceProvider(env.OPENAI_API_KEY!) : new RuleBasedEvidenceProvider();
+const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY) : null;
 const sources = env.sourceMode === 'mock' ? mockSources() : {
-  website: new RagWebsiteSource(env.OPENAI_API_KEY!, repository),
-  bar: new ApifyDirectorySource('bar', new ApifyClient(env.APIFY_API_TOKEN!)),
-  avvo: new ApifyDirectorySource('avvo', new ApifyClient(env.APIFY_API_TOKEN!)),
+  website: new WebsiteExtractionSource(repository, websiteEvidenceProvider),
+  bar: new ApifyDirectorySource('bar', apify!),
+  avvo: new ApifyDirectorySource('avvo', apify!),
 };
 const domainResolver = env.sourceMode === 'mock' ? new PublicDomainResolver(async url => {
   if (!(MOCK_DOMAINS as readonly string[]).includes(new URL(url).hostname)) throw new Error('Unknown mock domain');
 }) : new PublicDomainResolver();
 const clientIps = new WeakMap<Request, string>();
-const { app, drain } = createApp({ repository, domainResolver, pipeline: new InProcessPipeline({ ...sources, repository }),
+const { app, drain } = createApp({ repository, domainResolver, pipeline: new InProcessPipeline({ ...sources, repository,
+  maxDirectoryTargets: env.MAX_DIRECTORY_TARGETS }),
   sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
   clientIp: request => clientIps.get(request) ?? 'unknown' });
 const server = serve({ port: env.PORT, fetch: (request, bindings) => {

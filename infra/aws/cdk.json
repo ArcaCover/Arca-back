@@ -1,0 +1,7 @@
+{
+  "app": "npx tsx bin/arca-demo.ts",
+  "context": {
+    "@aws-cdk/aws-ec2:uniqueImdsv2TemplateName": true,
+    "@aws-cdk/aws-iam:minimizePolicies": true
+  }
+}

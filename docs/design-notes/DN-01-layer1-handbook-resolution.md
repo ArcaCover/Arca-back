@@ -5,6 +5,11 @@ Decisiones confirmadas por el usuario en esta conversación, 5 de septiembre de 
 Esta es la única nota activa de contradicciones, ambigüedades, cambios y resolución de la reconstrucción.
 Los documentos de `private` permanecen intactos como contexto histórico.
 
+> Las decisiones de contrato HTTP, Avvo y scoring actualizadas el 9 de septiembre de 2026
+> están en [DN-02](DN-02-2026-09-09-contract-avvo-scoring.md) y prevalecen sobre esta nota.
+> La separación entre Layer 1 y extracción, decidida el 12 de septiembre de 2026, está en
+> [DN-03](DN-03-provider-agnostic-layer1.md) y reemplaza la decisión anterior de usar GPT como extractor predeterminado.
+
 ## Principio rector
 
 La falta de información no acredita ni refuta una característica. Se representa mediante `null`,

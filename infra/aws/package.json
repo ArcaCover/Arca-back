@@ -1,0 +1,22 @@
+{
+  "name": "@arca/aws-infra",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "synth": "cdk synth --strict",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.269.0",
+    "constructs": "10.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.3",
+    "aws-cdk": "2.1141.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2"
+  }
+}

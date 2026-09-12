@@ -3,13 +3,13 @@ import { unknownWebsite } from '@arca/contracts';
 import { aiGovernance, reputation, category, tierForScore, decisionForTier, restrictDecision, mean, sum, allKnownTrue, anyKnownTrue, jaccard } from '../src/index.js';
 
 describe('evidence-aware scoring', () => {
-  it('does not convert unavailable evidence to zero or false', () => {
+  it('scores unavailable evidence as zero while preserving unknown rule state', () => {
     const score = aiGovernance(unknownWebsite());
-    expect(score.score).toBeNull();
+    expect(score.score).toBe(0);
     expect(score.status).toBe('UNKNOWN');
     expect(score.rules.every(rule => rule.points === null)).toBe(true);
     expect(mean([null, null])).toBeNull();
-    expect(sum([])).toBeNull();
+    expect(sum([])).toBe(0);
     expect(allKnownTrue([])).toBeNull();
     expect(allKnownTrue([true, null])).toBeNull();
     expect(anyKnownTrue([false, null])).toBeNull();
@@ -49,11 +49,11 @@ describe('evidence-aware scoring', () => {
     website.ai_disclosure.found = false; website.ai_blog_posts.found = true;
     expect(aiGovernance(website).score).toBe(23);
   });
-  it('keeps all reputation evidence unknown without manufacturing endorsements', () => {
-    expect(reputation({ rating: null, reviewRating: null, reviewCount: null, endorsements: null, awards: null }).score).toBeNull();
+  it('keeps reputation rules unknown without manufacturing points', () => {
+    expect(reputation({ rating: null, reviewRating: null, reviewCount: null, awards: null }).score).toBe(0);
   });
-  it.each([[8, 7], [7.95, 4], [7, 4], [6.99, 1], [5, 1], [4.99, -5]])('rates %s as %s points without decimal gaps', (rating, points) => {
-    const result = reputation({ rating, reviewRating: null, reviewCount: null, endorsements: null, awards: null });
+  it.each([[8, 9], [7.95, 6], [7, 6], [6.99, 2], [5, 2], [4.99, -5]])('rates %s as %s points without decimal gaps', (rating, points) => {
+    const result = reputation({ rating, reviewRating: null, reviewCount: null, awards: null });
     expect(result.rules[0]?.points).toBe(points);
   });
   it('caps a category and preserves zero after observed penalties', () => {

@@ -1,11 +1,13 @@
-import { unknownAttorney, Attorney, type AttorneyMatch, type DirectoryQuery, type DirectorySource, type SourceResult } from '@arca/contracts';
+import { unknownAttorney, Attorney, type AttorneyMatch, type DirectoryQuery, type DirectorySource, type SourceResult,
+  type SourceStatus } from '@arca/contracts';
 import { z } from 'zod';
-import { ApifyClient } from './apify-client.js';
+import { ApifyClientError, type ApifyRunResult } from './apify-client.js';
 import { normalizeName, stableSample, matchAttorney } from './matching.js';
 import { validDate } from '@arca/scoring';
 
 export const BAR_ACTOR = 'scrapers_lat/florida-bar-lawyers-scraper';
-export const AVVO_ACTOR = 'solidcode/avvo-scraper';
+export const AVVO_ACTOR = 'scrapers_lat/avvo-lawyers-scraper';
+export const MAX_PROVIDER_RESULTS = 7;
 const record = z.record(z.unknown());
 const text = (value: unknown): string | null => typeof value === 'string' && value.trim() ? value.trim() : null;
 const number = (value: unknown, min = 0, max = Infinity): number | null =>
@@ -50,35 +52,49 @@ export function parseBar(raw: unknown): Attorney | null {
   const actions: Attorney['disciplinaryActions'] = positiveHistory ? parseDisciplineSummary(history!) : null;
   const pending = text(row.pendingDisciplineCases);
   // Pending cases are not silently classified as confirmed active regulatory investigations.
-  return Attorney.parse({ ...unknownAttorney(name), city: text(row.physicalCity) ?? text(row.mailCity),
+  return Attorney.parse({ ...unknownAttorney(name), city: text(row.physicalCity) ?? text(row.mailCity), county: text(row.county),
     firmName: text(row.firm), barNumber: text(row.barNumber), barStatus: barStatus(row.status),
     admissionDate: admission(row.admittedDate), hasDisciplinaryHistory: positiveHistory ? true : null,
     disciplinaryActions: actions, activeInvestigation: pending && /^no active regulatory investigation\b/i.test(pending) ? false :
       pending && /^active regulatory investigation\b/i.test(pending) ? true : null,
-    practiceAreas: strings(row.practiceAreas), profileUrl: text(row.profileUrl) });
+    practiceAreas: strings(row.practiceAreas), phone: text(row.officePhone), addressStreet: text(row.mailAddress),
+    profileUrl: text(row.profileUrl) });
 }
 export function parseAvvo(raw: unknown): Attorney | null {
-  const row = record.parse(raw), name = text(row.attorneyName);
+  const row = record.parse(raw), name = text(row.name);
   if (row.error || !name) return null;
   return Attorney.parse({ ...unknownAttorney(name), city: text(row.city), firmName: text(row.firmName),
-    hasDisciplinaryHistory: boolean(row.disciplinaryAction),
+    hasDisciplinaryHistory: boolean(row.disciplined),
     avvoRating: number(row.avvoRating, 1, 10), practiceAreas: strings(row.practiceAreas),
-    reviewCount: Number.isInteger(row.reviewCount) ? number(row.reviewCount) : null,
-    averageReviewRating: number(row.averageReviewRating, 0, 5),
-    endorsementCount: Number.isInteger(row.peerEndorsementCount) ? number(row.peerEndorsementCount) : null,
-    awards: strings(row.awards), profileUrl: text(row.profileUrl) });
+    avvoRatingLevel: text(row.avvoRatingLevel),
+    reviewCount: Number.isInteger(row.reviewsCount) ? number(row.reviewsCount) : null,
+    averageReviewRating: number(row.reviewsRating, 0, 5),
+    awardsCount: Number.isInteger(row.awardsCount) ? number(row.awardsCount) : null,
+    topAward: text(row.topAward), phone: text(row.phone), addressStreet: text(row.addressStreet),
+    yearsLicensed: Number.isInteger(row.yearsLicensed) ? number(row.yearsLicensed) : null,
+    licensedSince: text(row.licensedSince), profileUrl: text(row.profileUrl) });
 }
 function firmKey(value: string) { return value.toLowerCase().replace(/\b(p\.?\s*a\.?|llp|pllc|llc|inc)\b/g, '').replace(/[^a-z0-9]/g, ''); }
+const providerError = (item: unknown) => {
+  const row = item !== null && typeof item === 'object' ? item as Record<string, unknown> : null;
+  return typeof row?.error === 'string' ? row.error.trim() : null;
+};
+const isNoMatch = (item: unknown) => /^no lawyers? matched\b|^no results?\b/i.test(providerError(item) ?? '');
+type DirectoryClient = { run(actor: string, input: Record<string, unknown>, signal: AbortSignal): Promise<unknown[] | ApifyRunResult> };
 export class ApifyDirectorySource implements DirectorySource {
-  constructor(private readonly source: 'bar' | 'avvo', private readonly client: Pick<ApifyClient, 'run'>) {}
+  constructor(private readonly source: 'bar' | 'avvo', private readonly client: DirectoryClient) {}
   async run(query: DirectoryQuery, signal: AbortSignal): Promise<SourceResult<AttorneyMatch[]>> {
     const started = Date.now();
-    const names = stableSample(query.names);
+    const names = stableSample(query.names).slice(0, query.maxTargets ?? 2);
     const fallback = names.length === 0;
-    const targets = fallback ? [query.firmName] : names;
+    const targets = fallback ? (query.firmName ? [query.firmName] : []) : names;
+    if (!targets.length) return { data: null, rawContent: null, status: { status: 'skipped', dataStatus: 'UNKNOWN',
+      durationMs: 0, code: 'INSUFFICIENT_IDENTITY', reason: 'No verified firm or attorney identity available',
+      attorneysSearched: 0, attorneysFound: 0, candidatesReceived: 0, recordsValid: 0, providerRuns: [], costUsd: 0 } };
     const rawResults: { target: string; items: unknown[] | null; error: string | null }[] = [];
     const matches: AttorneyMatch[] = [];
-    let failed = 0, successfulQueries = 0;
+    const providerRuns: NonNullable<SourceStatus['providerRuns']> = [];
+    let failed = 0, successfulQueries = 0, candidatesReceived = 0, recordsValid = 0;
     let cursor = 0;
     const worker = async () => {
       while (cursor < targets.length) {
@@ -88,25 +104,39 @@ export class ApifyDirectorySource implements DirectorySource {
           const parts = normalizeName(target).split(' ');
           const input = this.source === 'bar' ? {
             lastNames: fallback ? [] : [parts.at(-1)!], firstName: fallback ? '' : parts[0]![0],
-            ...(fallback ? { firm: target } : {}), maxLawyers: 30, withDetails: true,
+            ...(fallback ? { firm: target } : {}), maxLawyers: MAX_PROVIDER_RESULTS, withDetails: true,
             withLeadScore: false, withProfileSummary: false, eligibleOnly: false, includeDeceased: true,
-          } : { lawyerSearch: [`${fallback ? target : `${parts[0]![0]} ${parts.at(-1)}`} attorney Florida`],
-            states: ['FL'], includeReviews: true, maxReviewsPerAttorney: 10, maxItems: 15 };
-          const items = await this.client.run(this.source === 'bar' ? BAR_ACTOR : AVVO_ACTOR, input, signal);
+          } : { searchQueries: [target], ...(query.city ? { cities: [`${query.city}, FL`] } : {}),
+            withDetails: true, maxLawyers: MAX_PROVIDER_RESULTS };
+          const output = await this.client.run(this.source === 'bar' ? BAR_ACTOR : AVVO_ACTOR, input, signal);
+          const items = Array.isArray(output) ? output : output.items;
           rawResults.push({ target, items, error: null });
           const parse = this.source === 'bar' ? parseBar : parseAvvo;
-          const candidates = items.map(item => parse(item));
-          if (candidates.some(person => person === null)) failed++;
+          const noMatchRecords = items.filter(isNoMatch);
+          const errorRecords = items.filter(item => providerError(item) && !isNoMatch(item));
+          const candidateRecords = items.filter(item => !providerError(item));
+          candidatesReceived += candidateRecords.length;
+          const candidates = candidateRecords.map(item => parse(item));
+          if (errorRecords.length || candidates.some(person => person === null)) failed++;
           const valid = candidates.filter((person): person is Attorney => person !== null);
-          if (items.length === 0 || valid.length > 0) successfulQueries++;
+          recordsValid += valid.length;
+          if (items.length === 0 || noMatchRecords.length === items.length || valid.length > 0) successfulQueries++;
+          let accepted = 0;
           if (fallback) {
             const people = valid.filter(person => person.firmName && firmKey(person.firmName) === firmKey(target))
-              .sort((a, b) => normalizeName(a.name).localeCompare(normalizeName(b.name))).slice(0, 15);
+              .sort((a, b) => normalizeName(a.name).localeCompare(normalizeName(b.name))).slice(0, query.maxTargets ?? 2);
+            accepted = people.length;
             matches.push(...people.map(attorney => ({ searchedName: target, matchConfidence: 'firm_fallback' as const, attorney, ambiguous: false })));
-          } else matches.push(matchAttorney(target, valid));
-          if (this.source === 'bar' && items.length >= 30) failed++;
-        } catch {
+          } else {
+            const match = matchAttorney(target, valid);
+            accepted = match.attorney ? 1 : 0;
+            matches.push(this.source === 'avvo' && match.matchConfidence === 'exact'
+              ? { ...match, matchConfidence: 'exact_name' as const } : match);
+          }
+          if (!Array.isArray(output)) providerRuns.push({ ...output.metadata, acceptedCount: accepted });
+        } catch (error) {
           failed++;
+          if (error instanceof ApifyClientError && error.metadata) providerRuns.push(error.metadata);
           rawResults.push({ target, items: null, error: signal.aborted ? 'timeout' : 'source_error' });
           if (!fallback) matches.push({ searchedName: target, attorney: null, ambiguous: false, matchConfidence: 'no_match' });
         }
@@ -116,10 +146,15 @@ export class ApifyDirectorySource implements DirectorySource {
     const successful = successfulQueries > 0;
     matches.sort((a, b) => a.searchedName.localeCompare(b.searchedName) || (a.attorney?.name ?? '').localeCompare(b.attorney?.name ?? ''));
     const found = matches.filter(match => match.attorney !== null).length;
-    return { data: successful ? matches : null, rawContent: JSON.stringify(rawResults.sort((a, b) => a.target.localeCompare(b.target))),
+    const costUsd = providerRuns.reduce((total, run) => total + (run.costUsd ?? 0), 0);
+    const code = signal.aborted ? 'DEADLINE_REACHED' : !successful ? 'PROVIDER_ERROR' : failed ? 'PROVIDER_CONTRACT_ERROR' : found ? undefined : 'NO_MATCH';
+    return { data: successful ? matches : null, rawContent: JSON.stringify({
+      queries: rawResults.sort((a, b) => a.target.localeCompare(b.target)), providerRuns }),
       status: { status: failed ? successful ? 'partial' : signal.aborted ? 'timeout' : 'error' : 'ok',
         dataStatus: found ? 'PRESENT' : successful && !failed ? 'EMPTY' : 'UNKNOWN', durationMs: Date.now() - started,
         attorneysSearched: fallback ? null : names.length, attorneysFound: successful ? found : null,
-        reason: failed ? 'One or more targeted lookups were incomplete; raw responses retained' : null } };
+        candidatesReceived, recordsValid, providerRuns, costUsd, ...(code ? { code } : {}),
+        reason: failed ? 'One or more targeted lookups were incomplete; raw responses retained' :
+          found ? null : 'Provider completed successfully with no accepted identity match' } };
   }
 }

@@ -7,7 +7,7 @@ describe('PostgreSQL baseline', () => {
   beforeAll(async () => {
     db = new PGlite();
     await db.exec('create role anon; create role authenticated; create role service_role bypassrls;');
-    const sql = await readFile(new URL('../../../../supabase/migrations/20260905221010_create_layer1.sql', import.meta.url), 'utf8');
+    const sql = await readFile(new URL('../../../../supabase/migrations/20260908151940_create_layer1.sql', import.meta.url), 'utf8');
     await db.exec(sql);
   });
   afterAll(async () => { await db?.close(); });

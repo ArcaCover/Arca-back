@@ -3,7 +3,9 @@ import { createRequire } from 'node:module';
 import { fetchPublicResponse, fetchPublicText } from './network.js';
 
 export type CrawledPage = { url: string; html: string; text: string };
-export type CrawlResult = { pages: CrawledPage[]; partial: boolean };
+export type CrawlIssue = { url: string; code: 'ACCESS_BLOCKED' | 'ROBOTS_UNAVAILABLE' | 'ROBOTS_DISALLOWED' |
+  'HTTP_ERROR' | 'NO_READABLE_CONTENT' | 'REQUEST_FAILED'; status: number | null; detail?: string };
+export type CrawlResult = { pages: CrawledPage[]; partial: boolean; issues?: CrawlIssue[] };
 const USER_AGENT = 'ArcaBot/1.0';
 type RobotsRules = { isAllowed(url: string, agent: string): boolean | undefined };
 const robotsParser = createRequire(import.meta.url)('robots-parser') as (url: string, text: string) => RobotsRules;
@@ -29,6 +31,7 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
 } = { response: fetchPublicResponse, robots: fetchPublicText }): Promise<CrawlResult> {
   const signal = AbortSignal.any([parent, AbortSignal.timeout(20_000)]);
   const pages: CrawledPage[] = [];
+  const issues: CrawlIssue[] = [];
   let partial = false;
   const browser = await chromium.launch({ headless: true, timeout: 10_000 });
   const abort = () => { void browser.close().catch(() => {}); };
@@ -45,7 +48,10 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
           const robotsUrl = `${url.origin}/robots.txt`;
           const response = await transport.robots(robotsUrl, signal);
           if (response.status === 404 || response.status === 410) return robotsParser(robotsUrl, '');
-          if (response.status < 200 || response.status >= 300) throw new Error('Robots rules unavailable');
+          if (response.status < 200 || response.status >= 300) {
+            issues.push({ url: robotsUrl, code: 'ROBOTS_UNAVAILABLE', status: response.status });
+            throw new Error('Robots rules unavailable');
+          }
           return robotsParser(robotsUrl, response.text);
         })();
         robots.set(url.origin, entry);
@@ -61,8 +67,16 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
           await route.abort(); return;
         }
         const response = await transport.response(request.url(), signal, request.method(), request.postDataBuffer());
-        await route.fulfill({ status: response.status, headers: response.headers, body: response.body });
-      } catch { await route.abort().catch(() => {}); }
+        if ([401, 403, 429].includes(response.status)) issues.push({ url: request.url(), code: 'ACCESS_BLOCKED', status: response.status });
+        const headers = { ...response.headers };
+        for (const name of ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer',
+          'transfer-encoding', 'upgrade', 'content-length']) delete headers[name];
+        await route.fulfill({ status: response.status, headers, body: response.body });
+      } catch (error) {
+        issues.push({ url: route.request().url(), code: 'REQUEST_FAILED', status: null,
+          detail: error instanceof Error ? error.message.slice(0, 200) : 'Unknown transport error' });
+        await route.abort().catch(() => {});
+      }
     });
     await context.routeWebSocket('**/*', socket => socket.close());
     let queue = [{ url: `https://${domain}/`, depth: 0 }];
@@ -75,9 +89,11 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
         let page: import('playwright').Page | undefined;
         try {
           page = await context.newPage();
-          if (!(await allowed(item.url))) { partial = true; return; }
+          if (!(await allowed(item.url))) { partial = true; issues.push({ url: item.url, code: 'ROBOTS_DISALLOWED', status: null }); return; }
           const response = await page.goto(item.url, { timeout: 8000, waitUntil: 'domcontentloaded' });
           if (!response || response.status() >= 400 || !/text\/html|application\/xhtml/i.test(response.headers()['content-type'] ?? '')) {
+            const status = response?.status() ?? null;
+            issues.push({ url: item.url, code: status !== null && [401, 403, 429].includes(status) ? 'ACCESS_BLOCKED' : 'HTTP_ERROR', status });
             partial = true; return;
           }
           await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
@@ -85,17 +101,23 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
           const links = await page.locator('a[href]').evaluateAll(anchors => anchors.map(a => a.getAttribute('href') ?? ''));
           await page.locator('nav, footer, script, style, noscript, template, [aria-hidden="true"]').evaluateAll(elements => elements.forEach(element => element.remove()));
           const text = (await page.locator('body').innerText({ timeout: 1000 })).trim();
-          if (!text || /^(checking your browser|just a moment|access denied|verify you are human)/i.test(text)) { partial = true; return; }
+          if (!text || /^(checking your browser|just a moment|access denied|verify you are human)/i.test(text)) {
+            issues.push({ url: item.url, code: /^(checking your browser|just a moment|access denied|verify you are human)/i.test(text)
+              ? 'ACCESS_BLOCKED' : 'NO_READABLE_CONTENT', status: response.status() });
+            partial = true; return;
+          }
           pages.push({ url: page.url(), html, text });
           if (item.depth < 2) for (const link of links) {
             const url = canonicalUrl(link, page.url());
             if (url && !visited.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1 });
           }
-        } catch { partial = true; }
+        } catch (error) { partial = true; issues.push({ url: item.url, code: 'REQUEST_FAILED', status: null,
+          detail: error instanceof Error ? error.message.slice(0, 200) : 'Unknown navigation error' }); }
         finally { await page?.close().catch(() => {}); }
       }));
     }
-    return { pages: pages.sort((a, b) => a.url.localeCompare(b.url)), partial: partial || signal.aborted };
+    return { pages: pages.sort((a, b) => a.url.localeCompare(b.url)), partial: partial || signal.aborted,
+      issues: [...new Map(issues.map(issue => [`${issue.url}:${issue.code}:${issue.status}`, issue])).values()] };
   } finally {
     signal.removeEventListener('abort', abort);
     await browser.close().catch(() => {});

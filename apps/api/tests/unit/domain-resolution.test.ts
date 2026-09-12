@@ -32,8 +32,8 @@ describe('Request → DomainResolution → Assessment', () => {
     const { app } = createApp({ repository, pipeline: { run }, domainResolver: new PublicDomainResolver(async () => {}),
       sessionSecret: 's'.repeat(40), corsOrigins: [], clientIp: () => '127.0.0.1' });
     const response = await app.request('/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'user@gmail.com' }) });
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ status: 'UNRESOLVED', domainResolution: { status: 'UNRESOLVED', source: 'email', canonicalDomain: null, reason: 'PERSONAL_EMAIL' }, assessment: null });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: 'invalid_request' });
     expect(run).not.toHaveBeenCalled();
     expect(repository.scans.size).toBe(0);
   });

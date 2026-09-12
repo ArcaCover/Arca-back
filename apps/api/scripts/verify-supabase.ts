@@ -32,9 +32,10 @@ async function verify() {
     status: 'RUNNING', result: null, created_at: started, completed_at: null, duration_ms: null, cached: false });
   try {
     await repository.create(makeScan(ids[0]!));
-    const outcome = await new InProcessPipeline({ ...mockSources(), repository }).run({ scanId: ids[0]!, canonicalDomain });
+    const outcome = await new InProcessPipeline({ ...mockSources(), repository }).run({ scanId: ids[0]!, canonicalDomain,
+      email: 'supabase-verification@arca.example' });
     assert.equal(outcome.status, 'COMPLETED');
-    assert.equal(outcome.result.preScore.total, 84);
+    assert.equal(outcome.result.preScore.total, 82);
     await repository.complete(ids[0]!, { status: outcome.status, result: outcome.result,
       completed_at: outcome.result.meta.completedAt, duration_ms: outcome.result.meta.scanDurationMs });
     assert.deepEqual((await repository.get(ids[0]!))?.result, outcome.result);
@@ -44,12 +45,12 @@ async function verify() {
     assert(raw.data?.every(row => /^[a-f0-9]{64}$/.test(row.content_hash)));
     assert(await repository.latestRaw(canonicalDomain, 'website'));
     const cached = await repository.cached(canonicalDomain, started);
-    assert.equal(cached?.result?.preScore.total, 84);
+    assert.equal(cached?.result?.preScore.total, 82);
     await repository.create({ ...makeScan(ids[1]!), status: 'COMPLETED', cached: true,
       result: { ...outcome.result, meta: { ...outcome.result.meta, cached: true } },
       completed_at: new Date().toISOString(), duration_ms: 0 });
     assert.notEqual((await repository.cached(canonicalDomain, started))?.scan_id, ids[1]);
-    console.log('Supabase verified: persisted mock score 84, three raw sources, domain cache and JSON round-trip.');
+    console.log('Supabase verified: persisted mock score 82, three raw sources, domain cache and JSON round-trip.');
   } finally {
     const cleanup = await client.from('scans').delete().in('scan_id', ids);
     if (cleanup.error) throw new Error(`Verification cleanup failed; remove only scans ${ids.join(', ')}`);

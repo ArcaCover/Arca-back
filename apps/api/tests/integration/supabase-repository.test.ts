@@ -13,7 +13,9 @@ describe('Supabase Data API adapter', () => {
   it('queries only original completed evidence within the domain cache TTL', async () => {
     const { repository } = setup(url => {
       expect(url.pathname).toBe('/rest/v1/scans');
-      expect(Object.fromEntries(url.searchParams)).toMatchObject({ canonical_domain: 'eq.firm.com', cached: 'eq.false', status: 'eq.COMPLETED', completed_at: 'gte.2026-09-07T00:00:00.000Z', order: 'completed_at.desc', limit: '1' });
+      expect(Object.fromEntries(url.searchParams)).toMatchObject({ canonical_domain: 'eq.firm.com', cached: 'eq.false',
+        status: 'eq.COMPLETED', completed_at: 'gte.2026-09-07T00:00:00.000Z',
+        'result->meta->>contractVersion': 'eq.layer1-2026-09-12-v2', order: 'completed_at.desc', limit: '1' });
       return Response.json([]);
     });
     expect(await repository.cached('firm.com', '2026-09-07T00:00:00.000Z')).toBeNull();

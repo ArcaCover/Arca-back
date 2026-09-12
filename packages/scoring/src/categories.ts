@@ -13,14 +13,13 @@ export function aiGovernance(website: WebsiteData) {
 }
 export type ReputationEvidence = {
   rating: number | null; reviewRating: number | null; reviewCount: number | null;
-  endorsements: number | null; awards: boolean | null;
+  awards: boolean | null;
 };
 export function reputation(data: ReputationEvidence) {
-  const rating = data.rating === null ? null : data.rating >= 8 ? 7 : data.rating >= 7 ? 4 : data.rating >= 5 ? 1 : -5;
+  const rating = data.rating === null ? null : data.rating >= 8 ? 9 : data.rating >= 7 ? 6 : data.rating >= 5 ? 2 : -5;
   const reviews = data.reviewRating === null || data.reviewCount === null ? null :
     data.reviewRating >= 4 ? (data.reviewCount >= 10 ? 5 : 3) : 0;
-  const endorsements = data.endorsements === null ? null : data.endorsements >= 5 ? 4 : 1;
-  return category(20, [rule('A1', rating), rule('A3', reviews), rule('A5', endorsements), rule('A6', observedBoolean(data.awards, 4))]);
+  return category(20, [rule('A1', rating), rule('A3', reviews), rule('A6', observedBoolean(data.awards, 6))]);
 }
 
 export function professionalStanding(data: { allActive: boolean | null; cleanRecord: boolean | null;
