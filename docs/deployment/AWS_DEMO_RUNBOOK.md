@@ -85,6 +85,11 @@ Generate the documentation basic-auth hash in the same session and set `DOCS_AUT
 docker run --rm -it caddy:2.10.2-alpine caddy hash-password
 ```
 
+Compose interpolates every value in this file, so each `$` of the hash must be doubled when it is
+written to `.env.demo`: `$2a$14$...` is stored as `$$2a$$14$$...`. An unescaped hash reaches Caddy
+truncated and leaves the documentation open, so `deploy-image.sh` refuses to deploy without the
+escaped form.
+
 ## 5. Publish the current commit
 
 From the clean local checkout:

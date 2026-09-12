@@ -12,6 +12,13 @@ if [[ ! -s /opt/arca/.env.demo ]]; then
   echo "/opt/arca/.env.demo is empty; configure runtime values first" >&2
   exit 3
 fi
+# Compose interpolates env-file values, so every '$' of the bcrypt hash must be
+# doubled. An unescaped hash reaches Caddy truncated and silently leaves the
+# documentation open, so refuse the deployment instead.
+if ! grep -qE '^DOCS_AUTH_HASH=[$][$]2[aby][$][$][0-9]{2}[$][$][./A-Za-z0-9]{53}$' /opt/arca/.env.demo; then
+  echo "DOCS_AUTH_HASH must be a bcrypt hash with every dollar sign doubled" >&2
+  exit 4
+fi
 
 registry="${image%%/*}"
 aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry" >/dev/null
