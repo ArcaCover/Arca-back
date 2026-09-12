@@ -123,8 +123,11 @@ export class ApifyDirectorySource implements DirectorySource {
           if (items.length === 0 || noMatchRecords.length === items.length || valid.length > 0) successfulQueries++;
           let accepted = 0;
           if (fallback) {
+            // maxTargets budgets paid lookups. A fallback lookup is a single run that already
+            // returned the whole roster, so discarding part of it buys nothing and scores the firm
+            // on an alphabetical sample instead of its attorneys.
             const people = valid.filter(person => person.firmName && firmKey(person.firmName) === firmKey(target))
-              .sort((a, b) => normalizeName(a.name).localeCompare(normalizeName(b.name))).slice(0, query.maxTargets ?? 2);
+              .sort((a, b) => normalizeName(a.name).localeCompare(normalizeName(b.name)));
             accepted = people.length;
             matches.push(...people.map(attorney => ({ searchedName: target, matchConfidence: 'firm_fallback' as const, attorney, ambiguous: false })));
           } else {

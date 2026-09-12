@@ -98,13 +98,25 @@ describe('provider evidence boundaries', () => {
     expect(run).toHaveBeenCalledTimes(2);
     expect(result.status.status).toBe('partial');
   });
-  it('caps accepted firm-fallback attorneys at the configured validation limit', async () => {
+  it('accepts every firm-fallback attorney the single paid run already returned', async () => {
     const candidates = ['A One', 'B Two', 'C Three'].map(name => ({ name, firm: 'Smith Law' }));
+    const run = vi.fn(async () => candidates);
+    const result = await new ApifyDirectorySource('bar', { run }).run({
+      ...query, names: [], maxTargets: 2,
+    }, new AbortController().signal);
+    // maxTargets budgets paid lookups, not the records one lookup already produced.
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(result.data).toHaveLength(3);
+    expect(result.status.attorneysFound).toBe(3);
+  });
+  it('keeps rejecting firm-fallback records belonging to another firm', async () => {
+    const candidates = [{ name: 'A One', firm: 'Smith Law' }, { name: 'B Two', firm: 'Other Law' },
+      { name: 'C Three', firm: null }];
     const result = await new ApifyDirectorySource('bar', { run: async () => candidates }).run({
       ...query, names: [], maxTargets: 2,
     }, new AbortController().signal);
-    expect(result.data).toHaveLength(2);
-    expect(result.status.attorneysFound).toBe(2);
+    expect(result.data).toHaveLength(1);
+    expect(result.data?.[0]?.attorney?.name).toBe('A One');
   });
 });
 describe('Apify lifecycle', () => {
