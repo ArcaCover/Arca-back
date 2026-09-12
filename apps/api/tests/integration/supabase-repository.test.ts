@@ -10,11 +10,11 @@ describe('Supabase Data API adapter', () => {
     });
     return { repository: new SupabaseRepository(client), request };
   }
-  it('queries only original completed evidence within the domain cache TTL', async () => {
+  it('queries original completed and partial evidence within the domain cache TTL', async () => {
     const { repository } = setup(url => {
       expect(url.pathname).toBe('/rest/v1/scans');
       expect(Object.fromEntries(url.searchParams)).toMatchObject({ canonical_domain: 'eq.firm.com', cached: 'eq.false',
-        status: 'eq.COMPLETED', completed_at: 'gte.2026-09-07T00:00:00.000Z',
+        status: 'in.(COMPLETED,PARTIAL)', completed_at: 'gte.2026-09-07T00:00:00.000Z',
         'result->meta->>contractVersion': 'eq.layer1-2026-09-12-v2', order: 'completed_at.desc', limit: '1' });
       return Response.json([]);
     });

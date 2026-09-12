@@ -52,14 +52,14 @@ export function buildOpenApiDocument() {
   };
   const invalid = { invalidRequest: { summary: 'Invalid request', value: { error: 'invalid_request', message: 'A valid email and a non-empty domain are required' } } };
   registry.registerPath({ method: 'post', path: '/scan', summary: 'Start a domain scan or reuse a cached domain result',
-    description: 'Cache identity is the normalized domain. A cache miss returns 202 RUNNING. A hit within 24 hours returns 200 COMPLETED immediately with cached=true, a new scanId and a new sessionToken.',
+    description: 'Cache identity is the normalized domain. A cache miss returns 202 RUNNING. A hit within 24 hours returns 200 immediately with cached=true, a new scanId, a new sessionToken and the stored terminal status, which is COMPLETED or PARTIAL.',
     request: { body: { required: true, content: json(ScanRequest, { lawFirm: { summary: 'Start a firm scan',
       value: { email: 'contact@smithlaw.com', domain: 'smithlaw.com' } } }) } },
     responses: {
       202: { description: 'Fresh scan started; poll GET /scan/{scanId}', content: json(StartedScanResponse, {
         started: { summary: 'Scan accepted', value: { scanId: 'sc_abc123', sessionToken: 'eyJhbGciOiJIUzI1NiIs...', status: 'RUNNING' } },
       }) },
-      200: { description: 'Domain cache hit; completed result returned immediately with a new scan session', content: json(CachedScanResponse, {
+      200: { description: 'Domain cache hit; the stored COMPLETED or PARTIAL result is returned immediately with a new scan session', content: json(CachedScanResponse, {
         cacheHit: { summary: 'Cached domain result', value: { scanId: 'sc_abc123', sessionToken: 'eyJhbGciOiJIUzI1NiIs...', status: 'COMPLETED', cached: true,
           result: { ...result, meta: { ...result.meta, cached: true } } } },
       }) },

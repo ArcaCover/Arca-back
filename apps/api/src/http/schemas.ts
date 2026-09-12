@@ -8,7 +8,7 @@ export const StartedScanResponse = z.object({
   scanId: z.string(), sessionToken: z.string(), status: z.literal('RUNNING'),
 }).strict();
 export const CachedScanResponse = z.object({
-  scanId: z.string(), sessionToken: z.string(), status: z.literal('COMPLETED'),
+  scanId: z.string(), sessionToken: z.string(), status: z.enum(['COMPLETED', 'PARTIAL']),
   cached: z.literal(true), result: Layer1Result,
 }).strict();
 export const ScanResponse = z.union([StartedScanResponse, CachedScanResponse]);

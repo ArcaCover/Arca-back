@@ -30,7 +30,8 @@ Desde Swagger se puede ejecutar el flujo completo:
 1. Ejecutar `POST /scan` con `email` y `domain`.
 2. Si responde `202 RUNNING`, copiar `sessionToken`, usar **Authorize** con el Bearer token y consultar
    `GET /scan/{scanId}` hasta alcanzar un estado terminal.
-3. Si el dominio está en caché, `POST /scan` responde directamente `200 COMPLETED`, `cached: true` y `result`.
+3. Si el dominio está en caché, `POST /scan` responde directamente `200` con `cached: true`, `result` y el
+   estado terminal almacenado, que puede ser `COMPLETED` o `PARTIAL`.
 
 Cada operación incluye ejemplos para inicio, cache hit, polling, resultado completo y errores.
 
@@ -56,7 +57,7 @@ Una vez resuelta la identidad, el email no interviene en señales, score ni mult
 
 | Método | Ruta | Comportamiento |
 | --- | --- | --- |
-| POST | `/scan` | 202 RUNNING con scanId y sessionToken; 200 con `result` cacheado y una sesión nueva |
+| POST | `/scan` | 202 RUNNING con scanId y sessionToken; 200 con `result` cacheado, su estado terminal y una sesión nueva |
 | GET | `/scan/:scanId` | Polling con Bearer JWT de 24 horas vinculado al scan y solicitante |
 | GET | `/openapi.json` | Contrato generado OpenAPI 3.1 |
 | GET | `/docs` | Swagger UI |
@@ -71,7 +72,9 @@ La confianza HIGH/MEDIUM/LOW corresponde al número de fuentes técnicamente com
 `preScore.assessmentStatus=INSUFFICIENT_EVIDENCE` bloquea la decisión comercial automática y devuelve
 `decision=UNKNOWN`, salvo que evidencia disciplinaria conocida imponga una restricción explícita.
 
-La caché dura 24 horas por dominio canónico y solo reutiliza scans COMPLETED originales.
+La caché dura 24 horas por dominio canónico y reutiliza scans COMPLETED y PARTIAL originales; nunca
+reutiliza FAILED. Un scan solo queda PARTIAL después de que cada página recuperable agotó sus reintentos,
+así que repetirlo volvería a pagar las mismas ejecuciones de proveedor por la misma evidencia.
 Cada reutilización crea un registro y token propios, conserva la fecha de evidencia y no renueva el TTL.
 La caché vive en PostgreSQL/Supabase usando `scans`; no requiere Redis ni archivos locales. La consulta
 está respaldada por un índice parcial sobre dominio y fecha para scans COMPLETED no cacheados.
@@ -111,6 +114,9 @@ node apps/api/dist/server.js
 ```
 
 Website: Playwright, máximo 20 páginas y profundidad 2; robots y resolución pública fijada al socket.
+Una página que falla por transporte, error 5xx o 429 se reintenta hasta completar tres intentos antes de
+marcar el rastreo parcial; robots, 4xx y contenido ilegible no se reintentan. El rastreo tiene su propio
+plazo de 20 segundos, y al agotarse el resultado es parcial aunque queden reintentos disponibles.
 La extracción estructurada usa reglas conservadoras por defecto, con caché por hash, proveedor y versión.
 `WEBSITE_EVIDENCE_PROVIDER=openai` habilita opcionalmente GPT-4o-mini y exige `OPENAI_API_KEY`.
 Directorios: `scrapers_lat/florida-bar-lawyers-scraper` y `scrapers_lat/avvo-lawyers-scraper` mediante Apify.

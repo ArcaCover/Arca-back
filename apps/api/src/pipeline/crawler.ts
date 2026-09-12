@@ -7,6 +7,21 @@ export type CrawlIssue = { url: string; code: 'ACCESS_BLOCKED' | 'ROBOTS_UNAVAIL
   'HTTP_ERROR' | 'NO_READABLE_CONTENT' | 'REQUEST_FAILED'; status: number | null; detail?: string };
 export type CrawlResult = { pages: CrawledPage[]; partial: boolean; issues?: CrawlIssue[] };
 const USER_AGENT = 'ArcaBot/1.0';
+/** Attempts allowed per page, the first one included. */
+export const MAX_PAGE_ATTEMPTS = 3;
+/**
+ * A page is worth another attempt only while the crawl is alive and the failure could plausibly
+ * differ next time. Robots rules, missing pages and unreadable content are decided, so retrying
+ * them only spends the crawl deadline that a recoverable page still needs.
+ */
+export function shouldRetryPage(issue: CrawlIssue, attempt: number, aborted: boolean,
+  max = MAX_PAGE_ATTEMPTS): boolean {
+  if (aborted || attempt + 1 >= max) return false;
+  if (issue.code === 'REQUEST_FAILED') return true;
+  if (issue.code === 'HTTP_ERROR') return issue.status === null || issue.status >= 500;
+  if (issue.code === 'ACCESS_BLOCKED') return issue.status === 429;
+  return false;
+}
 type RobotsRules = { isAllowed(url: string, agent: string): boolean | undefined };
 const robotsParser = createRequire(import.meta.url)('robots-parser') as (url: string, text: string) => RobotsRules;
 export function pagePriority(raw: string): number {
@@ -79,8 +94,18 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
       }
     });
     await context.routeWebSocket('**/*', socket => socket.close());
-    let queue = [{ url: `https://${domain}/`, depth: 0 }];
+    let queue = [{ url: `https://${domain}/`, depth: 0, attempt: 0 }];
     const visited = new Set<string>();
+    // Requeued pages leave `visited`, so a retry costs another attempt but never another page budget.
+    const fail = (item: { url: string; depth: number; attempt: number }, issue: CrawlIssue) => {
+      if (shouldRetryPage(issue, item.attempt, signal.aborted)) {
+        visited.delete(item.url);
+        queue.push({ ...item, attempt: item.attempt + 1 });
+        return;
+      }
+      issues.push(issue);
+      partial = true;
+    };
     while (queue.length && visited.size < 20 && !signal.aborted) {
       queue.sort((a, b) => a.depth - b.depth || pagePriority(a.url) - pagePriority(b.url) || a.url.localeCompare(b.url));
       const batch = queue.splice(0, Math.min(3, 20 - visited.size)).filter(item => !visited.has(item.url));
@@ -89,12 +114,12 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
         let page: import('playwright').Page | undefined;
         try {
           page = await context.newPage();
-          if (!(await allowed(item.url))) { partial = true; issues.push({ url: item.url, code: 'ROBOTS_DISALLOWED', status: null }); return; }
+          if (!(await allowed(item.url))) { fail(item, { url: item.url, code: 'ROBOTS_DISALLOWED', status: null }); return; }
           const response = await page.goto(item.url, { timeout: 8000, waitUntil: 'domcontentloaded' });
           if (!response || response.status() >= 400 || !/text\/html|application\/xhtml/i.test(response.headers()['content-type'] ?? '')) {
             const status = response?.status() ?? null;
-            issues.push({ url: item.url, code: status !== null && [401, 403, 429].includes(status) ? 'ACCESS_BLOCKED' : 'HTTP_ERROR', status });
-            partial = true; return;
+            fail(item, { url: item.url, code: status !== null && [401, 403, 429].includes(status) ? 'ACCESS_BLOCKED' : 'HTTP_ERROR', status });
+            return;
           }
           await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
           const html = await page.content();
@@ -102,22 +127,25 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
           await page.locator('nav, footer, script, style, noscript, template, [aria-hidden="true"]').evaluateAll(elements => elements.forEach(element => element.remove()));
           const text = (await page.locator('body').innerText({ timeout: 1000 })).trim();
           if (!text || /^(checking your browser|just a moment|access denied|verify you are human)/i.test(text)) {
-            issues.push({ url: item.url, code: /^(checking your browser|just a moment|access denied|verify you are human)/i.test(text)
+            fail(item, { url: item.url, code: /^(checking your browser|just a moment|access denied|verify you are human)/i.test(text)
               ? 'ACCESS_BLOCKED' : 'NO_READABLE_CONTENT', status: response.status() });
-            partial = true; return;
+            return;
           }
           pages.push({ url: page.url(), html, text });
           if (item.depth < 2) for (const link of links) {
             const url = canonicalUrl(link, page.url());
-            if (url && !visited.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1 });
+            if (url && !visited.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1, attempt: 0 });
           }
-        } catch (error) { partial = true; issues.push({ url: item.url, code: 'REQUEST_FAILED', status: null,
+        } catch (error) { fail(item, { url: item.url, code: 'REQUEST_FAILED', status: null,
           detail: error instanceof Error ? error.message.slice(0, 200) : 'Unknown navigation error' }); }
         finally { await page?.close().catch(() => {}); }
       }));
     }
+    // A page that only failed on an earlier attempt is not an issue of the finished crawl.
+    const read = new Set(pages.map(page => page.url));
     return { pages: pages.sort((a, b) => a.url.localeCompare(b.url)), partial: partial || signal.aborted,
-      issues: [...new Map(issues.map(issue => [`${issue.url}:${issue.code}:${issue.status}`, issue])).values()] };
+      issues: [...new Map(issues.filter(issue => !read.has(issue.url))
+        .map(issue => [`${issue.url}:${issue.code}:${issue.status}`, issue])).values()] };
   } finally {
     signal.removeEventListener('abort', abort);
     await browser.close().catch(() => {});

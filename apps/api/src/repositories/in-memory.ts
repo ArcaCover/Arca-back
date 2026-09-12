@@ -17,7 +17,7 @@ export class InMemoryRepository implements ScanRepository {
   async cached(domain: string, since: string) {
     return structuredClone([...this.scans.values()].filter(s => s.canonical_domain === domain && !s.cached &&
       s.result?.meta.contractVersion === LAYER1_CONTRACT_VERSION &&
-      s.status === 'COMPLETED' && s.completed_at !== null && s.completed_at >= since)
+      (s.status === 'COMPLETED' || s.status === 'PARTIAL') && s.completed_at !== null && s.completed_at >= since)
       .sort((a, b) => b.completed_at!.localeCompare(a.completed_at!))[0] ?? null);
   }
   async saveRaw(record: RawRecord) { this.raw.push(structuredClone(record)); }

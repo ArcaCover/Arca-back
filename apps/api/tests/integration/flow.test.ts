@@ -76,6 +76,25 @@ describe('asynchronous scan API', () => {
     clock += 200000;
     expect(await repository.cached('firm.com', new Date(clock - 86400000).toISOString())).toBeNull();
   });
+  it('reuses a partial result and keeps reporting it as partial', async () => {
+    const repository = new InMemoryRepository();
+    const now = Date.now();
+    const oldTime = new Date(now - 86300000).toISOString();
+    const original = fixtureResult('sc_partial', 'original@firm.com');
+    original.meta.completedAt = oldTime;
+    await repository.create({ id: randomUUID(), scan_id: 'sc_partial', canonical_domain: 'firm.com', email: 'original@firm.com',
+      domain_resolution: { status: 'RESOLVED', canonicalDomain: 'firm.com', source: 'request', reason: null },
+      status: 'PARTIAL', result: original, created_at: oldTime, completed_at: oldTime, duration_ms: 10, cached: false });
+    const run = vi.fn();
+    const { app } = createApp({ domainResolver, repository, pipeline: { run }, sessionSecret: secret,
+      corsOrigins: [], clientIp: () => '127.0.0.1', now: () => now });
+    const response = await app.request(post('second@gmail.com'));
+    expect(response.status).toBe(200);
+    const body = ScanResponse.parse(await response.json());
+    expect(body).toMatchObject({ status: 'PARTIAL', cached: true });
+    expect(run).not.toHaveBeenCalled();
+    expect(repository.scans.get(body.scanId)?.status).toBe('PARTIAL');
+  });
   it('reports failures as terminal HTTP 200 instead of leaving RUNNING forever', async () => {
     const repository = new InMemoryRepository();
     const { app, drain } = createApp({ domainResolver, repository, pipeline: { run: async () => { throw new Error('Fixture failure'); } },

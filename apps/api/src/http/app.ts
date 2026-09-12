@@ -52,15 +52,17 @@ export function createApp(deps: AppDeps) {
     const cachedResult = cached?.result ? Layer1Result.parse({ ...cached.result, scanId, domain: canonicalDomain, email,
       meta: { ...cached.result.meta, cached: true } }) : null;
     if (cachedResult && cachedResult.domain !== canonicalDomain) throw new Error('Cached domain identity mismatch');
+    // A reused scan keeps the terminal status of the evidence it reuses; partial stays partial.
+    const cachedStatus = cached?.status === 'PARTIAL' ? 'PARTIAL' as const : 'COMPLETED' as const;
     const scan: ScanRecord = {
       id: randomUUID(), scan_id: scanId, email, canonical_domain: canonicalDomain, domain_resolution: domainResolution,
-      status: cachedResult ? 'COMPLETED' : 'RUNNING', result: cachedResult,
+      status: cachedResult ? cachedStatus : 'RUNNING', result: cachedResult,
       created_at: new Date(timestamp).toISOString(),
       completed_at: cachedResult ? new Date(timestamp).toISOString() : null,
       duration_ms: cachedResult ? 0 : null, cached: cachedResult !== null,
     };
     await deps.repository.create(scan);
-    if (cachedResult) return c.json({ scanId, sessionToken, status: 'COMPLETED' as const, cached: true, result: cachedResult }, 200);
+    if (cachedResult) return c.json({ scanId, sessionToken, status: cachedStatus, cached: true, result: cachedResult }, 200);
     // Persist RUNNING before dispatch. Requests never wait for the scan's external I/O.
     const job = Promise.resolve().then(async () => {
       try {

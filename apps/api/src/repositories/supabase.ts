@@ -19,7 +19,7 @@ export class SupabaseRepository implements ScanRepository {
   }
   async cached(domain: string, since: string): Promise<ScanRecord | null> {
     const { data, error } = await this.client.from('scans').select('*').eq('canonical_domain', domain)
-      .eq('cached', false).eq('status', 'COMPLETED').gte('completed_at', since)
+      .eq('cached', false).in('status', ['COMPLETED', 'PARTIAL']).gte('completed_at', since)
       .eq('result->meta->>contractVersion', LAYER1_CONTRACT_VERSION)
       .order('completed_at', { ascending: false }).limit(1).maybeSingle();
     if (error) throw new Error('Unable to read cache', { cause: error });
