@@ -7,7 +7,7 @@ import { validDate } from '@arca/scoring';
 
 export const BAR_ACTOR = 'scrapers_lat/florida-bar-lawyers-scraper';
 export const AVVO_ACTOR = 'scrapers_lat/avvo-lawyers-scraper';
-export const MAX_PROVIDER_RESULTS = 7;
+export const MAX_PROVIDER_RESULTS = 10;
 const record = z.record(z.unknown());
 const text = (value: unknown): string | null => typeof value === 'string' && value.trim() ? value.trim() : null;
 const number = (value: unknown, min = 0, max = Infinity): number | null =>

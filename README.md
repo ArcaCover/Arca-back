@@ -121,8 +121,9 @@ La extracción estructurada usa reglas conservadoras por defecto, con caché por
 `WEBSITE_EVIDENCE_PROVIDER=openai` habilita opcionalmente GPT-4o-mini y exige `OPENAI_API_KEY`.
 Directorios: `scrapers_lat/florida-bar-lawyers-scraper` y `scrapers_lat/avvo-lawyers-scraper` mediante Apify.
 Cada scan consulta como máximo dos identidades, cuatro ejecuciones entre ambos directorios y dos actores
-simultáneos. Cada ejecución solicita como máximo siete registros al actor y Layer 1 acepta como máximo dos
-coincidencias. Run ID, fingerprint de consulta, conteos y coste reportado quedan junto a la evidencia.
+simultáneos. Cada ejecución solicita como máximo diez registros al actor. En búsqueda por nombre acepta una
+coincidencia por objetivo; en fallback por despacho acepta todos los registros devueltos que pertenecen a ese
+despacho, porque son evidencia de una sola ejecución ya pagada. Run ID, fingerprint de consulta, conteos y coste reportado quedan junto a la evidencia.
 Los mensajes conocidos de cero resultados son `EMPTY/NO_MATCH`; errores de actor o contrato permanecen errores.
 Las respuestas originales disponibles se guardan con hash SHA-256 antes de devolver el resultado.
 El pipeline reserva 5 segundos de sus 55 segundos para persistencia y cancela fuentes al agotar su plazo.

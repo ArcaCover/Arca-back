@@ -39,18 +39,18 @@ describe('provider evidence boundaries', () => {
     const run = vi.fn(async () => []);
     await new ApifyDirectorySource('avvo', { run }).run(query, new AbortController().signal);
     expect(run).toHaveBeenCalledWith(AVVO_ACTOR, {
-      searchQueries: ['Jane Smith'], cities: ['Miami, FL'], withDetails: true, maxLawyers: 7,
+      searchQueries: ['Jane Smith'], cities: ['Miami, FL'], withDetails: true, maxLawyers: 10,
     }, expect.any(AbortSignal));
     expect(AVVO_ACTOR).toBe('scrapers_lat/avvo-lawyers-scraper');
   });
-  it('caps the records requested from both paid providers at seven', async () => {
+  it('caps the records requested from both paid providers at ten', async () => {
     const run = vi.fn(async () => []);
     const signal = new AbortController().signal;
     await new ApifyDirectorySource('bar', { run }).run(query, signal);
     await new ApifyDirectorySource('avvo', { run }).run(query, signal);
-    expect(MAX_PROVIDER_RESULTS).toBe(7);
-    expect(run).toHaveBeenNthCalledWith(1, BAR_ACTOR, expect.objectContaining({ maxLawyers: 7 }), signal);
-    expect(run).toHaveBeenNthCalledWith(2, AVVO_ACTOR, expect.objectContaining({ maxLawyers: 7 }), signal);
+    expect(MAX_PROVIDER_RESULTS).toBe(10);
+    expect(run).toHaveBeenNthCalledWith(1, BAR_ACTOR, expect.objectContaining({ maxLawyers: 10 }), signal);
+    expect(run).toHaveBeenNthCalledWith(2, AVVO_ACTOR, expect.objectContaining({ maxLawyers: 10 }), signal);
   });
   it('treats a complete seven-record response as valid evidence', async () => {
     const candidates = Array.from({ length: 7 }, (_, index) => ({

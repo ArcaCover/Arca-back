@@ -95,7 +95,7 @@ Required values in `/opt/arca/.env.demo`:
 | `MAX_DIRECTORY_TARGETS` | `2` |
 | `MAX_APIFY_CONCURRENCY` | `2` |
 
-Each paid provider run requests at most seven records. A scan starts no more than four directory runs.
+Each paid provider run requests at most ten records. A scan starts no more than four directory runs.
 
 Secrets are not passed through CDK, user data, container layers or SSM command arguments. They are
 entered interactively on the host through Session Manager and the file is mode `0600` owned by root.
