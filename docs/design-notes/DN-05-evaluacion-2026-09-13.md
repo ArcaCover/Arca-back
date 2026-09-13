@@ -211,3 +211,52 @@ Scripts de diagnóstico (no versionados) en `output/diag/`: `replay-extract.ts`,
 9. Reintento acotado por fase ante 5xx y timeout, dentro del presupuesto global.
 10. Reducir la latencia: 202 s en la única corrida completa, frente a un p95 exigido de 120 s.
 11. Repetir las seis corridas en serie, no en paralelo, para separar el efecto de la concurrencia.
+
+## 7. Línea base de precisión
+
+Con el evaluador y las etiquetas verificadas de la Tarea 1 (`signal-evaluation.ts`,
+`apps/api/tests/fixtures/gold/*.json`) ya en verde, se ejecutó la línea base exigida antes de tocar el
+workflow:
+
+```
+NVIDIA_NIM_MODEL=z-ai/glm-5.3-flash npm run eval:signals -- duqueimmigration.com gallardolawyers.com --runs 3
+```
+
+Reporte completo: `output/eval/2026-09-13T17-26-28-777Z/summary.json` (no versionado, `output/` está en
+`.gitignore`).
+
+| Firma | Corrida | Estado | Duración | Correctos | Incorrectos | Recall de abogados |
+| --- | --- | --- | --- | --- | --- | --- |
+| duqueimmigration.com | 1 | Falló | 120.1 s | — | — | — |
+| duqueimmigration.com | 2 | Falló | 120.1 s | — | — | — |
+| duqueimmigration.com | 3 | Falló | 15.2 s | — | — | — |
+| gallardolawyers.com | 1 | Falló | 0.7 s | — | — | — |
+| gallardolawyers.com | 2 | Falló | 1.7 s | — | — | — |
+| gallardolawyers.com | 3 | Falló | 1.0 s | — | — | — |
+
+**Valores incorrectos:** ninguno; ninguna corrida llegó a `evaluateWebsiteData` porque las seis fallaron
+antes de producir `WebsiteData`.
+
+**Mensajes de error de las corridas fallidas:**
+
+- Duque 1 y 2: `ExtractionFailure: Request timed out.` (se agotó el `timeout: 120_000` del cliente OpenAI
+  en `nvidia-evidence-provider.ts` antes de recibir respuesta).
+- Duque 3, Gallardo 1, 2 y 3: `ExtractionFailure: 404 status code (no body)`, en 0.7–15.2 s, sin ningún
+  intento registrado en `attempts` (el fallo ocurrió en la primera llamada al API, antes de cualquier
+  intento de extracción).
+
+**Causa raíz identificada (diagnóstico, no se tocó código de producción):** una llamada directa al API de
+NVIDIA NIM con el mismo `NVIDIA_NIM_API_KEY` confirma que el modelo `z-ai/glm-5.3-flash` —el mismo elegido
+en la sección 2 y usado con éxito en la sección 4 el mismo día— responde **404 sin cuerpo** para
+`POST /v1/chat/completions`, mientras que el modelo por defecto (`nvidia/nemotron-3-super-120b-a12b`)
+responde `200` con el mismo payload. El modelo parece haber sido retirado o renombrado en el catálogo de
+NVIDIA NIM entre la sección 4 (corridas de la madrugada del 13 de septiembre) y esta línea base (misma
+tarde). Los dos timeouts de Duque son compatibles con la misma causa: una ruta de modelo que empezó a
+responder lento o de forma intermitente antes de desaparecer del catálogo.
+
+**Lectura:** la línea base no pudo medir precisión real del workflow porque ningún intento llegó a
+producir `WebsiteData` — es un fallo de infraestructura del modelo fijado en el comando, no del evaluador
+ni de las etiquetas doradas, que quedan verificados por la suite unitaria (`signal-evaluation.test.ts`, 3
+pruebas en verde). Antes de repetir la línea base hace falta fijar un modelo vigente en el catálogo NVIDIA
+NIM (por ejemplo confirmando con una llamada mínima al API, como se hizo aquí) o añadir un chequeo previo
+que lo valide.

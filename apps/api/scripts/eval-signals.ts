@@ -1,0 +1,46 @@
+import { existsSync, readFileSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { loadEnvFile } from 'node:process';
+import { resolve } from 'node:path';
+import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../src/pipeline/nvidia-evidence-provider.js';
+import { GoldLabels, evaluateWebsiteData } from '../src/pipeline/signal-evaluation.js';
+
+if (existsSync('.env.local')) loadEnvFile('.env.local');
+const key = process.env.NVIDIA_NIM_API_KEY?.trim();
+if (!key) throw new Error('NVIDIA_NIM_API_KEY is required');
+const args = process.argv.slice(2);
+const runsFlag = args.indexOf('--runs');
+const runs = runsFlag >= 0 ? Number(args[runsFlag + 1]) : 3;
+const domains = args.filter((arg, index) => !arg.startsWith('--') && !(runsFlag >= 0 && index === runsFlag + 1));
+if (!domains.length || !Number.isInteger(runs) || runs < 1) throw new Error('Usage: npm run eval:signals -- <domain> [...] --runs 3');
+
+const output = resolve('output', 'eval', new Date().toISOString().replace(/[:.]/g, '-'));
+await mkdir(output, { recursive: true });
+const summary: Array<Record<string, unknown>> = [];
+let incorrectTotal = 0;
+for (const domain of domains) {
+  const gold = GoldLabels.parse(JSON.parse(readFileSync(`apps/api/tests/fixtures/gold/${domain}.json`, 'utf8')));
+  const crawl = JSON.parse(readFileSync(`output/eval/snapshots/${domain}.crawl.json`, 'utf8'));
+  for (let run = 1; run <= runs; run++) {
+    const started = Date.now();
+    const provider = new NvidiaNimEvidenceProvider(key, process.env.NVIDIA_NIM_MODEL?.trim() || undefined);
+    try {
+      const result = await provider.extractDetailed(crawl, AbortSignal.timeout(900_000));
+      const evaluation = evaluateWebsiteData(result.websiteData, gold);
+      incorrectTotal += evaluation.incorrect;
+      await writeFile(resolve(output, `${domain}-run${run}.json`), JSON.stringify({ evaluation, diagnostics: result.diagnostics,
+        websiteData: result.websiteData }, null, 2));
+      summary.push({ domain, run, status: 'completed', durationMs: Date.now() - started, correct: evaluation.correct,
+        incorrect: evaluation.incorrect, attorneyRecall: evaluation.attorneyRecall,
+        incorrectValues: evaluation.outcomes.filter(item => item.verdict === 'incorrect') });
+    } catch (error) {
+      await writeFile(resolve(output, `${domain}-run${run}.error.json`), JSON.stringify({ message: String(error),
+        attempts: error instanceof ExtractionFailure ? error.attempts : [] }, null, 2));
+      summary.push({ domain, run, status: 'failed', durationMs: Date.now() - started, error: String(error) });
+    }
+  }
+}
+await writeFile(resolve(output, 'summary.json'), JSON.stringify(summary, null, 2));
+console.table(summary.map(({ incorrectValues: _omit, ...row }) => row));
+console.log(`incorrect accepted values: ${incorrectTotal}; report: ${output}`);
+if (incorrectTotal > 0 || summary.some(row => row.status === 'failed')) process.exitCode = 1;

@@ -21,7 +21,8 @@
     "db:new": "supabase migration new",
     "db:push": "supabase db push"
     ,"db:verify": "tsx --conditions=development apps/api/scripts/verify-supabase.ts",
-    "demo:signals": "tsx --conditions=development apps/api/scripts/demo-signals.ts"
+    "demo:signals": "tsx --conditions=development apps/api/scripts/demo-signals.ts",
+    "eval:signals": "tsx --conditions=development apps/api/scripts/eval-signals.ts"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.8",
