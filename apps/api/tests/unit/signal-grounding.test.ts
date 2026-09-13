@@ -49,10 +49,20 @@ describe('signal grounding', () => {
 
   it('rejects a practice-area list when any canonical area is absent from its evidence', () => {
     const item: Claim = { id: 'areas', field: 'practice_areas', value: ['Personal Injury', 'Medical Malpractice'],
-      explanation: 'services', citations: [{ segmentId: segment.id, quote: 'Smith Law was founded in 2001.' }] };
+      explanation: 'services', citations: [{ segmentId: segment.id, quote: 'Smith Law was founded in 2001. Jane Doe is an Attorney at Smith Law.' }] };
     const supported: SignalReview = { verdicts: [{ claimId: item.id, verdict: 'supported', reason: 'services',
       citations: item.citations }] };
     expect(acceptClaims([item], supported, corpus).report.items[0]).toMatchObject({ status: 'rejected', reason: 'UNSUPPORTED_CLAIM' });
+  });
+
+  it('does not treat medical-negligence case language as a medical-malpractice practice area', () => {
+    const areas = buildCorpus({ partial: false, pages: [{ url: 'https://firm.com/', html: '',
+      text: 'We represent clients in medical negligence cases.' }] });
+    const item: Claim = { id: 'medical', field: 'practice_areas', value: ['Medical Malpractice'], explanation: 'case type',
+      citations: [{ segmentId: areas.segments[0]!.id, quote: 'medical negligence cases' }] };
+    const supported: SignalReview = { verdicts: [{ claimId: item.id, verdict: 'supported', reason: 'case type',
+      citations: item.citations }] };
+    expect(acceptClaims([item], supported, areas).report.items[0]).toMatchObject({ status: 'rejected', reason: 'UNSUPPORTED_CLAIM' });
   });
 
   it('rejects a phone claim that combines separate phone numbers', () => {

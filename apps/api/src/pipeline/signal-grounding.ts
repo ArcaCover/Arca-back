@@ -42,7 +42,7 @@ function quotedValue(claim: Claim, quotes: string[]): boolean {
 const PRACTICE_AREA_EVIDENCE: Record<string, RegExp> = {
   'Criminal Defense': /\b(criminal defense|defensa penal)\b/i,
   Immigration: /\b(immigration|inmigracion)\b/i,
-  'Medical Malpractice': /\b(medical malpractice|medical negligence|negligencia medica|mala praxis)\b/i,
+  'Medical Malpractice': /\b(medical malpractice|mala praxis)\b/i,
   'Personal Injury': /\b(personal injury|lesiones personales)\b/i,
   'IP/Patents': /\b(intellectual property|patents?|propiedad intelectual|patentes?)\b/i,
   'Family Law': /\b(family law|derecho de familia)\b/i,
