@@ -41,6 +41,8 @@ for (const target of targets) {
     await writeFile(resolve(output, 'candidates.json'), json(result.diagnostics.extraction));
     await writeFile(resolve(output, 'review.json'), json(result.diagnostics.review));
     await writeFile(resolve(output, 'acceptance.json'), json(result.diagnostics.grounding));
+    await writeFile(resolve(output, 'tool-calls.json'), json({ rounds: result.diagnostics.rounds,
+      stopReason: result.diagnostics.stopReason, calls: result.diagnostics.toolCalls }));
     await writeFile(resolve(output, 'website-data.json'), json(result.websiteData));
     console.log(`[${domain}] 3/5 building verified identity`);
     const identity = buildFirmIdentity(domain, result.websiteData);
