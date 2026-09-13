@@ -30,7 +30,7 @@ for (const domain of domains) {
     const started = Date.now();
     const provider = new NvidiaNimEvidenceProvider(key, process.env.NVIDIA_NIM_MODEL?.trim() || undefined, client as never);
     try {
-      const result = await provider.extractDetailed(crawl, AbortSignal.timeout(900_000));
+      const result = await provider.extractDetailed(crawl, AbortSignal.timeout(2_700_000));
       const evaluation = evaluateWebsiteData(result.websiteData, gold);
       incorrectTotal += evaluation.incorrect;
       await writeFile(resolve(output, `${domain}-run${run}.json`), JSON.stringify({ evaluation, diagnostics: result.diagnostics,
