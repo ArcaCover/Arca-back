@@ -99,7 +99,7 @@ describe('NVIDIA evidence provider', () => {
       toolCalls: [{ round: 1, tool: 'fetch_pages', target: 'L-invented', status: 'skipped', detail: 'UNKNOWN_LINK' }] });
   });
 
-  it('never reads the sitemap twice and ends at the round limit', async () => {
+  it('never reads the sitemap twice and stops when the repeat brings no new evidence', async () => {
     const create = scripted([() => ({ claims: [], action: { type: 'read_sitemap', targetFields: ['attorneys'], reason: 'map' } })]);
     const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn(async () => ({
       links: [{ url: 'https://firm.com/equipo/', kind: 'page' as const }],
@@ -109,5 +109,79 @@ describe('NVIDIA evidence provider', () => {
     expect(access.readSitemap).toHaveBeenCalledTimes(1);
     expect(result.diagnostics.stopReason).toBe('NO_NEW_EVIDENCE');
     expect(result.diagnostics.toolCalls.at(-1)).toMatchObject({ round: 2, tool: 'read_sitemap', status: 'skipped', detail: 'ALREADY_READ' });
+  });
+
+  it('searches the site across rounds and stops at the round limit', async () => {
+    const filler = 'x'.repeat(700);
+    const page = { url: 'https://firm.com/', html: '',
+      text: `Criminal Defense info. ${filler} 555-1234 contact info.` };
+    const create = scripted([
+      () => ({ claims: [], action: { type: 'find_in_site', terms: ['Criminal Defense'], targetFields: ['practice_areas'], reason: 'r1' } }),
+      () => ({ claims: [], action: { type: 'find_in_site', terms: ['555-1234'], targetFields: ['phone'], reason: 'r2' } }),
+      () => ({ claims: [], action: { type: 'read_sitemap', targetFields: ['attorneys'], reason: 'r3' } }),
+    ]);
+    const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn(async () => ({
+      links: [{ url: 'https://firm.com/equipo/', kind: 'page' as const }],
+      calls: [{ tool: 'read_sitemap' as const, target: 'https://firm.com/', status: 'read' as const, detail: '1 urls' }] })) };
+    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
+    expect(result.diagnostics).toMatchObject({ rounds: 3, stopReason: 'ROUND_LIMIT' });
+    const findCalls = result.diagnostics.toolCalls.filter(call => call.tool === 'find_in_site');
+    expect(findCalls).toHaveLength(2);
+    expect(findCalls.every(call => call.status === 'read')).toBe(true);
+    expect(result.diagnostics.toolCalls.some(call => call.tool === 'read_sitemap')).toBe(false);
+    expect(access.readSitemap).not.toHaveBeenCalled();
+  });
+
+  it('deduplicates repeated link IDs before reading them', async () => {
+    const page = { url: 'https://firm.com/', html: '<a href="/about">About</a>', text: 'Smith Law is a law firm.' };
+    const create = scripted([
+      user => ({ claims: [], action: { type: 'fetch_pages', linkIds: Array(2).fill(/\[(L-[^\]]+)\] PAGE/.exec(user)![1]), targetFields: ['firm_name'], reason: 'about' } }),
+      () => ({ claims: [], action: { type: 'finish', reason: 'done' } }),
+    ]);
+    const access = { fetchPages: vi.fn(async (urls: string[]) => ({
+      pages: urls.map(url => ({ url, html: '', text: 'About Smith Law.' })),
+      calls: urls.map(target => ({ tool: 'fetch_pages' as const, target, status: 'read' as const, detail: null })) })),
+      readDocuments: vi.fn(), readSitemap: vi.fn() };
+    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
+    expect(access.fetchPages).toHaveBeenCalledWith(['https://firm.com/about'], expect.anything());
+    expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: 'https://firm.com/about', status: 'read', detail: null }]);
+  });
+
+  it('never retries a URL whose earlier tool call already failed', async () => {
+    const page = { url: 'https://firm.com/', html: '<a href="/about">About</a><a href="/team">Team</a>', text: 'Smith Law is a law firm.' };
+    const create = scripted([
+      user => ({ claims: [], action: { type: 'fetch_pages',
+        linkIds: [/\[(L-[^\]]+)\] PAGE https:\/\/firm\.com\/about/.exec(user)![1], /\[(L-[^\]]+)\] PAGE https:\/\/firm\.com\/team/.exec(user)![1]],
+        targetFields: ['firm_name'], reason: 'r1' } }),
+      user => ({ claims: [], action: { type: 'fetch_pages',
+        linkIds: [/\[(L-[^\]]+)\] PAGE https:\/\/firm\.com\/team/.exec(user)![1]], targetFields: ['firm_name'], reason: 'retry' } }),
+    ]);
+    const access = { fetchPages: vi.fn(async (urls: string[]) => ({
+      pages: urls.filter(url => url.endsWith('/about')).map(url => ({ url, html: '', text: 'About Smith Law.' })),
+      calls: urls.map(url => url.endsWith('/about')
+        ? { tool: 'fetch_pages' as const, target: url, status: 'read' as const, detail: null }
+        : { tool: 'fetch_pages' as const, target: url, status: 'failed' as const, detail: 'boom' }) })),
+      readDocuments: vi.fn(), readSitemap: vi.fn() };
+    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
+    expect(access.fetchPages).toHaveBeenCalledTimes(1);
+    expect(result.diagnostics).toMatchObject({ rounds: 2, stopReason: 'NO_NEW_EVIDENCE' });
+    expect(result.diagnostics.toolCalls).toEqual([
+      { round: 1, tool: 'fetch_pages', target: 'https://firm.com/about', status: 'read', detail: null },
+      { round: 1, tool: 'fetch_pages', target: 'https://firm.com/team', status: 'failed', detail: 'boom' },
+      { round: 2, tool: 'fetch_pages', target: 'https://firm.com/team', status: 'skipped', detail: 'ALREADY_FAILED' },
+    ]);
+  });
+
+  it('truncates an unbounded unknown link ID before recording it', async () => {
+    const longId = `L-${'x'.repeat(100)}`;
+    const create = scripted([() => ({ claims: [], action: { type: 'fetch_pages', linkIds: [longId], targetFields: ['attorneys'], reason: 'guess' } })]);
+    const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn() };
+    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const result = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }], partial: false }, new AbortController().signal);
+    expect(access.fetchPages).not.toHaveBeenCalled();
+    expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: longId.slice(0, 64), status: 'skipped', detail: 'UNKNOWN_LINK' }]);
   });
 });

@@ -197,18 +197,19 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
       const before = { pages: crawl.pages.length, links: discovered.length, passages: passages.length };
       const resolve = (ids: string[], kind: 'page' | 'document') => ids.flatMap(id => {
         const link = corpus.links.find(item => item.id === id && item.kind === kind);
-        if (!link) { record([{ tool: kind === 'page' ? 'fetch_pages' : 'read_document', target: id, status: 'skipped', detail: 'UNKNOWN_LINK' }]); return []; }
+        if (!link) { record([{ tool: kind === 'page' ? 'fetch_pages' : 'read_document', target: id.slice(0, 64), status: 'skipped', detail: 'UNKNOWN_LINK' }]); return []; }
         if (crawl.pages.some(page => page.url === link.url)) { record([{ tool: kind === 'page' ? 'fetch_pages' : 'read_document', target: link.url, status: 'skipped', detail: 'ALREADY_READ' }]); return []; }
+        if (toolCalls.some(call => call.target === link.url && call.status === 'failed')) { record([{ tool: kind === 'page' ? 'fetch_pages' : 'read_document', target: link.url, status: 'skipped', detail: 'ALREADY_FAILED' }]); return []; }
         return [link.url];
       });
       const merge = (pages: CrawledPage[]) => {
         crawl = { pages: [...new Map([...crawl.pages, ...pages].map(page => [page.url, page])).values()], partial: crawl.partial, issues: crawl.issues ?? [] };
       };
       if (action.type === 'fetch_pages') {
-        const urls = resolve(action.linkIds, 'page').slice(0, 4);
+        const urls = [...new Set(resolve(action.linkIds, 'page'))].slice(0, 4);
         if (urls.length) { const result = await this.access.fetchPages(urls, signal); record(result.calls); merge(result.pages); }
       } else if (action.type === 'read_document') {
-        const urls = resolve(action.linkIds, 'document').slice(0, 2);
+        const urls = [...new Set(resolve(action.linkIds, 'document'))].slice(0, 2);
         if (urls.length) { const result = await this.access.readDocuments(urls, signal); record(result.calls); merge(result.pages); }
       } else if (action.type === 'read_sitemap') {
         if (sitemapRead) record([{ tool: 'read_sitemap', target: `https://${domain}/`, status: 'skipped', detail: 'ALREADY_READ' }]);
