@@ -2,9 +2,9 @@ import OpenAI from 'openai';
 import { SignalExtraction, SignalReview, WebsiteData, type Claim, type GroundingReport } from '@arca/contracts';
 import { classifyRole, personEvidence } from './attorney-roles.js';
 import type { CrawlResult } from './crawler.js';
-import { crawlWebsite } from './crawler.js';
 import { buildCorpus, serializeCorpus, type EvidenceCorpus } from './evidence-corpus.js';
 import { acceptClaims, toWebsiteData } from './signal-grounding.js';
+import { createSiteAccess, type SiteAccess, type ToolCall } from './site-access.js';
 import type { WebsiteEvidenceProvider } from './website-evidence-provider.js';
 
 export const DEFAULT_NVIDIA_NIM_MODEL = 'nvidia/nemotron-3-super-120b-a12b';
@@ -65,7 +65,7 @@ export class ExtractionFailure extends Error {
   }
 }
 export type ExtractionDiagnostics = { model: string; version: string; corpus: EvidenceCorpus; attempts: Attempt[];
-  extraction: unknown; review: unknown; grounding: GroundingReport; actionExecuted: string[] };
+  extraction: unknown; review: unknown; grounding: GroundingReport; toolCalls: ToolCall[] };
 export type DetailedExtraction = { websiteData: WebsiteData; diagnostics: ExtractionDiagnostics };
 
 function responseText(response: unknown): string {
@@ -111,7 +111,8 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
   readonly id = 'nvidia-nim';
   readonly version: string;
   private readonly client: CompletionClient;
-  constructor(apiKey: string, readonly model = DEFAULT_NVIDIA_NIM_MODEL, client?: CompletionClient) {
+  constructor(apiKey: string, readonly model = DEFAULT_NVIDIA_NIM_MODEL, client?: CompletionClient,
+    private readonly access: SiteAccess = createSiteAccess()) {
     this.version = `${EXTRACTION_VERSION}:${model}`;
     this.client = client ?? new OpenAI({ apiKey, baseURL: 'https://integrate.api.nvidia.com/v1', maxRetries: 0,
       timeout: 120_000 }) as unknown as CompletionClient;
@@ -151,8 +152,8 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
   }
 
   async extractDetailed(input: CrawlResult, signal: AbortSignal): Promise<DetailedExtraction> {
-    const attempts: Attempt[] = [], actionExecuted: string[] = [];
-    try { return await this.runWorkflow(input, signal, attempts, actionExecuted); }
+    const attempts: Attempt[] = [], toolCalls: ToolCall[] = [];
+    try { return await this.runWorkflow(input, signal, attempts, toolCalls); }
     catch (error) {
       if (error instanceof ExtractionFailure) throw error;
       throw new ExtractionFailure(error instanceof Error ? error.message : 'Extraction failed', attempts, { cause: error });
@@ -160,21 +161,18 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
   }
 
   private async runWorkflow(input: CrawlResult, signal: AbortSignal, attempts: Attempt[],
-    actionExecuted: string[]): Promise<DetailedExtraction> {
+    toolCalls: ToolCall[]): Promise<DetailedExtraction> {
     let crawl = input, corpus = buildCorpus(crawl);
     let extraction = await this.parseWithRepair('extract', SignalExtraction, SIGNAL_EXTRACTION_PROMPT,
       serializeCorpus(corpus), signal, attempts);
     if (extraction.action.type === 'fetch_pages') {
-      const wanted = extraction.action.linkIds.map(id => corpus.links.find(link => link.id === id)).filter(Boolean)
-        .filter(link => !crawl.pages.some(page => page.url === link!.url)).slice(0, 4);
-      const added: CrawlResult['pages'] = [];
-      for (const link of wanted) {
-        signal.throwIfAborted();
-        const extra = await crawlWebsite(link!.url, signal, undefined, { timeoutMs: 10_000, maxPages: 2, maxDepth: 0 });
-        actionExecuted.push(link!.url); added.push(...extra.pages);
-      }
-      if (added.length) {
-        crawl = { pages: [...new Map([...crawl.pages, ...added].map(page => [page.url, page])).values()],
+      const wanted = extraction.action.linkIds.map(id => corpus.links.find(link => link.id === id && link.kind === 'page'))
+        .filter((link): link is NonNullable<typeof link> => Boolean(link))
+        .filter(link => !crawl.pages.some(page => page.url === link.url)).slice(0, 4);
+      const { pages, calls } = await this.access.fetchPages(wanted.map(link => link.url), signal);
+      toolCalls.push(...calls.map(call => ({ round: 1, ...call })));
+      if (pages.length) {
+        crawl = { pages: [...new Map([...crawl.pages, ...pages].map(page => [page.url, page])).values()],
           partial: crawl.partial, issues: [...(crawl.issues ?? [])] };
         corpus = buildCorpus(crawl);
         extraction = await this.parseWithRepair('refine', SignalExtraction, SIGNAL_EXTRACTION_PROMPT,
@@ -209,7 +207,7 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
     const grounded = acceptClaims(extraction.claims, review, corpus);
     const websiteData = toWebsiteData(grounded.accepted, corpus);
     return { websiteData, diagnostics: { model: this.model, version: this.version, corpus, attempts,
-      extraction, review, grounding: grounded.report, actionExecuted } };
+      extraction, review, grounding: grounded.report, toolCalls } };
   }
 
   async extract(input: CrawlResult, signal: AbortSignal): Promise<WebsiteData> {

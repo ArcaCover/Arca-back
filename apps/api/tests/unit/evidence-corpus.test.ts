@@ -19,4 +19,10 @@ describe('evidence corpus', () => {
     expect(normalizeForGrounding('No   usamos  IA')).toBe('No usamos IA');
     expect(normalizeForGrounding('inmigración')).not.toBe(normalizeForGrounding('inmigracion'));
   });
+  it('offers PDFs as documents and drops links the crawler cannot read', () => {
+    const corpus = buildCorpus({ pages: [{ url: 'https://firm.com/', text: 'Home', html:
+      '<a href="/team">Team</a><a href="/files/Policy.pdf">Privacy</a><a href="/logo.png">Logo</a><a href="mailto:a@firm.com">Mail</a>' }],
+    partial: false });
+    expect(corpus.links.map(link => [new URL(link.url).pathname, link.kind])).toEqual([['/team', 'page'], ['/files/Policy.pdf', 'document']]);
+  });
 });

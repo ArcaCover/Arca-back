@@ -33,4 +33,25 @@ describe('NVIDIA evidence provider', () => {
     expect(attempts.map(attempt => attempt.phase)).toEqual(['extract', 'extract-repair']);
     expect(attempts.every(attempt => attempt.rawContent.includes('not-an-array') && attempt.validationIssues)).toBe(true);
   });
+
+  it('records a link that cannot be fetched and keeps the extraction', async () => {
+    const page = { url: 'https://firm.com/', html: '<a href="/about">About</a>', text: 'Smith Law is a law firm.' };
+    let segmentId = '';
+    const create = vi.fn(async (request: Record<string, unknown>) => {
+      const user = (request.messages as Array<{ content: string }>)[1]!.content;
+      segmentId ||= /\[(D-[^\]]+)\]/.exec(user)?.[1] ?? '';
+      const linkId = /\[(L-[^\]]+)\] PAGE/.exec(user)?.[1] ?? '';
+      const claims = [{ id: 'firm', field: 'firm_name', value: 'Smith Law', explanation: 'operator', citations: [{ segmentId, quote: 'Smith Law' }] }];
+      const content = user.startsWith('CANDIDATE CLAIMS')
+        ? JSON.stringify({ verdicts: [{ claimId: 'firm', verdict: 'supported', reason: 'operator', citations: claims[0]!.citations }] })
+        : JSON.stringify({ claims, action: { type: 'fetch_pages', linkIds: [linkId], targetFields: ['firm_name'], reason: 'about' } });
+      return { choices: [{ finish_reason: 'stop', message: { content } }] };
+    });
+    const access = { fetchPages: vi.fn(async (urls: string[]) => ({ pages: [],
+      calls: urls.map(target => ({ tool: 'fetch_pages' as const, target, status: 'failed' as const, detail: 'boom' })) })) };
+    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
+    expect(result.websiteData.firm_name).toBe('Smith Law');
+    expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: 'https://firm.com/about', status: 'failed', detail: 'boom' }]);
+  });
 });
