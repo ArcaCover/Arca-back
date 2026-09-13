@@ -57,6 +57,10 @@ const PRACTICE_AREA_EVIDENCE: Record<string, RegExp> = {
 
 function semanticGuard(claim: Claim, quotes: string[]): GroundingReport['items'][number]['reason'] {
   const joined = normalizeForGrounding(quotes.join(' ')).toLocaleLowerCase();
+  if (claim.field === 'phone') {
+    const digits = String(claim.value).replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+    if (digits.length !== 10) return 'UNSUPPORTED_CLAIM';
+  }
   if (claim.field === 'firm_established_year' && !/\b(founded|established|fundad[ao]|constitu(?:ida|ido)|cread[ao])\b/.test(joined)) {
     return 'UNSUPPORTED_CLAIM';
   }

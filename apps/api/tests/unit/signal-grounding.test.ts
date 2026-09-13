@@ -54,6 +54,16 @@ describe('signal grounding', () => {
       citations: item.citations }] };
     expect(acceptClaims([item], supported, corpus).report.items[0]).toMatchObject({ status: 'rejected', reason: 'UNSUPPORTED_CLAIM' });
   });
+
+  it('rejects a phone claim that combines separate phone numbers', () => {
+    const phones = buildCorpus({ partial: false, pages: [{ url: 'https://firm.com/', html: '',
+      text: 'Main line: (305) 436-0155. Detention hotline: (645) 236-3669.' }] });
+    const item: Claim = { id: 'phone', field: 'phone', value: '(305) 436-0155; detention hotline (645) 236-3669',
+      explanation: 'contacts', citations: [{ segmentId: phones.segments[0]!.id, quote: 'Main line: (305) 436-0155. Detention hotline: (645) 236-3669.' }] };
+    const supported: SignalReview = { verdicts: [{ claimId: item.id, verdict: 'supported', reason: 'contacts',
+      citations: item.citations }] };
+    expect(acceptClaims([item], supported, phones).report.items[0]).toMatchObject({ status: 'rejected', reason: 'UNSUPPORTED_CLAIM' });
+  });
 });
 
 describe('absence claims', () => {
