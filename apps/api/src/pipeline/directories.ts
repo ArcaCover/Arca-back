@@ -80,14 +80,31 @@ const providerError = (item: unknown) => {
   return typeof row?.error === 'string' ? row.error.trim() : null;
 };
 const isNoMatch = (item: unknown) => /^no lawyers? matched\b|^no results?\b/i.test(providerError(item) ?? '');
+export type DirectoryInput = { target: string; actor: string; input: Record<string, unknown>; fallback: boolean };
+export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQuery): DirectoryInput[] {
+  const names = stableSample(query.names).slice(0, query.maxTargets ?? 2);
+  const fallback = names.length === 0;
+  const targets = fallback ? (query.firmName ? [query.firmName] : []) : names;
+  return targets.map(target => {
+    const parts = normalizeName(target).split(' ');
+    const input = source === 'bar' ? {
+      lastNames: fallback ? [] : [parts.at(-1)!], firstName: fallback ? '' : parts[0]![0],
+      ...(fallback ? { firm: target } : {}), maxLawyers: MAX_PROVIDER_RESULTS, withDetails: true,
+      withLeadScore: false, withProfileSummary: false, eligibleOnly: false, includeDeceased: true,
+    } : { searchQueries: [target], ...(query.city ? { cities: [`${query.city}, FL`] } : {}),
+      withDetails: true, maxLawyers: MAX_PROVIDER_RESULTS };
+    return { target, actor: source === 'bar' ? BAR_ACTOR : AVVO_ACTOR, input, fallback };
+  });
+}
 type DirectoryClient = { run(actor: string, input: Record<string, unknown>, signal: AbortSignal): Promise<unknown[] | ApifyRunResult> };
 export class ApifyDirectorySource implements DirectorySource {
   constructor(private readonly source: 'bar' | 'avvo', private readonly client: DirectoryClient) {}
   async run(query: DirectoryQuery, signal: AbortSignal): Promise<SourceResult<AttorneyMatch[]>> {
     const started = Date.now();
+    const planned = buildDirectoryInputs(this.source, query);
     const names = stableSample(query.names).slice(0, query.maxTargets ?? 2);
     const fallback = names.length === 0;
-    const targets = fallback ? (query.firmName ? [query.firmName] : []) : names;
+    const targets = planned.map(item => item.target);
     if (!targets.length) return { data: null, rawContent: null, status: { status: 'skipped', dataStatus: 'UNKNOWN',
       durationMs: 0, code: 'INSUFFICIENT_IDENTITY', reason: 'No verified firm or attorney identity available',
       attorneysSearched: 0, attorneysFound: 0, candidatesReceived: 0, recordsValid: 0, providerRuns: [], costUsd: 0 } };
@@ -101,14 +118,8 @@ export class ApifyDirectorySource implements DirectorySource {
         const target = targets[cursor++]!;
         if (signal.aborted) { failed++; continue; }
         try {
-          const parts = normalizeName(target).split(' ');
-          const input = this.source === 'bar' ? {
-            lastNames: fallback ? [] : [parts.at(-1)!], firstName: fallback ? '' : parts[0]![0],
-            ...(fallback ? { firm: target } : {}), maxLawyers: MAX_PROVIDER_RESULTS, withDetails: true,
-            withLeadScore: false, withProfileSummary: false, eligibleOnly: false, includeDeceased: true,
-          } : { searchQueries: [target], ...(query.city ? { cities: [`${query.city}, FL`] } : {}),
-            withDetails: true, maxLawyers: MAX_PROVIDER_RESULTS };
-          const output = await this.client.run(this.source === 'bar' ? BAR_ACTOR : AVVO_ACTOR, input, signal);
+          const plan = planned.find(item => item.target === target)!;
+          const output = await this.client.run(plan.actor, plan.input, signal);
           const items = Array.isArray(output) ? output : output.items;
           rawResults.push({ target, items, error: null });
           const parse = this.source === 'bar' ? parseBar : parseAvvo;

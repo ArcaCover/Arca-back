@@ -4,11 +4,12 @@ const EnvSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
   SOURCE_MODE: z.enum(['mock', 'live']).optional(),
   STORAGE_BACKEND: z.enum(['memory', 'supabase']).optional(),
-  WEBSITE_EVIDENCE_PROVIDER: z.enum(['rules', 'openai']).default('rules'),
+  WEBSITE_EVIDENCE_PROVIDER: z.enum(['nvidia', 'rules', 'openai']).default('nvidia'),
   // Backward-compatible defaults for existing environments. Explicit modes take precedence.
   MOCK_MODE: z.enum(['true', 'false']).optional(),
   SUPABASE_URL: z.string().optional(), SUPABASE_SECRET_KEY: z.string().optional(), SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   SESSION_TOKEN_SECRET: z.string().min(32), OPENAI_API_KEY: z.string().optional(), APIFY_API_TOKEN: z.string().optional(),
+  NVIDIA_NIM_API_KEY: z.string().optional(), NVIDIA_NIM_MODEL: z.string().optional(),
   CORS_ALLOWED_ORIGINS: z.string().min(1),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
   MAX_DIRECTORY_TARGETS: z.coerce.number().int().min(1).max(2).default(2),
@@ -28,8 +29,12 @@ export function loadEnv(source = process.env) {
   if (sourceMode === 'live' && env.WEBSITE_EVIDENCE_PROVIDER === 'openai' && !env.OPENAI_API_KEY?.trim()) {
     throw new Error('OPENAI_API_KEY is required only when WEBSITE_EVIDENCE_PROVIDER=openai');
   }
+  if (sourceMode === 'live' && env.WEBSITE_EVIDENCE_PROVIDER === 'nvidia' && !env.NVIDIA_NIM_API_KEY?.trim()) {
+    throw new Error('NVIDIA_NIM_API_KEY is required when WEBSITE_EVIDENCE_PROVIDER=nvidia');
+  }
   const corsOrigins = env.CORS_ALLOWED_ORIGINS.split(',').map(value => value.trim()).filter(Boolean);
   for (const origin of corsOrigins) if (new URL(origin).origin !== origin) throw new Error('CORS entries must be exact origins');
   if (env.SUPABASE_URL) z.string().url().parse(env.SUPABASE_URL);
-  return { ...env, sourceMode, storageBackend, supabaseKey, corsOrigins };
+  return { ...env, NVIDIA_NIM_MODEL: env.NVIDIA_NIM_MODEL?.trim() || undefined,
+    sourceMode, storageBackend, supabaseKey, corsOrigins };
 }

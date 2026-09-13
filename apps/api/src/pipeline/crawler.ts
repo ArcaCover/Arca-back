@@ -50,10 +50,20 @@ export function canonicalUrl(raw: string, base: string): string | null {
     return url.href;
   } catch { return null; }
 }
-export async function crawlWebsite(domain: string, parent: AbortSignal, transport: {
+export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, transport: {
   response: typeof fetchPublicResponse; robots: typeof fetchPublicText;
-} = { response: fetchPublicResponse, robots: fetchPublicText }): Promise<CrawlResult> {
-  const signal = AbortSignal.any([parent, AbortSignal.timeout(20_000)]);
+} = { response: fetchPublicResponse, robots: fetchPublicText }, options: {
+  timeoutMs?: number; maxPages?: number; maxDepth?: number;
+} = {}): Promise<CrawlResult> {
+  const supplied = /^[a-z]+:\/\//i.test(domainOrUrl) ? new URL(domainOrUrl) : new URL(`https://${domainOrUrl}/`);
+  const domain = supplied.hostname.replace(/^www\./, '');
+  if (!domain) throw new Error('A website domain is required');
+  supplied.hash = '';
+  const rootUrl = `https://${domain}/`;
+  const seedUrl = canonicalUrl(supplied.href, rootUrl);
+  if (!seedUrl) throw new Error('The requested website URL is outside the canonical domain');
+  const maxPages = options.maxPages ?? 20, maxDepth = options.maxDepth ?? 2;
+  const signal = AbortSignal.any([parent, AbortSignal.timeout(options.timeoutMs ?? 30_000)]);
   const pages: CrawledPage[] = [];
   const issues: CrawlIssue[] = [];
   let partial = false;
@@ -103,7 +113,7 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
       }
     });
     await context.routeWebSocket('**/*', socket => socket.close());
-    let queue = [{ url: `https://${domain}/`, depth: 0, attempt: 0 }];
+    let queue = [...new Set([rootUrl, seedUrl])].map(url => ({ url, depth: 0, attempt: 0 }));
     const visited = new Set<string>();
     // Requeued pages leave `visited`, so a retry costs another attempt but never another page budget.
     const fail = (item: { url: string; depth: number; attempt: number }, issue: CrawlIssue) => {
@@ -115,9 +125,9 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
       issues.push(issue);
       partial = true;
     };
-    while (queue.length && visited.size < 20 && !signal.aborted) {
+    while (queue.length && visited.size < maxPages && !signal.aborted) {
       queue.sort((a, b) => a.depth - b.depth || pagePriority(a.url) - pagePriority(b.url) || a.url.localeCompare(b.url));
-      const batch = queue.splice(0, Math.min(3, 20 - visited.size)).filter(item => !visited.has(item.url));
+      const batch = queue.splice(0, Math.min(3, maxPages - visited.size)).filter(item => !visited.has(item.url));
       for (const item of batch) visited.add(item.url);
       await Promise.all(batch.map(async item => {
         let page: import('playwright').Page | undefined;
@@ -141,7 +151,7 @@ export async function crawlWebsite(domain: string, parent: AbortSignal, transpor
             return;
           }
           pages.push({ url: page.url(), html, text });
-          if (item.depth < 2) for (const link of links) {
+          if (item.depth < maxDepth) for (const link of links) {
             const url = canonicalUrl(link, page.url());
             if (url && !visited.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1, attempt: 0 });
           }

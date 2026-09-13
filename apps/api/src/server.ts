@@ -9,6 +9,7 @@ import { createRepository } from './repositories/supabase.js';
 import { InProcessPipeline } from './pipeline/in-process-pipeline.js';
 import { WebsiteExtractionSource } from './pipeline/website-source.js';
 import { OpenAIEvidenceProvider, RuleBasedEvidenceProvider } from './pipeline/website-evidence-provider.js';
+import { NvidiaNimEvidenceProvider } from './pipeline/nvidia-evidence-provider.js';
 import { ApifyClient } from './pipeline/apify-client.js';
 import { ApifyDirectorySource } from './pipeline/directories.js';
 import { PublicDomainResolver } from './pipeline/domain-resolution.js';
@@ -19,11 +20,12 @@ if (existsSync(envPath)) loadEnvFile(envPath);
 const env = loadEnv();
 const repository = env.storageBackend === 'memory' ? new InMemoryRepository() : createRepository(env.SUPABASE_URL!, env.supabaseKey!);
 await repository.recoverInterrupted(new Date(Date.now() - 60_000).toISOString());
-const websiteEvidenceProvider = env.WEBSITE_EVIDENCE_PROVIDER === 'openai'
-  ? new OpenAIEvidenceProvider(env.OPENAI_API_KEY!) : new RuleBasedEvidenceProvider();
+const websiteEvidenceProvider = env.sourceMode === 'mock' ? null : env.WEBSITE_EVIDENCE_PROVIDER === 'openai'
+  ? new OpenAIEvidenceProvider(env.OPENAI_API_KEY!) : env.WEBSITE_EVIDENCE_PROVIDER === 'rules'
+    ? new RuleBasedEvidenceProvider() : new NvidiaNimEvidenceProvider(env.NVIDIA_NIM_API_KEY!, env.NVIDIA_NIM_MODEL);
 const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY) : null;
 const sources = env.sourceMode === 'mock' ? mockSources() : {
-  website: new WebsiteExtractionSource(repository, websiteEvidenceProvider),
+  website: new WebsiteExtractionSource(repository, websiteEvidenceProvider!),
   bar: new ApifyDirectorySource('bar', apify!),
   avvo: new ApifyDirectorySource('avvo', apify!),
 };

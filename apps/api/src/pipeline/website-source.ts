@@ -24,24 +24,33 @@ export class WebsiteExtractionSource implements WebsiteSource {
     const contentHash = hash(JSON.stringify(crawl.pages.map(({ url, html }) => ({ url, html }))));
     const previous = await this.repository.latestRaw(domain, 'website');
     let analysis: WebsiteData | null = null;
+    let diagnostics: unknown = null;
     if (previous) {
       try {
         const record = JSON.parse(previous.raw_content);
         if (record.provider === this.provider.id && record.version === this.provider.version && record.contentHash === contentHash) {
           analysis = WebsiteData.parse(record.analysis);
+          diagnostics = record.diagnostics ?? null;
         }
       } catch { /* Invalid or incompatible historic evidence cannot supply an analysis. */ }
     }
     if (!analysis) {
-      try { analysis = WebsiteData.parse(await this.provider.extract(crawl, signal)); }
+      try {
+        const detailed = this.provider as WebsiteEvidenceProvider & { extractDetailed?: (crawl: CrawlResult,
+          signal: AbortSignal) => Promise<{ websiteData: WebsiteData; diagnostics: unknown }> };
+        if (detailed.extractDetailed) {
+          const result = await detailed.extractDetailed(crawl, signal);
+          analysis = WebsiteData.parse(result.websiteData); diagnostics = result.diagnostics;
+        } else analysis = WebsiteData.parse(await this.provider.extract(crawl, signal));
+      }
       catch {
-        return { data: null, rawContent: JSON.stringify({ ...base, contentHash, analysis: null }),
+        return { data: null, rawContent: JSON.stringify({ ...base, contentHash, analysis: null, diagnostics }),
           status: { status: signal.aborted ? 'timeout' : 'error', dataStatus: 'UNKNOWN', durationMs: Date.now() - start,
             pagesCrawled: crawl.pages.length, code: signal.aborted ? 'DEADLINE_REACHED' : 'PROVIDER_ERROR',
             reason: 'Website evidence extraction unavailable' } };
       }
     }
-    return { data: analysis, rawContent: JSON.stringify({ ...base, contentHash, analysis }),
+    return { data: analysis, rawContent: JSON.stringify({ ...base, contentHash, analysis, diagnostics }),
       status: { status: crawl.partial ? 'partial' : 'ok', dataStatus: 'PRESENT', durationMs: Date.now() - start,
         pagesCrawled: crawl.pages.length, reason: null } };
   }
