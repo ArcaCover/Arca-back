@@ -39,6 +39,22 @@ function quotedValue(claim: Claim, quotes: string[]): boolean {
   return true;
 }
 
+const PRACTICE_AREA_EVIDENCE: Record<string, RegExp> = {
+  'Criminal Defense': /\b(criminal defense|defensa penal)\b/i,
+  Immigration: /\b(immigration|inmigracion)\b/i,
+  'Medical Malpractice': /\b(medical malpractice|medical negligence|negligencia medica|mala praxis)\b/i,
+  'Personal Injury': /\b(personal injury|lesiones personales)\b/i,
+  'IP/Patents': /\b(intellectual property|patents?|propiedad intelectual|patentes?)\b/i,
+  'Family Law': /\b(family law|derecho de familia)\b/i,
+  Securities: /\b(securities|valores)\b/i,
+  'Commercial Litigation': /\b(commercial litigation|litigio comercial)\b/i,
+  'Employment Law': /\b(employment law|labor law|derecho laboral)\b/i,
+  Bankruptcy: /\b(bankruptcy|bancarrota)\b/i,
+  'Corporate/M&A': /\b(corporate|mergers? and acquisitions|fusiones y adquisiciones|derecho corporativo)\b/i,
+  'Real Estate': /\b(real estate|derecho inmobiliario)\b/i,
+  'Tax/Regulatory': /\b(tax law|regulatory|derecho tributario|regulatorio)\b/i,
+};
+
 function semanticGuard(claim: Claim, quotes: string[]): GroundingReport['items'][number]['reason'] {
   const joined = normalizeForGrounding(quotes.join(' ')).toLocaleLowerCase();
   if (claim.field === 'firm_established_year' && !/\b(founded|established|fundad[ao]|constitu(?:ida|ido)|cread[ao])\b/.test(joined)) {
@@ -48,6 +64,9 @@ function semanticGuard(claim: Claim, quotes: string[]): GroundingReport['items']
     /\b(no|not|never|does not|do not|sin)\b.{0,35}\b(ai|ia|chatgpt|copilot|harvey)\b/i.test(joined)) return 'CONFLICT';
   if (claim.field === 'attorney_count' && /\b(more than|over|más de|mas de|greater than)\s+\d+\b/i.test(joined)) {
     return 'INCOMPLETE_SCOPE';
+  }
+  if (claim.field === 'practice_areas' && !(claim.value as string[]).every(area => PRACTICE_AREA_EVIDENCE[area]?.test(joined))) {
+    return 'UNSUPPORTED_CLAIM';
   }
   return null;
 }

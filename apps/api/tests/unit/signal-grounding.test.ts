@@ -42,6 +42,14 @@ describe('signal grounding', () => {
     expect(result.report.items[0]).toMatchObject({ status: 'accepted', reason: null });
     expect(toWebsiteData(result.accepted, corpus).team_size).toBeNull();
   });
+
+  it('rejects a practice-area list when any canonical area is absent from its evidence', () => {
+    const item: Claim = { id: 'areas', field: 'practice_areas', value: ['Personal Injury', 'Medical Malpractice'],
+      explanation: 'services', citations: [{ segmentId: segment.id, quote: 'Smith Law was founded in 2001.' }] };
+    const supported: SignalReview = { verdicts: [{ claimId: item.id, verdict: 'supported', reason: 'services',
+      citations: item.citations }] };
+    expect(acceptClaims([item], supported, corpus).report.items[0]).toMatchObject({ status: 'rejected', reason: 'UNSUPPORTED_CLAIM' });
+  });
 });
 
 describe('absence claims', () => {
