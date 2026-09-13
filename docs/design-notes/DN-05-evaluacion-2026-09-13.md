@@ -296,3 +296,35 @@ El recall de abogados fue 1.0 en Duque y Gallardo corrida 1, y 0.76 en Gallardo 
 corridas del mismo modelo con el mismo corpus, sin re-muestreo del crawl). No se interpreta ni se ajusta
 nada del workflow ni del extractor a partir de esta corrida; queda como línea base para comparar contra
 tareas posteriores del plan.
+
+## 8. Evaluación con harness
+
+Evaluación posterior al harness con snapshots congelados y `z-ai/glm-5.3-flash`:
+`output/eval/2026-09-13T21-31-27-584Z/summary.json` (no versionado). Tras cada falso positivo observado
+se añadió una prueba y una guarda determinista: no confundir `attorney_count` con `team_size`, no usar una
+dirección postal de política de privacidad como ciudad primaria, exigir evidencia por cada área de práctica y
+rechazar teléfonos concatenados.
+
+| Firma | Corrida | Estado | Duración | Herramientas | Correctos / outcomes | Incorrectos | Recall abogados |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Duque | 1 | Completa | 397.1 s | `read_document` ×2, `fetch_pages` | 3 / 13 | 0 | 1 / 1 |
+| Duque | 2 | Completa | 435.9 s | `read_document` ×2, `fetch_pages` | 3 / 13 | 0 | 1 / 1 |
+| Duque | 3 | Completa | 618.1 s | `read_document` ×2, `read_sitemap` | 2 / 13 | 0 | 1 / 1 |
+| Gallardo | 1 | Completa | 397.7 s | `fetch_pages` ×4 | 29 / 37 | 0 | 25 / 25 |
+| Gallardo | 2 | Completa | 373.2 s | `fetch_pages` ×4 | 29 / 37 | 0 | 25 / 25 |
+| Gallardo | 3 | Falló | 338.7 s | — | — | — | — |
+
+En las cinco corridas completas hubo **66 valores correctos de 113 outcomes**, **0 valores incorrectos**,
+37 ausentes y 10 no verificados. Duque leyó ambas políticas de privacidad en las tres corridas (`read_document`
+sobre `DuqueImmigrationPoliticaPrivacidad.pdf` y `DuqueImmigrationPrivacyPolicyEN.pdf`); `team_members` solo
+incluyó a Carlos Mauricio Duque, sin nadie de `notAttorneys`.
+
+Gallardo 3 no superó el gate: `ExtractionFailure: extract-roster response failed schema validation` después de
+tres intentos (`extract-round-1`, `extract-roster`, `extract-roster-repair`). No fue un timeout ni un 5xx, por
+lo que no se reintentó bajo la regla de la tarea. La comparación con la línea base de la sección 7 mejora de
+1 aceptación incorrecta entre 5 corridas completas a 0 entre 5, y eleva el recall observado de Gallardo de
+0.76–1.0 a 1.0 en las dos completas; sin embargo, ambas mediciones tuvieron 5/6 corridas completas.
+
+**Decisión del gate: no pasa.** Aunque `incorrect accepted values: 0`, una de las seis corridas falló. Además,
+las duraciones de 338.7–618.1 s están fuera del p95 de 120 s y esta evaluación exploratoria sigue teniendo solo
+dos snapshots, no los 20 casos, adversariales ni conjunto reservado exigidos por DN-05 §12.
