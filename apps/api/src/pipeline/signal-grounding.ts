@@ -89,7 +89,7 @@ function checkAbsences(claim: Claim, quotes: string[], corpus: EvidenceCorpus): 
   const completePolicy = claim.field === 'privacy_policy' && claim.citations.length > 0 && claim.citations.every(citation => {
     const segment = corpus.segments.find(item => item.id === citation.segmentId);
     const document = segment?.kind === 'document' ? corpus.documents.find(item => item.url === segment.url) : undefined;
-    return Boolean(document?.complete && /privac/i.test(`${document.url} ${segment!.text}`));
+    return Boolean(document?.complete && /privac/i.test(document.url));
   });
   const value = { ...(claim.value as Record<string, unknown>) };
   const degradedFields = aiNegation ? [] : Object.keys(negatives).filter(key => negatives[key]!(value[key]) &&

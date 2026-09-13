@@ -110,4 +110,32 @@ describe('absence claims', () => {
       explanation: 'none found', citations: [{ segmentId: documents.segments[0]!.id, quote: 'Terms of Service.' }] };
     expect(acceptClaims([item], supported([item]), documents).report.items[0]).toMatchObject({ status: 'unknown', reason: 'UNSUPPORTED_ABSENCE' });
   });
+
+  it('does not treat a complete non-privacy document that mentions privacy as the policy', () => {
+    const documents = buildCorpus({ partial: false, pages: [{ url: 'https://firm.com/terms.pdf', html: '',
+      text: 'Terms of Service. We respect your privacy.', kind: 'document', complete: true }] });
+    const item: Claim = { id: 'privacy_policy', field: 'privacy_policy', value: { found: true, mentions_client_data: false },
+      explanation: 'test', citations: [{ segmentId: documents.segments[0]!.id, quote: 'We respect your privacy.' }] };
+    expect(acceptClaims([item], supported([item]), documents).report.items[0]).toMatchObject({ status: 'accepted', degradedFields: ['mentions_client_data'] });
+  });
+
+  it('keeps the negative degraded when any citation is not the complete privacy document', () => {
+    const documents = buildCorpus({ partial: false, pages: [
+      { url: 'https://firm.com/privacy-policy.pdf', html: '', text: 'Privacy Policy. We use contact details to answer your requests.', kind: 'document', complete: true },
+      { url: 'https://firm.com/contact', html: '', text: 'Contact us for a consultation.' },
+    ] });
+    const privacySegmentId = documents.segments.find(s => s.url === 'https://firm.com/privacy-policy.pdf')!.id;
+    const contactSegmentId = documents.segments.find(s => s.url === 'https://firm.com/contact')!.id;
+    const item: Claim = { id: 'privacy_policy', field: 'privacy_policy', value: { found: true, mentions_client_data: false },
+      explanation: 'test', citations: [{ segmentId: privacySegmentId, quote: 'Privacy Policy.' }, { segmentId: contactSegmentId, quote: 'Contact us' }] };
+    expect(acceptClaims([item], supported([item]), documents).report.items[0]).toMatchObject({ status: 'accepted', degradedFields: ['mentions_client_data'] });
+  });
+
+  it('never accepts a missing policy even when citing a complete privacy document', () => {
+    const documents = buildCorpus({ partial: false, pages: [{ url: 'https://firm.com/privacy-policy.pdf', html: '',
+      text: 'Privacy Policy. We use contact details to answer your requests.', kind: 'document', complete: true }] });
+    const item: Claim = { id: 'privacy_policy', field: 'privacy_policy', value: { found: false, mentions_client_data: null },
+      explanation: 'none found', citations: [{ segmentId: documents.segments[0]!.id, quote: 'Privacy Policy.' }] };
+    expect(acceptClaims([item], supported([item]), documents).report.items[0]).toMatchObject({ status: 'unknown', reason: 'UNSUPPORTED_ABSENCE' });
+  });
 });
