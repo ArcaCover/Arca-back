@@ -123,6 +123,26 @@ export function buildCorpus(crawl: CrawlResult, budgetChars = 24_000): EvidenceC
     omittedUrls, totalChars: used, documents };
 }
 
+export function withLinks(corpus: EvidenceCorpus, targets: Array<{ url: string; kind: 'page' | 'document' }>, sourceUrl: string): EvidenceCorpus {
+  const links = [...corpus.links];
+  for (const target of targets) {
+    const id = `L-${digest(target.url)}`;
+    if (!links.some(link => link.id === id)) links.push({ id, url: target.url, sourceUrl, label: new URL(target.url).pathname, kind: target.kind });
+  }
+  return { ...corpus, links };
+}
+
+export function withPassages(corpus: EvidenceCorpus, passages: Array<{ url: string; start: number; end: number; text: string }>): EvidenceCorpus {
+  const segments = [...corpus.segments];
+  for (const passage of passages) {
+    const id = `S-${digest(`${passage.url}:${passage.start}:${passage.end}`)}`;
+    if (!segments.some(segment => segment.id === id)) {
+      segments.push({ id, pageId: `D-${digest(passage.url)}`, url: passage.url, kind: 'search', text: passage.text });
+    }
+  }
+  return { ...corpus, segments };
+}
+
 export function serializeCorpus(corpus: EvidenceCorpus): string {
   const segments = corpus.segments.map(segment => `[${segment.id}] URL=${segment.url} KIND=${segment.kind}\n${segment.text}`).join('\n\n');
   const linkPriority = (link: EvidenceLink) => /team|attorney|lawyer|abogad|equipo|about|nosotros|quienes|privacy|privacidad|contact/i.test(`${link.url} ${link.label}`) ? 0 : 1;

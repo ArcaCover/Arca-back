@@ -1,5 +1,6 @@
 import { crawlWebsite, type CrawledPage } from './crawler.js';
 import { readDocument } from './document-reader.js';
+import { readSitemap as readSitemapUrls } from './sitemap-reader.js';
 
 export type ToolName = 'fetch_pages' | 'read_document' | 'read_sitemap' | 'find_in_site';
 export type ToolCall = { round: number; tool: ToolName; target: string; status: 'read' | 'failed' | 'skipped'; detail: string | null };
@@ -9,6 +10,7 @@ export type ToolResult = { calls: Omit<ToolCall, 'round'>[] };
 export interface SiteAccess {
   fetchPages(urls: string[], signal: AbortSignal): Promise<ToolResult & { pages: CrawledPage[] }>;
   readDocuments(urls: string[], signal: AbortSignal): Promise<ToolResult & { pages: CrawledPage[] }>;
+  readSitemap(domain: string, signal: AbortSignal): Promise<ToolResult & { links: Array<{ url: string; kind: 'page' | 'document' }> }>;
 }
 
 export function createSiteAccess(): SiteAccess {
@@ -37,6 +39,11 @@ export function createSiteAccess(): SiteAccess {
           detail: page ? (page.complete ? 'complete' : 'truncated') : detail });
       }
       return { pages, calls };
+    },
+    async readSitemap(domain, signal) {
+      const { links, detail } = await readSitemapUrls(domain, signal);
+      return { links, calls: [{ tool: 'read_sitemap', target: `https://${domain}/`, status: links.length ? 'read' : 'failed',
+        detail: links.length ? `${links.length} urls` : detail }] };
     },
   };
 }
