@@ -23,11 +23,15 @@ describe('signal grounding', () => {
     expect(acceptClaims([firm], review('unsupported'), corpus).report.items[0]?.reason).toBe('UNSUPPORTED_CLAIM');
   });
 
-  it('does not identify the firm city only from a privacy policy mailing address', () => {
-    const policy = buildCorpus({ partial: false, pages: [{ url: 'https://firm.com/privacy-policy.pdf', html: '',
-      text: 'Privacy Policy. Mail: Smith Law, 10 Main Street, Doral, FL 33166.', kind: 'document', complete: true }] });
+  it('does not identify the firm city from a privacy policy mailing address plus a different marketed city', () => {
+    const policy = buildCorpus({ partial: false, pages: [
+      { url: 'https://firm.com/privacy-policy.pdf', html: '',
+        text: 'Privacy Policy. Mail: Smith Law, 10 Main Street, Doral, FL 33166.', kind: 'document', complete: true },
+      { url: 'https://firm.com/', html: '', text: 'Miami immigration attorneys.' },
+    ] });
     const item: Claim = { id: 'city', field: 'city', value: 'Doral, FL', explanation: 'mailing address',
-      citations: [{ segmentId: policy.segments[0]!.id, quote: 'Doral, FL' }] };
+      citations: [{ segmentId: policy.segments.find(segment => segment.url === 'https://firm.com/privacy-policy.pdf')!.id, quote: 'Doral, FL' },
+        { segmentId: policy.segments.find(segment => segment.url === 'https://firm.com/')!.id, quote: 'Miami immigration attorneys.' }] };
     const supported: SignalReview = { verdicts: [{ claimId: item.id, verdict: 'supported', reason: 'address',
       citations: item.citations }] };
     expect(acceptClaims([item], supported, policy).report.items[0]).toMatchObject({ status: 'rejected', reason: 'UNSUPPORTED_CLAIM' });

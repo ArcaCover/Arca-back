@@ -143,11 +143,16 @@ export function acceptClaims(claimsInput: Claim[], review: SignalReview, corpus:
     }
     if (!reason && !quotedValue(claim, quotes)) reason = 'VALUE_NOT_IN_QUOTE';
     // A privacy-policy contact address can be a mailing address, not the firm's operating city.
-    // Require a non-policy source before exposing a city that downstream matching will use.
-    if (!reason && claim.field === 'city' && claim.citations.every(citation => {
-      const segment = segments.get(citation.segmentId);
-      return segment?.kind === 'document' && /privac/i.test(segment.url);
-    })) reason = 'UNSUPPORTED_CLAIM';
+    // Require the claimed city itself in a non-policy source before exposing it to downstream matching.
+    if (!reason && claim.field === 'city') {
+      const city = normalizeForGrounding(String(claim.value)).toLocaleLowerCase();
+      const supportedOutsidePolicy = claim.citations.some(citation => {
+        const segment = segments.get(citation.segmentId);
+        const privacyDocument = segment?.kind === 'document' && /privac/i.test(segment.url);
+        return !privacyDocument && normalizeForGrounding(citation.quote).toLocaleLowerCase().includes(city);
+      });
+      if (!supportedOutsidePolicy) reason = 'UNSUPPORTED_CLAIM';
+    }
     if (!reason) reason = semanticGuard(claim, quotes);
     let degradedFields: string[] = [];
     if (!reason) {
