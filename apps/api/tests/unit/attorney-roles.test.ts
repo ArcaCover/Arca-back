@@ -29,4 +29,16 @@ describe('attorney role classification', () => {
   it('does not promote someone with no role evidence', () => {
     expect(classifyRole({ role: 'Attorney', title: null, evidence: 'Carolina Bonilla' })).toBe('unclear');
   });
+
+  it('gives a nameless entry no evidence and no attorney role', () => {
+    const evidence = personEvidence(['Carmen Gallardo Lawyer'], '', ['Carmen Gallardo']);
+    expect(evidence).toBe('');
+    expect(classifyRole({ role: 'Attorney', title: null, evidence })).toBe('unclear');
+  });
+
+  it('gives a whitespace-only name no evidence and no attorney role', () => {
+    const evidence = personEvidence(['Carmen Gallardo Lawyer'], '   ', ['Carmen Gallardo']);
+    expect(evidence).toBe('');
+    expect(classifyRole({ role: 'Attorney', title: null, evidence })).toBe('unclear');
+  });
 });

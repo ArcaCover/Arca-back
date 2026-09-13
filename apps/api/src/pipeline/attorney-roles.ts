@@ -7,6 +7,7 @@ const ATTORNEY = /\b(attorney|lawyer|abogad[oa]|partner|socio|counsel|esq)\b/;
 /** Text about one person: from their name up to the next listed person, so neighbours' roles do not leak in. */
 export function personEvidence(quotes: string[], name: string, otherNames: string[]): string {
   const target = plain(name);
+  if (!target.trim()) return '';
   return quotes.flatMap(quote => {
     const text = plain(quote), start = text.indexOf(target);
     if (start < 0) return [];
