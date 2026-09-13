@@ -216,7 +216,9 @@ Scripts de diagnóstico (no versionados) en `output/diag/`: `replay-extract.ts`,
 
 Con el evaluador y las etiquetas verificadas de la Tarea 1 (`signal-evaluation.ts`,
 `apps/api/tests/fixtures/gold/*.json`) ya en verde, se ejecutó la línea base exigida antes de tocar el
-workflow:
+workflow.
+
+### Intento 1 — `z-ai/glm-5.3-flash`: HTTP 404
 
 ```
 NVIDIA_NIM_MODEL=z-ai/glm-5.3-flash npm run eval:signals -- duqueimmigration.com gallardolawyers.com --runs 3
@@ -249,14 +251,48 @@ antes de producir `WebsiteData`.
 NVIDIA NIM con el mismo `NVIDIA_NIM_API_KEY` confirma que el modelo `z-ai/glm-5.3-flash` —el mismo elegido
 en la sección 2 y usado con éxito en la sección 4 el mismo día— responde **404 sin cuerpo** para
 `POST /v1/chat/completions`, mientras que el modelo por defecto (`nvidia/nemotron-3-super-120b-a12b`)
-responde `200` con el mismo payload. El modelo parece haber sido retirado o renombrado en el catálogo de
-NVIDIA NIM entre la sección 4 (corridas de la madrugada del 13 de septiembre) y esta línea base (misma
-tarde). Los dos timeouts de Duque son compatibles con la misma causa: una ruta de modelo que empezó a
-responder lento o de forma intermitente antes de desaparecer del catálogo.
+responde `200` con el mismo payload. El modelo sigue listado en `/v1/models` pero no se sirve. Los dos
+timeouts de Duque son compatibles con la misma causa: una ruta de modelo que empezó a responder lento o de
+forma intermitente antes de dejar de servirse. Este intento se conserva como referencia histórica; no
+produjo cifras de precisión.
 
-**Lectura:** la línea base no pudo medir precisión real del workflow porque ningún intento llegó a
-producir `WebsiteData` — es un fallo de infraestructura del modelo fijado en el comando, no del evaluador
-ni de las etiquetas doradas, que quedan verificados por la suite unitaria (`signal-evaluation.test.ts`, 3
-pruebas en verde). Antes de repetir la línea base hace falta fijar un modelo vigente en el catálogo NVIDIA
-NIM (por ejemplo confirmando con una llamada mínima al API, como se hizo aquí) o añadir un chequeo previo
-que lo valide.
+### Intento 2 — `deepseek-ai/deepseek-v4-pro-0813`
+
+Modelo de reemplazo confirmado disponible (llamada directa al API: HTTP 200) y con la mejor precisión del
+benchmark de la sección 2. La latencia queda fuera de alcance para esta medición: el cliente OpenAI que
+construye el script de evaluación usa un timeout de 600 s por llamada en lugar de los 120 s por defecto
+del proveedor, inyectado por el tercer parámetro del constructor de `NvidiaNimEvidenceProvider` (sin tocar
+`nvidia-evidence-provider.ts`), porque una extracción con `deepseek-v4-pro` puede tardar ~125 s.
+
+```
+NVIDIA_NIM_MODEL=deepseek-ai/deepseek-v4-pro-0813 npm run eval:signals -- duqueimmigration.com gallardolawyers.com --runs 3
+```
+
+Reporte completo: `output/eval/2026-09-13T17-45-51-008Z/summary.json` (no versionado, `output/` está en
+`.gitignore`).
+
+| Firma | Corrida | Estado | Duración | Correctos | Incorrectos | Recall de abogados |
+| --- | --- | --- | --- | --- | --- | --- |
+| duqueimmigration.com | 1 | Completa | 347.6 s | 5 | 0 | 1 |
+| duqueimmigration.com | 2 | Completa | 267.6 s | 5 | 1 | 1 |
+| duqueimmigration.com | 3 | Completa | 310.9 s | 5 | 0 | 1 |
+| gallardolawyers.com | 1 | Completa | 375.3 s | 36 | 0 | 1 |
+| gallardolawyers.com | 2 | Falló | 546.2 s | — | — | — |
+| gallardolawyers.com | 3 | Completa | 325.7 s | 23 | 0 | 0.76 |
+
+**Valores incorrectos (1 en total):**
+
+- Duque, corrida 2 — campo `team_size`, valor `1`: la etiqueta dorada dice `correct: []` (no hay tamaño de
+  equipo verificable), así que cualquier valor aceptado es incorrecto.
+
+**Mensaje de error de la corrida fallida:**
+
+- Gallardo, corrida 2: `ExtractionFailure: 504 status code (no body)`, a los 546.2 s, dentro del timeout
+  de evaluación de 600 s (el API de NVIDIA devolvió el error, no un timeout del cliente).
+
+**Lectura:** este es el número de referencia. 5 de 6 corridas completaron con el workflow actual (sin
+cambios), 74 valores correctos evaluados en total y una sola aceptación incorrecta (`team_size` en Duque).
+El recall de abogados fue 1.0 en Duque y Gallardo corrida 1, y 0.76 en Gallardo corrida 3 (variación entre
+corridas del mismo modelo con el mismo corpus, sin re-muestreo del crawl). No se interpreta ni se ajusta
+nada del workflow ni del extractor a partir de esta corrida; queda como línea base para comparar contra
+tareas posteriores del plan.

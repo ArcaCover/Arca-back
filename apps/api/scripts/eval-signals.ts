@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
+import OpenAI from 'openai';
 import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../src/pipeline/nvidia-evidence-provider.js';
 import { GoldLabels, evaluateWebsiteData } from '../src/pipeline/signal-evaluation.js';
 
@@ -14,6 +15,10 @@ const runs = runsFlag >= 0 ? Number(args[runsFlag + 1]) : 3;
 const domains = args.filter((arg, index) => !arg.startsWith('--') && !(runsFlag >= 0 && index === runsFlag + 1));
 if (!domains.length || !Number.isInteger(runs) || runs < 1) throw new Error('Usage: npm run eval:signals -- <domain> [...] --runs 3');
 
+// Latency is out of scope for evaluation: use a longer per-call timeout than the provider's default 120 s,
+// since one deepseek-v4-pro extraction call can take ~125 s.
+const client = new OpenAI({ apiKey: key, baseURL: 'https://integrate.api.nvidia.com/v1', maxRetries: 0, timeout: 600_000 });
+
 const output = resolve('output', 'eval', new Date().toISOString().replace(/[:.]/g, '-'));
 await mkdir(output, { recursive: true });
 const summary: Array<Record<string, unknown>> = [];
@@ -23,7 +28,7 @@ for (const domain of domains) {
   const crawl = JSON.parse(readFileSync(`output/eval/snapshots/${domain}.crawl.json`, 'utf8'));
   for (let run = 1; run <= runs; run++) {
     const started = Date.now();
-    const provider = new NvidiaNimEvidenceProvider(key, process.env.NVIDIA_NIM_MODEL?.trim() || undefined);
+    const provider = new NvidiaNimEvidenceProvider(key, process.env.NVIDIA_NIM_MODEL?.trim() || undefined, client as never);
     try {
       const result = await provider.extractDetailed(crawl, AbortSignal.timeout(900_000));
       const evaluation = evaluateWebsiteData(result.websiteData, gold);
