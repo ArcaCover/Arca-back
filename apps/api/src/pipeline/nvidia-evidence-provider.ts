@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import { SignalExtraction, SignalReview, WebsiteData, type Claim, type GroundingReport } from '@arca/contracts';
+import { classifyRole, personEvidence } from './attorney-roles.js';
 import type { CrawlResult } from './crawler.js';
 import { crawlWebsite } from './crawler.js';
 import { buildCorpus, serializeCorpus, type EvidenceCorpus } from './evidence-corpus.js';
@@ -85,17 +86,18 @@ function normalizeClaims(claims: Claim[]): Claim[] {
   const firmName = claims.find(claim => claim.field === 'firm_name' && typeof claim.value === 'string')?.value as string | undefined;
   return claims.flatMap(claim => {
     if (claim.field !== 'attorneys' || !Array.isArray(claim.value)) return claim;
-    const people = claim.value.map(raw => {
+    const names = claim.value.map(raw => String((raw as Record<string, unknown> | null)?.full_name ?? '').trim());
+    const people = claim.value.map((raw, index) => {
       const person = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
-      const roleText = `${String(person.role ?? '')} ${String(person.title ?? '')}`.toLocaleLowerCase();
+      const full_name = names[index]!;
+      const evidence = personEvidence(claim.citations.map(citation => citation.quote), full_name,
+        names.filter((_, other) => other !== index));
       const affiliationText = String(person.affiliation ?? '').toLocaleLowerCase();
-      const role = /attorney|lawyer|abogad|partner|counsel/.test(roleText) ? 'attorney' as const
-        : /staff|manager|coordinator|assistant|gerente|coordinador|paralegal|recepcion/.test(roleText) ? 'staff' as const : 'unclear' as const;
       const affiliation = /former|previous|ex[- ]|anterior/.test(affiliationText) ? 'former' as const
         : affiliationText === 'current' || Boolean(firmName && affiliationText.includes(firmName.toLocaleLowerCase()))
           ? 'current' as const : 'unclear' as const;
-      return { full_name: String(person.full_name ?? '').trim(), title: typeof person.title === 'string' ? person.title.trim() || null : null,
-        role, affiliation };
+      return { full_name, title: typeof person.title === 'string' ? person.title.trim() || null : null,
+        role: classifyRole({ role: person.role, title: person.title, evidence }), affiliation };
     });
     return people.map((person, index) => {
       const name = person.full_name.toLocaleLowerCase();
