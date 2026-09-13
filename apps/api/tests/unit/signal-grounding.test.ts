@@ -22,6 +22,26 @@ describe('signal grounding', () => {
     expect(acceptClaims([{ ...firm, value: 'Other Law' }], review('supported'), corpus).report.items[0]?.reason).toBe('VALUE_NOT_IN_QUOTE');
     expect(acceptClaims([firm], review('unsupported'), corpus).report.items[0]?.reason).toBe('UNSUPPORTED_CLAIM');
   });
+
+  it('does not identify the firm city only from a privacy policy mailing address', () => {
+    const policy = buildCorpus({ partial: false, pages: [{ url: 'https://firm.com/privacy-policy.pdf', html: '',
+      text: 'Privacy Policy. Mail: Smith Law, 10 Main Street, Doral, FL 33166.', kind: 'document', complete: true }] });
+    const item: Claim = { id: 'city', field: 'city', value: 'Doral, FL', explanation: 'mailing address',
+      citations: [{ segmentId: policy.segments[0]!.id, quote: 'Doral, FL' }] };
+    const supported: SignalReview = { verdicts: [{ claimId: item.id, verdict: 'supported', reason: 'address',
+      citations: item.citations }] };
+    expect(acceptClaims([item], supported, policy).report.items[0]).toMatchObject({ status: 'rejected', reason: 'UNSUPPORTED_CLAIM' });
+  });
+
+  it('does not expose an attorney count as the total team size', () => {
+    const item: Claim = { id: 'attorney-count', field: 'attorney_count', value: 1, explanation: 'one attorney',
+      citations: [{ segmentId: segment.id, quote: 'Jane Doe is an Attorney' }] };
+    const supported: SignalReview = { verdicts: [{ claimId: item.id, verdict: 'supported', reason: 'listed attorney',
+      citations: item.citations }] };
+    const result = acceptClaims([item], supported, corpus);
+    expect(result.report.items[0]).toMatchObject({ status: 'accepted', reason: null });
+    expect(toWebsiteData(result.accepted, corpus).team_size).toBeNull();
+  });
 });
 
 describe('absence claims', () => {

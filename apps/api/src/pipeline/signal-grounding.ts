@@ -123,6 +123,12 @@ export function acceptClaims(claimsInput: Claim[], review: SignalReview, corpus:
       quotes.push(citation.quote);
     }
     if (!reason && !quotedValue(claim, quotes)) reason = 'VALUE_NOT_IN_QUOTE';
+    // A privacy-policy contact address can be a mailing address, not the firm's operating city.
+    // Require a non-policy source before exposing a city that downstream matching will use.
+    if (!reason && claim.field === 'city' && claim.citations.every(citation => {
+      const segment = segments.get(citation.segmentId);
+      return segment?.kind === 'document' && /privac/i.test(segment.url);
+    })) reason = 'UNSUPPORTED_CLAIM';
     if (!reason) reason = semanticGuard(claim, quotes);
     let degradedFields: string[] = [];
     if (!reason) {
@@ -183,7 +189,6 @@ export function toWebsiteData(claims: Claim[], corpus: EvidenceCorpus): WebsiteD
       .map(({ full_name, title }) => ({ full_name, title }));
     if (current.length) data.team_members = current;
   }
-  const count = first(claims, 'attorney_count'); if (count) data.team_size = count.value as number;
   const policy = first(claims, 'ai_policy'); if (policy) data.ai_policy = { ...(policy.value as WebsiteData['ai_policy']),
     text_excerpt: policy.citations[0]?.quote ?? null };
   const use = first(claims, 'ai_in_services'); if (use) data.ai_in_services = use.value as WebsiteData['ai_in_services'];
