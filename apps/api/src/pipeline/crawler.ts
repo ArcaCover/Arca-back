@@ -27,7 +27,16 @@ const robotsParser = createRequire(import.meta.url)('robots-parser') as (url: st
 export function pagePriority(raw: string): number {
   const path = new URL(raw).pathname.toLowerCase();
   if (path === '/') return 0;
-  const groups = [/about/, /team|attorney|lawyer|people/, /service|practice/, /privacy/, /blog|insight|news/];
+  // Spanish stems carry the same weight as their English equivalents. Without them a Spanish site
+  // has no ranked page at all, the whole crawl ties at the lowest priority and the budget goes to
+  // whatever sorts first alphabetically, which is usually the blog.
+  const groups = [
+    /about|nosotros|quienes-somos|acerca|la-firma/,
+    /team|attorney|lawyer|people|abogad|equipo|socios/,
+    /service|practice|servicio|practica/,
+    /privacy|privacidad|aviso-legal/,
+    /blog|insight|news|noticias/,
+  ];
   const index = groups.findIndex(group => group.test(path));
   return index < 0 ? 6 : index + 1;
 }

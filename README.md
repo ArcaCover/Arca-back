@@ -117,6 +117,10 @@ Website: Playwright, máximo 20 páginas y profundidad 2; robots y resolución p
 Una página que falla por transporte, error 5xx o 429 se reintenta hasta completar tres intentos antes de
 marcar el rastreo parcial; robots, 4xx y contenido ilegible no se reintentan. El rastreo tiene su propio
 plazo de 20 segundos, y al agotarse el resultado es parcial aunque queden reintentos disponibles.
+La prioridad de rastreo reconoce vocabulario en inglés y en español, para que un sitio en español no empate
+todas sus páginas en la prioridad mínima y gaste el plazo en el blog.
+El nombre del despacho se toma de `JSON-LD` cuando existe; al recurrir a `og:site_name` se descarta la cola
+de título posterior al separador, porque ese texto viaja como identidad a las búsquedas pagadas.
 La extracción estructurada usa reglas conservadoras por defecto, con caché por hash, proveedor y versión.
 `WEBSITE_EVIDENCE_PROVIDER=openai` habilita opcionalmente GPT-4o-mini y exige `OPENAI_API_KEY`.
 Directorios: `scrapers_lat/florida-bar-lawyers-scraper` y `scrapers_lat/avvo-lawyers-scraper` mediante Apify.

@@ -95,6 +95,17 @@ function metaContent(html: string, property: string): string | null {
 }
 
 /** Conservative deterministic fallback. It reports positives only when explicit text is present. */
+/**
+ * og:site_name frequently carries a page title rather than the firm's name, and the marketing tail
+ * travels into the directory lookup as if it were the entity. A title separator is never part of a
+ * firm name, so the leading segment is the closest thing to a name the page offers. A value with no
+ * separator, or whose leading segment is too short to be a name, is returned untouched.
+ */
+export function firmNameFromSiteName(raw: string): string | null {
+  const leading = raw.split(/\s*[|｜]\s*|\s+[–—-]\s+/)[0]?.trim();
+  return leading && leading.length >= 3 ? leading : (raw.trim() || null);
+}
+
 export class RuleBasedEvidenceProvider implements WebsiteEvidenceProvider {
   readonly id = 'rules';
   readonly version = 'rules-v1';
@@ -158,7 +169,8 @@ export class RuleBasedEvidenceProvider implements WebsiteEvidenceProvider {
       }
       if (!evidence.firm_name) {
         const siteName = metaContent(page.html, 'og:site_name');
-        if (siteName) { evidence.firm_name = siteName; addProvenance('firm_name', page.url, siteName, 'meta'); }
+        const name = siteName ? firmNameFromSiteName(siteName) : null;
+        if (name) { evidence.firm_name = name; addProvenance('firm_name', page.url, name, 'meta'); }
       }
     }
     if (people.size) {
