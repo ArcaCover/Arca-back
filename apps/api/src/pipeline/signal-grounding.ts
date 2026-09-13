@@ -74,8 +74,9 @@ const NEGATIVE_SUBFIELDS: Partial<Record<Claim['field'], Record<string, (value: 
  * that depend on a whole page or site (no privacy policy, a policy that omits client data, no team page, a zero
  * count) cannot be shown by a quote at all. Unsupported negatives are nulled; positives in the same claim stay.
  * The negation test is necessary rather than sufficient: whose AI use is negated is left to semantic review.
+ * The single exception is a client-data negative cited from a privacy document read in full.
  */
-function checkAbsences(claim: Claim, quotes: string[]): AbsenceCheck {
+function checkAbsences(claim: Claim, quotes: string[], corpus: EvidenceCorpus): AbsenceCheck {
   const unchanged = { value: claim.value, degradedFields: [], informative: true };
   if (claim.field === 'team_page_quality') return claim.value === 'no_team_page'
     ? { value: null, degradedFields: [claim.field], informative: false } : unchanged;
@@ -83,9 +84,16 @@ function checkAbsences(claim: Claim, quotes: string[]): AbsenceCheck {
     ? { value: null, degradedFields: [claim.field], informative: false } : unchanged;
   const negatives = NEGATIVE_SUBFIELDS[claim.field];
   if (!negatives) return unchanged;
-  const established = claim.field !== 'privacy_policy' && EXPLICIT_AI_NEGATION.test(plain(quotes.join(' ')));
+  const aiNegation = claim.field !== 'privacy_policy' && EXPLICIT_AI_NEGATION.test(plain(quotes.join(' ')));
+  // A negative about a policy's contents is observable only when that whole policy is in the corpus.
+  const completePolicy = claim.field === 'privacy_policy' && claim.citations.length > 0 && claim.citations.every(citation => {
+    const segment = corpus.segments.find(item => item.id === citation.segmentId);
+    const document = segment?.kind === 'document' ? corpus.documents.find(item => item.url === segment.url) : undefined;
+    return Boolean(document?.complete && /privac/i.test(`${document.url} ${segment!.text}`));
+  });
   const value = { ...(claim.value as Record<string, unknown>) };
-  const degradedFields = established ? [] : Object.keys(negatives).filter(key => negatives[key]!(value[key]));
+  const degradedFields = aiNegation ? [] : Object.keys(negatives).filter(key => negatives[key]!(value[key]) &&
+    !(key === 'mentions_client_data' && completePolicy));
   for (const key of degradedFields) value[key] = null;
   return { value, degradedFields, informative: Object.values(value).some(item => item !== null) };
 }
@@ -118,7 +126,7 @@ export function acceptClaims(claimsInput: Claim[], review: SignalReview, corpus:
     if (!reason) reason = semanticGuard(claim, quotes);
     let degradedFields: string[] = [];
     if (!reason) {
-      const absence = checkAbsences(claim, quotes);
+      const absence = checkAbsences(claim, quotes, corpus);
       if (!absence.informative) {
         items.push({ claimId: claim.id, field: claim.field, status: 'unknown', reason: 'UNSUPPORTED_ABSENCE',
           degradedFields: absence.degradedFields });

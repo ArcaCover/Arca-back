@@ -87,4 +87,27 @@ describe('absence claims', () => {
       expect(accept(item).report.items[0]).toMatchObject({ status: 'unknown', reason: 'UNSUPPORTED_ABSENCE' });
     }
   });
+
+  it('accepts a client-data negative only from a complete privacy document', () => {
+    const policy = (complete: boolean) => buildCorpus({ partial: false, pages: [{ url: 'https://firm.com/privacy-policy.pdf', html: '',
+      text: 'Privacy Policy. We use contact details to answer your requests.', kind: 'document', complete }] });
+    const judge = (documents: ReturnType<typeof buildCorpus>) => {
+      const item: Claim = { id: 'privacy_policy', field: 'privacy_policy', value: { found: true, mentions_client_data: false },
+        explanation: 'whole policy read', citations: [{ segmentId: documents.segments[0]!.id, quote: 'Privacy Policy.' }] };
+      return acceptClaims([item], supported([item]), documents);
+    };
+    const complete = judge(policy(true));
+    expect(complete.report.items[0]).toMatchObject({ status: 'accepted', reason: null });
+    expect(complete.report.items[0]).not.toHaveProperty('degradedFields');
+    expect(toWebsiteData(complete.accepted, policy(true)).privacy_policy).toEqual({ found: true, mentions_client_data: false });
+    expect(judge(policy(false)).report.items[0]).toMatchObject({ status: 'accepted', degradedFields: ['mentions_client_data'] });
+  });
+
+  it('still never accepts a missing privacy policy', () => {
+    const documents = buildCorpus({ partial: false, pages: [{ url: 'https://firm.com/terms.pdf', html: '',
+      text: 'Terms of Service.', kind: 'document', complete: true }] });
+    const item: Claim = { id: 'privacy_policy', field: 'privacy_policy', value: { found: false, mentions_client_data: null },
+      explanation: 'none found', citations: [{ segmentId: documents.segments[0]!.id, quote: 'Terms of Service.' }] };
+    expect(acceptClaims([item], supported([item]), documents).report.items[0]).toMatchObject({ status: 'unknown', reason: 'UNSUPPORTED_ABSENCE' });
+  });
 });
