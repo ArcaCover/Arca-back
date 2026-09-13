@@ -25,4 +25,12 @@ describe('evidence corpus', () => {
     partial: false });
     expect(corpus.links.map(link => [new URL(link.url).pathname, link.kind])).toEqual([['/team', 'page'], ['/files/Policy.pdf', 'document']]);
   });
+  it('keeps a complete document whole and records its completeness', () => {
+    const text = 'Privacy Policy\n' + 'Clause. '.repeat(1200);
+    const corpus = buildCorpus({ pages: [{ url: 'https://firm.com/policy.pdf', html: '', text, kind: 'document', complete: true }], partial: false });
+    expect(corpus.segments.every(segment => segment.kind === 'document')).toBe(true);
+    expect(corpus.documents).toEqual([{ url: 'https://firm.com/policy.pdf', complete: true, chars: expect.any(Number) }]);
+    // Segments are cut every 800 characters, sometimes mid-word, so compare content without whitespace.
+    expect(corpus.segments.map(segment => segment.text).join('').replace(/\s+/g, '')).toBe(text.replace(/\s+/g, ''));
+  });
 });

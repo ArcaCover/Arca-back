@@ -22,6 +22,7 @@
     "openai": "^7.10.0",
     "playwright": "^1.49.1",
     "robots-parser": "^3.0.1",
+    "unpdf": "1.8.1",
     "zod": "^3.25.0"
   }
 }

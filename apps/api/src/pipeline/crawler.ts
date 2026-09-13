@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 import { createRequire } from 'node:module';
 import { fetchPublicResponse, fetchPublicText } from './network.js';
 
-export type CrawledPage = { url: string; html: string; text: string };
+export type CrawledPage = { url: string; html: string; text: string; kind?: 'page' | 'document'; complete?: boolean };
 export type CrawlIssue = { url: string; code: 'ACCESS_BLOCKED' | 'ROBOTS_UNAVAILABLE' | 'ROBOTS_DISALLOWED' |
   'HTTP_ERROR' | 'NO_READABLE_CONTENT' | 'REQUEST_FAILED'; status: number | null; detail?: string };
 export type CrawlResult = { pages: CrawledPage[]; partial: boolean; issues?: CrawlIssue[] };

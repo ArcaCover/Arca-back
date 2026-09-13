@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto';
 import { canonicalUrl, type CrawlResult } from './crawler.js';
+import { MAX_DOCUMENT_CHARS } from './document-reader.js';
 
 export type EvidenceSegment = { id: string; pageId: string; url: string;
-  kind: 'text' | 'json_ld' | 'meta' | 'footer'; text: string };
+  kind: 'text' | 'json_ld' | 'meta' | 'footer' | 'document' | 'search'; text: string };
 export type EvidenceLink = { id: string; url: string; sourceUrl: string; label: string; kind: 'page' | 'document' };
 export type EvidenceCorpus = { version: 'corpus-v2'; snapshotId: string; segments: EvidenceSegment[];
-  links: EvidenceLink[]; truncated: boolean; omittedUrls: string[]; totalChars: number };
+  links: EvidenceLink[]; truncated: boolean; omittedUrls: string[]; totalChars: number;
+  documents: Array<{ url: string; complete: boolean; chars: number }> };
 
 /** Offer the agent only links the backend can actually read, typed by the tool that reads them. */
 export function classifyLink(raw: string, base: string): { url: string; kind: 'page' | 'document' } | null {
@@ -74,6 +76,7 @@ export function buildCorpus(crawl: CrawlResult, budgetChars = 24_000): EvidenceC
   const segments: EvidenceSegment[] = [], links: EvidenceLink[] = [], omittedUrls: string[] = [];
   let used = 0, truncated = false;
   const seenText = new Set<string>();
+  const documents: EvidenceCorpus['documents'] = []; let documentChars = 0;
   const priority = (url: string) => {
     const path = new URL(url).pathname.toLowerCase();
     if (path === '/') return 0;
@@ -87,22 +90,27 @@ export function buildCorpus(crawl: CrawlResult, budgetChars = 24_000): EvidenceC
   const pages = [...crawl.pages].sort((a, b) => priority(a.url) - priority(b.url) || a.url.localeCompare(b.url));
   for (const page of pages) {
     const pageHash = digest(`${page.url}\n${page.html}`), pageId = `D-${pageHash}`;
+    const isDocument = page.kind === 'document';
+    const pageCap = isDocument ? MAX_DOCUMENT_CHARS : 6_000;
+    let dropped = false;
     const candidates = [
       ...metadata(page.html),
-      ...paragraphs(page.text).map((text, index) => ({ kind: 'text' as const, locator: `text:${index}`, text })),
+      ...paragraphs(page.text).map((text, index) => ({ kind: isDocument ? 'document' as const : 'text' as const, locator: `text:${index}`, text })),
     ];
     let included = false, pageUsed = 0;
     for (const candidate of candidates) {
       const contentKey = normalizeForGrounding(candidate.text).toLocaleLowerCase();
-      if (seenText.has(contentKey)) continue;
-      if (pageUsed + candidate.text.length > 6_000 || used + candidate.text.length > budgetChars) { truncated = true; continue; }
-      included = true; used += candidate.text.length;
-      pageUsed += candidate.text.length;
+      if (!isDocument && seenText.has(contentKey)) continue;
+      const overGlobal = isDocument ? documentChars + candidate.text.length > 120_000 : used + candidate.text.length > budgetChars;
+      if (pageUsed + candidate.text.length > pageCap || overGlobal) { truncated = true; dropped = true; continue; }
+      included = true; pageUsed += candidate.text.length;
+      if (isDocument) documentChars += candidate.text.length; else used += candidate.text.length;
       seenText.add(contentKey);
       segments.push({ id: `${pageId}-${digest(`${candidate.locator}:${candidate.text}`)}`, pageId, url: page.url,
         kind: candidate.kind, text: candidate.text });
     }
     if (!included && candidates.length) omittedUrls.push(page.url);
+    if (isDocument) documents.push({ url: page.url, complete: page.complete !== false && !dropped, chars: pageUsed });
     for (const match of page.html.matchAll(/<a\b[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
       const target = classifyLink(match[1]!, page.url);
       if (!target) continue;
@@ -112,7 +120,7 @@ export function buildCorpus(crawl: CrawlResult, budgetChars = 24_000): EvidenceC
   }
   const snapshotId = digest(crawl.pages.map(page => `${page.url}:${digest(page.html)}`).sort().join('|'));
   return { version: 'corpus-v2', snapshotId, segments, links, truncated: truncated || omittedUrls.length > 0 || used >= budgetChars,
-    omittedUrls, totalChars: used };
+    omittedUrls, totalChars: used, documents };
 }
 
 export function serializeCorpus(corpus: EvidenceCorpus): string {
