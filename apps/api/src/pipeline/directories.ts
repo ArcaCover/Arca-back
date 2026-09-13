@@ -7,7 +7,9 @@ import { validDate } from '@arca/scoring';
 
 export const BAR_ACTOR = 'scrapers_lat/florida-bar-lawyers-scraper';
 export const AVVO_ACTOR = 'scrapers_lat/avvo-lawyers-scraper';
-export const MAX_PROVIDER_RESULTS = 10;
+// Actor-defined maxima, not application budgets. The Apify client paginates every completed dataset.
+export const BAR_TECHNICAL_MAX_LAWYERS = 1_000_000;
+export const AVVO_TECHNICAL_MAX_LAWYERS = 100_000;
 const record = z.record(z.unknown());
 const text = (value: unknown): string | null => typeof value === 'string' && value.trim() ? value.trim() : null;
 const number = (value: unknown, min = 0, max = Infinity): number | null =>
@@ -82,17 +84,17 @@ const providerError = (item: unknown) => {
 const isNoMatch = (item: unknown) => /^no lawyers? matched\b|^no results?\b/i.test(providerError(item) ?? '');
 export type DirectoryInput = { target: string; actor: string; input: Record<string, unknown>; fallback: boolean };
 export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQuery): DirectoryInput[] {
-  const names = stableSample(query.names).slice(0, query.maxTargets ?? 2);
+  const names = stableSample(query.names);
   const fallback = names.length === 0;
   const targets = fallback ? (query.firmName ? [query.firmName] : []) : names;
   return targets.map(target => {
     const parts = normalizeName(target).split(' ');
     const input = source === 'bar' ? {
       lastNames: fallback ? [] : [parts.at(-1)!], firstName: fallback ? '' : parts[0]![0],
-      ...(fallback ? { firm: target } : {}), maxLawyers: MAX_PROVIDER_RESULTS, withDetails: true,
+      ...(fallback ? { firm: target } : {}), maxLawyers: BAR_TECHNICAL_MAX_LAWYERS, withDetails: true,
       withLeadScore: false, withProfileSummary: false, eligibleOnly: false, includeDeceased: true,
     } : { searchQueries: [target], ...(query.city ? { cities: [`${query.city}, FL`] } : {}),
-      withDetails: true, maxLawyers: MAX_PROVIDER_RESULTS };
+      withDetails: true, maxLawyers: AVVO_TECHNICAL_MAX_LAWYERS };
     return { target, actor: source === 'bar' ? BAR_ACTOR : AVVO_ACTOR, input, fallback };
   });
 }
@@ -102,7 +104,7 @@ export class ApifyDirectorySource implements DirectorySource {
   async run(query: DirectoryQuery, signal: AbortSignal): Promise<SourceResult<AttorneyMatch[]>> {
     const started = Date.now();
     const planned = buildDirectoryInputs(this.source, query);
-    const names = stableSample(query.names).slice(0, query.maxTargets ?? 2);
+    const names = stableSample(query.names);
     const fallback = names.length === 0;
     const targets = planned.map(item => item.target);
     if (!targets.length) return { data: null, rawContent: null, status: { status: 'skipped', dataStatus: 'UNKNOWN',
@@ -134,9 +136,8 @@ export class ApifyDirectorySource implements DirectorySource {
           if (items.length === 0 || noMatchRecords.length === items.length || valid.length > 0) successfulQueries++;
           let accepted = 0;
           if (fallback) {
-            // maxTargets budgets paid lookups. A fallback lookup is a single run that already
-            // returned the whole roster, so discarding part of it buys nothing and scores the firm
-            // on an alphabetical sample instead of its attorneys.
+            // A firm fallback is one run whose complete, paginated dataset is the roster. Do not
+            // discard any attorney from it or score the firm on an alphabetical sample.
             const people = valid.filter(person => person.firmName && firmKey(person.firmName) === firmKey(target))
               .sort((a, b) => normalizeName(a.name).localeCompare(normalizeName(b.name)));
             accepted = people.length;

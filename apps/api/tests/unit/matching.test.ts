@@ -6,9 +6,9 @@ describe('targeted identity matching', () => {
     expect(normalizeName('José Smith, Esq.')).toBe('jose smith');
     expect(normalizeName('John Smith III')).toBe('john smith');
   });
-  it('selects at most 15 distinct normalized names independently of website ordering', () => {
-    const names = Array.from({ length: 20 }, (_, i) => `Jane ${String.fromCharCode(65 + i)}`);
-    expect(stableSample(names)).toHaveLength(15);
+  it('keeps every distinct normalized name independently of website ordering', () => {
+    const names = Array.from({ length: 30 }, (_, i) => `Jane Name${String.fromCharCode(65 + Math.floor(i / 26))}${String.fromCharCode(65 + i % 26)}`);
+    expect(stableSample(names)).toHaveLength(30);
     expect(stableSample(names)).toEqual(stableSample([...names].reverse()));
     expect(stableSample(['John Smith Esq.', 'John Smith'])).toHaveLength(1);
   });

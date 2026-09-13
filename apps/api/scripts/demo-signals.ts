@@ -47,7 +47,7 @@ for (const target of targets) {
     console.log(`[${domain}] 3/5 building verified identity`);
     const identity = buildFirmIdentity(domain, result.websiteData);
     const query = { canonicalDomain: domain, names: identity.attorneyNames, firmName: identity.firmName,
-      city: identity.city, state: 'FL' as const, maxTargets: 2 };
+      city: identity.city, state: 'FL' as const };
     const directoryInputs = identity.status === 'INSUFFICIENT' ? [] : [
       ...buildDirectoryInputs('bar', query), ...buildDirectoryInputs('avvo', query),
     ];

@@ -10,7 +10,8 @@ export function stableSample(names: string[]): string[] {
   const sorted = [...names].sort((a, b) => normalizeName(a).localeCompare(normalizeName(b)) || a.localeCompare(b));
   const unique = new Map<string, string>();
   for (const name of sorted) { const key = normalizeName(name); if (key && !unique.has(key)) unique.set(key, name); }
-  return [...unique.values()].slice(0, 15);
+  // Keep a stable order for repeatable directory calls, but never sample the roster.
+  return [...unique.values()];
 }
 
 function sameInitialAndLast(a: string, b: string) {

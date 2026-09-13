@@ -103,7 +103,7 @@ export const SourceStatus = z.object({
 export type SourceStatus = z.infer<typeof SourceStatus>;
 export type SourceResult<T> = { data: T | null; rawContent: string | null; status: SourceStatus };
 export type DirectoryQuery = { canonicalDomain: string; names: string[]; firmName: string | null;
-  city: string | null; state: 'FL'; maxTargets?: number };
+  city: string | null; state: 'FL' };
 export interface WebsiteSource {
   run(domain: string, signal: AbortSignal): Promise<SourceResult<WebsiteData>>;
 }

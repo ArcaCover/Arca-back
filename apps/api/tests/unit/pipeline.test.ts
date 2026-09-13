@@ -4,7 +4,7 @@ import { mockSources } from '../../src/pipeline/mock-sources.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import { createApp } from '../../src/http/app.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
-import type { SourceResult, AttorneyMatch } from '@arca/contracts';
+import { unknownWebsite, type SourceResult, type AttorneyMatch } from '@arca/contracts';
 
 const failed = (): Promise<SourceResult<AttorneyMatch[]>> => Promise.resolve({ data: null, rawContent: null,
   status: { status: 'error', dataStatus: 'UNKNOWN', durationMs: 0 } });
@@ -34,6 +34,23 @@ describe('three-source orchestration', () => {
       avvo: { run: async () => { avvoStarted = true; expect(barStarted).toBe(true); return failed(); } },
     });
     expect((await pipeline.run({ scanId: 'sc_parallel', canonicalDomain: 'robust.arca.example', email: 'owner@robust.arca.example' })).status).toBe('PARTIAL');
+  });
+  it('passes every verified attorney to both directories without a roster cap', async () => {
+    const names = Array.from({ length: 30 }, (_, index) =>
+      `Attorney Name${String.fromCharCode(65 + Math.floor(index / 26))}${String.fromCharCode(65 + index % 26)}`);
+    const queries: string[][] = [];
+    const directories = { run: async (query: { names: string[] }) => {
+      queries.push(query.names);
+      return failed();
+    } };
+    const pipeline = new InProcessPipeline({ repository: new InMemoryRepository(),
+      website: { run: async () => ({ data: { ...unknownWebsite(), firm_name: 'Thirty Attorney Law',
+        team_members: names.map(full_name => ({ full_name, title: 'Attorney' })) }, rawContent: '{}',
+        status: { status: 'ok' as const, dataStatus: 'PRESENT' as const, durationMs: 0 } }) },
+      bar: directories, avvo: directories });
+    await pipeline.run({ scanId: 'sc_full_roster', canonicalDomain: 'firm.com', email: 'owner@firm.com' });
+    expect(queries).toHaveLength(2);
+    expect(queries.every(query => query.length === 30 && names.every(name => query.includes(name)))).toBe(true);
   });
   it('has MEDIUM technical confidence with one failed source', async () => {
     const pipeline = new InProcessPipeline({ ...mockSources(), avvo: { run: failed }, repository: new InMemoryRepository() });

@@ -119,15 +119,12 @@ Aparte, el crawler no lee PDFs, así que hoy la señal de privacidad de Duque es
 - Solo 2 rechazos, ambos `UNCERTAIN_ATTRIBUTION`: un modo de fallo seguro.
 - Gobernanza de IA y privacidad quedaron desconocidas: no estaban en las 8 páginas rastreadas.
 
-### 4.3 El sesgo alfabético reaparece en la ruta dirigida
+### 4.3 Sesgo alfabético en la ruta dirigida (resuelto)
 
-Con 24 abogados verificados, el payload que iría a Apify consulta solo **Aliet Sanchez y Barbara D.
-Meneses**: los dos primeros en orden alfabético. `maxTargets: 2` y `stableSample` reproducen en la ruta
-dirigida el mismo sesgo que se corrigió en fallback (`05bbf71`). Además `identity.attorneyNames` llega
-recortado a 15 por `stableSample`.
-
-Contradice el requisito explícito de no puntuar a un despacho con dos abogados. Requiere una decisión de
-producto: presupuesto de consultas pagadas frente a tamaño del roster.
+El harness originalmente reducía `identity.attorneyNames` a 15 y `maxTargets` a 2, por lo que una firma
+grande solo consultaba los primeros nombres alfabéticos. La ruta dirigida ahora conserva cada identidad
+normalizada y programa una consulta por abogado; los máximos de los actores son solo sus techos documentados
+(`1,000,000` para Florida Bar y `100,000` para Avvo) y el cliente pagina el dataset de Apify hasta agotarlo.
 
 ### 4.4 Resiliencia y latencia
 
@@ -207,7 +204,8 @@ Scripts de diagnóstico (no versionados) en `output/diag/`: `replay-extract.ts`,
 6. Las gates de DN-05 §12 siguen sin cumplirse: faltan 20 snapshots, casos adversariales y tres corridas
    medidas en un conjunto reservado.
 7. **Bloqueante:** filtrar links no recuperables en el corpus y aislar fallos por link en `fetch_pages`.
-8. Decidir cuántos abogados consulta Apify cuando el roster verificado supera `maxTargets`.
+8. Vigilar costes y duración de directorios para rosters grandes; ya no se reduce el roster para respetar un
+   presupuesto artificial de consultas.
 9. Reintento acotado por fase ante 5xx y timeout, dentro del presupuesto global.
 10. Reducir la latencia: 202 s en la única corrida completa, frente a un p95 exigido de 120 s.
 11. Repetir las seis corridas en serie, no en paralelo, para separar el efecto de la concurrencia.

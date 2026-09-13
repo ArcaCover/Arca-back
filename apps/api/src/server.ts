@@ -33,8 +33,7 @@ const domainResolver = env.sourceMode === 'mock' ? new PublicDomainResolver(asyn
   if (!(MOCK_DOMAINS as readonly string[]).includes(new URL(url).hostname)) throw new Error('Unknown mock domain');
 }) : new PublicDomainResolver();
 const clientIps = new WeakMap<Request, string>();
-const { app, drain } = createApp({ repository, domainResolver, pipeline: new InProcessPipeline({ ...sources, repository,
-  maxDirectoryTargets: env.MAX_DIRECTORY_TARGETS }),
+const { app, drain } = createApp({ repository, domainResolver, pipeline: new InProcessPipeline({ ...sources, repository }),
   sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
   clientIp: request => clientIps.get(request) ?? 'unknown' });
 const server = serve({ port: env.PORT, fetch: (request, bindings) => {

@@ -9,7 +9,7 @@ import type { ScanRepository } from '../repositories/types.js';
 export class InProcessPipeline implements Layer1Pipeline {
   constructor(private readonly deps: {
     website: WebsiteSource; bar: DirectorySource; avvo: DirectorySource; repository: ScanRepository;
-    timeoutMs?: number; now?: () => number; maxDirectoryTargets?: number;
+    timeoutMs?: number; now?: () => number;
   }) {}
   async run(input: { scanId: string; canonicalDomain: string; email: string }): Promise<PipelineResult> {
     if (!input.canonicalDomain || normalizeDomain(input.canonicalDomain) !== input.canonicalDomain) {
@@ -43,8 +43,7 @@ export class InProcessPipeline implements Layer1Pipeline {
       const website = await bounded<WebsiteData>(() => this.deps.website.run(input.canonicalDomain, signal));
       const identity = buildFirmIdentity(input.canonicalDomain, website.data);
       const query = { canonicalDomain: input.canonicalDomain, names: identity.attorneyNames,
-        firmName: identity.firmName, city: identity.city, state: 'FL' as const,
-        maxTargets: this.deps.maxDirectoryTargets ?? 2 };
+        firmName: identity.firmName, city: identity.city, state: 'FL' as const };
       const [bar, avvo] = identity.status === 'INSUFFICIENT' ? [insufficientIdentity(), insufficientIdentity()] : await Promise.all([
           bounded<AttorneyMatch[]>(() => this.deps.bar.run(query, signal)),
           bounded<AttorneyMatch[]>(() => this.deps.avvo.run(query, signal)),

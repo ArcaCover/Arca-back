@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { unknownWebsite } from '@arca/contracts';
-import { ApifyDirectorySource, AVVO_ACTOR, BAR_ACTOR, MAX_PROVIDER_RESULTS, parseBar, parseAvvo,
+import { ApifyDirectorySource, AVVO_ACTOR, BAR_ACTOR, AVVO_TECHNICAL_MAX_LAWYERS, BAR_TECHNICAL_MAX_LAWYERS, parseBar, parseAvvo,
   parseDisciplineSummary } from '../../src/pipeline/directories.js';
 import { ApifyClient } from '../../src/pipeline/apify-client.js';
 import { RagWebsiteSource, WebsiteExtractionSource } from '../../src/pipeline/website-source.js';
@@ -39,18 +39,17 @@ describe('provider evidence boundaries', () => {
     const run = vi.fn(async () => []);
     await new ApifyDirectorySource('avvo', { run }).run(query, new AbortController().signal);
     expect(run).toHaveBeenCalledWith(AVVO_ACTOR, {
-      searchQueries: ['Jane Smith'], cities: ['Miami, FL'], withDetails: true, maxLawyers: 10,
+      searchQueries: ['Jane Smith'], cities: ['Miami, FL'], withDetails: true, maxLawyers: AVVO_TECHNICAL_MAX_LAWYERS,
     }, expect.any(AbortSignal));
     expect(AVVO_ACTOR).toBe('scrapers_lat/avvo-lawyers-scraper');
   });
-  it('caps the records requested from both paid providers at ten', async () => {
+  it('uses only the providers’ documented technical maxima, never an application result cap', async () => {
     const run = vi.fn(async () => []);
     const signal = new AbortController().signal;
     await new ApifyDirectorySource('bar', { run }).run(query, signal);
     await new ApifyDirectorySource('avvo', { run }).run(query, signal);
-    expect(MAX_PROVIDER_RESULTS).toBe(10);
-    expect(run).toHaveBeenNthCalledWith(1, BAR_ACTOR, expect.objectContaining({ maxLawyers: 10 }), signal);
-    expect(run).toHaveBeenNthCalledWith(2, AVVO_ACTOR, expect.objectContaining({ maxLawyers: 10 }), signal);
+    expect(run).toHaveBeenNthCalledWith(1, BAR_ACTOR, expect.objectContaining({ maxLawyers: BAR_TECHNICAL_MAX_LAWYERS }), signal);
+    expect(run).toHaveBeenNthCalledWith(2, AVVO_ACTOR, expect.objectContaining({ maxLawyers: AVVO_TECHNICAL_MAX_LAWYERS }), signal);
   });
   it('treats a complete seven-record response as valid evidence', async () => {
     const candidates = Array.from({ length: 7 }, (_, index) => ({
@@ -92,19 +91,30 @@ describe('provider evidence boundaries', () => {
     expect(result.status).toMatchObject({ costUsd: .25, candidatesReceived: 1, recordsValid: 1,
       providerRuns: [{ runId: 'run-1', acceptedCount: 1, costUsd: .25 }] });
   });
-  it('keeps partial directory evidence and caps paid searches at two identities', async () => {
+  it('runs a lookup for every named attorney, including a thirty-attorney roster', async () => {
+    const names = Array.from({ length: 30 }, (_, index) =>
+      `Attorney Name${String.fromCharCode(65 + Math.floor(index / 26))}${String.fromCharCode(65 + index % 26)}`);
+    const run = vi.fn(async (_actor: string, input: Record<string, unknown>) => {
+      const target = String((input.searchQueries as string[] | undefined)?.[0] ?? '');
+      return [{ name: target }];
+    });
+    const result = await new ApifyDirectorySource('avvo', { run }).run({ ...query, names }, new AbortController().signal);
+    expect(run).toHaveBeenCalledTimes(30);
+    expect(result.status).toMatchObject({ status: 'ok', attorneysSearched: 30, attorneysFound: 30 });
+    expect(result.data?.map(match => match.searchedName)).toEqual(expect.arrayContaining(names));
+  });
+  it('keeps partial directory evidence when some named lookups fail', async () => {
     const run = vi.fn(async () => [{ name: 'Jane Smith' }, { error: 'unreadable' }]);
     const result = await new ApifyDirectorySource('bar', { run }).run({ ...query, names: Array.from({ length: 20 }, (_, i) => `Jane Smith${String.fromCharCode(97 + i)}`) }, new AbortController().signal);
-    expect(run).toHaveBeenCalledTimes(2);
+    expect(run).toHaveBeenCalledTimes(20);
     expect(result.status.status).toBe('partial');
   });
   it('accepts every firm-fallback attorney the single paid run already returned', async () => {
     const candidates = ['A One', 'B Two', 'C Three'].map(name => ({ name, firm: 'Smith Law' }));
     const run = vi.fn(async () => candidates);
     const result = await new ApifyDirectorySource('bar', { run }).run({
-      ...query, names: [], maxTargets: 2,
+      ...query, names: [],
     }, new AbortController().signal);
-    // maxTargets budgets paid lookups, not the records one lookup already produced.
     expect(run).toHaveBeenCalledTimes(1);
     expect(result.data).toHaveLength(3);
     expect(result.status.attorneysFound).toBe(3);
@@ -113,7 +123,7 @@ describe('provider evidence boundaries', () => {
     const candidates = [{ name: 'A One', firm: 'Smith Law' }, { name: 'B Two', firm: 'Other Law' },
       { name: 'C Three', firm: null }];
     const result = await new ApifyDirectorySource('bar', { run: async () => candidates }).run({
-      ...query, names: [], maxTargets: 2,
+      ...query, names: [],
     }, new AbortController().signal);
     expect(result.data).toHaveLength(1);
     expect(result.data?.[0]?.attorney?.name).toBe('A One');
@@ -132,6 +142,18 @@ describe('Apify lifecycle', () => {
     expect(output.items).toHaveLength(101);
     expect(output.metadata).toMatchObject({ actor: 'owner/actor', itemCount: 101, acceptedCount: 0 });
     expect(request).toHaveBeenCalledTimes(3);
+  });
+  it('continues dataset pagination beyond one thousand attorneys', async () => {
+    const request = vi.fn(async (url: string | URL | Request) => {
+      const value = String(url);
+      if (value.includes('/runs?')) return Response.json({ data: { id: 'run', status: 'SUCCEEDED', defaultDatasetId: 'dataset' } });
+      const offset = Number(new URL(value).searchParams.get('offset'));
+      const count = offset < 1_000 ? 100 : 1;
+      return Response.json(Array.from({ length: count }, (_, index) => ({ id: offset + index })));
+    });
+    const output = await new ApifyClient('token', request as typeof fetch).run('owner/actor', {}, new AbortController().signal);
+    expect(output.items).toHaveLength(1_001);
+    expect(request).toHaveBeenCalledTimes(12);
   });
   it('aborts a remote run when the caller cancels', async () => {
     const controller = new AbortController();

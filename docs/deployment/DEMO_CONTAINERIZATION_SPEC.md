@@ -92,7 +92,6 @@ Required values in `/opt/arca/.env.demo`:
 | `APIFY_API_TOKEN` | Backend-only Apify token |
 | `CORS_ALLOWED_ORIGINS` | `https://arcacover.com,http://localhost:3000` |
 | `TRUST_PROXY_HOPS` | `1`, because Caddy is the only ingress |
-| `MAX_DIRECTORY_TARGETS` | `2` |
 | `MAX_APIFY_CONCURRENCY` | `2` |
 
 Each paid provider run requests at most ten records. A scan starts no more than four directory runs.

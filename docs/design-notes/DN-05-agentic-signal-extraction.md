@@ -426,7 +426,8 @@ Extraer funciones puras `buildDirectoryQuery(identity, limits)` y
 `buildDirectoryInputs(source, query)` a un módulo sin dependencias de red. El pipeline y la demo
 comparten selección de targets, muestreo, fallback, límite y parámetros. Los inputs devuelven
 `{ target, actor, input }` para conservar correlación con respuestas. Mantener payloads actuales y
-`maxTargets=2`; `INSUFFICIENT` produce cero targets. No crear un LLM que redacte inputs de Apify.
+Cada identidad de abogado verificada produce un target; `INSUFFICIENT` produce cero targets. No crear un LLM
+que redacte inputs de Apify ni recortar el roster por presupuesto.
 
 Salida `output/demo/<domain>-<timestamp>/`, ya ignorada por Git:
 

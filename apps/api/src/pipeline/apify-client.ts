@@ -62,7 +62,6 @@ export class ApifyClient {
         if (page.length < 100) return { items, metadata: { provider: 'apify', actor, runId, status: run.status,
           queryFingerprint,
           itemCount: items.length, acceptedCount: 0, costUsd: run.usageTotalUsd ?? null } };
-        if (items.length >= 1000) throw new Error('Unexpectedly large targeted dataset');
       }
     } catch (error) {
       if (error instanceof ApifyClientError) throw error;

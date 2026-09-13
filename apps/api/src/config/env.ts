@@ -12,7 +12,6 @@ const EnvSchema = z.object({
   NVIDIA_NIM_API_KEY: z.string().optional(), NVIDIA_NIM_MODEL: z.string().optional(),
   CORS_ALLOWED_ORIGINS: z.string().min(1),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
-  MAX_DIRECTORY_TARGETS: z.coerce.number().int().min(1).max(2).default(2),
   MAX_APIFY_CONCURRENCY: z.coerce.number().int().min(1).max(2).default(2),
 });
 export function loadEnv(source = process.env) {
