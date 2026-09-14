@@ -35,6 +35,12 @@ describe('evidence corpus', () => {
   });
   const longPage = (url: string, paragraphs: number) => ({ url, html: '',
     text: Array.from({ length: paragraphs }, (_, i) => `${url} paragraph ${i} ${'detail '.repeat(90)}`).join('\n\n') });
+  it('keeps the about page ahead of a low-value page the agent requested', () => {
+    const corpus = buildCorpus({ pages: [longPage('https://firm.com/about', 3), { ...longPage('https://firm.com/blog', 3), requested: true }],
+      partial: false }, 2_100);
+    expect(corpus.segments.some(segment => segment.url === 'https://firm.com/about')).toBe(true);
+    expect(corpus.omittedUrls).toContain('https://firm.com/blog');
+  });
   it('includes a page the agent requested before pages the crawler found', () => {
     const corpus = buildCorpus({ pages: [longPage('https://firm.com/practice-a', 3), longPage('https://firm.com/practice-b', 3),
       { url: 'https://firm.com/carmen-gallardo', html: '', text: `Carmen Gallardo, Esq. Founding Partner. ${'Biography '.repeat(70)}`, requested: true }],

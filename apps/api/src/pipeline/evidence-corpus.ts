@@ -89,8 +89,8 @@ export function buildCorpus(crawl: CrawlResult, budgetChars = 24_000): EvidenceC
     if (/blog|author|category/.test(path)) return 7;
     return 6;
   };
-  // A page the agent asked for ranks with the team pages: it was requested because a field needs it.
-  const rank = (page: CrawlResult['pages'][number]) => page.requested ? 1 : priority(page.url);
+  // A page the agent asked for is lifted up to the about pages: ahead of practice and blog pages, never ahead of identity.
+  const rank = (page: CrawlResult['pages'][number]) => page.requested ? Math.min(priority(page.url), 2) : priority(page.url);
   const pages = [...crawl.pages].sort((a, b) => rank(a) - rank(b) || a.url.localeCompare(b.url));
   for (const page of pages) {
     const pageHash = digest(`${page.url}\n${page.html}`), pageId = `D-${pageHash}`;
