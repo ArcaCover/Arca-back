@@ -72,7 +72,8 @@ export function normalizeForGrounding(value: string): string {
   return value.normalize('NFC').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/\s+/g, ' ').trim();
 }
 
-export function buildCorpus(crawl: CrawlResult, budgetChars = 24_000): EvidenceCorpus {
+// 60,000 characters stays well under DN-05's 24,000-token input limit per call; 24,000 characters dropped most of a site.
+export function buildCorpus(crawl: CrawlResult, budgetChars = 60_000): EvidenceCorpus {
   const segments: EvidenceSegment[] = [], links: EvidenceLink[] = [], omittedUrls: string[] = [];
   let used = 0, truncated = false;
   const seenText = new Set<string>();
@@ -87,7 +88,9 @@ export function buildCorpus(crawl: CrawlResult, budgetChars = 24_000): EvidenceC
     if (/blog|author|category/.test(path)) return 7;
     return 6;
   };
-  const pages = [...crawl.pages].sort((a, b) => priority(a.url) - priority(b.url) || a.url.localeCompare(b.url));
+  // A page the agent asked for ranks with the team pages: it was requested because a field needs it.
+  const rank = (page: CrawlResult['pages'][number]) => page.requested ? 1 : priority(page.url);
+  const pages = [...crawl.pages].sort((a, b) => rank(a) - rank(b) || a.url.localeCompare(b.url));
   for (const page of pages) {
     const pageHash = digest(`${page.url}\n${page.html}`), pageId = `D-${pageHash}`;
     const isDocument = page.kind === 'document';

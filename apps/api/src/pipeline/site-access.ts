@@ -13,14 +13,14 @@ export interface SiteAccess {
   readSitemap(domain: string, signal: AbortSignal): Promise<ToolResult & { links: Array<{ url: string; kind: 'page' | 'document' }> }>;
 }
 
-export function createSiteAccess(): SiteAccess {
+export function createSiteAccess(transport?: Parameters<typeof crawlWebsite>[2]): SiteAccess {
   return {
     async fetchPages(urls, signal) {
       const pages: CrawledPage[] = [], calls: ToolResult['calls'] = [];
       for (const url of urls) {
         signal.throwIfAborted();
         try {
-          const crawl = await crawlWebsite(url, signal, undefined, { timeoutMs: 30_000, maxPages: 1, maxDepth: 0 });
+          const crawl = await crawlWebsite(url, signal, transport, { timeoutMs: 30_000, maxPages: 1, maxDepth: 0, seedOnly: true });
           pages.push(...crawl.pages);
           calls.push({ tool: 'fetch_pages', target: url, status: crawl.pages.length ? 'read' : 'failed',
             detail: crawl.pages.length ? null : crawl.issues?.[0]?.code ?? 'NO_READABLE_CONTENT' });

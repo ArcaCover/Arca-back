@@ -2,7 +2,8 @@ import { chromium } from 'playwright';
 import { createRequire } from 'node:module';
 import { fetchPublicResponse, fetchPublicText } from './network.js';
 
-export type CrawledPage = { url: string; html: string; text: string; kind?: 'page' | 'document'; complete?: boolean };
+/** `requested` marks a page the extraction agent asked for, so the corpus never drops it for crawled pages. */
+export type CrawledPage = { url: string; html: string; text: string; kind?: 'page' | 'document'; complete?: boolean; requested?: boolean };
 export type CrawlIssue = { url: string; code: 'ACCESS_BLOCKED' | 'ROBOTS_UNAVAILABLE' | 'ROBOTS_DISALLOWED' |
   'HTTP_ERROR' | 'NO_READABLE_CONTENT' | 'REQUEST_FAILED'; status: number | null; detail?: string };
 export type CrawlResult = { pages: CrawledPage[]; partial: boolean; issues?: CrawlIssue[] };
@@ -54,6 +55,8 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
   response: typeof fetchPublicResponse; robots: typeof fetchPublicText;
 } = { response: fetchPublicResponse, robots: fetchPublicText }, options: {
   timeoutMs?: number; maxPages?: number; maxDepth?: number;
+  /** Start from the requested URL only. Without it the root page is queued first and wins a one-page budget. */
+  seedOnly?: boolean;
 } = {}): Promise<CrawlResult> {
   const supplied = /^[a-z]+:\/\//i.test(domainOrUrl) ? new URL(domainOrUrl) : new URL(`https://${domainOrUrl}/`);
   const domain = supplied.hostname.replace(/^www\./, '');
@@ -113,7 +116,7 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
       }
     });
     await context.routeWebSocket('**/*', socket => socket.close());
-    let queue = [...new Set([rootUrl, seedUrl])].map(url => ({ url, depth: 0, attempt: 0 }));
+    let queue = [...new Set(options.seedOnly ? [seedUrl] : [rootUrl, seedUrl])].map(url => ({ url, depth: 0, attempt: 0 }));
     const visited = new Set<string>();
     // Requeued pages leave `visited`, so a retry costs another attempt but never another page budget.
     const fail = (item: { url: string; depth: number; attempt: number }, issue: CrawlIssue) => {

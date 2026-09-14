@@ -9,7 +9,7 @@ import { findPassages } from './site-search.js';
 import type { WebsiteEvidenceProvider } from './website-evidence-provider.js';
 
 export const DEFAULT_NVIDIA_NIM_MODEL = 'nvidia/nemotron-3-super-120b-a12b';
-export const EXTRACTION_VERSION = 'agentic-signals-v2';
+export const EXTRACTION_VERSION = 'agentic-signals-v3';
 export const MAX_AGENT_ROUNDS = 3;
 export type StopReason = 'SUFFICIENT_FOR_EXTRACTION' | 'ROUND_LIMIT' | 'NO_NEW_EVIDENCE';
 
@@ -194,7 +194,8 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
       if (action.type === 'finish') { stopReason = 'SUFFICIENT_FOR_EXTRACTION'; break; }
       if (round === MAX_AGENT_ROUNDS) { stopReason = 'ROUND_LIMIT'; break; }
       const record = (calls: Array<Omit<ToolCall, 'round'>>) => toolCalls.push(...calls.map(call => ({ round, ...call })));
-      const before = { pages: crawl.pages.length, links: discovered.length, passages: passages.length };
+      // Compare URLs, not counts: merging deduplicates the crawl, which can hide a newly read page.
+      const before = { urls: new Set(crawl.pages.map(page => page.url)), links: discovered.length, passages: passages.length };
       const resolve = (ids: string[], kind: 'page' | 'document') => ids.flatMap(id => {
         const link = corpus.links.find(item => item.id === id && item.kind === kind);
         if (!link) { record([{ tool: kind === 'page' ? 'fetch_pages' : 'read_document', target: id.slice(0, 64), status: 'skipped', detail: 'UNKNOWN_LINK' }]); return []; }
@@ -207,7 +208,7 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
       };
       if (action.type === 'fetch_pages') {
         const urls = [...new Set(resolve(action.linkIds, 'page'))].slice(0, 4);
-        if (urls.length) { const result = await this.access.fetchPages(urls, signal); record(result.calls); merge(result.pages); }
+        if (urls.length) { const result = await this.access.fetchPages(urls, signal); record(result.calls); merge(result.pages.map(page => ({ ...page, requested: true }))); }
       } else if (action.type === 'read_document') {
         const urls = [...new Set(resolve(action.linkIds, 'document'))].slice(0, 2);
         if (urls.length) { const result = await this.access.readDocuments(urls, signal); record(result.calls); merge(result.pages); }
@@ -220,7 +221,7 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
         record([{ tool: 'find_in_site', target: action.terms.join(' | '), status: found.length ? 'read' : 'failed', detail: `${found.length} passages` }]);
         passages = [...passages, ...found];
       }
-      if (crawl.pages.length === before.pages && discovered.length === before.links && passages.length === before.passages) {
+      if (crawl.pages.every(page => before.urls.has(page.url)) && discovered.length === before.links && passages.length === before.passages) {
         stopReason = 'NO_NEW_EVIDENCE'; break;
       }
       corpus = assemble();

@@ -184,4 +184,37 @@ describe('NVIDIA evidence provider', () => {
     expect(access.fetchPages).not.toHaveBeenCalled();
     expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: longId.slice(0, 64), status: 'skipped', detail: 'UNKNOWN_LINK' }]);
   });
+
+  it('extracts again after reading a document even when the crawl repeated a URL', async () => {
+    const home = { url: 'https://firm.com/', text: 'Smith Law.', html: '<a href="/policy.pdf">Privacy</a>' };
+    const create = scripted([
+      user => ({ claims: [], action: { type: 'read_document', linkIds: [/\[(L-[^\]]+)\] DOCUMENT/.exec(user)![1]], targetFields: ['privacy_policy'], reason: 'policy' } }),
+      () => ({ claims: [], action: { type: 'finish', reason: 'done' } }),
+    ]);
+    const access = { fetchPages: vi.fn(), readSitemap: vi.fn(), readDocuments: vi.fn(async (urls: string[]) => ({
+      pages: [{ url: urls[0]!, html: '', text: 'Privacy Policy.', kind: 'document' as const, complete: true }],
+      calls: [{ tool: 'read_document' as const, target: urls[0]!, status: 'read' as const, detail: 'complete' }] })) };
+    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const result = await provider.extractDetailed({ pages: [home, { ...home }], partial: false }, new AbortController().signal);
+    expect(result.diagnostics).toMatchObject({ rounds: 2, stopReason: 'SUFFICIENT_FOR_EXTRACTION' });
+  });
+
+  it('shows a fetched page in the next round even when crawled pages fill the corpus', async () => {
+    const practice = (n: number) => ({ url: `https://firm.com/practice-${n}`, html: '',
+      text: Array.from({ length: 8 }, (_, i) => `Practice ${n} paragraph ${i} ${'detail '.repeat(100)}`).join('\n\n') });
+    const home = { url: 'https://firm.com/', html: '<a href="/carmen-gallardo">Carmen Gallardo</a>', text: 'Smith Law.' };
+    let secondRound = '';
+    const create = scripted([
+      user => ({ claims: [], action: { type: 'fetch_pages', linkIds: [/\[(L-[^\]]+)\] PAGE https:\/\/firm\.com\/carmen-gallardo/.exec(user)![1]],
+        targetFields: ['attorneys'], reason: 'bio' } }),
+      user => { secondRound = user; return { claims: [], action: { type: 'finish', reason: 'done' } }; },
+    ]);
+    const access = { fetchPages: vi.fn(async (urls: string[]) => ({
+      pages: urls.map(url => ({ url, html: '', text: `Carmen Gallardo, Esq. Attorney | Founding Partner. ${'Biography '.repeat(75)}` })),
+      calls: urls.map(target => ({ tool: 'fetch_pages' as const, target, status: 'read' as const, detail: null })) })),
+      readDocuments: vi.fn(), readSitemap: vi.fn() };
+    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    await provider.extractDetailed({ pages: [home, ...Array.from({ length: 14 }, (_, n) => practice(n))], partial: false }, new AbortController().signal);
+    expect(secondRound).toContain('Founding Partner');
+  });
 });
