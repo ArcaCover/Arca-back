@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../../src/pipeline/nvidia-evidence-provider.js';
-import { LLM_ENDPOINTS } from '../../src/pipeline/llm-endpoint.js';
+import { LLM_ENDPOINTS, openAiEndpoint } from '../../src/pipeline/llm-endpoint.js';
 
 describe('NVIDIA evidence provider', () => {
   it('uses the probed endpoint parameters and maps reviewed grounded claims', async () => {
@@ -251,5 +251,32 @@ describe('NVIDIA evidence provider', () => {
     const { provider, request } = await firstRequest(LLM_ENDPOINTS.nvidia, 'z-ai/glm-5.3-flash');
     expect(request).toMatchObject({ temperature: 0, max_tokens: 8000, chat_template_kwargs: { enable_thinking: false } });
     expect(provider.id).toBe('nvidia-nim');
+  });
+
+  it('asks OpenAI reasoning models for the configured reasoning effort only', async () => {
+    expect((await firstRequest(openAiEndpoint('low'), 'gpt-5-mini')).request).toMatchObject({ reasoning_effort: 'low' });
+    expect((await firstRequest(openAiEndpoint('low'), 'gpt-4.1-mini')).request).not.toHaveProperty('reasoning_effort');
+    expect((await firstRequest(LLM_ENDPOINTS.openai, 'gpt-5-mini')).request).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('accepts a roster returned as one short-cited claim per person', async () => {
+    const page = { url: 'https://firm.com/attorneys', html: '', text: 'Jane Doe\nLawyer\nJohn Roe\nLawyer' };
+    const create = vi.fn(async (request: Record<string, unknown>) => {
+      const [system, user] = (request.messages as Array<{ content: string }>).map(message => message.content) as [string, string];
+      if (user.startsWith('CANDIDATE CLAIMS')) {
+        const claims = JSON.parse(user.slice('CANDIDATE CLAIMS\n'.length, user.indexOf('\n\nSNAPSHOT'))) as Array<{ id: string; citations: unknown[] }>;
+        return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ verdicts: claims.map(claim =>
+          ({ claimId: claim.id, verdict: 'supported', reason: 'listed', citations: claim.citations })) }) } }] };
+      }
+      const segmentId = /\[(D-[^\]]+)\]/.exec(user)?.[1] ?? '';
+      const person = (name: string) => ({ id: `att-${name}`, field: 'attorneys', explanation: 'listed as lawyer',
+        value: [{ full_name: name, title: 'Lawyer', role: 'attorney', affiliation: 'current' }], citations: [{ segmentId, quote: `${name}\nLawyer` }] });
+      const claims = system.includes('This pass is only for attorneys') ? [person('Jane Doe'), person('John Roe')] : [];
+      return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ claims, action: { type: 'finish', reason: 'done' } }) } }] };
+    });
+    const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn() };
+    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
+    expect(result.websiteData.team_members?.map(member => member.full_name).sort()).toEqual(['Jane Doe', 'John Roe']);
   });
 });

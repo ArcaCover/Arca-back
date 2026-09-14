@@ -4,11 +4,13 @@ import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
 import OpenAI from 'openai';
 import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../src/pipeline/nvidia-evidence-provider.js';
-import { LLM_ENDPOINTS } from '../src/pipeline/llm-endpoint.js';
+import { LLM_ENDPOINTS, REASONING_EFFORTS, openAiEndpoint, type ReasoningEffort } from '../src/pipeline/llm-endpoint.js';
 import { GoldLabels, evaluateWebsiteData } from '../src/pipeline/signal-evaluation.js';
 
 if (existsSync('.env.local')) loadEnvFile('.env.local');
-const endpoint = LLM_ENDPOINTS[process.env.SIGNAL_LLM_ENDPOINT === 'openai' ? 'openai' : 'nvidia'];
+const effort = process.env.SIGNAL_LLM_REASONING_EFFORT?.trim() || undefined;
+if (effort && !(REASONING_EFFORTS as readonly string[]).includes(effort)) throw new Error(`Unknown SIGNAL_LLM_REASONING_EFFORT ${effort}`);
+const endpoint = process.env.SIGNAL_LLM_ENDPOINT === 'openai' ? openAiEndpoint(effort as ReasoningEffort | undefined) : LLM_ENDPOINTS.nvidia;
 const keyName = endpoint.id === 'openai' ? 'OPENAI_API_KEY' : 'NVIDIA_NIM_API_KEY';
 const key = process.env[keyName]?.trim();
 if (!key) throw new Error(`${keyName} is required`);

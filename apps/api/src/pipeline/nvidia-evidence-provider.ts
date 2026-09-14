@@ -10,7 +10,7 @@ import type { WebsiteEvidenceProvider } from './website-evidence-provider.js';
 import { LLM_ENDPOINTS, type LlmEndpoint } from './llm-endpoint.js';
 
 export const DEFAULT_NVIDIA_NIM_MODEL = 'nvidia/nemotron-3-super-120b-a12b';
-export const EXTRACTION_VERSION = 'agentic-signals-v3';
+export const EXTRACTION_VERSION = 'agentic-signals-v4';
 export const MAX_AGENT_ROUNDS = 3;
 export type StopReason = 'SUFFICIENT_FOR_EXTRACTION' | 'ROUND_LIMIT' | 'NO_NEW_EVIDENCE';
 
@@ -32,12 +32,19 @@ requires that document listed as complete in DOCUMENTS. A person marked "(No es 
 manager, assistant or customer service is staff even if described elsewhere as a lawyer licensed in another country.
 Each claim is {"id":"unique","field":"one allowed field","value":...,"explanation":"brief subject/relation/scope",
 "citations":[{"segmentId":"exact supplied ID","quote":"literal nonempty substring"}]}.
+Every claim must include id, field, value, explanation and citations; every citation must include segmentId and quote.
+Copy each quote from one segment only: a contiguous substring of that segment's text of at most 200 characters.
+Never join text from different segments, skip words inside a quote or paraphrase it; cite several short quotes instead.
+Return at most 40 claims per round and keep each explanation under 30 words.
 Allowed fields: ${FIELDS}.
 Never infer absence from missing text. Use no claim for unknown values. False or zero require explicit evidence.
 The firm name is the site operator, not a client, opponent, slogan or page title tail. Attorneys require a legal
 role and current affiliation; attorneys value is an array of {full_name,title,role,affiliation}. Staff and former
-people may be included for audit but are not attorneys. attorney_count requires an explicit total or demonstrably
+people may be included for audit but are not attorneys. Testimonial or review authors and clients are never team
+members; do not list them. attorney_count requires an explicit total or demonstrably
 complete roster; never use a partial list size. Copyright is never an establishment year.
+city is the office location the site presents in a page header, footer, contact page or JSON-LD; an address that
+appears only inside a policy document is not enough.
 practice_areas must use only: Criminal Defense, Immigration, Medical Malpractice, Personal Injury, IP/Patents,
 Family Law, Securities, Commercial Litigation, Employment Law, Bankruptcy, Corporate/M&A, Real Estate,
 Tax/Regulatory. Translate Spanish evidence to those labels.
@@ -61,9 +68,10 @@ advice to clients as internal AI policy, negated tool use as positive use, and c
 Use uncertain when coverage is insufficient. Every supported verdict needs at least one literal citation.`;
 
 const ROSTER_PROMPT = `${SIGNAL_EXTRACTION_PROMPT}\nThis pass is only for attorneys, attorney_count and
-team_page_quality. Return one attorneys claim whose value lists every uniquely named person visible in the supplied
-team evidence. Copy role and affiliation as the exact enums attorney|staff|unclear and current|former|unclear.
-For every person include a citation containing that person's name and nearby role. attorney_count is allowed only
+team_page_quality. Return one attorneys claim per uniquely named person visible in the supplied
+team evidence: its value is a one-item array and it has exactly one citation, a quote of at most 120 characters copied
+from a single segment that contains that person's name and, when shown, the role next to it.
+Copy role and affiliation as the exact enums attorney|staff|unclear and current|former|unclear. attorney_count is allowed only
 when the supplied team page is complete and must equal the number of unique current attorneys listed. Always finish.`;
 
 type CompletionClient = { chat: { completions: { create(body: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<unknown> } } };
@@ -153,7 +161,7 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
     if (parsed.success) return parsed.data!;
     const rejected = attempts.at(-1);
     if (rejected) rejected.validationIssues = String(parsed.error).slice(0, 4000);
-    const repair = `${user}\n\nYour prior response failed JSON/schema validation. Return a complete corrected JSON object only.\nErrors: ${String(parsed.error).slice(0, 3000)}`;
+    const repair = `${user}\n\nYour prior response failed JSON/schema validation. Return a complete corrected JSON object only. Every claim needs id, field, value, explanation and citations, and every citation needs segmentId and a quote copied from one segment.\nErrors: ${String(parsed.error).slice(0, 3000)}`;
     value = await this.complete(`${phase}-repair`, system, repair, signal, attempts);
     parsed = schema.safeParse(value);
     if (!parsed.success) {

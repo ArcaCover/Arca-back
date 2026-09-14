@@ -43,4 +43,11 @@ describe('independent source and storage configuration', () => {
     expect(loadEnv({ ...live, NVIDIA_NIM_API_KEY: 'nim-test', NVIDIA_NIM_MODEL: 'z-ai/glm-5.3-flash' }))
       .toMatchObject({ SIGNAL_LLM_ENDPOINT: 'nvidia', signalModel: 'z-ai/glm-5.3-flash' });
   });
+  it('accepts only known reasoning efforts for the agentic extraction', () => {
+    const openai = { ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test', SIGNAL_LLM_ENDPOINT: 'openai',
+      OPENAI_API_KEY: 'sk-test', SIGNAL_LLM_MODEL: 'gpt-5-mini' };
+    expect(loadEnv({ ...openai, SIGNAL_LLM_REASONING_EFFORT: 'low' })).toMatchObject({ SIGNAL_LLM_REASONING_EFFORT: 'low' });
+    expect(loadEnv(openai).SIGNAL_LLM_REASONING_EFFORT).toBeUndefined();
+    expect(() => loadEnv({ ...openai, SIGNAL_LLM_REASONING_EFFORT: 'extreme' })).toThrow();
+  });
 });

@@ -10,7 +10,7 @@ import { InProcessPipeline } from './pipeline/in-process-pipeline.js';
 import { WebsiteExtractionSource } from './pipeline/website-source.js';
 import { OpenAIEvidenceProvider, RuleBasedEvidenceProvider } from './pipeline/website-evidence-provider.js';
 import { NvidiaNimEvidenceProvider } from './pipeline/nvidia-evidence-provider.js';
-import { LLM_ENDPOINTS } from './pipeline/llm-endpoint.js';
+import { LLM_ENDPOINTS, openAiEndpoint } from './pipeline/llm-endpoint.js';
 import { ApifyClient } from './pipeline/apify-client.js';
 import { ApifyDirectorySource } from './pipeline/directories.js';
 import { PublicDomainResolver } from './pipeline/domain-resolution.js';
@@ -25,7 +25,7 @@ const websiteEvidenceProvider = env.sourceMode === 'mock' ? null : env.WEBSITE_E
   ? new OpenAIEvidenceProvider(env.OPENAI_API_KEY!) : env.WEBSITE_EVIDENCE_PROVIDER === 'rules'
     ? new RuleBasedEvidenceProvider() : new NvidiaNimEvidenceProvider(
       env.SIGNAL_LLM_ENDPOINT === 'openai' ? env.OPENAI_API_KEY! : env.NVIDIA_NIM_API_KEY!, env.signalModel, undefined, undefined,
-      LLM_ENDPOINTS[env.SIGNAL_LLM_ENDPOINT]);
+      env.SIGNAL_LLM_ENDPOINT === 'openai' ? openAiEndpoint(env.SIGNAL_LLM_REASONING_EFFORT) : LLM_ENDPOINTS.nvidia);
 const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY) : null;
 const sources = env.sourceMode === 'mock' ? mockSources() : {
   website: new WebsiteExtractionSource(repository, websiteEvidenceProvider!),

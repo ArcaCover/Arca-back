@@ -12,6 +12,9 @@ const EnvSchema = z.object({
   NVIDIA_NIM_API_KEY: z.string().optional(), NVIDIA_NIM_MODEL: z.string().optional(),
   // Endpoint and model of the agentic extraction (WEBSITE_EVIDENCE_PROVIDER=nvidia).
   SIGNAL_LLM_ENDPOINT: z.enum(['nvidia', 'openai']).default('nvidia'), SIGNAL_LLM_MODEL: z.string().optional(),
+  // Optional for OpenAI reasoning models; an empty value means not configured.
+  SIGNAL_LLM_REASONING_EFFORT: z.preprocess(value => value === '' ? undefined : value,
+    z.enum(['none', 'minimal', 'low', 'medium', 'high']).optional()),
   CORS_ALLOWED_ORIGINS: z.string().min(1),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
   MAX_APIFY_CONCURRENCY: z.coerce.number().int().min(1).max(2).default(2),
