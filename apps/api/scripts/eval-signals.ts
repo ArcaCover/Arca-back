@@ -4,11 +4,16 @@ import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
 import OpenAI from 'openai';
 import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../src/pipeline/nvidia-evidence-provider.js';
+import { LLM_ENDPOINTS } from '../src/pipeline/llm-endpoint.js';
 import { GoldLabels, evaluateWebsiteData } from '../src/pipeline/signal-evaluation.js';
 
 if (existsSync('.env.local')) loadEnvFile('.env.local');
-const key = process.env.NVIDIA_NIM_API_KEY?.trim();
-if (!key) throw new Error('NVIDIA_NIM_API_KEY is required');
+const endpoint = LLM_ENDPOINTS[process.env.SIGNAL_LLM_ENDPOINT === 'openai' ? 'openai' : 'nvidia'];
+const keyName = endpoint.id === 'openai' ? 'OPENAI_API_KEY' : 'NVIDIA_NIM_API_KEY';
+const key = process.env[keyName]?.trim();
+if (!key) throw new Error(`${keyName} is required`);
+const model = process.env.SIGNAL_LLM_MODEL?.trim() || (endpoint.id === 'nvidia' ? process.env.NVIDIA_NIM_MODEL?.trim() : undefined) || undefined;
+if (endpoint.id === 'openai' && !model) throw new Error('SIGNAL_LLM_MODEL is required for the openai endpoint');
 const args = process.argv.slice(2);
 const runsFlag = args.indexOf('--runs');
 const runs = runsFlag >= 0 ? Number(args[runsFlag + 1]) : 3;
@@ -17,7 +22,7 @@ if (!domains.length || !Number.isInteger(runs) || runs < 1) throw new Error('Usa
 
 // Latency is out of scope for evaluation: use a longer per-call timeout than the provider's default 120 s,
 // since one deepseek-v4-pro extraction call can take ~125 s.
-const client = new OpenAI({ apiKey: key, baseURL: 'https://integrate.api.nvidia.com/v1', maxRetries: 0, timeout: 600_000 });
+const client = new OpenAI({ apiKey: key, baseURL: endpoint.baseURL, maxRetries: 0, timeout: 600_000 });
 
 const output = resolve('output', 'eval', new Date().toISOString().replace(/[:.]/g, '-'));
 await mkdir(output, { recursive: true });
@@ -28,7 +33,7 @@ for (const domain of domains) {
   const crawl = JSON.parse(readFileSync(`output/eval/snapshots/${domain}.crawl.json`, 'utf8'));
   for (let run = 1; run <= runs; run++) {
     const started = Date.now();
-    const provider = new NvidiaNimEvidenceProvider(key, process.env.NVIDIA_NIM_MODEL?.trim() || undefined, client as never);
+    const provider = new NvidiaNimEvidenceProvider(key, model, client as never, undefined, endpoint);
     try {
       const result = await provider.extractDetailed(crawl, AbortSignal.timeout(2_700_000));
       const evaluation = evaluateWebsiteData(result.websiteData, gold);

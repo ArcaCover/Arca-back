@@ -34,4 +34,13 @@ describe('independent source and storage configuration', () => {
     expect(() => loadEnv({ ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test',
       WEBSITE_EVIDENCE_PROVIDER: 'openai' })).toThrow('OPENAI_API_KEY');
   });
+  it('lets the agentic extraction run on OpenAI with its own key and model', () => {
+    const live = { ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test' };
+    expect(() => loadEnv({ ...live, SIGNAL_LLM_ENDPOINT: 'openai', NVIDIA_NIM_API_KEY: 'nim-test' })).toThrow('OPENAI_API_KEY');
+    expect(() => loadEnv({ ...live, SIGNAL_LLM_ENDPOINT: 'openai', OPENAI_API_KEY: 'sk-test' })).toThrow('SIGNAL_LLM_MODEL');
+    expect(loadEnv({ ...live, SIGNAL_LLM_ENDPOINT: 'openai', OPENAI_API_KEY: 'sk-test', SIGNAL_LLM_MODEL: ' gpt-5.6-luna ' }))
+      .toMatchObject({ SIGNAL_LLM_ENDPOINT: 'openai', signalModel: 'gpt-5.6-luna' });
+    expect(loadEnv({ ...live, NVIDIA_NIM_API_KEY: 'nim-test', NVIDIA_NIM_MODEL: 'z-ai/glm-5.3-flash' }))
+      .toMatchObject({ SIGNAL_LLM_ENDPOINT: 'nvidia', signalModel: 'z-ai/glm-5.3-flash' });
+  });
 });

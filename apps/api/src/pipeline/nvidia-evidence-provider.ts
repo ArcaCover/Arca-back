@@ -7,6 +7,7 @@ import { acceptClaims, toWebsiteData } from './signal-grounding.js';
 import { createSiteAccess, type SiteAccess, type ToolCall } from './site-access.js';
 import { findPassages } from './site-search.js';
 import type { WebsiteEvidenceProvider } from './website-evidence-provider.js';
+import { LLM_ENDPOINTS, type LlmEndpoint } from './llm-endpoint.js';
 
 export const DEFAULT_NVIDIA_NIM_MODEL = 'nvidia/nemotron-3-super-120b-a12b';
 export const EXTRACTION_VERSION = 'agentic-signals-v3';
@@ -83,7 +84,7 @@ function responseText(response: unknown): string {
   const value = response as { choices?: Array<{ message?: { content?: unknown }; finish_reason?: string }> };
   const choice = value.choices?.[0];
   if (!choice || choice.finish_reason === 'length' || typeof choice.message?.content !== 'string') {
-    throw new Error('NIM returned an incomplete response');
+    throw new Error('The model returned an incomplete response');
   }
   return choice.message.content;
 }
@@ -119,20 +120,21 @@ function normalizeClaims(claims: Claim[]): Claim[] {
 }
 
 export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
-  readonly id = 'nvidia-nim';
+  readonly id: string;
   readonly version: string;
   private readonly client: CompletionClient;
   constructor(apiKey: string, readonly model = DEFAULT_NVIDIA_NIM_MODEL, client?: CompletionClient,
-    private readonly access: SiteAccess = createSiteAccess()) {
-    this.version = `${EXTRACTION_VERSION}:${model}`;
-    this.client = client ?? new OpenAI({ apiKey, baseURL: 'https://integrate.api.nvidia.com/v1', maxRetries: 0,
+    private readonly access: SiteAccess = createSiteAccess(), private readonly endpoint: LlmEndpoint = LLM_ENDPOINTS.nvidia) {
+    this.id = endpoint.id === 'nvidia' ? 'nvidia-nim' : `${endpoint.id}-agentic`;
+    this.version = `${EXTRACTION_VERSION}:${endpoint.id}:${model}`;
+    this.client = client ?? new OpenAI({ apiKey, baseURL: endpoint.baseURL, maxRetries: 0,
       timeout: 120_000 }) as unknown as CompletionClient;
   }
 
   private async complete(phase: string, system: string, user: string, signal: AbortSignal, attempts: Attempt[]) {
-    const request = { model: this.model, stream: false, temperature: 0, max_tokens: 8000,
+    const request = { model: this.model, stream: false, ...this.endpoint.requestParams(this.model),
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-      response_format: { type: 'json_object' }, chat_template_kwargs: { enable_thinking: false } };
+      response_format: { type: 'json_object' } };
     const started = Date.now();
     const response = await this.client.chat.completions.create(request, { signal });
     // Record the attempt before validating it: truncated or malformed answers are the ones worth auditing.

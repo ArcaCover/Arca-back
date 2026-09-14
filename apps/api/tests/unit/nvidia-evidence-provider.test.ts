@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../../src/pipeline/nvidia-evidence-provider.js';
+import { LLM_ENDPOINTS } from '../../src/pipeline/llm-endpoint.js';
 
 describe('NVIDIA evidence provider', () => {
   it('uses the probed endpoint parameters and maps reviewed grounded claims', async () => {
@@ -216,5 +217,39 @@ describe('NVIDIA evidence provider', () => {
     const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
     await provider.extractDetailed({ pages: [home, ...Array.from({ length: 14 }, (_, n) => practice(n))], partial: false }, new AbortController().signal);
     expect(secondRound).toContain('Founding Partner');
+  });
+
+  const finishing = () => vi.fn(async (request: Record<string, unknown>) => {
+    const user = (request.messages as Array<{ content: string }>)[1]!.content;
+    const content = user.startsWith('CANDIDATE CLAIMS') ? JSON.stringify({ verdicts: [] })
+      : JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } });
+    return { choices: [{ finish_reason: 'stop', message: { content } }] };
+  });
+  const firstRequest = async (endpoint: (typeof LLM_ENDPOINTS)[keyof typeof LLM_ENDPOINTS], model: string) => {
+    const create = finishing();
+    const provider = new NvidiaNimEvidenceProvider('key', model, { chat: { completions: { create } } }, undefined, endpoint);
+    await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }], partial: false }, new AbortController().signal);
+    return { provider, request: create.mock.calls[0]![0] };
+  };
+
+  it('sends only parameters an OpenAI reasoning model accepts', async () => {
+    const { provider, request } = await firstRequest(LLM_ENDPOINTS.openai, 'gpt-5.6-luna');
+    expect(request).toMatchObject({ model: 'gpt-5.6-luna', max_completion_tokens: expect.any(Number), response_format: { type: 'json_object' } });
+    expect(request).not.toHaveProperty('temperature');
+    expect(request).not.toHaveProperty('max_tokens');
+    expect(request).not.toHaveProperty('chat_template_kwargs');
+    expect(provider.version).toContain('openai:gpt-5.6-luna');
+  });
+
+  it('keeps a deterministic temperature for OpenAI models that support it', async () => {
+    const { request } = await firstRequest(LLM_ENDPOINTS.openai, 'gpt-4.1-mini');
+    expect(request).toMatchObject({ model: 'gpt-4.1-mini', temperature: 0, max_completion_tokens: expect.any(Number) });
+    expect(request).not.toHaveProperty('chat_template_kwargs');
+  });
+
+  it('keeps the NIM request profile by default', async () => {
+    const { provider, request } = await firstRequest(LLM_ENDPOINTS.nvidia, 'z-ai/glm-5.3-flash');
+    expect(request).toMatchObject({ temperature: 0, max_tokens: 8000, chat_template_kwargs: { enable_thinking: false } });
+    expect(provider.id).toBe('nvidia-nim');
   });
 });

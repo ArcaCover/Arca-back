@@ -10,6 +10,8 @@ const EnvSchema = z.object({
   SUPABASE_URL: z.string().optional(), SUPABASE_SECRET_KEY: z.string().optional(), SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   SESSION_TOKEN_SECRET: z.string().min(32), OPENAI_API_KEY: z.string().optional(), APIFY_API_TOKEN: z.string().optional(),
   NVIDIA_NIM_API_KEY: z.string().optional(), NVIDIA_NIM_MODEL: z.string().optional(),
+  // Endpoint and model of the agentic extraction (WEBSITE_EVIDENCE_PROVIDER=nvidia).
+  SIGNAL_LLM_ENDPOINT: z.enum(['nvidia', 'openai']).default('nvidia'), SIGNAL_LLM_MODEL: z.string().optional(),
   CORS_ALLOWED_ORIGINS: z.string().min(1),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
   MAX_APIFY_CONCURRENCY: z.coerce.number().int().min(1).max(2).default(2),
@@ -28,12 +30,15 @@ export function loadEnv(source = process.env) {
   if (sourceMode === 'live' && env.WEBSITE_EVIDENCE_PROVIDER === 'openai' && !env.OPENAI_API_KEY?.trim()) {
     throw new Error('OPENAI_API_KEY is required only when WEBSITE_EVIDENCE_PROVIDER=openai');
   }
-  if (sourceMode === 'live' && env.WEBSITE_EVIDENCE_PROVIDER === 'nvidia' && !env.NVIDIA_NIM_API_KEY?.trim()) {
-    throw new Error('NVIDIA_NIM_API_KEY is required when WEBSITE_EVIDENCE_PROVIDER=nvidia');
+  if (sourceMode === 'live' && env.WEBSITE_EVIDENCE_PROVIDER === 'nvidia') {
+    const key = env.SIGNAL_LLM_ENDPOINT === 'openai' ? 'OPENAI_API_KEY' : 'NVIDIA_NIM_API_KEY';
+    if (!env[key]?.trim()) throw new Error(`${key} is required when the agentic extraction uses SIGNAL_LLM_ENDPOINT=${env.SIGNAL_LLM_ENDPOINT}`);
+    if (env.SIGNAL_LLM_ENDPOINT === 'openai' && !env.SIGNAL_LLM_MODEL?.trim()) throw new Error('SIGNAL_LLM_MODEL is required when SIGNAL_LLM_ENDPOINT=openai');
   }
   const corsOrigins = env.CORS_ALLOWED_ORIGINS.split(',').map(value => value.trim()).filter(Boolean);
   for (const origin of corsOrigins) if (new URL(origin).origin !== origin) throw new Error('CORS entries must be exact origins');
   if (env.SUPABASE_URL) z.string().url().parse(env.SUPABASE_URL);
-  return { ...env, NVIDIA_NIM_MODEL: env.NVIDIA_NIM_MODEL?.trim() || undefined,
+  const signalModel = env.SIGNAL_LLM_MODEL?.trim() || (env.SIGNAL_LLM_ENDPOINT === 'nvidia' ? env.NVIDIA_NIM_MODEL?.trim() : undefined) || undefined;
+  return { ...env, NVIDIA_NIM_MODEL: env.NVIDIA_NIM_MODEL?.trim() || undefined, signalModel,
     sourceMode, storageBackend, supabaseKey, corsOrigins };
 }
