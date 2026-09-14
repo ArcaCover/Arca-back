@@ -72,8 +72,9 @@ export function normalizeForGrounding(value: string): string {
   return value.normalize('NFC').replace(/[“”]/g, '"').replace(/[‘’]/g, "'").replace(/\s+/g, ' ').trim();
 }
 
-// 60,000 characters stays well under DN-05's 24,000-token input limit per call; 24,000 characters dropped most of a site.
-export function buildCorpus(crawl: CrawlResult, budgetChars = 60_000): EvidenceCorpus {
+// Measured on live sites: 24,000 characters of pages already make a ~13,000-token extraction prompt, and 60,000 made
+// ~25,000 tokens, over DN-05's 24,000-token limit per call, and the endpoint answered with 5xx. Requested pages rank first instead.
+export function buildCorpus(crawl: CrawlResult, budgetChars = 24_000): EvidenceCorpus {
   const segments: EvidenceSegment[] = [], links: EvidenceLink[] = [], omittedUrls: string[] = [];
   let used = 0, truncated = false;
   const seenText = new Set<string>();

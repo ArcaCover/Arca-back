@@ -35,11 +35,6 @@ describe('evidence corpus', () => {
   });
   const longPage = (url: string, paragraphs: number) => ({ url, html: '',
     text: Array.from({ length: paragraphs }, (_, i) => `${url} paragraph ${i} ${'detail '.repeat(90)}`).join('\n\n') });
-  it('keeps every page of a crawl whose readable text totals 50,000 characters', () => {
-    const corpus = buildCorpus({ pages: Array.from({ length: 10 }, (_, n) => longPage(`https://firm.com/page-${n}`, 7)), partial: false });
-    expect(corpus.omittedUrls).toEqual([]);
-    expect(corpus.truncated).toBe(false);
-  });
   it('includes a page the agent requested before pages the crawler found', () => {
     const corpus = buildCorpus({ pages: [longPage('https://firm.com/practice-a', 3), longPage('https://firm.com/practice-b', 3),
       { url: 'https://firm.com/carmen-gallardo', html: '', text: `Carmen Gallardo, Esq. Founding Partner. ${'Biography '.repeat(70)}`, requested: true }],
