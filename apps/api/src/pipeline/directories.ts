@@ -89,8 +89,10 @@ export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQue
   const targets = fallback ? (query.firmName ? [query.firmName] : []) : names;
   return targets.map(target => {
     const parts = normalizeName(target).split(' ');
+    // The Bar actor matches on the whole first name: an initial alone returns "No lawyers matched".
+    const title = (word: string) => word.replace(/(^|[-'])([a-z])/g, (_match, lead: string, letter: string) => `${lead}${letter.toUpperCase()}`);
     const input = source === 'bar' ? {
-      lastNames: fallback ? [] : [parts.at(-1)!], firstName: fallback ? '' : parts[0]![0],
+      lastNames: fallback ? [] : [title(parts.at(-1)!)], firstName: fallback ? '' : title(parts[0]!),
       ...(fallback ? { firm: target } : {}), maxLawyers: BAR_TECHNICAL_MAX_LAWYERS, withDetails: true,
       withLeadScore: false, withProfileSummary: false, eligibleOnly: false, includeDeceased: true,
     } : { searchQueries: [target], ...(query.city ? { cities: [`${query.city}, FL`] } : {}),
