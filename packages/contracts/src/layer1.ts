@@ -57,7 +57,7 @@ export const FirmIdentity = z.object({
   addressStreet: z.string().nullable(), phone: z.string().nullable(),
   attorneyNames: z.array(z.string()), status: z.enum(['VERIFIED', 'PARTIAL', 'INSUFFICIENT']),
   evidence: z.array(z.object({ sourceUrl: z.string().url(), excerpt: z.string().nullable(),
-    method: z.enum(['json_ld', 'meta', 'page_text', 'provider']) }).strict()),
+    method: z.enum(['json_ld', 'meta', 'page_text', 'provider', 'derived']) }).strict()),
 }).strict();
 export type FirmIdentity = z.infer<typeof FirmIdentity>;
 export const Layer1Result = z.object({

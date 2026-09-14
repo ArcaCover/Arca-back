@@ -6,16 +6,19 @@ import { buildCorpus, serializeCorpus, withLinks, withPassages, type EvidenceCor
 import { acceptClaims, toWebsiteData } from './signal-grounding.js';
 import { createSiteAccess, type SiteAccess, type ToolCall } from './site-access.js';
 import { findPassages } from './site-search.js';
+import { DERIVED_FIELDS, deriveTeamPageQuality, deriveWebsiteQuality, type TeamPageDerivation, type WebsiteDerivation } from './derived-signals.js';
+import { PAGE_CLASSIFICATION_PROMPT, PAGE_TYPE_VOTES, PageClassification, acquisitionFloor, majorityPageTypes, pageCandidates,
+  serializeCandidates, type PageCandidate, type PageType } from './page-types.js';
 import type { WebsiteEvidenceProvider } from './website-evidence-provider.js';
 import { LLM_ENDPOINTS, type LlmEndpoint } from './llm-endpoint.js';
 
 export const DEFAULT_NVIDIA_NIM_MODEL = 'nvidia/nemotron-3-super-120b-a12b';
-export const EXTRACTION_VERSION = 'agentic-signals-v4';
+export const EXTRACTION_VERSION = 'agentic-signals-v5';
 export const MAX_AGENT_ROUNDS = 3;
 export type StopReason = 'SUFFICIENT_FOR_EXTRACTION' | 'ROUND_LIMIT' | 'NO_NEW_EVIDENCE';
 
 const FIELDS = `firm_name, firm_aliases, city, county, address_street, phone, office_count, attorneys,
-attorney_count, team_page_quality, firm_established_year, practice_areas, website_quality, ai_policy,
+attorney_count, firm_established_year, practice_areas, ai_policy,
 ai_in_services, ai_disclosure, ai_blog_posts, privacy_policy`;
 
 export const SIGNAL_EXTRACTION_PROMPT = `You extract evidence about the law firm operating a website.
@@ -54,7 +57,6 @@ A client advisory or blog is not the firm's internal policy. ai_in_services is
 require the firm's current use. ai_disclosure is {found:boolean|null}. ai_blog_posts is
 {found:boolean|null,count:number|null,titles:string[]|null}. privacy_policy is
 {found:boolean|null,mentions_client_data:boolean|null}; a negative mention requires the complete privacy policy.
-team_page_quality is detailed, names_only or no_team_page; website_quality is robust, basic or minimal.
 Prefer the tool most likely to resolve an important missing, conflicting or scope-dependent field.`;
 
 export const SIGNAL_REVIEW_PROMPT = `Review evidence claims about the law firm operating this website.
@@ -67,8 +69,8 @@ Reject client/opponent names as firm identity, staff/former people as current at
 advice to clients as internal AI policy, negated tool use as positive use, and counts inferred from incomplete lists.
 Use uncertain when coverage is insufficient. Every supported verdict needs at least one literal citation.`;
 
-const ROSTER_PROMPT = `${SIGNAL_EXTRACTION_PROMPT}\nThis pass is only for attorneys, attorney_count and
-team_page_quality. Return one attorneys claim per uniquely named person visible in the supplied
+const ROSTER_PROMPT = `${SIGNAL_EXTRACTION_PROMPT}\nThis pass is only for attorneys and
+attorney_count. Return one attorneys claim per uniquely named person visible in the supplied
 team evidence: its value is a one-item array and it has exactly one citation, a quote of at most 120 characters copied
 from a single segment that contains that person's name and, when shown, the role next to it.
 Copy role and affiliation as the exact enums attorney|staff|unclear and current|former|unclear. attorney_count is allowed only
@@ -85,7 +87,8 @@ export class ExtractionFailure extends Error {
   }
 }
 export type ExtractionDiagnostics = { model: string; version: string; corpus: EvidenceCorpus; attempts: Attempt[];
-  extraction: unknown; review: unknown; grounding: GroundingReport; toolCalls: ToolCall[]; rounds: number; stopReason: StopReason };
+  extraction: unknown; review: unknown; grounding: GroundingReport; toolCalls: ToolCall[]; rounds: number; stopReason: StopReason;
+  pageTypes: Array<{ url: string; type: PageType }>; derived: { team: TeamPageDerivation; website: WebsiteDerivation } };
 export type DetailedExtraction = { websiteData: WebsiteData; diagnostics: ExtractionDiagnostics };
 
 function responseText(response: unknown): string {
@@ -132,7 +135,8 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
   readonly version: string;
   private readonly client: CompletionClient;
   constructor(apiKey: string, readonly model = DEFAULT_NVIDIA_NIM_MODEL, client?: CompletionClient,
-    private readonly access: SiteAccess = createSiteAccess(), private readonly endpoint: LlmEndpoint = LLM_ENDPOINTS.nvidia) {
+    private readonly access: SiteAccess = createSiteAccess(), private readonly endpoint: LlmEndpoint = LLM_ENDPOINTS.nvidia,
+    private readonly options: { planPages?: boolean } = {}) {
     this.id = endpoint.id === 'nvidia' ? 'nvidia-nim' : `${endpoint.id}-agentic`;
     this.version = `${EXTRACTION_VERSION}:${endpoint.id}:${model}`;
     this.client = client ?? new OpenAI({ apiKey, baseURL: endpoint.baseURL, maxRetries: 0,
@@ -190,6 +194,32 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
     const domain = crawl.pages[0] ? new URL(crawl.pages[0].url).hostname.replace(/^www\./, '') : '';
     const assemble = () => withPassages(withLinks(buildCorpus(crawl), discovered, 'sitemap'), passages);
     let corpus = assemble();
+    const merge = (pages: CrawledPage[]) => {
+      crawl = { pages: [...new Map([...crawl.pages, ...pages].map(page => [page.url, page])).values()], partial: crawl.partial, issues: crawl.issues ?? [] };
+    };
+    // Page plan: the model only labels pages from a closed list, by majority vote; the backend then always reads the unread
+    // team, about and contact pages and privacy documents, so the evidence floor never depends on what the agent picks.
+    let candidates: PageCandidate[] = [];
+    let pageTypes = new Map<string, PageType>();
+    if (this.options.planPages !== false) {
+      candidates = pageCandidates(crawl, corpus);
+      const votes = await Promise.all(Array.from({ length: PAGE_TYPE_VOTES }, (_, index) => this.parseWithRepair(`classify-pages-${index + 1}`,
+        PageClassification, PAGE_CLASSIFICATION_PROMPT, serializeCandidates(candidates), signal, attempts)
+        .catch((error: unknown) => { if (error instanceof ExtractionFailure) return null; throw error; })));
+      pageTypes = majorityPageTypes(candidates, votes.filter((vote): vote is PageClassification => vote !== null));
+      const floor = acquisitionFloor(candidates, pageTypes);
+      if (floor.pages.length) {
+        const result = await this.access.fetchPages(floor.pages, signal);
+        toolCalls.push(...result.calls.map(call => ({ round: 0, ...call })));
+        merge(result.pages.map(page => ({ ...page, requested: true })));
+      }
+      if (floor.documents.length) {
+        const result = await this.access.readDocuments(floor.documents, signal);
+        toolCalls.push(...result.calls.map(call => ({ round: 0, ...call })));
+        merge(result.pages);
+      }
+      corpus = assemble();
+    }
     let extraction!: SignalExtraction;
     let stopReason: StopReason = 'ROUND_LIMIT', rounds = 0;
     for (let round = 1; round <= MAX_AGENT_ROUNDS; round++) {
@@ -213,9 +243,6 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
         if (toolCalls.some(call => call.target === link.url && call.status === 'failed')) { record([{ tool: kind === 'page' ? 'fetch_pages' : 'read_document', target: link.url, status: 'skipped', detail: 'ALREADY_FAILED' }]); return []; }
         return [link.url];
       });
-      const merge = (pages: CrawledPage[]) => {
-        crawl = { pages: [...new Map([...crawl.pages, ...pages].map(page => [page.url, page])).values()], partial: crawl.partial, issues: crawl.issues ?? [] };
-      };
       if (action.type === 'fetch_pages') {
         const urls = [...new Set(resolve(action.linkIds, 'page'))].slice(0, 4);
         if (urls.length) { const result = await this.access.fetchPages(urls, signal); record(result.calls); merge(result.pages.map(page => ({ ...page, requested: true }))); }
@@ -245,7 +272,7 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
         !['attorneys', 'attorney_count', 'team_page_quality'].includes(claim.field)), ...roster.claims.filter(claim =>
         ['attorneys', 'attorney_count', 'team_page_quality'].includes(claim.field))] };
     }
-    extraction = { ...extraction, claims: normalizeClaims(extraction.claims) };
+    extraction = { ...extraction, claims: normalizeClaims(extraction.claims).filter(claim => !DERIVED_FIELDS.includes(claim.field)) };
     const attorneyClaims = extraction.claims.filter(claim => claim.field === 'attorneys');
     const generalClaims = extraction.claims.filter(claim => claim.field !== 'attorneys');
     const attorneyUrls = new Set(attorneyClaims.flatMap(claim => claim.citations)
@@ -262,9 +289,16 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
       signal, attempts)));
     const review = SignalReview.parse({ verdicts: reviews.flatMap(item => item.verdicts) });
     const grounded = acceptClaims(extraction.claims, review, corpus);
-    const websiteData = toWebsiteData(grounded.accepted, corpus);
+    const accepted = toWebsiteData(grounded.accepted, corpus);
+    const urls = [...new Set([...crawl.pages.map(page => page.url), ...corpus.links.map(link => link.url), ...candidates.map(item => item.url)])];
+    const team = deriveTeamPageQuality(crawl, pageTypes, accepted.team_members);
+    const website = deriveWebsiteQuality(urls, pageTypes, accepted, team.value);
+    const websiteData = WebsiteData.parse({ ...accepted, team_page_quality: team.value, website_quality: website.value,
+      provenance: { ...accepted.provenance, ...(team.value ? { team_page_quality: team.evidence } : {}),
+        ...(website.value ? { website_quality: website.evidence } : {}) } });
     return { websiteData, diagnostics: { model: this.model, version: this.version, corpus, attempts,
-      extraction, review, grounding: grounded.report, toolCalls, rounds, stopReason } };
+      extraction, review, grounding: grounded.report, toolCalls, rounds, stopReason,
+      pageTypes: [...pageTypes].map(([url, type]) => ({ url, type })), derived: { team, website } } };
   }
 
   async extract(input: CrawlResult, signal: AbortSignal): Promise<WebsiteData> {

@@ -201,6 +201,12 @@ export function acceptClaims(claimsInput: Claim[], review: SignalReview, corpus:
 }
 
 const first = (claims: Claim[], field: Claim['field']) => claims.find(claim => claim.field === field);
+// One display format for United States numbers, so the same number never reads as two different values.
+function formatPhone(value: string): string {
+  const digits = value.replace(/\D/g, '').replace(/^1(?=\d{10}$)/, '');
+  return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : value;
+}
+
 export function toWebsiteData(claims: Claim[], corpus: EvidenceCorpus): WebsiteData {
   const data = unknownWebsite();
   const set = <K extends keyof WebsiteData>(field: Claim['field'], target: K) => {
@@ -208,6 +214,7 @@ export function toWebsiteData(claims: Claim[], corpus: EvidenceCorpus): WebsiteD
   };
   set('firm_name', 'firm_name'); set('firm_aliases', 'firm_aliases'); set('city', 'city'); set('county', 'county');
   set('address_street', 'address_street'); set('phone', 'phone'); set('office_count', 'office_count');
+  if (data.phone) data.phone = formatPhone(data.phone);
   set('team_page_quality', 'team_page_quality'); set('firm_established_year', 'firm_established_year');
   set('practice_areas', 'practice_areas'); set('website_quality', 'website_quality');
   const attorneys = claims.filter(claim => claim.field === 'attorneys')

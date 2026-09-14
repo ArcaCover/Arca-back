@@ -7,7 +7,7 @@ const strings = z.array(z.string()).nullable();
 export const EvidenceReference = z.object({
   sourceUrl: z.string().url(),
   excerpt: z.string().min(1).nullable(),
-  method: z.enum(['json_ld', 'meta', 'page_text', 'provider']),
+  method: z.enum(['json_ld', 'meta', 'page_text', 'provider', 'derived']),
 }).strict();
 export type EvidenceReference = z.infer<typeof EvidenceReference>;
 export const WebsiteData = z.object({

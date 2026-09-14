@@ -2,6 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../../src/pipeline/nvidia-evidence-provider.js';
 import { LLM_ENDPOINTS, openAiEndpoint } from '../../src/pipeline/llm-endpoint.js';
 
+// These tests script every model call; the page plan adds classification calls and floor reads they do not expect.
+const withoutPagePlan = (...args: ConstructorParameters<typeof NvidiaNimEvidenceProvider>) =>
+  new NvidiaNimEvidenceProvider(args[0], args[1], args[2], args[3], args[4], { planPages: false });
+
 describe('NVIDIA evidence provider', () => {
   it('uses the probed endpoint parameters and maps reviewed grounded claims', async () => {
     const page = { url: 'https://firm.com/', html: '', text: 'Smith Law is a law firm.' };
@@ -14,7 +18,7 @@ describe('NVIDIA evidence provider', () => {
         : JSON.stringify({ claims: [{ id: 'firm', field: 'firm_name', value: 'Smith Law', explanation: 'operator', citations: [{ segmentId, quote: 'Smith Law' }] }], action: { type: 'finish', reason: 'enough' } });
       return { choices: [{ finish_reason: 'stop', message: { content } }] };
     });
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
     const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
     expect(result.websiteData.firm_name).toBe('Smith Law');
     expect(result.websiteData.provenance.firm_name?.[0]?.method).toBe('provider');
@@ -26,7 +30,7 @@ describe('NVIDIA evidence provider', () => {
   it('keeps every rejected attempt when the answer never matches the schema', async () => {
     const create = vi.fn(async () => ({ choices: [{ finish_reason: 'stop',
       message: { content: JSON.stringify({ claims: 'not-an-array' }) } }] }));
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
     const failure = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }],
       partial: false }, new AbortController().signal).catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(ExtractionFailure);
@@ -51,7 +55,7 @@ describe('NVIDIA evidence provider', () => {
     const access = { fetchPages: vi.fn(async (urls: string[]) => ({ pages: [],
       calls: urls.map(target => ({ tool: 'fetch_pages' as const, target, status: 'failed' as const, detail: 'boom' })) })),
       readDocuments: vi.fn(), readSitemap: vi.fn() };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
     expect(result.websiteData.firm_name).toBe('Smith Law');
     expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: 'https://firm.com/about', status: 'failed', detail: 'boom' }]);
@@ -83,7 +87,7 @@ describe('NVIDIA evidence provider', () => {
     const access = { fetchPages: vi.fn(), readSitemap: vi.fn(), readDocuments: vi.fn(async (urls: string[]) => ({
       pages: [{ url: urls[0]!, html: '', text: 'Privacy Policy. We keep client information confidential.', kind: 'document' as const, complete: true }],
       calls: [{ tool: 'read_document' as const, target: urls[0]!, status: 'read' as const, detail: 'complete' }] })) };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [home], partial: false }, new AbortController().signal);
     expect(result.websiteData.privacy_policy.found).toBe(true);
     expect(result.diagnostics).toMatchObject({ rounds: 2, stopReason: 'SUFFICIENT_FOR_EXTRACTION',
@@ -93,7 +97,7 @@ describe('NVIDIA evidence provider', () => {
   it('skips unknown link IDs and stops when a round brings no new evidence', async () => {
     const create = scripted([() => ({ claims: [], action: { type: 'fetch_pages', linkIds: ['L-invented'], targetFields: ['attorneys'], reason: 'guess' } })]);
     const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn() };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }], partial: false }, new AbortController().signal);
     expect(access.fetchPages).not.toHaveBeenCalled();
     expect(result.diagnostics).toMatchObject({ stopReason: 'NO_NEW_EVIDENCE',
@@ -105,7 +109,7 @@ describe('NVIDIA evidence provider', () => {
     const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn(async () => ({
       links: [{ url: 'https://firm.com/equipo/', kind: 'page' as const }],
       calls: [{ tool: 'read_sitemap' as const, target: 'https://firm.com/', status: 'read' as const, detail: '1 urls' }] })) };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }], partial: false }, new AbortController().signal);
     expect(access.readSitemap).toHaveBeenCalledTimes(1);
     expect(result.diagnostics.stopReason).toBe('NO_NEW_EVIDENCE');
@@ -124,7 +128,7 @@ describe('NVIDIA evidence provider', () => {
     const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn(async () => ({
       links: [{ url: 'https://firm.com/equipo/', kind: 'page' as const }],
       calls: [{ tool: 'read_sitemap' as const, target: 'https://firm.com/', status: 'read' as const, detail: '1 urls' }] })) };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
     expect(result.diagnostics).toMatchObject({ rounds: 3, stopReason: 'ROUND_LIMIT' });
     const findCalls = result.diagnostics.toolCalls.filter(call => call.tool === 'find_in_site');
@@ -144,7 +148,7 @@ describe('NVIDIA evidence provider', () => {
       pages: urls.map(url => ({ url, html: '', text: 'About Smith Law.' })),
       calls: urls.map(target => ({ tool: 'fetch_pages' as const, target, status: 'read' as const, detail: null })) })),
       readDocuments: vi.fn(), readSitemap: vi.fn() };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
     expect(access.fetchPages).toHaveBeenCalledWith(['https://firm.com/about'], expect.anything());
     expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: 'https://firm.com/about', status: 'read', detail: null }]);
@@ -165,7 +169,7 @@ describe('NVIDIA evidence provider', () => {
         ? { tool: 'fetch_pages' as const, target: url, status: 'read' as const, detail: null }
         : { tool: 'fetch_pages' as const, target: url, status: 'failed' as const, detail: 'boom' }) })),
       readDocuments: vi.fn(), readSitemap: vi.fn() };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
     expect(access.fetchPages).toHaveBeenCalledTimes(1);
     expect(result.diagnostics).toMatchObject({ rounds: 2, stopReason: 'NO_NEW_EVIDENCE' });
@@ -180,7 +184,7 @@ describe('NVIDIA evidence provider', () => {
     const longId = `L-${'x'.repeat(100)}`;
     const create = scripted([() => ({ claims: [], action: { type: 'fetch_pages', linkIds: [longId], targetFields: ['attorneys'], reason: 'guess' } })]);
     const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn() };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }], partial: false }, new AbortController().signal);
     expect(access.fetchPages).not.toHaveBeenCalled();
     expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: longId.slice(0, 64), status: 'skipped', detail: 'UNKNOWN_LINK' }]);
@@ -195,7 +199,7 @@ describe('NVIDIA evidence provider', () => {
     const access = { fetchPages: vi.fn(), readSitemap: vi.fn(), readDocuments: vi.fn(async (urls: string[]) => ({
       pages: [{ url: urls[0]!, html: '', text: 'Privacy Policy.', kind: 'document' as const, complete: true }],
       calls: [{ tool: 'read_document' as const, target: urls[0]!, status: 'read' as const, detail: 'complete' }] })) };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [home, { ...home }], partial: false }, new AbortController().signal);
     expect(result.diagnostics).toMatchObject({ rounds: 2, stopReason: 'SUFFICIENT_FOR_EXTRACTION' });
   });
@@ -214,7 +218,7 @@ describe('NVIDIA evidence provider', () => {
       pages: urls.map(url => ({ url, html: '', text: `Carmen Gallardo, Esq. Attorney | Founding Partner. ${'Biography '.repeat(75)}` })),
       calls: urls.map(target => ({ tool: 'fetch_pages' as const, target, status: 'read' as const, detail: null })) })),
       readDocuments: vi.fn(), readSitemap: vi.fn() };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     await provider.extractDetailed({ pages: [home, ...Array.from({ length: 14 }, (_, n) => practice(n))], partial: false }, new AbortController().signal);
     expect(secondRound).toContain('Founding Partner');
   });
@@ -227,7 +231,7 @@ describe('NVIDIA evidence provider', () => {
   });
   const firstRequest = async (endpoint: (typeof LLM_ENDPOINTS)[keyof typeof LLM_ENDPOINTS], model: string) => {
     const create = finishing();
-    const provider = new NvidiaNimEvidenceProvider('key', model, { chat: { completions: { create } } }, undefined, endpoint);
+    const provider = withoutPagePlan('key', model, { chat: { completions: { create } } }, undefined, endpoint);
     await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }], partial: false }, new AbortController().signal);
     return { provider, request: create.mock.calls[0]![0] };
   };
@@ -275,7 +279,7 @@ describe('NVIDIA evidence provider', () => {
       return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ claims, action: { type: 'finish', reason: 'done' } }) } }] };
     });
     const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn() };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
     expect(result.websiteData.team_members?.map(member => member.full_name).sort()).toEqual(['Jane Doe', 'John Roe']);
   });

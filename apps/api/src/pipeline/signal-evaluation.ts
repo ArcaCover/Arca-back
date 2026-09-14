@@ -60,3 +60,33 @@ export function evaluateWebsiteData(data: WebsiteData, gold: GoldLabels): Evalua
     incorrect: outcomes.filter(item => item.verdict === 'incorrect').length,
     attorneyRecall: roster?.attorneys.length ? found.size / roster.attorneys.length : null };
 }
+
+export type ConsistencyField = { field: string; agreed: boolean; values: string[] };
+export type Consistency = { runs: number; fields: ConsistencyField[]; agreement: number | null; scoresAgree: boolean | null };
+const CONSISTENCY_FIELDS = ['firm_name', 'firm_aliases', 'city', 'county', 'address_street', 'phone', 'office_count',
+  'firm_established_year', 'practice_areas', 'team_members', 'team_page_quality', 'website_quality', 'privacy_policy',
+  'ai_policy', 'ai_in_services', 'ai_disclosure', 'ai_blog_posts'] as const;
+
+function comparable(field: (typeof CONSISTENCY_FIELDS)[number], data: WebsiteData): string {
+  const value = (data as Record<string, unknown>)[field];
+  if (value === null || value === undefined) return '—';
+  if (field === 'phone') return digits(value) || '—';
+  if (field === 'team_members') return (value as Array<{ full_name: string }>).map(person => key(person.full_name)).sort().join(' | ') || '—';
+  if (Array.isArray(value)) return value.map(key).sort().join(' | ') || '—';
+  if (typeof value === 'object') {
+    const parts = Object.entries(value).filter(([name]) => name !== 'text_excerpt' && name !== 'titles')
+      .map(([name, item]) => `${name}=${item === null ? '—' : Array.isArray(item) ? item.map(key).sort().join(',') : key(item)}`);
+    return parts.every(part => part.endsWith('=—')) ? '—' : parts.join(' ');
+  }
+  return key(value);
+}
+
+/** Same crawl, same version: every accepted value and the score should repeat across runs. */
+export function measureConsistency(runs: WebsiteData[], scores: number[] = []): Consistency {
+  const fields = CONSISTENCY_FIELDS.map(field => {
+    const values = runs.map(run => comparable(field, run));
+    return { field, agreed: values.every(value => value === values[0]), values };
+  });
+  return { runs: runs.length, fields, agreement: runs.length > 1 ? fields.filter(field => field.agreed).length / fields.length : null,
+    scoresAgree: scores.length > 1 ? scores.every(score => score === scores[0]) : null };
+}
