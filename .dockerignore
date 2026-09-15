@@ -6,4 +6,7 @@ node_modules
 private
 coverage
 docs
+infra
+scripts
+output
 supabase/.temp

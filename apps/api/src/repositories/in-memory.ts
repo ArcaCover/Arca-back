@@ -1,9 +1,13 @@
-import type { ScanRepository, ScanRecord, RawRecord } from './types.js';
-import type { SourceName } from '@arca/contracts';
+import { randomUUID } from 'node:crypto';
+import type { ScanRepository, ScanRecord, RawRecord, ApifyRunRecord, ReserveApifyRun, ApifyRunReservation,
+  ApifyRunUpdate } from './types.js';
+import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
 
 export class InMemoryRepository implements ScanRepository {
   readonly scans = new Map<string, ScanRecord>();
   readonly raw: RawRecord[] = [];
+  readonly apifyRuns = new Map<string, ApifyRunRecord>();
+  readonly scanApifyRuns = new Map<string, Map<string, boolean>>();
   async create(scan: ScanRecord) {
     if (this.scans.has(scan.scan_id)) throw new Error('Duplicate scan');
     this.scans.set(scan.scan_id, structuredClone(scan));
@@ -16,7 +20,8 @@ export class InMemoryRepository implements ScanRepository {
   }
   async cached(domain: string, since: string) {
     return structuredClone([...this.scans.values()].filter(s => s.canonical_domain === domain && !s.cached &&
-      s.status === 'COMPLETED' && s.completed_at !== null && s.completed_at >= since)
+      s.result?.meta.contractVersion === LAYER1_CONTRACT_VERSION &&
+      (s.status === 'COMPLETED' || s.status === 'PARTIAL') && s.completed_at !== null && s.completed_at >= since)
       .sort((a, b) => b.completed_at!.localeCompare(a.completed_at!))[0] ?? null);
   }
   async saveRaw(record: RawRecord) { this.raw.push(structuredClone(record)); }
@@ -28,5 +33,49 @@ export class InMemoryRepository implements ScanRepository {
     for (const scan of this.scans.values()) if (scan.status === 'RUNNING' && scan.created_at < before) {
       scan.status = 'FAILED'; scan.completed_at = new Date().toISOString();
     }
+  }
+  async reserveApifyRun(request: ReserveApifyRun): Promise<ApifyRunReservation> {
+    const now = new Date().toISOString();
+    const existing = [...this.apifyRuns.values()].filter(run => run.query_fingerprint === request.queryFingerprint)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+    const attach = (id: string, charged: boolean) => {
+      if (!request.scanId) return;
+      const runs = this.scanApifyRuns.get(request.scanId) ?? new Map<string, boolean>();
+      if (!runs.has(id)) runs.set(id, charged); this.scanApifyRuns.set(request.scanId, runs);
+    };
+    if (existing && existing.expires_at > now && (existing.items !== null || existing.dataset_id !== null) &&
+      (existing.status === 'SUCCEEDED' || existing.partial)) {
+      attach(existing.id, false); return { decision: 'reuse', record: structuredClone(existing), chargedToScan: false };
+    }
+    if (existing && ['RESERVED', 'READY', 'RUNNING', 'TIMING-OUT', 'ABORTING', 'START_UNCERTAIN'].includes(existing.status)
+      && existing.expires_at > now) {
+      attach(existing.id, false); return { decision: 'resume', record: structuredClone(existing), chargedToScan: false };
+    }
+    if (existing && existing.expires_at > now) {
+      attach(existing.id, false); return { decision: 'failed', record: structuredClone(existing), chargedToScan: false };
+    }
+    const reserved = (run: ApifyRunRecord) => run.accounting_complete ? (run.cost_usd ?? run.reserved_usd) : run.reserved_usd;
+    const day = now.slice(0, 10);
+    const daily = [...this.apifyRuns.values()].filter(run => run.created_at.startsWith(day)).reduce((sum, run) => sum + reserved(run), 0);
+    const scan = request.scanId ? [...(this.scanApifyRuns.get(request.scanId) ?? [])]
+      .filter(([, charged]) => charged).map(([id]) => this.apifyRuns.get(id))
+      .filter((run): run is ApifyRunRecord => Boolean(run))
+      .reduce((sum, run) => sum + reserved(run), 0) : 0;
+    if (daily + request.maxCostUsd > request.maxDailyCostUsd || scan + request.maxCostUsd > request.maxScanCostUsd) {
+      return { decision: 'budget_exceeded', record: null, chargedToScan: false };
+    }
+    const record: ApifyRunRecord = { id: randomUUID(), query_fingerprint: request.queryFingerprint,
+      actor: request.actor, build: request.build, build_id: null, build_number: null,
+      input_json: structuredClone(request.input), run_id: null,
+      dataset_id: null, status: 'RESERVED', items: null, item_count: 0, accepted_count: 0, cost_usd: null,
+      reserved_usd: request.maxCostUsd, accounting_complete: false, partial: false, created_at: now,
+      updated_at: now, expires_at: request.expiresAt, last_error: null };
+    this.apifyRuns.set(record.id, record); attach(record.id, true);
+    return { decision: 'start', record: structuredClone(record), chargedToScan: true };
+  }
+  async getApifyRun(id: string) { return structuredClone(this.apifyRuns.get(id) ?? null); }
+  async updateApifyRun(id: string, update: ApifyRunUpdate) {
+    const record = this.apifyRuns.get(id); if (!record) throw new Error('Apify run not found');
+    Object.assign(record, structuredClone(update), { updated_at: new Date().toISOString() });
   }
 }

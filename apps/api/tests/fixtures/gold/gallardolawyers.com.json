@@ -1,0 +1,23 @@
+{
+  "domain": "gallardolawyers.com",
+  "verifiedAt": "2026-09-13",
+  "notes": "Verificado contra el crawl del 2026-09-13. /attorneys lista 25 personas con rótulo 'Lawyer'. /about: 'When we founded Gallardo Law Firm in 2012'. 'recovered for injured victims since 2012' no es fundación. Hialeah figura como oficina en el Florida Bar.",
+  "fields": {
+    "firm_name": { "correct": ["Gallardo Law Firm"] },
+    "city": { "correct": ["Miami", "Hialeah"] },
+    "phone": { "digits": "3052617000" },
+    "firm_established_year": { "correct": [2012] },
+    "team_size": { "correct": [] },
+    "practice_areas": { "allowed": ["Personal Injury", "Immigration", "Family Law", "Criminal Defense", "Bankruptcy",
+      "Employment Law", "Commercial Litigation"] },
+    "team_members": {
+      "attorneys": ["Carmen Gallardo", "Maria Vargas", "Jesús Novo", "Natalia Timmons", "Nelson Vladimir Jaramillo",
+        "Maria D. Lopez", "Eusebio Gonzalez", "Dianet Torres", "Dianelys Cala", "Mayron Gallardo", "Ismael Labrador",
+        "Mara Fontanet", "Yesenia Alfonso", "Marcos Garcia", "Aliet Sanchez", "Mariangeli Mercado", "Christopher Rivera",
+        "Briana Mauri", "Lorena Gaona Krewson", "Susana Ramos", "Barbara D. Meneses", "Cinthya Gomez", "Leisy Jimenez",
+        "Yiana Arenal", "Amanda Hernandez"],
+      "notAttorneys": []
+    }
+  },
+  "unverified": ["ai_policy", "ai_in_services", "ai_disclosure", "ai_blog_posts", "privacy_policy", "website_quality", "team_page_quality"]
+}

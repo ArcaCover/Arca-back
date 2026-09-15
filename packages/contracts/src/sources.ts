@@ -4,6 +4,12 @@ const text = z.string().nullable();
 const bool = z.boolean().nullable();
 const count = z.number().int().nonnegative().nullable();
 const strings = z.array(z.string()).nullable();
+export const EvidenceReference = z.object({
+  sourceUrl: z.string().url(),
+  excerpt: z.string().min(1).nullable(),
+  method: z.enum(['json_ld', 'meta', 'page_text', 'provider', 'derived']),
+}).strict();
+export type EvidenceReference = z.infer<typeof EvidenceReference>;
 export const WebsiteData = z.object({
   ai_policy: z.object({ found: bool, depth: z.enum(['comprehensive', 'basic', 'mention_only', 'none']).nullable(), text_excerpt: text }).strict(),
   ai_in_services: z.object({ found: bool, tools_mentioned: strings, integration_depth: z.enum(['core_service', 'supplementary', 'experimental', 'none_detected']).nullable() }).strict(),
@@ -18,6 +24,12 @@ export const WebsiteData = z.object({
   website_quality: z.enum(['robust', 'basic', 'minimal']).nullable(),
   firm_established_year: z.number().int().min(1000).max(9999).nullable(),
   firm_name: text,
+  firm_aliases: strings.default(null),
+  city: text.default(null),
+  county: text.default(null),
+  address_street: text.default(null),
+  phone: text.default(null),
+  provenance: z.record(z.string(), z.array(EvidenceReference)).default({}),
 }).strict();
 export type WebsiteData = z.infer<typeof WebsiteData>;
 
@@ -31,6 +43,7 @@ export type DisciplinaryAction = z.infer<typeof DisciplinaryAction>;
 export const Attorney = z.object({
   name: z.string().min(1),
   city: text,
+  county: text.default(null),
   firmName: text,
   barNumber: text,
   barStatus: z.enum(['active', 'inactive', 'suspended', 'disbarred', 'retired', 'deceased', 'UNKNOWN']).nullable(),
@@ -39,37 +52,66 @@ export const Attorney = z.object({
   disciplinaryActions: z.array(DisciplinaryAction).nullable(),
   activeInvestigation: bool,
   avvoRating: z.number().min(1).max(10).nullable(),
+  avvoRatingLevel: text.default(null),
   practiceAreas: strings,
   reviewCount: count,
   averageReviewRating: z.number().min(0).max(5).nullable(),
   endorsementCount: count,
   awards: strings,
+  awardsCount: count.default(null),
+  topAward: text.default(null),
+  phone: text.default(null),
+  addressStreet: text.default(null),
+  yearsLicensed: count.default(null),
+  licensedSince: text.default(null),
   profileUrl: text,
 }).strict();
 export type Attorney = z.infer<typeof Attorney>;
-export const MatchConfidence = z.enum(['exact', 'fuzzy', 'firm_fallback', 'no_match']);
+export const MatchConfidence = z.enum(['exact', 'exact_name', 'cross_ref', 'county_match', 'fuzzy', 'firm_fallback', 'no_match']);
 export const AttorneyMatch = z.object({
   searchedName: z.string(),
   matchConfidence: MatchConfidence,
   attorney: Attorney.nullable(),
   ambiguous: z.boolean(),
+  candidates: z.array(Attorney).optional(),
 }).strict();
 export type AttorneyMatch = z.infer<typeof AttorneyMatch>;
 
 export const SourceName = z.enum(['website', 'bar', 'avvo']);
 export type SourceName = z.infer<typeof SourceName>;
+export const SourceIssueCode = z.enum(['ACCESS_BLOCKED', 'NO_READABLE_EVIDENCE', 'INSUFFICIENT_IDENTITY',
+  'NO_MATCH', 'PROVIDER_ERROR', 'PROVIDER_CONTRACT_ERROR', 'BUDGET_EXCEEDED', 'DEADLINE_REACHED', 'TRUNCATED']);
+export const ProviderRun = z.object({
+  provider: z.literal('apify'), actor: z.string(), runId: z.string(), status: z.string(),
+  queryFingerprint: z.string(), itemCount: z.number().int().nonnegative(),
+  acceptedCount: z.number().int().nonnegative(), costUsd: z.number().nonnegative().nullable(),
+  build: z.string().optional(), buildId: z.string().nullable().optional(), buildNumber: z.string().nullable().optional(),
+  datasetId: z.string().nullable().optional(), partial: z.boolean().optional(),
+  cached: z.boolean().optional(), resumed: z.boolean().optional(), accountingComplete: z.boolean().optional(),
+  chargedToScan: z.boolean().optional(),
+}).strict();
 export const SourceStatus = z.object({
-  status: z.enum(['ok', 'partial', 'timeout', 'error']),
+  status: z.enum(['ok', 'partial', 'timeout', 'error', 'skipped']),
   dataStatus: z.enum(['PRESENT', 'EMPTY', 'UNKNOWN']),
   durationMs: z.number().int().nonnegative(),
   pagesCrawled: count.optional(),
   attorneysSearched: count.optional(),
   attorneysFound: count.optional(),
   reason: text.optional(),
+  code: SourceIssueCode.optional(),
+  candidatesReceived: count.optional(),
+  recordsValid: count.optional(),
+  providerRuns: z.array(ProviderRun).optional(),
+  costUsd: z.number().nonnegative().nullable().optional(),
+  accountingComplete: z.boolean().optional(),
+  cachedRuns: z.number().int().nonnegative().optional(), resumedRuns: z.number().int().nonnegative().optional(),
+  costPerAcceptedAttorneyUsd: z.number().nonnegative().nullable().optional(),
 }).strict();
 export type SourceStatus = z.infer<typeof SourceStatus>;
 export type SourceResult<T> = { data: T | null; rawContent: string | null; status: SourceStatus };
-export type DirectoryQuery = { canonicalDomain: string; names: string[]; firmName: string; state: 'FL' };
+export type DirectoryQuery = { canonicalDomain: string; names: string[]; firmName: string | null;
+  aliases?: string[]; city: string | null; county?: string | null; addressStreet?: string | null;
+  phone?: string | null; state: 'FL'; scanId?: string };
 export interface WebsiteSource {
   run(domain: string, signal: AbortSignal): Promise<SourceResult<WebsiteData>>;
 }
@@ -85,13 +127,15 @@ export function unknownWebsite(): WebsiteData {
     ai_blog_posts: { found: null, count: null, titles: null },
     practice_areas: null, team_members: null, team_size: null, team_page_quality: null,
     office_count: null, privacy_policy: { found: null, mentions_client_data: null },
-    website_quality: null, firm_established_year: null, firm_name: null,
+    website_quality: null, firm_established_year: null, firm_name: null, firm_aliases: null,
+    city: null, county: null, address_street: null, phone: null, provenance: {},
   };
 }
 
 export function unknownAttorney(name: string): Attorney {
-  return { name, city: null, firmName: null, barNumber: null, barStatus: null,
+  return { name, city: null, county: null, firmName: null, barNumber: null, barStatus: null,
     admissionDate: null, hasDisciplinaryHistory: null, disciplinaryActions: null,
-    activeInvestigation: null, avvoRating: null, practiceAreas: null, reviewCount: null,
-    averageReviewRating: null, endorsementCount: null, awards: null, profileUrl: null };
+    activeInvestigation: null, avvoRating: null, avvoRatingLevel: null, practiceAreas: null, reviewCount: null,
+    averageReviewRating: null, endorsementCount: null, awards: null, awardsCount: null, topAward: null,
+    phone: null, addressStreet: null, yearsLicensed: null, licensedSince: null, profileUrl: null };
 }

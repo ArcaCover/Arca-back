@@ -1,14 +1,20 @@
 import { z } from 'zod';
-import { Layer1Result, ScanStatus, DomainResolution } from '@arca/contracts';
+import { Layer1Result } from '@arca/contracts';
 export const ScanRequest = z.object({
-  domain: z.string().max(2048).optional(),
+  domain: z.string().trim().min(1).max(2048),
   email: z.string().trim().email().max(320).transform(v => v.toLowerCase()),
 }).strict();
-export const ScanResponse = z.object({
-  scanId: z.string().optional(), sessionToken: z.string().optional(), status: z.union([ScanStatus, z.literal('UNRESOLVED')]),
-  domainResolution: DomainResolution, assessment: Layer1Result.nullable(), cached: z.boolean().optional(),
+export const StartedScanResponse = z.object({
+  scanId: z.string(), sessionToken: z.string(), status: z.literal('RUNNING'),
 }).strict();
-export const PollResponse = z.object({
-  scanId: z.string(), status: ScanStatus, elapsed: z.number().optional(),
-  domainResolution: DomainResolution, assessment: Layer1Result.nullable(), cached: z.boolean().optional(),
+export const CachedScanResponse = z.object({
+  scanId: z.string(), sessionToken: z.string(), status: z.enum(['COMPLETED', 'PARTIAL']),
+  cached: z.literal(true), result: Layer1Result,
 }).strict();
+export const ScanResponse = z.union([StartedScanResponse, CachedScanResponse]);
+const runningPoll = z.object({ scanId: z.string(), status: z.literal('RUNNING'), elapsed: z.number().nonnegative() }).strict();
+const resultPoll = (status: 'COMPLETED' | 'PARTIAL') => z.object({
+  scanId: z.string(), status: z.literal(status), cached: z.boolean(), result: Layer1Result,
+}).strict();
+const failedPoll = z.object({ scanId: z.string(), status: z.literal('FAILED'), cached: z.boolean() }).strict();
+export const PollResponse = z.union([runningPoll, resultPoll('COMPLETED'), resultPoll('PARTIAL'), failedPoll]);

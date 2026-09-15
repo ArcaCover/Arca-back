@@ -1,0 +1,31 @@
+{
+	admin off
+}
+
+{$DEMO_HOSTNAME} {
+	encode zstd gzip
+
+	request_body {
+		max_size 32KB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# The API documentation is not part of the public contract. Scan endpoints stay
+	# open for the frontend; scan reads are already gated by per-scan session tokens.
+	@documentation path /docs /docs/* /openapi.json
+	basic_auth @documentation {
+		{$DOCS_AUTH_USER} {$DOCS_AUTH_HASH}
+	}
+
+	reverse_proxy api:8080 {
+		health_uri /health
+		health_interval 15s
+		health_timeout 3s
+	}
+}

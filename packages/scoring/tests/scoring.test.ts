@@ -17,13 +17,14 @@ describe('complete Layer 1 mathematics', () => {
     expect(preScore.tier).toBe('FORTRESS');
     expect(signals.website).not.toHaveProperty('W10_domainType');
   });
-  it('scores the robust mock at 84', () => { expect(scoreEvidence(robust()).preScore.total).toBe(84); });
-  it('retains score and tier after an active-investigation decision override', () => {
+  it('scores the robust mock at 82 with the revised reputation table', () => { expect(scoreEvidence(robust()).preScore.total).toBe(82); });
+  it('forces score zero after an active-investigation override', () => {
     const input = robust(), before = scoreEvidence(input);
     input.bar![0]!.attorney!.activeInvestigation = true;
     const after = scoreEvidence(input);
-    expect(after.preScore.total).toBe(before.preScore.total);
-    expect(after.preScore.tier).toBe(before.preScore.tier);
+    expect(before.preScore.total).toBeGreaterThan(0);
+    expect(after.preScore.total).toBe(0);
+    expect(after.preScore.tier).toBe('CRITICAL');
     expect(after.preScore.decision).toBe('DECLINE');
   });
   it('applies a recent-sanction override after scoring', () => {
@@ -31,7 +32,7 @@ describe('complete Layer 1 mathematics', () => {
     input.bar![0]!.attorney!.hasDisciplinaryHistory = true;
     input.bar![0]!.attorney!.disciplinaryActions = [{ severity: 'public_reprimand', date: '2026-08-01', description: 'Confirmed' }];
     const result = scoreEvidence(input).preScore;
-    expect(result.total).toBe(74);
+    expect(result.total).toBe(72);
     expect(result.tier).toBe('FORTIFIED');
     expect(result.decision).toBe('REFERRAL_SENIOR');
   });
@@ -63,12 +64,15 @@ describe('complete Layer 1 mathematics', () => {
   it('handles leap-day anniversaries without inventing March 1', () => {
     expect(sanctionBucket('2024-02-29', '2025-02-28T00:00:00Z')).toBe('one_to_three');
   });
-  it('keeps all missing source evidence unknown and multipliers neutral', () => {
+  it('scores all missing source evidence as zero with low confidence and neutral multipliers', () => {
     const input = robust(); input.website = null; input.bar = null; input.avvo = null;
     for (const source of Object.values(input.sources)) Object.assign(source, { status: 'error', dataStatus: 'UNKNOWN', attorneysSearched: null });
     const result = scoreEvidence(input);
-    expect(result.preScore.total).toBeNull();
-    expect(result.preScore.tier).toBe('UNKNOWN');
+    expect(result.preScore.total).toBe(0);
+    expect(result.preScore.tier).toBe('CRITICAL');
+    expect(result.preScore.decision).toBe('UNKNOWN');
+    expect(result.preScore.assessmentStatus).toBe('INSUFFICIENT_EVIDENCE');
+    expect(result.preScore.flags).toContain('COMMERCIAL_DECISION_BLOCKED');
     expect(result.preScore.confidence).toBe('LOW');
     expect(Object.values(result.multipliers).every(m => m.value === 1 && !m.known)).toBe(true);
   });
@@ -80,6 +84,14 @@ describe('complete Layer 1 mathematics', () => {
     expect(result.signals.bar.B1_allActive).toBeNull();
     expect(result.signals.bar.B2_worstDisciplinary).toBeNull();
     expect(result.signals.avvo.A1_avgRating).toBeNull();
+  });
+  it('keeps unknown provider accounting and exhausted budgets explicit', () => {
+    const input = robust();
+    Object.assign(input.sources.avvo, { accountingComplete: false, costUsd: null });
+    Object.assign(input.sources.bar, { code: 'BUDGET_EXCEEDED' });
+    const flags = scoreEvidence(input).preScore.flags;
+    expect(flags).toContain('PROVIDER_COST_UNKNOWN');
+    expect(flags).toContain('PROVIDER_BUDGET_EXCEEDED');
   });
   it('does not fabricate an age at an ambiguous year boundary', () => {
     const website = unknownWebsite(); website.firm_established_year = 2016;

@@ -4,12 +4,31 @@ const EnvSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
   SOURCE_MODE: z.enum(['mock', 'live']).optional(),
   STORAGE_BACKEND: z.enum(['memory', 'supabase']).optional(),
+  WEBSITE_EVIDENCE_PROVIDER: z.enum(['nvidia', 'rules', 'openai']).default('nvidia'),
   // Backward-compatible defaults for existing environments. Explicit modes take precedence.
   MOCK_MODE: z.enum(['true', 'false']).optional(),
   SUPABASE_URL: z.string().optional(), SUPABASE_SECRET_KEY: z.string().optional(), SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   SESSION_TOKEN_SECRET: z.string().min(32), OPENAI_API_KEY: z.string().optional(), APIFY_API_TOKEN: z.string().optional(),
+  NVIDIA_NIM_API_KEY: z.string().optional(), NVIDIA_NIM_MODEL: z.string().optional(),
+  // Endpoint and model of the agentic extraction (WEBSITE_EVIDENCE_PROVIDER=nvidia).
+  SIGNAL_LLM_ENDPOINT: z.enum(['nvidia', 'openai']).default('nvidia'), SIGNAL_LLM_MODEL: z.string().optional(),
+  // Optional for OpenAI reasoning models; an empty value means not configured.
+  SIGNAL_LLM_REASONING_EFFORT: z.preprocess(value => value === '' ? undefined : value,
+    z.enum(['none', 'minimal', 'low', 'medium', 'high']).optional()),
   CORS_ALLOWED_ORIGINS: z.string().min(1),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
+  MAX_APIFY_CONCURRENCY: z.coerce.number().int().min(1).max(2).default(2),
+  APIFY_ACTOR_BUILD: z.string().min(1).default('latest'),
+  APIFY_MAX_COST_USD_PER_RUN: z.coerce.number().positive().default(1),
+  APIFY_MAX_COST_USD_PER_SCAN: z.coerce.number().positive().default(10),
+  APIFY_MAX_COST_USD_PER_DAY: z.coerce.number().positive().default(100),
+  APIFY_QUERY_CACHE_TTL_MS: z.coerce.number().int().positive().default(86_400_000),
+  APIFY_ACTIVE_RUN_TTL_MS: z.coerce.number().int().positive().default(900_000),
+  APIFY_RUN_TIMEOUT_SECS: z.coerce.number().int().min(60).max(86_400).default(300),
+  APIFY_BAR_TARGETED_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(25),
+  APIFY_AVVO_TARGETED_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(10),
+  APIFY_MAX_CACHED_ITEMS: z.coerce.number().int().min(1).max(10_000).default(1000),
+  PIPELINE_TIMEOUT_MS: z.coerce.number().int().min(10_000).max(3_600_000).default(600_000),
 });
 export function loadEnv(source = process.env) {
   const env = EnvSchema.parse(source);
@@ -21,11 +40,26 @@ export function loadEnv(source = process.env) {
     if (!supabaseKey) throw new Error('SUPABASE_SECRET_KEY (or legacy SUPABASE_SERVICE_ROLE_KEY) is required for Supabase storage');
     if (supabaseKey.startsWith('sb_publishable_')) throw new Error('Supabase storage requires a server secret key, not a publishable key');
   }
-  if (sourceMode === 'live') for (const name of ['OPENAI_API_KEY', 'APIFY_API_TOKEN'] as const) {
-    if (!env[name]?.trim()) throw new Error(`${name} is required for live sources`);
+  if (sourceMode === 'live' && !env.APIFY_API_TOKEN?.trim()) throw new Error('APIFY_API_TOKEN is required for live directory sources');
+  if (sourceMode === 'live' && env.WEBSITE_EVIDENCE_PROVIDER === 'openai' && !env.OPENAI_API_KEY?.trim()) {
+    throw new Error('OPENAI_API_KEY is required only when WEBSITE_EVIDENCE_PROVIDER=openai');
+  }
+  if (sourceMode === 'live' && env.WEBSITE_EVIDENCE_PROVIDER === 'nvidia') {
+    const key = env.SIGNAL_LLM_ENDPOINT === 'openai' ? 'OPENAI_API_KEY' : 'NVIDIA_NIM_API_KEY';
+    if (!env[key]?.trim()) throw new Error(`${key} is required when the agentic extraction uses SIGNAL_LLM_ENDPOINT=${env.SIGNAL_LLM_ENDPOINT}`);
+    if (env.SIGNAL_LLM_ENDPOINT === 'openai' && !env.SIGNAL_LLM_MODEL?.trim()) throw new Error('SIGNAL_LLM_MODEL is required when SIGNAL_LLM_ENDPOINT=openai');
   }
   const corsOrigins = env.CORS_ALLOWED_ORIGINS.split(',').map(value => value.trim()).filter(Boolean);
   for (const origin of corsOrigins) if (new URL(origin).origin !== origin) throw new Error('CORS entries must be exact origins');
   if (env.SUPABASE_URL) z.string().url().parse(env.SUPABASE_URL);
-  return { ...env, sourceMode, storageBackend, supabaseKey, corsOrigins };
+  const signalModel = env.SIGNAL_LLM_MODEL?.trim() || (env.SIGNAL_LLM_ENDPOINT === 'nvidia' ? env.NVIDIA_NIM_MODEL?.trim() : undefined) || undefined;
+  if (env.APIFY_MAX_COST_USD_PER_RUN > env.APIFY_MAX_COST_USD_PER_SCAN ||
+    env.APIFY_MAX_COST_USD_PER_SCAN > env.APIFY_MAX_COST_USD_PER_DAY) {
+    throw new Error('Apify budgets must satisfy per-run <= per-scan <= per-day');
+  }
+  if (env.APIFY_ACTIVE_RUN_TTL_MS < (env.APIFY_RUN_TIMEOUT_SECS + 60) * 1000) {
+    throw new Error('APIFY_ACTIVE_RUN_TTL_MS must exceed the remote run timeout by at least 60 seconds');
+  }
+  return { ...env, NVIDIA_NIM_MODEL: env.NVIDIA_NIM_MODEL?.trim() || undefined, signalModel,
+    sourceMode, storageBackend, supabaseKey, corsOrigins };
 }

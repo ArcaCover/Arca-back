@@ -4,6 +4,7 @@ import { SourceStatus, WebsiteData, AttorneyMatch } from './sources.js';
 export const Tier = z.enum(['FORTRESS', 'FORTIFIED', 'GUARDED', 'EXPOSED', 'CRITICAL', 'UNKNOWN']);
 export const Decision = z.enum(['AUTO_BIND', 'AUTO_BIND_CONDITIONAL', 'REFERRAL', 'REFERRAL_SENIOR', 'DECLINE', 'UNKNOWN']);
 export const ScanStatus = z.enum(['RUNNING', 'COMPLETED', 'PARTIAL', 'FAILED']);
+export const LAYER1_CONTRACT_VERSION = 'layer1-2026-09-12-v2' as const;
 const nullableNumber = z.number().finite().nullable();
 export const Rule = z.object({ id: z.string(), points: nullableNumber, reason: z.string() }).strict();
 export const Category = z.object({
@@ -17,6 +18,7 @@ export const PreScore = z.object({
   confidence: z.enum(['HIGH', 'MEDIUM', 'LOW']),
   overrides: z.array(z.object({ id: z.string(), decision: Decision, reason: z.string() }).strict()),
   flags: z.array(z.string()),
+  assessmentStatus: z.enum(['SUFFICIENT', 'INSUFFICIENT_EVIDENCE']),
 }).strict();
 export type PreScore = z.infer<typeof PreScore>;
 export const Signals = z.object({
@@ -36,9 +38,10 @@ export const Signals = z.object({
     attorneys: z.array(AttorneyMatch).nullable(),
   }).strict(),
   avvo: z.object({
-    A1_avgRating: nullableNumber, A2_practiceAreas: z.array(z.string()).nullable(),
+    A1_avgRating: nullableNumber, A1_ratingLevel: z.string().nullable(), A2_practiceAreas: z.array(z.string()).nullable(),
     A3_avgReviewRating: nullableNumber, A3_totalReviews: nullableNumber,
-    A5_avgEndorsements: nullableNumber, A6_hasAwards: z.boolean().nullable(),
+    A6_hasAwards: z.boolean().nullable(), A6_awardsCount: nullableNumber,
+    A6_topAward: z.string().nullable(), A8_disciplined: z.boolean().nullable(),
   }).strict(),
 }).strict();
 export type Signals = z.infer<typeof Signals>;
@@ -48,17 +51,29 @@ export const Multipliers = z.object({
   jurisdiction: multiplier.extend({ state: z.string().nullable() }).strict(),
   size: multiplier.extend({ teamSize: nullableNumber }).strict(),
 }).strict();
+export const FirmIdentity = z.object({
+  canonicalDomain: z.string().min(1), firmName: z.string().min(1).nullable(),
+  aliases: z.array(z.string()), city: z.string().nullable(), county: z.string().nullable(),
+  addressStreet: z.string().nullable(), phone: z.string().nullable(),
+  attorneyNames: z.array(z.string()), status: z.enum(['VERIFIED', 'PARTIAL', 'INSUFFICIENT']),
+  evidence: z.array(z.object({ sourceUrl: z.string().url(), excerpt: z.string().nullable(),
+    method: z.enum(['json_ld', 'meta', 'page_text', 'provider', 'derived']) }).strict()),
+}).strict();
+export type FirmIdentity = z.infer<typeof FirmIdentity>;
 export const Layer1Result = z.object({
-  canonicalDomain: z.string().min(1), preScore: PreScore,
+  scanId: z.string().min(1), domain: z.string().min(1), email: z.string().email(), preScore: PreScore,
+  identity: FirmIdentity.nullable().default(null),
   signals: Signals, multipliers: Multipliers,
   sources: z.object({ website: SourceStatus, bar: SourceStatus, avvo: SourceStatus }).strict(),
-  meta: z.object({ scanDurationMs: z.number().int().nonnegative(), cached: z.boolean(), completedAt: z.string().datetime() }).strict(),
+  meta: z.object({ scanDurationMs: z.number().int().nonnegative(), cached: z.boolean(),
+    reusedEvidence: z.boolean().default(false), contractVersion: z.literal(LAYER1_CONTRACT_VERSION).default(LAYER1_CONTRACT_VERSION),
+    completedAt: z.string().datetime() }).strict(),
 }).strict();
 export type Layer1Result = z.infer<typeof Layer1Result>;
 export type ScanStatus = z.infer<typeof ScanStatus>;
 export type PipelineResult = { status: Exclude<ScanStatus, 'RUNNING'>; result: Layer1Result };
 export interface Layer1Pipeline {
-  run(input: { scanId: string; canonicalDomain: string }): Promise<PipelineResult>;
+  run(input: { scanId: string; canonicalDomain: string; email: string }): Promise<PipelineResult>;
 }
 export const DomainResolution = z.discriminatedUnion('status', [
   z.object({ status: z.literal('RESOLVED'), canonicalDomain: z.string().min(1),
@@ -77,3 +92,14 @@ export type ScoringInput = {
   sources: Layer1Result['sources'];
   now: string;
 };
+
+/** Structured, provider-agnostic input consumed by the deterministic Layer 1 core. */
+export const Layer1Evidence = z.object({
+  identity: FirmIdentity,
+  website: WebsiteData.nullable(),
+  bar: z.array(AttorneyMatch).nullable(),
+  avvo: z.array(AttorneyMatch).nullable(),
+  sources: z.object({ website: SourceStatus, bar: SourceStatus, avvo: SourceStatus }).strict(),
+  observedAt: z.string().datetime(),
+}).strict();
+export type Layer1Evidence = z.infer<typeof Layer1Evidence>;

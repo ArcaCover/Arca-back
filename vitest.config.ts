@@ -6,7 +6,7 @@ export default defineConfig({
     conditions: ['development', 'import', 'node', 'default'],
   },
   test: {
-    include: ['packages/*/tests/**/*.test.ts', 'apps/*/tests/**/*.test.ts'],
+    include: ['packages/*/tests/**/*.test.ts', 'apps/*/tests/**/*.test.ts', 'infra/*/lib/**/*.test.ts'],
     environment: 'node',
     testTimeout: 20_000,
     coverage: {

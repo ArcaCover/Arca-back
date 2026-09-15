@@ -31,7 +31,8 @@ describe('scan boundaries', () => {
   });
   it('normalizes domains and validates email', () => {
     expect(normalizeDomain('HTTPS://WWW.Firm.com/about')).toBe('firm.com');
-    expect(ScanRequest.parse({ email: 'Test@Firm.com' })).toEqual({ email: 'test@firm.com' });
+    expect(ScanRequest.parse({ email: 'Test@Firm.com', domain: 'firm.com' })).toEqual({ email: 'test@firm.com', domain: 'firm.com' });
+    expect(ScanRequest.safeParse({ email: 'Test@Firm.com' }).success).toBe(false);
     expect(normalizeDomain('localhost')).toBe('');
     expect(ScanRequest.safeParse({ domain: 'firm.com' }).success).toBe(false);
     expect(normalizeDomain('https://user:pass@firm.com')).toBe('');

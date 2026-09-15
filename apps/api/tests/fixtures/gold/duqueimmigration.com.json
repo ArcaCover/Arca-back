@@ -1,0 +1,19 @@
+{
+  "domain": "duqueimmigration.com",
+  "verifiedAt": "2026-09-13",
+  "notes": "Verificado contra el crawl del 2026-09-13. El equipo marca '(No es abogada)'. Melina Ocampo y Diana Posada tienen licencia solo en Colombia y cargos de coordinadora y paralegal. 2007 es la graduación del abogado, no la fundación.",
+  "fields": {
+    "firm_name": { "correct": ["Duque Immigration Law, PLLC", "Duque Immigration Law"] },
+    "city": { "correct": ["Miami"] },
+    "phone": { "digits": "3054360155" },
+    "firm_established_year": { "correct": [] },
+    "team_size": { "correct": [] },
+    "practice_areas": { "allowed": ["Immigration"] },
+    "team_members": {
+      "attorneys": ["Carlos Mauricio Duque"],
+      "notAttorneys": ["Andrea Herrera", "Lorraine Chilson", "Melina Ocampo", "Laura Pereira", "Diana Posada",
+        "Carolina Bonilla", "Daniela Tulande", "Ingrid Linares", "Manuel Marín"]
+    }
+  },
+  "unverified": ["ai_policy", "ai_in_services", "ai_disclosure", "ai_blog_posts", "privacy_policy", "website_quality", "team_page_quality"]
+}
