@@ -43,7 +43,8 @@ export class InProcessPipeline implements Layer1Pipeline {
       const website = await bounded<WebsiteData>(() => this.deps.website.run(input.canonicalDomain, signal));
       const identity = buildFirmIdentity(input.canonicalDomain, website.data);
       const query = { canonicalDomain: input.canonicalDomain, names: identity.attorneyNames,
-        firmName: identity.firmName, city: identity.city, state: 'FL' as const };
+        firmName: identity.firmName, aliases: identity.aliases, city: identity.city, county: identity.county,
+        addressStreet: identity.addressStreet, phone: identity.phone, state: 'FL' as const, scanId: input.scanId };
       const [bar, avvo] = identity.status === 'INSUFFICIENT' ? [insufficientIdentity(), insufficientIdentity()] : await Promise.all([
           bounded<AttorneyMatch[]>(() => this.deps.bar.run(query, signal)),
           bounded<AttorneyMatch[]>(() => this.deps.avvo.run(query, signal)),

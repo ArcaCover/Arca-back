@@ -85,6 +85,14 @@ describe('complete Layer 1 mathematics', () => {
     expect(result.signals.bar.B2_worstDisciplinary).toBeNull();
     expect(result.signals.avvo.A1_avgRating).toBeNull();
   });
+  it('keeps unknown provider accounting and exhausted budgets explicit', () => {
+    const input = robust();
+    Object.assign(input.sources.avvo, { accountingComplete: false, costUsd: null });
+    Object.assign(input.sources.bar, { code: 'BUDGET_EXCEEDED' });
+    const flags = scoreEvidence(input).preScore.flags;
+    expect(flags).toContain('PROVIDER_COST_UNKNOWN');
+    expect(flags).toContain('PROVIDER_BUDGET_EXCEEDED');
+  });
   it('does not fabricate an age at an ambiguous year boundary', () => {
     const website = unknownWebsite(); website.firm_established_year = 2016;
     expect(firmMaturity(website, null, NOW).rules.find(r => r.id === 'W8')?.points).toBeNull();

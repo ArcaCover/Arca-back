@@ -1,6 +1,7 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
-import type { ScanRepository, ScanRecord, RawRecord } from './types.js';
+import type { ScanRepository, ScanRecord, RawRecord, ReserveApifyRun, ApifyRunReservation, ApifyRunRecord,
+  ApifyRunUpdate } from './types.js';
 
 export class SupabaseRepository implements ScanRepository {
   constructor(private readonly client: SupabaseClient) {}
@@ -39,6 +40,25 @@ export class SupabaseRepository implements ScanRepository {
     const { error } = await this.client.from('scans').update({ status: 'FAILED', completed_at: new Date().toISOString() })
       .eq('status', 'RUNNING').lt('created_at', before);
     if (error) throw new Error('Unable to recover interrupted scans', { cause: error });
+  }
+  async reserveApifyRun(request: ReserveApifyRun): Promise<ApifyRunReservation> {
+    const { data, error } = await this.client.rpc('reserve_apify_run', { p_scan_id: request.scanId ?? null,
+      p_query_fingerprint: request.queryFingerprint, p_actor: request.actor, p_build: request.build,
+      p_input_json: request.input, p_max_cost_usd: request.maxCostUsd,
+      p_max_scan_cost_usd: request.maxScanCostUsd, p_max_daily_cost_usd: request.maxDailyCostUsd,
+      p_expires_at: request.expiresAt });
+    if (error || !data) throw new Error('Unable to reserve Apify run', { cause: error });
+    return data as ApifyRunReservation;
+  }
+  async getApifyRun(id: string): Promise<ApifyRunRecord | null> {
+    const { data, error } = await this.client.from('apify_runs').select('*').eq('id', id).maybeSingle();
+    if (error) throw new Error('Unable to read Apify run', { cause: error });
+    return data;
+  }
+  async updateApifyRun(id: string, update: ApifyRunUpdate) {
+    const { data, error } = await this.client.from('apify_runs').update({ ...update, updated_at: new Date().toISOString() })
+      .eq('id', id).select('id').single();
+    if (error || !data) throw new Error('Unable to update Apify run', { cause: error });
   }
 }
 export function createRepository(url: string, key: string) {

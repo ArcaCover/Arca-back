@@ -80,11 +80,15 @@ export type AttorneyMatch = z.infer<typeof AttorneyMatch>;
 export const SourceName = z.enum(['website', 'bar', 'avvo']);
 export type SourceName = z.infer<typeof SourceName>;
 export const SourceIssueCode = z.enum(['ACCESS_BLOCKED', 'NO_READABLE_EVIDENCE', 'INSUFFICIENT_IDENTITY',
-  'NO_MATCH', 'PROVIDER_ERROR', 'PROVIDER_CONTRACT_ERROR', 'BUDGET_EXCEEDED', 'DEADLINE_REACHED']);
+  'NO_MATCH', 'PROVIDER_ERROR', 'PROVIDER_CONTRACT_ERROR', 'BUDGET_EXCEEDED', 'DEADLINE_REACHED', 'TRUNCATED']);
 export const ProviderRun = z.object({
   provider: z.literal('apify'), actor: z.string(), runId: z.string(), status: z.string(),
   queryFingerprint: z.string(), itemCount: z.number().int().nonnegative(),
   acceptedCount: z.number().int().nonnegative(), costUsd: z.number().nonnegative().nullable(),
+  build: z.string().optional(), buildId: z.string().nullable().optional(), buildNumber: z.string().nullable().optional(),
+  datasetId: z.string().nullable().optional(), partial: z.boolean().optional(),
+  cached: z.boolean().optional(), resumed: z.boolean().optional(), accountingComplete: z.boolean().optional(),
+  chargedToScan: z.boolean().optional(),
 }).strict();
 export const SourceStatus = z.object({
   status: z.enum(['ok', 'partial', 'timeout', 'error', 'skipped']),
@@ -99,11 +103,15 @@ export const SourceStatus = z.object({
   recordsValid: count.optional(),
   providerRuns: z.array(ProviderRun).optional(),
   costUsd: z.number().nonnegative().nullable().optional(),
+  accountingComplete: z.boolean().optional(),
+  cachedRuns: z.number().int().nonnegative().optional(), resumedRuns: z.number().int().nonnegative().optional(),
+  costPerAcceptedAttorneyUsd: z.number().nonnegative().nullable().optional(),
 }).strict();
 export type SourceStatus = z.infer<typeof SourceStatus>;
 export type SourceResult<T> = { data: T | null; rawContent: string | null; status: SourceStatus };
 export type DirectoryQuery = { canonicalDomain: string; names: string[]; firmName: string | null;
-  city: string | null; state: 'FL' };
+  aliases?: string[]; city: string | null; county?: string | null; addressStreet?: string | null;
+  phone?: string | null; state: 'FL'; scanId?: string };
 export interface WebsiteSource {
   run(domain: string, signal: AbortSignal): Promise<SourceResult<WebsiteData>>;
 }

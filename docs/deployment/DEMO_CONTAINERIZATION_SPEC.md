@@ -93,6 +93,17 @@ Required values in `/opt/arca/.env.demo`:
 | `CORS_ALLOWED_ORIGINS` | `https://arcacover.com,http://localhost:3000` |
 | `TRUST_PROXY_HOPS` | `1`, because Caddy is the only ingress |
 | `MAX_APIFY_CONCURRENCY` | `2` |
+| `APIFY_ACTOR_BUILD` | `latest` hasta fijar un build validado por el canario |
+| `APIFY_MAX_COST_USD_PER_RUN` | `1` |
+| `APIFY_MAX_COST_USD_PER_SCAN` | `10` |
+| `APIFY_MAX_COST_USD_PER_DAY` | `100` |
+| `APIFY_QUERY_CACHE_TTL_MS` | `86400000` |
+| `APIFY_ACTIVE_RUN_TTL_MS` | `900000` |
+| `APIFY_RUN_TIMEOUT_SECS` | `300` |
+| `APIFY_BAR_TARGETED_MAX_RESULTS` | `25` |
+| `APIFY_AVVO_TARGETED_MAX_RESULTS` | `10` |
+| `APIFY_MAX_CACHED_ITEMS` | `1000` |
+| `PIPELINE_TIMEOUT_MS` | `600000` |
 
 Each paid provider run requests at most ten records. A scan starts no more than four directory runs.
 

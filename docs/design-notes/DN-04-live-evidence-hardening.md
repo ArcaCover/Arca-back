@@ -12,9 +12,10 @@ Fecha: 12 de septiembre de 2026.
 - `No lawyers matched` es una consulta exitosa vacía. Errores desconocidos y filas incompatibles se
   distinguen mediante `PROVIDER_ERROR` y `PROVIDER_CONTRACT_ERROR`.
 - Cada ejecución Apify conserva actor, run ID, fingerprint, estado, registros, aceptados y coste reportado.
-- Se consultan como máximo dos identidades por directorio y el cliente admite dos ejecuciones simultáneas.
-  Cada run solicita como máximo siete registros al proveedor y Layer 1 acepta hasta dos coincidencias. Por
-  construcción, un scan inicia como máximo cuatro runs de directorio y no reintenta runs pagados.
+- Se consulta todo el roster verificado, con hasta dos ejecuciones remotas simultáneas. Las búsquedas nominales
+  tienen límites de resultados configurables; el fallback de firma conserva el roster completo. El presupuesto
+  monetario, la reserva atómica y la caché por fingerprint de DN-06 limitan el gasto sin convertir una muestra
+  en cobertura completa. Un run pagado nunca se reintenta a ciegas.
 - Solicitudes simultáneas del mismo dominio comparten el trabajo externo; cada solicitud conserva su propio
   scan y sesión, y `meta.reusedEvidence` informa la reutilización.
 - La falta de evidencia mantiene el score cuantitativo, pero marca `INSUFFICIENT_EVIDENCE` y bloquea la

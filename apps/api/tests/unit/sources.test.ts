@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { unknownWebsite } from '@arca/contracts';
-import { ApifyDirectorySource, AVVO_ACTOR, BAR_ACTOR, AVVO_TECHNICAL_MAX_LAWYERS, BAR_TECHNICAL_MAX_LAWYERS, parseBar, parseAvvo,
+import { ApifyDirectorySource, AVVO_ACTOR, BAR_ACTOR, AVVO_TECHNICAL_MAX_LAWYERS, BAR_TECHNICAL_MAX_LAWYERS,
+  AVVO_TARGETED_MAX_LAWYERS, BAR_TARGETED_MAX_LAWYERS, parseBar, parseAvvo,
   parseDisciplineSummary } from '../../src/pipeline/directories.js';
 import { ApifyClient } from '../../src/pipeline/apify-client.js';
 import { RagWebsiteSource, WebsiteExtractionSource } from '../../src/pipeline/website-source.js';
@@ -24,6 +25,13 @@ describe('provider evidence boundaries', () => {
   it('distinguishes explicit zero from missing Avvo fields', () => {
     expect(parseAvvo({ name: 'Jane Smith', reviewsCount: 0, disciplined: false })).toMatchObject({ reviewCount: 0, hasDisciplinaryHistory: false, avvoRating: null, awardsCount: null });
   });
+  it('uses the structured Bar street and ignores directory contact placeholders', () => {
+    expect(parseBar({ name: 'Briana Nicole Mauri', mailStreet: '14561 SW 37th St',
+      mailAddress: 'Ms. Briana Nicole Mauri, 14561 SW 37th St, Miramar, FL 33027' })).toMatchObject({
+      addressStreet: '14561 SW 37th St',
+    });
+    expect(parseAvvo({ name: 'Briana Nicole Mauri', phone: 'Not Available' })?.phone).toBeNull();
+  });
   it('parses the latest Avvo actor fields used by scoring and cross-reference', () => {
     expect(parseAvvo({ name: 'Jane Q. Smith', avvoRating: 9.2, avvoRatingLevel: 'Superb',
       reviewsCount: 12, reviewsRating: 4.8, awardsCount: 3, topAward: 'Super Lawyer - 2026',
@@ -39,17 +47,21 @@ describe('provider evidence boundaries', () => {
     const run = vi.fn(async () => []);
     await new ApifyDirectorySource('avvo', { run }).run(query, new AbortController().signal);
     expect(run).toHaveBeenCalledWith(AVVO_ACTOR, {
-      searchQueries: ['Jane Smith'], cities: ['Miami, FL'], withDetails: true, maxLawyers: AVVO_TECHNICAL_MAX_LAWYERS,
-    }, expect.any(AbortSignal));
+      searchQueries: ['Jane Smith'], cities: ['Miami, FL'], withDetails: true, maxLawyers: AVVO_TARGETED_MAX_LAWYERS,
+    }, expect.any(AbortSignal), { scanId: undefined });
     expect(AVVO_ACTOR).toBe('scrapers_lat/avvo-lawyers-scraper');
   });
-  it('uses only the providers’ documented technical maxima, never an application result cap', async () => {
+  it('caps targeted searches while preserving technical maxima for complete firm fallbacks', async () => {
     const run = vi.fn(async () => []);
     const signal = new AbortController().signal;
     await new ApifyDirectorySource('bar', { run }).run(query, signal);
     await new ApifyDirectorySource('avvo', { run }).run(query, signal);
-    expect(run).toHaveBeenNthCalledWith(1, BAR_ACTOR, expect.objectContaining({ maxLawyers: BAR_TECHNICAL_MAX_LAWYERS }), signal);
-    expect(run).toHaveBeenNthCalledWith(2, AVVO_ACTOR, expect.objectContaining({ maxLawyers: AVVO_TECHNICAL_MAX_LAWYERS }), signal);
+    expect(run).toHaveBeenNthCalledWith(1, BAR_ACTOR, expect.objectContaining({ maxLawyers: BAR_TARGETED_MAX_LAWYERS }), signal, { scanId: undefined });
+    expect(run).toHaveBeenNthCalledWith(2, AVVO_ACTOR, expect.objectContaining({ maxLawyers: AVVO_TARGETED_MAX_LAWYERS }), signal, { scanId: undefined });
+    await new ApifyDirectorySource('bar', { run }).run({ ...query, names: [] }, signal);
+    await new ApifyDirectorySource('avvo', { run }).run({ ...query, names: [] }, signal);
+    expect(run).toHaveBeenNthCalledWith(3, BAR_ACTOR, expect.objectContaining({ maxLawyers: BAR_TECHNICAL_MAX_LAWYERS }), signal, { scanId: undefined });
+    expect(run).toHaveBeenNthCalledWith(4, AVVO_ACTOR, expect.objectContaining({ maxLawyers: AVVO_TECHNICAL_MAX_LAWYERS }), signal, { scanId: undefined });
   });
   it('treats a complete seven-record response as valid evidence', async () => {
     const candidates = Array.from({ length: 7 }, (_, index) => ({
@@ -90,6 +102,12 @@ describe('provider evidence boundaries', () => {
     const result = await source.run(query, new AbortController().signal);
     expect(result.status).toMatchObject({ costUsd: .25, candidatesReceived: 1, recordsValid: 1,
       providerRuns: [{ runId: 'run-1', acceptedCount: 1, costUsd: .25 }] });
+  });
+  it('isolates malformed rows instead of discarding valid rows from the same paid dataset', async () => {
+    const source = new ApifyDirectorySource('bar', { run: async () => [{ name: 'Jane Smith' }, 'invalid'] });
+    const result = await source.run(query, new AbortController().signal);
+    expect(result.data?.[0]?.attorney?.name).toBe('Jane Smith');
+    expect(result.status).toMatchObject({ status: 'partial', candidatesReceived: 2, recordsValid: 1 });
   });
   it('runs a lookup for every named attorney, including a thirty-attorney roster', async () => {
     const names = Array.from({ length: 30 }, (_, index) =>
@@ -155,8 +173,9 @@ describe('Apify lifecycle', () => {
     expect(output.items).toHaveLength(1_001);
     expect(request).toHaveBeenCalledTimes(12);
   });
-  it('aborts a remote run when the caller cancels', async () => {
+  it('retains a remote run when the caller cancels so it can be recovered', async () => {
     const controller = new AbortController();
+    const repository = new InMemoryRepository();
     const request = vi.fn(async (url: string | URL | Request) => {
       if (String(url).includes('/runs?')) {
         controller.abort();
@@ -164,8 +183,91 @@ describe('Apify lifecycle', () => {
       }
       return Response.json({});
     });
-    await expect(new ApifyClient('token', request as typeof fetch).run('owner/actor', {}, controller.signal)).rejects.toThrow();
-    expect(String(request.mock.calls.at(-1)?.[0])).toContain('/actor-runs/run/abort');
+    await expect(new ApifyClient('token', request as typeof fetch, 2, { store: repository })
+      .run('owner/actor', {}, controller.signal)).rejects.toThrow('retained for recovery');
+    expect(request.mock.calls.some(call => String(call[0]).includes('/abort'))).toBe(false);
+    expect([...repository.apifyRuns.values()][0]).toMatchObject({ run_id: 'run', status: 'RUNNING' });
+  });
+  it('recovers rows from a timed-out run as explicitly partial evidence', async () => {
+    const request = vi.fn(async (url: string | URL | Request) => String(url).includes('/runs?')
+      ? Response.json({ data: { id: 'run', status: 'TIMED-OUT', defaultDatasetId: 'dataset', usageTotalUsd: .4 } })
+      : Response.json([{ name: 'Jane Smith' }]));
+    const output = await new ApifyClient('token', request as typeof fetch).run('owner/actor', {}, new AbortController().signal);
+    expect(output.items).toEqual([{ name: 'Jane Smith' }]);
+    expect(output.metadata).toMatchObject({ status: 'TIMED-OUT', partial: true, costUsd: .4, accountingComplete: true });
+  });
+  it('reuses a completed query without a second actor POST', async () => {
+    const repository = new InMemoryRepository();
+    const request = vi.fn(async (url: string | URL | Request) => String(url).includes('/runs?')
+      ? Response.json({ data: { id: 'run', status: 'SUCCEEDED', defaultDatasetId: 'dataset', usageTotalUsd: .1 } })
+      : Response.json([{ name: 'Jane Smith' }]));
+    const client = new ApifyClient('token', request as typeof fetch, 2, { store: repository });
+    await client.run('owner/actor', { name: 'Jane' }, new AbortController().signal, { scanId: 'sc_one' });
+    const cached = await client.run('owner/actor', { name: 'Jane' }, new AbortController().signal, { scanId: 'sc_two' });
+    expect(cached.metadata.cached).toBe(true);
+    expect(request.mock.calls.filter(call => String(call[0]).includes('/runs?'))).toHaveLength(1);
+  });
+  it('reuses the dataset id without storing an oversized dataset in one ledger row', async () => {
+    const repository = new InMemoryRepository();
+    const request = vi.fn(async (url: string | URL | Request) => String(url).includes('/runs?')
+      ? Response.json({ data: { id: 'run', status: 'SUCCEEDED', defaultDatasetId: 'dataset', usageTotalUsd: .1 } })
+      : Response.json([{ name: 'Jane Smith' }, { name: 'John Smith' }]));
+    const client = new ApifyClient('token', request as typeof fetch, 2, { store: repository, maxCachedItems: 1 });
+    await client.run('owner/actor', { firm: 'Smith' }, new AbortController().signal);
+    const cached = await client.run('owner/actor', { firm: 'Smith' }, new AbortController().signal);
+    expect(cached.items).toHaveLength(2);
+    expect([...repository.apifyRuns.values()][0]?.items).toBeNull();
+    expect(request.mock.calls.filter(call => String(call[0]).includes('/runs?'))).toHaveLength(1);
+  });
+  it('reports zero incremental scan cost when a directory query is served from cache', async () => {
+    const repository = new InMemoryRepository();
+    const request = vi.fn(async (url: string | URL | Request) => String(url).includes('/runs?')
+      ? Response.json({ data: { id: 'run', status: 'SUCCEEDED', defaultDatasetId: 'dataset', usageTotalUsd: .1 } })
+      : Response.json([{ name: 'Jane Smith' }]));
+    const source = new ApifyDirectorySource('bar', new ApifyClient('token', request as typeof fetch, 2, { store: repository }));
+    const first = await source.run({ ...query, scanId: 'sc_one' }, new AbortController().signal);
+    const second = await source.run({ ...query, scanId: 'sc_two' }, new AbortController().signal);
+    expect(first.status).toMatchObject({ costUsd: .1, cachedRuns: 0, costPerAcceptedAttorneyUsd: .1 });
+    expect(second.status).toMatchObject({ costUsd: 0, cachedRuns: 1, costPerAcceptedAttorneyUsd: 0 });
+  });
+  it('resumes the same remote run after the first caller deadline', async () => {
+    const repository = new InMemoryRepository();
+    const firstController = new AbortController();
+    const request = vi.fn(async (url: string | URL | Request) => {
+      const value = String(url);
+      if (value.includes('/runs?')) { firstController.abort(); return Response.json({ data: {
+        id: 'run', status: 'RUNNING', defaultDatasetId: 'dataset' } }); }
+      if (value.includes('/actor-runs/')) return Response.json({ data: {
+        id: 'run', status: 'SUCCEEDED', defaultDatasetId: 'dataset', usageTotalUsd: .2 } });
+      return Response.json([{ name: 'Jane Smith' }]);
+    });
+    const client = new ApifyClient('token', request as typeof fetch, 2, { store: repository });
+    await expect(client.run('owner/actor', { name: 'Jane' }, firstController.signal)).rejects.toThrow();
+    const recovered = await client.run('owner/actor', { name: 'Jane' }, new AbortController().signal);
+    expect(recovered.metadata).toMatchObject({ runId: 'run', resumed: true, chargedToScan: false });
+    expect(request.mock.calls.filter(call => String(call[0]).includes('/runs?'))).toHaveLength(1);
+  });
+  it('blocks new work when unknown accounting has consumed the scan reservation', async () => {
+    const repository = new InMemoryRepository();
+    await repository.create({ id: 'id', scan_id: 'sc_budget', email: 'owner@firm.com', canonical_domain: 'firm.com',
+      domain_resolution: { status: 'RESOLVED', canonicalDomain: 'firm.com', source: 'request', reason: null },
+      status: 'RUNNING', result: null, created_at: new Date().toISOString(), completed_at: null, duration_ms: null, cached: false });
+    const request = vi.fn(async (url: string | URL | Request) => String(url).includes('/runs?')
+      ? Response.json({ data: { id: 'run', status: 'SUCCEEDED', defaultDatasetId: 'dataset' } }) : Response.json([]));
+    const client = new ApifyClient('token', request as typeof fetch, 2, { store: repository,
+      maxCostUsdPerRun: 1, maxCostUsdPerScan: 1, maxCostUsdPerDay: 2 });
+    await client.run('owner/actor', { name: 'Jane' }, new AbortController().signal, { scanId: 'sc_budget' });
+    await expect(client.run('owner/actor', { name: 'John' }, new AbortController().signal, { scanId: 'sc_budget' }))
+      .rejects.toMatchObject({ code: 'BUDGET_EXCEEDED' });
+  });
+  it('does not repeat a failed paid run during its retry cooldown', async () => {
+    const repository = new InMemoryRepository();
+    const request = vi.fn(async () => Response.json({ data: {
+      id: 'failed-run', status: 'FAILED', defaultDatasetId: null, usageTotalUsd: .3, statusMessage: 'blocked' } }));
+    const client = new ApifyClient('token', request as typeof fetch, 2, { store: repository });
+    await expect(client.run('owner/actor', { name: 'Jane' }, new AbortController().signal)).rejects.toThrow('FAILED');
+    await expect(client.run('owner/actor', { name: 'Jane' }, new AbortController().signal)).rejects.toThrow('cooldown');
+    expect(request.mock.calls.filter(call => String(call[0]).includes('/runs?'))).toHaveLength(1);
   });
 });
 describe('website extraction', () => {

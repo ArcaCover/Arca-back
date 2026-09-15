@@ -50,4 +50,16 @@ describe('independent source and storage configuration', () => {
     expect(loadEnv(openai).SIGNAL_LLM_REASONING_EFFORT).toBeUndefined();
     expect(() => loadEnv({ ...openai, SIGNAL_LLM_REASONING_EFFORT: 'extreme' })).toThrow();
   });
+  it('validates nested Apify budgets and a recovery window longer than the remote timeout', () => {
+    expect(loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' })).toMatchObject({
+      APIFY_MAX_COST_USD_PER_RUN: 1, APIFY_MAX_COST_USD_PER_SCAN: 10, APIFY_MAX_COST_USD_PER_DAY: 100,
+      APIFY_RUN_TIMEOUT_SECS: 300, APIFY_ACTIVE_RUN_TTL_MS: 900000,
+      APIFY_BAR_TARGETED_MAX_RESULTS: 25, APIFY_AVVO_TARGETED_MAX_RESULTS: 10,
+      APIFY_MAX_CACHED_ITEMS: 1000,
+    });
+    expect(() => loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory',
+      APIFY_MAX_COST_USD_PER_RUN: '3', APIFY_MAX_COST_USD_PER_SCAN: '2' })).toThrow('per-run <= per-scan');
+    expect(() => loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory',
+      APIFY_RUN_TIMEOUT_SECS: '600', APIFY_ACTIVE_RUN_TTL_MS: '600000' })).toThrow('must exceed');
+  });
 });

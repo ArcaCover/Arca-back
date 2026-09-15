@@ -7,9 +7,10 @@ septiembre de 2026 sobre el bloque anterior duplicado.
 
 - `POST /scan` exige `email` y `domain` y devuelve `202` con `scanId`, `sessionToken` y `status`.
 - El polling terminal devuelve `result`; el resultado incluye `scanId`, `domain` y `email`.
-- Avvo usa `scrapers_lat/avvo-lawyers-scraper` con `searchQueries`, `cities: ["Miami, FL"]`,
-  `withDetails: true` y su máximo técnico documentado de 100,000 resultados; el roster no se recorta y
-  el dataset de Apify se pagina hasta agotarse.
+- Avvo usa `scrapers_lat/avvo-lawyers-scraper` con `searchQueries`, ciudad observada cuando existe y
+  `withDetails: true`. Desde DN-06, las búsquedas nominales usan un límite configurable y un resultado que
+  alcanza ese límite queda `TRUNCATED`; el fallback de firma conserva el máximo técnico, y todo dataset ya
+  generado se pagina hasta agotarse.
 - El adaptador consume rating, reviews, awards, disciplina y campos de cross-reference del actor nuevo.
 - Reputation elimina A5, asigna 9/6/2/-5 por rating, hasta 5 por reviews y 6 por awards.
 - Una investigación regulatoria activa fuerza score 0, decisión DECLINE y tier cuantitativo CRITICAL.

@@ -49,11 +49,13 @@ export function createApp(deps: AppDeps) {
     const scanId = `sc_${randomUUID().replaceAll('-', '')}`;
     const sessionToken = await issueSessionToken(scanId, email, deps.sessionSecret);
     const cached = await deps.repository.cached(canonicalDomain, new Date(timestamp - 86400000).toISOString());
-    const cachedResult = cached?.result ? Layer1Result.parse({ ...cached.result, scanId, domain: canonicalDomain, email,
+    // Completed scans are returned immediately. Partial scans warm the website and per-query caches,
+    // then run again so only missing or expired external evidence is repaired.
+    const cachedResult = cached?.status === 'COMPLETED' && cached.result ? Layer1Result.parse({ ...cached.result, scanId, domain: canonicalDomain, email,
       meta: { ...cached.result.meta, cached: true } }) : null;
     if (cachedResult && cachedResult.domain !== canonicalDomain) throw new Error('Cached domain identity mismatch');
     // A reused scan keeps the terminal status of the evidence it reuses; partial stays partial.
-    const cachedStatus = cached?.status === 'PARTIAL' ? 'PARTIAL' as const : 'COMPLETED' as const;
+    const cachedStatus = 'COMPLETED' as const;
     const scan: ScanRecord = {
       id: randomUUID(), scan_id: scanId, email, canonical_domain: canonicalDomain, domain_resolution: domainResolution,
       status: cachedResult ? cachedStatus : 'RUNNING', result: cachedResult,

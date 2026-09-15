@@ -64,8 +64,8 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
   if (disciplinary.uncertain) flags.push('DISCIPLINARY_DETAILS_UNKNOWN');
   if ([...(bar ?? []), ...(avvo ?? [])].some(match => match.ambiguous)) flags.push('AMBIGUOUS_IDENTITY_MATCH');
   if (barPeople.some(person => person && ['inactive', 'retired', 'deceased'].includes(person.barStatus ?? ''))) flags.push('NON_ACTIVE_ATTORNEY');
-  const providerCost = Object.values(input.sources).reduce((total, source) => total + (source.costUsd ?? 0), 0);
-  if (providerCost > 1) flags.push('PROVIDER_COST_OVER_BUDGET');
+  if (Object.values(input.sources).some(source => source.accountingComplete === false)) flags.push('PROVIDER_COST_UNKNOWN');
+  if (Object.values(input.sources).some(source => source.code === 'BUDGET_EXCEEDED')) flags.push('PROVIDER_BUDGET_EXCEEDED');
   const assessmentStatus = Object.values(categories).every(category => category.status === 'KNOWN') &&
     !flags.includes('AMBIGUOUS_IDENTITY_MATCH') ? 'SUFFICIENT' as const : 'INSUFFICIENT_EVIDENCE' as const;
   if (assessmentStatus === 'INSUFFICIENT_EVIDENCE') flags.push('COMMERCIAL_DECISION_BLOCKED');

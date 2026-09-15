@@ -20,23 +20,31 @@ const envPath = fileURLToPath(new URL('../../../.env.local', import.meta.url));
 if (existsSync(envPath)) loadEnvFile(envPath);
 const env = loadEnv();
 const repository = env.storageBackend === 'memory' ? new InMemoryRepository() : createRepository(env.SUPABASE_URL!, env.supabaseKey!);
-await repository.recoverInterrupted(new Date(Date.now() - 60_000).toISOString());
+const interruptedBefore = () => new Date(Date.now() - env.PIPELINE_TIMEOUT_MS - 120_000).toISOString();
+await repository.recoverInterrupted(interruptedBefore());
 const websiteEvidenceProvider = env.sourceMode === 'mock' ? null : env.WEBSITE_EVIDENCE_PROVIDER === 'openai'
   ? new OpenAIEvidenceProvider(env.OPENAI_API_KEY!) : env.WEBSITE_EVIDENCE_PROVIDER === 'rules'
     ? new RuleBasedEvidenceProvider() : new NvidiaNimEvidenceProvider(
       env.SIGNAL_LLM_ENDPOINT === 'openai' ? env.OPENAI_API_KEY! : env.NVIDIA_NIM_API_KEY!, env.signalModel, undefined, undefined,
       env.SIGNAL_LLM_ENDPOINT === 'openai' ? openAiEndpoint(env.SIGNAL_LLM_REASONING_EFFORT) : LLM_ENDPOINTS.nvidia);
-const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY) : null;
+const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY, {
+  store: repository, build: env.APIFY_ACTOR_BUILD, maxCostUsdPerRun: env.APIFY_MAX_COST_USD_PER_RUN,
+  maxCostUsdPerScan: env.APIFY_MAX_COST_USD_PER_SCAN, maxCostUsdPerDay: env.APIFY_MAX_COST_USD_PER_DAY,
+  cacheTtlMs: env.APIFY_QUERY_CACHE_TTL_MS, activeTtlMs: env.APIFY_ACTIVE_RUN_TTL_MS,
+  runTimeoutSecs: env.APIFY_RUN_TIMEOUT_SECS,
+  maxCachedItems: env.APIFY_MAX_CACHED_ITEMS,
+}) : null;
 const sources = env.sourceMode === 'mock' ? mockSources() : {
   website: new WebsiteExtractionSource(repository, websiteEvidenceProvider!),
-  bar: new ApifyDirectorySource('bar', apify!),
-  avvo: new ApifyDirectorySource('avvo', apify!),
+  bar: new ApifyDirectorySource('bar', apify!, { targetedMaxLawyers: env.APIFY_BAR_TARGETED_MAX_RESULTS }),
+  avvo: new ApifyDirectorySource('avvo', apify!, { targetedMaxLawyers: env.APIFY_AVVO_TARGETED_MAX_RESULTS }),
 };
 const domainResolver = env.sourceMode === 'mock' ? new PublicDomainResolver(async url => {
   if (!(MOCK_DOMAINS as readonly string[]).includes(new URL(url).hostname)) throw new Error('Unknown mock domain');
 }) : new PublicDomainResolver();
 const clientIps = new WeakMap<Request, string>();
-const { app, drain } = createApp({ repository, domainResolver, pipeline: new InProcessPipeline({ ...sources, repository }),
+const { app, drain } = createApp({ repository, domainResolver,
+  pipeline: new InProcessPipeline({ ...sources, repository, timeoutMs: env.PIPELINE_TIMEOUT_MS }),
   sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
   clientIp: request => clientIps.get(request) ?? 'unknown' });
 const server = serve({ port: env.PORT, fetch: (request, bindings) => {
@@ -47,7 +55,7 @@ const server = serve({ port: env.PORT, fetch: (request, bindings) => {
   return app.fetch(request);
 } }, info => console.log(`[api] sources=${env.sourceMode} storage=${env.storageBackend} on port ${info.port}`));
 const recoverTimer = setInterval(() => {
-  void repository.recoverInterrupted(new Date(Date.now() - 120_000).toISOString()).catch(() => console.error('[api] recovery failed'));
+  void repository.recoverInterrupted(interruptedBefore()).catch(() => console.error('[api] recovery failed'));
 }, 60_000);
 recoverTimer.unref();
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => {

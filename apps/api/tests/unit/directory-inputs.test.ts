@@ -14,3 +14,8 @@ it('keeps the firm fallback without person names', () => {
   const [input] = buildDirectoryInputs('bar', query([]));
   expect(input).toMatchObject({ target: 'Duque Immigration Law, PLLC', fallback: true, input: { lastNames: [], firstName: '', firm: 'Duque Immigration Law, PLLC' } });
 });
+
+it('keeps recognized surname particles in a Bar lookup', () => {
+  const [input] = buildDirectoryInputs('bar', query(['María de la Cruz']));
+  expect(input?.input).toMatchObject({ firstName: 'Maria', lastNames: ['De La Cruz'] });
+});
