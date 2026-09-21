@@ -44,8 +44,7 @@ export class SupabaseRepository implements ScanRepository {
   async reserveApifyRun(request: ReserveApifyRun): Promise<ApifyRunReservation> {
     const { data, error } = await this.client.rpc('reserve_apify_run', { p_scan_id: request.scanId ?? null,
       p_query_fingerprint: request.queryFingerprint, p_actor: request.actor, p_build: request.build,
-      p_input_json: request.input, p_max_cost_usd: request.maxCostUsd,
-      p_max_scan_cost_usd: request.maxScanCostUsd, p_max_daily_cost_usd: request.maxDailyCostUsd,
+      p_input_json: request.input, p_expected_cost_usd: request.expectedCostUsd,
       p_expires_at: request.expiresAt });
     if (error || !data) throw new Error('Unable to reserve Apify run', { cause: error });
     return data as ApifyRunReservation;

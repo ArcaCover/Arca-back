@@ -247,7 +247,7 @@ describe('Apify lifecycle', () => {
     expect(recovered.metadata).toMatchObject({ runId: 'run', resumed: true, chargedToScan: false });
     expect(request.mock.calls.filter(call => String(call[0]).includes('/runs?'))).toHaveLength(1);
   });
-  it('blocks new work when unknown accounting has consumed the scan reservation', async () => {
+  it('keeps working past the old scan ceiling and books every run on the ledger', async () => {
     const repository = new InMemoryRepository();
     await repository.create({ id: 'id', scan_id: 'sc_budget', email: 'owner@firm.com', canonical_domain: 'firm.com',
       domain_resolution: { status: 'RESOLVED', canonicalDomain: 'firm.com', source: 'request', reason: null },
@@ -255,10 +255,18 @@ describe('Apify lifecycle', () => {
     const request = vi.fn(async (url: string | URL | Request) => String(url).includes('/runs?')
       ? Response.json({ data: { id: 'run', status: 'SUCCEEDED', defaultDatasetId: 'dataset' } }) : Response.json([]));
     const client = new ApifyClient('token', request as typeof fetch, 2, { store: repository,
-      maxCostUsdPerRun: 1, maxCostUsdPerScan: 1, maxCostUsdPerDay: 2 });
-    await client.run('owner/actor', { name: 'Jane' }, new AbortController().signal, { scanId: 'sc_budget' });
-    await expect(client.run('owner/actor', { name: 'John' }, new AbortController().signal, { scanId: 'sc_budget' }))
-      .rejects.toMatchObject({ code: 'BUDGET_EXCEEDED' });
+      expectedCostUsdPerRun: 1 });
+    // Two runs on one scan: under the old per-scan cap of 1 USD the second was refused.
+    const first = await client.run('owner/actor', { name: 'Jane' }, new AbortController().signal, { scanId: 'sc_budget' });
+    const second = await client.run('owner/actor', { name: 'John' }, new AbortController().signal, { scanId: 'sc_budget' });
+    expect(first.metadata.chargedToScan).toBe(true);
+    expect(second.metadata.chargedToScan).toBe(true);
+    // Both are distinct ledger entries: the spend is recorded, it is simply not refused.
+    expect(second.metadata.ledgerId).not.toBe(first.metadata.ledgerId);
+    for (const entry of [first, second]) {
+      await expect(repository.getApifyRun(entry.metadata.ledgerId!))
+        .resolves.toMatchObject({ reserved_usd: 1 });
+    }
   });
   it('does not repeat a failed paid run during its retry cooldown', async () => {
     const repository = new InMemoryRepository();

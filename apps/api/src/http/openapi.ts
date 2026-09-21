@@ -1,6 +1,6 @@
 import { extendZodWithOpenApi, OpenAPIRegistry, OpenApiGeneratorV31 } from '@asteasolutions/zod-to-openapi';
 import { z } from 'zod';
-import { CachedScanResponse, StartedScanResponse, PollResponse, ScanRequest } from './schemas.js';
+import { CachedScanResponse, StartedScanResponse, PollResponse, ScanRequest } from '@arca/contracts';
 extendZodWithOpenApi(z);
 export function buildOpenApiDocument() {
   const registry = new OpenAPIRegistry();
@@ -52,14 +52,14 @@ export function buildOpenApiDocument() {
   };
   const invalid = { invalidRequest: { summary: 'Invalid request', value: { error: 'invalid_request', message: 'A valid email and a non-empty domain are required' } } };
   registry.registerPath({ method: 'post', path: '/scan', summary: 'Start a domain scan or reuse a cached domain result',
-    description: 'Cache identity is the normalized domain. A cache miss returns 202 RUNNING. A hit within 24 hours returns 200 immediately with cached=true, a new scanId, a new sessionToken and the stored terminal status, which is COMPLETED or PARTIAL.',
+    description: 'Cache identity is the normalized domain. A cache miss returns 202 RUNNING. A hit inside the cache window (SCAN_CACHE_TTL_MS, 7 days by default) returns 200 immediately with cached=true, a new scanId, a new sessionToken and status COMPLETED. A cached partial scan is never returned as it stands: it is repaired first, so it arrives through polling.',
     request: { body: { required: true, content: json(ScanRequest, { lawFirm: { summary: 'Start a firm scan',
       value: { email: 'contact@smithlaw.com', domain: 'smithlaw.com' } } }) } },
     responses: {
       202: { description: 'Fresh scan started; poll GET /scan/{scanId}', content: json(StartedScanResponse, {
         started: { summary: 'Scan accepted', value: { scanId: 'sc_abc123', sessionToken: 'eyJhbGciOiJIUzI1NiIs...', status: 'RUNNING' } },
       }) },
-      200: { description: 'Domain cache hit; the stored COMPLETED or PARTIAL result is returned immediately with a new scan session', content: json(CachedScanResponse, {
+      200: { description: 'Domain cache hit; the stored COMPLETED result is returned immediately with a new scan session', content: json(CachedScanResponse, {
         cacheHit: { summary: 'Cached domain result', value: { scanId: 'sc_abc123', sessionToken: 'eyJhbGciOiJIUzI1NiIs...', status: 'COMPLETED', cached: true,
           result: { ...result, meta: { ...result.meta, cached: true } } } },
       }) },
@@ -74,6 +74,8 @@ export function buildOpenApiDocument() {
     responses: { 200: { description: 'RUNNING, COMPLETED, PARTIAL or FAILED. All but RUNNING are terminal.', content: json(PollResponse, {
       running: { summary: 'Scan still running', value: { scanId: 'sc_abc123', status: 'RUNNING', elapsed: 12400 } },
       completed: { summary: 'Completed scan', value: { scanId: 'sc_abc123', status: 'COMPLETED', cached: false, result } },
+      partial: { summary: 'Partial scan: a source could not be repaired', value: { scanId: 'sc_abc123', status: 'PARTIAL', cached: false,
+        result: { ...result, preScore: { ...result.preScore, assessmentStatus: 'INSUFFICIENT_EVIDENCE', decision: 'UNKNOWN', flags: ['INCOMPLETE_SOURCES'] } } } },
       failed: { summary: 'Terminal scan failure', value: { scanId: 'sc_abc123', status: 'FAILED', cached: false } },
     }) },
       401: { description: 'Missing or invalid session', content: json(error) },

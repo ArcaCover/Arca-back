@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { decodeJwt, SignJWT } from 'jose';
 import { issueSessionToken, verifySessionToken } from '../../src/auth/session-token.js';
 import { ScanLimiter } from '../../src/http/rate-limit.js';
-import { ScanRequest } from '../../src/http/schemas.js';
+import { ScanRequest } from '@arca/contracts';
 import { assertPublicUrl } from '../../src/pipeline/network.js';
 import { normalizeDomain } from '../../src/pipeline/domain-resolution.js';
 const secret = 's'.repeat(40);

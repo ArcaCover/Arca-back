@@ -16,11 +16,12 @@ export type ApifyRunRecord = {
   accounting_complete: boolean; partial: boolean; created_at: string; updated_at: string;
   expires_at: string; last_error: string | null;
 };
-export type ApifyRunReservation = { decision: 'start' | 'reuse' | 'resume' | 'failed' | 'budget_exceeded';
+export type ApifyRunReservation = { decision: 'start' | 'reuse' | 'resume' | 'failed';
   record: ApifyRunRecord | null; chargedToScan: boolean };
 export type ReserveApifyRun = {
   scanId?: string; queryFingerprint: string; actor: string; build: string; input: Record<string, unknown>;
-  maxCostUsd: number; maxScanCostUsd: number; maxDailyCostUsd: number; expiresAt: string;
+  // Provisional cost booked against the run while it is in flight. Accounting, not a cap.
+  expectedCostUsd: number; expiresAt: string;
 };
 export type ApifyRunUpdate = Partial<Pick<ApifyRunRecord, 'run_id' | 'dataset_id' | 'build_id' | 'build_number' | 'status' | 'items' |
   'item_count' | 'accepted_count' | 'cost_usd' | 'accounting_complete' | 'partial' | 'expires_at' | 'last_error'>>;

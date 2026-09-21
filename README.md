@@ -40,11 +40,16 @@ $scan = Invoke-RestMethod http://localhost:8080/scan -Method Post -ContentType '
 Invoke-RestMethod "http://localhost:8080/scan/$($scan.scanId)" -Headers @{ Authorization = "Bearer $($scan.sessionToken)" }
 ```
 
-| Dominio mock | Score | Resultado relevante |
+| Dominio mock | Estado terminal | Resultado relevante |
 | --- | --- | --- |
-| robust.arca.example | 82 | FORTRESS |
-| minimal.arca.example | 25 | EXPOSED; evidencia incompleta |
-| sanctioned.arca.example | 72 | FORTIFIED; decisión REFERRAL_SENIOR por sanción reciente |
+| robust.arca.example | COMPLETED | Score 82, FORTRESS |
+| minimal.arca.example | COMPLETED | Score 25, EXPOSED; evidencia incompleta |
+| sanctioned.arca.example | COMPLETED | Score 72, FORTIFIED; decisión REFERRAL_SENIOR por sanción reciente |
+| partial.arca.example | PARTIAL | Avvo caído; `INSUFFICIENT_EVIDENCE` y decisión `UNKNOWN` |
+| failed.arca.example | FAILED | Ninguna fuente utilizable; sin `result` en la respuesta |
+
+Los dos últimos existen para que el frontend pueda desarrollar sus ramas de error sin
+desenchufar la red.
 
 Los fixtures están en `apps/api/mocks`; la sanción reciente se fecha al cargar el escenario.
 
@@ -72,13 +77,25 @@ La confianza HIGH/MEDIUM/LOW corresponde al número de fuentes técnicamente com
 `preScore.assessmentStatus=INSUFFICIENT_EVIDENCE` bloquea la decisión comercial automática y devuelve
 `decision=UNKNOWN`, salvo que evidencia disciplinaria conocida imponga una restricción explícita.
 
-La caché dura 24 horas por dominio canónico y reutiliza scans COMPLETED y PARTIAL originales; nunca
-reutiliza FAILED. Un scan solo queda PARTIAL después de que cada página recuperable agotó sus reintentos,
-así que repetirlo volvería a pagar las mismas ejecuciones de proveedor por la misma evidencia.
+La caché dura `SCAN_CACHE_TTL_MS` por dominio canónico, 7 días por defecto, y nunca reutiliza FAILED.
+**Un cache hit siempre es COMPLETED.** Un scan que quedó PARTIAL sí entra en la caché, pero no se
+devuelve tal cual: se re-ejecuta reutilizando el análisis de website por hash de contenido y las
+consultas de directorio vigentes, de modo que solo se repara la evidencia que falta, y el solicitante
+recibe el resultado reparado. Devolverlo sin reparar congelaría el fallo durante toda la ventana.
+Un scan solo queda PARTIAL después de que cada página recuperable agotó sus reintentos.
+`APIFY_QUERY_CACHE_TTL_MS` se mantiene acoplado a `SCAN_CACHE_TTL_MS`: si expirara antes, cada
+reparación volvería a pagar las consultas de directorio que debía reutilizar.
 Cada reutilización crea un registro y token propios, conserva la fecha de evidencia y no renueva el TTL.
 La caché vive en PostgreSQL/Supabase usando `scans`; no requiere Redis ni archivos locales. La consulta
-está respaldada por un índice parcial sobre dominio y fecha para scans COMPLETED no cacheados.
+está respaldada por un índice parcial sobre dominio y fecha para scans reutilizables no cacheados.
 Los límites en memoria son 10 solicitudes por IP/hora y 3 por email/hora.
+
+El gasto de Apify se **registra pero no se limita**. El ledger (`apify_runs`, `scan_apify_runs`,
+`cost_usd`, `reserved_usd`, `accounting_complete`, `charged_to_scan`) queda intacto y atribuye el
+coste por scan; `APIFY_EXPECTED_COST_USD_PER_RUN` es la cifra provisional que se reserva mientras un
+run está en vuelo, antes de que Apify reporte el coste real. No hay tope por run, por scan ni por día,
+y tampoco `maxTotalChargeUsd` del lado del proveedor: lo único que acota un run individual es
+`APIFY_RUN_TIMEOUT_SECS`.
 
 ## Reglas
 

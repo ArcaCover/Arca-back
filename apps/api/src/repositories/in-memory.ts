@@ -54,21 +54,12 @@ export class InMemoryRepository implements ScanRepository {
     if (existing && existing.expires_at > now) {
       attach(existing.id, false); return { decision: 'failed', record: structuredClone(existing), chargedToScan: false };
     }
-    const reserved = (run: ApifyRunRecord) => run.accounting_complete ? (run.cost_usd ?? run.reserved_usd) : run.reserved_usd;
-    const day = now.slice(0, 10);
-    const daily = [...this.apifyRuns.values()].filter(run => run.created_at.startsWith(day)).reduce((sum, run) => sum + reserved(run), 0);
-    const scan = request.scanId ? [...(this.scanApifyRuns.get(request.scanId) ?? [])]
-      .filter(([, charged]) => charged).map(([id]) => this.apifyRuns.get(id))
-      .filter((run): run is ApifyRunRecord => Boolean(run))
-      .reduce((sum, run) => sum + reserved(run), 0) : 0;
-    if (daily + request.maxCostUsd > request.maxDailyCostUsd || scan + request.maxCostUsd > request.maxScanCostUsd) {
-      return { decision: 'budget_exceeded', record: null, chargedToScan: false };
-    }
+    // Spend is recorded, never capped: the ledger below is the whole point, the gate is gone.
     const record: ApifyRunRecord = { id: randomUUID(), query_fingerprint: request.queryFingerprint,
       actor: request.actor, build: request.build, build_id: null, build_number: null,
       input_json: structuredClone(request.input), run_id: null,
       dataset_id: null, status: 'RESERVED', items: null, item_count: 0, accepted_count: 0, cost_usd: null,
-      reserved_usd: request.maxCostUsd, accounting_complete: false, partial: false, created_at: now,
+      reserved_usd: request.expectedCostUsd, accounting_complete: false, partial: false, created_at: now,
       updated_at: now, expires_at: request.expiresAt, last_error: null };
     this.apifyRuns.set(record.id, record); attach(record.id, true);
     return { decision: 'start', record: structuredClone(record), chargedToScan: true };

@@ -80,7 +80,7 @@ export type AttorneyMatch = z.infer<typeof AttorneyMatch>;
 export const SourceName = z.enum(['website', 'bar', 'avvo']);
 export type SourceName = z.infer<typeof SourceName>;
 export const SourceIssueCode = z.enum(['ACCESS_BLOCKED', 'NO_READABLE_EVIDENCE', 'INSUFFICIENT_IDENTITY',
-  'NO_MATCH', 'PROVIDER_ERROR', 'PROVIDER_CONTRACT_ERROR', 'BUDGET_EXCEEDED', 'DEADLINE_REACHED', 'TRUNCATED']);
+  'NO_MATCH', 'PROVIDER_ERROR', 'PROVIDER_CONTRACT_ERROR', 'DEADLINE_REACHED', 'TRUNCATED']);
 export const ProviderRun = z.object({
   provider: z.literal('apify'), actor: z.string(), runId: z.string(), status: z.string(),
   queryFingerprint: z.string(), itemCount: z.number().int().nonnegative(),
