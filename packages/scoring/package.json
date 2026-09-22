@@ -5,7 +5,7 @@
   "type": "module",
   "exports": {
     ".": {
-      "development": "./src/index.ts",
+      "arca-source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
