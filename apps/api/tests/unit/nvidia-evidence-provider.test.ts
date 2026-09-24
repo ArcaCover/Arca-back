@@ -251,6 +251,20 @@ describe('NVIDIA evidence provider', () => {
     expect(request).not.toHaveProperty('chat_template_kwargs');
   });
 
+  it('treats every model from GPT-5 onwards as a reasoning model', async () => {
+    // Probed against the API on 2026-09-23: gpt-6-luna answers `max_completion_tokens` alone
+    // and rejects temperature with "does not support 0 with this model. Only the default (1)".
+    // The family test used to be anchored on gpt-5, so a gpt-6 model was sent temperature 0
+    // and every extraction call failed outright.
+    for (const model of ['gpt-6-luna', 'gpt-6-astra', 'gpt-10-whatever']) {
+      const { request } = await firstRequest(LLM_ENDPOINTS.openai, model);
+      expect(request, model).not.toHaveProperty('temperature');
+      expect(request, model).toMatchObject({ max_completion_tokens: expect.any(Number) });
+    }
+    // GPT-4 and earlier keep the deterministic profile they do support.
+    expect((await firstRequest(LLM_ENDPOINTS.openai, 'gpt-4.1-mini')).request).toMatchObject({ temperature: 0 });
+  });
+
   it('keeps the NIM request profile by default', async () => {
     const { provider, request } = await firstRequest(LLM_ENDPOINTS.nvidia, 'z-ai/glm-5.3-flash');
     expect(request).toMatchObject({ temperature: 0, max_tokens: 8000, chat_template_kwargs: { enable_thinking: false } });
