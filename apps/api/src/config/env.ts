@@ -19,16 +19,21 @@ const EnvSchema = z.object({
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
   MAX_APIFY_CONCURRENCY: z.coerce.number().int().min(1).max(2).default(2),
   APIFY_ACTOR_BUILD: z.string().min(1).default('latest'),
-  APIFY_MAX_COST_USD_PER_RUN: z.coerce.number().positive().default(1),
-  APIFY_MAX_COST_USD_PER_SCAN: z.coerce.number().positive().default(10),
-  APIFY_MAX_COST_USD_PER_DAY: z.coerce.number().positive().default(100),
-  APIFY_QUERY_CACHE_TTL_MS: z.coerce.number().int().positive().default(86_400_000),
+  // Provisional figure the ledger reserves while a run is in flight, before Apify reports
+  // the real cost. Accounting only: spend is recorded, never capped.
+  APIFY_EXPECTED_COST_USD_PER_RUN: z.coerce.number().positive().default(1),
+  // Kept in step with SCAN_CACHE_TTL_MS. If this expires first, repairing a partial scan
+  // re-pays the directory runs it was meant to reuse.
+  APIFY_QUERY_CACHE_TTL_MS: z.coerce.number().int().positive().default(604_800_000),
   APIFY_ACTIVE_RUN_TTL_MS: z.coerce.number().int().positive().default(900_000),
   APIFY_RUN_TIMEOUT_SECS: z.coerce.number().int().min(60).max(86_400).default(300),
   APIFY_BAR_TARGETED_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(25),
   APIFY_AVVO_TARGETED_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(10),
   APIFY_MAX_CACHED_ITEMS: z.coerce.number().int().min(1).max(10_000).default(1000),
   PIPELINE_TIMEOUT_MS: z.coerce.number().int().min(10_000).max(3_600_000).default(600_000),
+  // Domain scan cache window. Layer 1 evidence (a published AI policy, bar standing, an
+  // Avvo rating) changes in weeks, not hours.
+  SCAN_CACHE_TTL_MS: z.coerce.number().int().positive().default(604_800_000),
 });
 export function loadEnv(source = process.env) {
   const env = EnvSchema.parse(source);
@@ -53,10 +58,6 @@ export function loadEnv(source = process.env) {
   for (const origin of corsOrigins) if (new URL(origin).origin !== origin) throw new Error('CORS entries must be exact origins');
   if (env.SUPABASE_URL) z.string().url().parse(env.SUPABASE_URL);
   const signalModel = env.SIGNAL_LLM_MODEL?.trim() || (env.SIGNAL_LLM_ENDPOINT === 'nvidia' ? env.NVIDIA_NIM_MODEL?.trim() : undefined) || undefined;
-  if (env.APIFY_MAX_COST_USD_PER_RUN > env.APIFY_MAX_COST_USD_PER_SCAN ||
-    env.APIFY_MAX_COST_USD_PER_SCAN > env.APIFY_MAX_COST_USD_PER_DAY) {
-    throw new Error('Apify budgets must satisfy per-run <= per-scan <= per-day');
-  }
   if (env.APIFY_ACTIVE_RUN_TTL_MS < (env.APIFY_RUN_TIMEOUT_SECS + 60) * 1000) {
     throw new Error('APIFY_ACTIVE_RUN_TTL_MS must exceed the remote run timeout by at least 60 seconds');
   }

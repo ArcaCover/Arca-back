@@ -43,8 +43,14 @@ export class WebsiteExtractionSource implements WebsiteSource {
           analysis = WebsiteData.parse(result.websiteData); diagnostics = result.diagnostics;
         } else analysis = WebsiteData.parse(await this.provider.extract(crawl, signal));
       }
-      catch {
-        return { data: null, rawContent: JSON.stringify({ ...base, contentHash, analysis: null, diagnostics }),
+      catch (error) {
+        // A failed extraction is not a local setback: without website data the identity is
+        // insufficient, the directories are skipped and the whole scan ends FAILED. Keep the
+        // provider's own message in the stored evidence, or there is no way to tell a token
+        // limit from a timeout afterwards. It stays out of `reason`, which the API returns.
+        const message = error instanceof Error ? error.message : String(error);
+        return { data: null, rawContent: JSON.stringify({ ...base, contentHash, analysis: null,
+            diagnostics: { ...(diagnostics as object ?? {}), error: message, pagesCrawled: crawl.pages.length } }),
           status: { status: signal.aborted ? 'timeout' : 'error', dataStatus: 'UNKNOWN', durationMs: Date.now() - start,
             pagesCrawled: crawl.pages.length, code: signal.aborted ? 'DEADLINE_REACHED' : 'PROVIDER_ERROR',
             reason: 'Website evidence extraction unavailable' } };

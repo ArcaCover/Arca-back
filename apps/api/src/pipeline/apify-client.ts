@@ -20,8 +20,8 @@ export type ApifyRunMetadata = { provider: 'apify'; actor: string; runId: string
   accountingComplete?: boolean; chargedToScan?: boolean; ledgerId?: string };
 export type ApifyRunResult = { items: unknown[]; metadata: ApifyRunMetadata };
 export type ApifyRunContext = { scanId?: string };
-export type ApifyClientOptions = { store?: RunStore; build?: string; maxCostUsdPerRun?: number;
-  maxCostUsdPerScan?: number; maxCostUsdPerDay?: number; cacheTtlMs?: number; activeTtlMs?: number;
+export type ApifyClientOptions = { store?: RunStore; build?: string; expectedCostUsdPerRun?: number;
+  cacheTtlMs?: number; activeTtlMs?: number;
   runTimeoutSecs?: number; pollWaitSecs?: number; maxCachedItems?: number };
 
 const canonical = (value: unknown): string => value !== null && typeof value === 'object'
@@ -32,7 +32,7 @@ const canonical = (value: unknown): string => value !== null && typeof value ===
 const terminal = (status: string) => !['RESERVED', 'READY', 'RUNNING', 'TIMING-OUT', 'ABORTING'].includes(status);
 
 export class ApifyClientError extends Error {
-  constructor(readonly code: 'PROVIDER_ERROR' | 'BUDGET_EXCEEDED', message: string,
+  constructor(readonly code: 'PROVIDER_ERROR', message: string,
     readonly metadata: ApifyRunMetadata | null = null) { super(message); }
 }
 
@@ -44,9 +44,8 @@ export class ApifyClient {
   constructor(private readonly token: string, private readonly request: typeof fetch = fetch,
     private readonly maxConcurrency = 2, options: ApifyClientOptions = {}) {
     this.store = options.store ?? new InMemoryRepository();
-    this.options = { build: options.build ?? 'latest', maxCostUsdPerRun: options.maxCostUsdPerRun ?? 1,
-      maxCostUsdPerScan: options.maxCostUsdPerScan ?? 10, maxCostUsdPerDay: options.maxCostUsdPerDay ?? 100,
-      cacheTtlMs: options.cacheTtlMs ?? 86_400_000, activeTtlMs: options.activeTtlMs ?? 900_000,
+    this.options = { build: options.build ?? 'latest', expectedCostUsdPerRun: options.expectedCostUsdPerRun ?? 1,
+      cacheTtlMs: options.cacheTtlMs ?? 604_800_000, activeTtlMs: options.activeTtlMs ?? 900_000,
       runTimeoutSecs: options.runTimeoutSecs ?? 300, pollWaitSecs: options.pollWaitSecs ?? 10,
       maxCachedItems: options.maxCachedItems ?? 1000 };
   }
@@ -100,13 +99,9 @@ export class ApifyClient {
     let reservation: ApifyRunReservation;
     try {
       reservation = await this.store.reserveApifyRun({ scanId: context.scanId, queryFingerprint, actor,
-        build: this.options.build, input, maxCostUsd: this.options.maxCostUsdPerRun,
-        maxScanCostUsd: this.options.maxCostUsdPerScan, maxDailyCostUsd: this.options.maxCostUsdPerDay,
+        build: this.options.build, input, expectedCostUsd: this.options.expectedCostUsdPerRun,
         expiresAt: new Date(Date.now() + this.options.activeTtlMs).toISOString() });
     } catch (error) { this.release(); throw error; }
-    if (reservation.decision === 'budget_exceeded') {
-      this.release(); throw new ApifyClientError('BUDGET_EXCEEDED', 'Apify spend budget exhausted');
-    }
     let record = reservation.record!;
     if (reservation.decision === 'failed') {
       this.release(); throw new ApifyClientError('PROVIDER_ERROR', 'Previous Apify run failed; retry cooldown active',
@@ -125,8 +120,10 @@ export class ApifyClient {
         const state = await this.json(`actor-runs/${encodeURIComponent(record.run_id)}?waitForFinish=${this.options.pollWaitSecs}`, signal);
         run = z.object({ data: Run }).parse(state).data;
       } else if (reservation.decision === 'start') {
+        // No maxTotalChargeUsd: spend is recorded in the ledger, not capped at the provider.
+        // The run timeout is what bounds a single run.
         const parameters = new URLSearchParams({ waitForFinish: '60', timeout: String(this.options.runTimeoutSecs),
-          build: this.options.build, maxTotalChargeUsd: String(this.options.maxCostUsdPerRun) });
+          build: this.options.build });
         let start: unknown;
         try {
           start = await this.json(`acts/${encodeURIComponent(actor.replace('/', '~'))}/runs?${parameters}`, signal,

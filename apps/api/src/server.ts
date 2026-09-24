@@ -28,8 +28,7 @@ const websiteEvidenceProvider = env.sourceMode === 'mock' ? null : env.WEBSITE_E
       env.SIGNAL_LLM_ENDPOINT === 'openai' ? env.OPENAI_API_KEY! : env.NVIDIA_NIM_API_KEY!, env.signalModel, undefined, undefined,
       env.SIGNAL_LLM_ENDPOINT === 'openai' ? openAiEndpoint(env.SIGNAL_LLM_REASONING_EFFORT) : LLM_ENDPOINTS.nvidia);
 const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY, {
-  store: repository, build: env.APIFY_ACTOR_BUILD, maxCostUsdPerRun: env.APIFY_MAX_COST_USD_PER_RUN,
-  maxCostUsdPerScan: env.APIFY_MAX_COST_USD_PER_SCAN, maxCostUsdPerDay: env.APIFY_MAX_COST_USD_PER_DAY,
+  store: repository, build: env.APIFY_ACTOR_BUILD, expectedCostUsdPerRun: env.APIFY_EXPECTED_COST_USD_PER_RUN,
   cacheTtlMs: env.APIFY_QUERY_CACHE_TTL_MS, activeTtlMs: env.APIFY_ACTIVE_RUN_TTL_MS,
   runTimeoutSecs: env.APIFY_RUN_TIMEOUT_SECS,
   maxCachedItems: env.APIFY_MAX_CACHED_ITEMS,
@@ -46,6 +45,7 @@ const clientIps = new WeakMap<Request, string>();
 const { app, drain } = createApp({ repository, domainResolver,
   pipeline: new InProcessPipeline({ ...sources, repository, timeoutMs: env.PIPELINE_TIMEOUT_MS }),
   sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
+  scanCacheTtlMs: env.SCAN_CACHE_TTL_MS,
   clientIp: request => clientIps.get(request) ?? 'unknown' });
 const server = serve({ port: env.PORT, fetch: (request, bindings) => {
   const connection = bindings as HttpBindings;

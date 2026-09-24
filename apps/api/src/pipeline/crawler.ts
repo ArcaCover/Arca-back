@@ -41,6 +41,11 @@ export function pagePriority(raw: string): number {
   const index = groups.findIndex(group => group.test(path));
   return index < 0 ? 6 : index + 1;
 }
+/** Caps how many pages of one priority group a single crawl will visit. Without it a firm with many
+    attorney bios (priority group 2, muscalaw.com had 15) fills the whole page budget before privacy
+    or blog — lower-priority groups that settle real signals — ever get a turn. Only group 2 is capped:
+    it is the one observed to explode in page count; the others stay uncapped as before. */
+const GROUP_PAGE_LIMITS: Partial<Record<number, number>> = { 2: 3 };
 export function canonicalUrl(raw: string, base: string): string | null {
   try {
     const url = new URL(raw, base);
@@ -48,6 +53,10 @@ export function canonicalUrl(raw: string, base: string): string | null {
     if (!['https:', 'http:'].includes(url.protocol) || url.hostname.replace(/^www\./, '') !== host ||
       url.username || url.password || url.port || /\.(pdf|jpg|jpeg|png|gif|webp|zip|svg|mp4|css|js)$/i.test(url.pathname)) return null;
     url.hash = ''; url.search = '';
+    // The same page reached with and without "www." must canonicalize to one identical string, or a
+    // self-link in the other form (common on real sites: muscalaw.com's own home link) gets queued
+    // and crawled a second time, spending a page of budget on content already read.
+    url.hostname = host;
     return url.href;
   } catch { return null; }
 }
@@ -128,10 +137,24 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
       issues.push(issue);
       partial = true;
     };
+    const groupCounts = new Map<number, number>();
     while (queue.length && visited.size < maxPages && !signal.aborted) {
       queue.sort((a, b) => a.depth - b.depth || pagePriority(a.url) - pagePriority(b.url) || a.url.localeCompare(b.url));
-      const batch = queue.splice(0, Math.min(3, maxPages - visited.size)).filter(item => !visited.has(item.url));
-      for (const item of batch) visited.add(item.url);
+      const underGroupLimit = (item: { url: string }) => {
+        const limit = GROUP_PAGE_LIMITS[pagePriority(item.url)];
+        return limit === undefined || (groupCounts.get(pagePriority(item.url)) ?? 0) < limit;
+      };
+      const capacity = Math.min(3, maxPages - visited.size);
+      const eligible = queue.filter(underGroupLimit);
+      // Falling back to over-limit items only once nothing else is queued keeps the reservation from
+      // wasting budget: a site with no blog or privacy page should not leave slots unused.
+      const pool = eligible.length ? eligible : queue;
+      const batch = pool.slice(0, capacity).filter(item => !visited.has(item.url));
+      for (const item of batch) queue.splice(queue.indexOf(item), 1);
+      for (const item of batch) {
+        visited.add(item.url);
+        groupCounts.set(pagePriority(item.url), (groupCounts.get(pagePriority(item.url)) ?? 0) + 1);
+      }
       await Promise.all(batch.map(async item => {
         let page: import('playwright').Page | undefined;
         try {
@@ -153,7 +176,11 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
               ? 'ACCESS_BLOCKED' : 'NO_READABLE_CONTENT', status: response.status() });
             return;
           }
-          pages.push({ url: page.url(), html, text });
+          // Store under the canonical (www-stripped) identity, not the raw post-navigation url: a
+          // site that redirects the bare domain to www (muscalaw.com does) would otherwise leave this
+          // page indexed under a different string than the one every discovered link to it
+          // canonicalizes to, so it would look unread the next time such a link surfaces.
+          pages.push({ url: canonicalUrl(page.url(), rootUrl) ?? page.url(), html, text });
           if (item.depth < maxDepth) for (const link of links) {
             const url = canonicalUrl(link, page.url());
             if (url && !visited.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1, attempt: 0 });

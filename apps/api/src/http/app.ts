@@ -2,22 +2,22 @@ import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { swaggerUI } from '@hono/swagger-ui';
-import { Layer1Result, DomainResolution, type Layer1Pipeline, type DomainResolver, type PipelineResult } from '@arca/contracts';
+import { Layer1Result, DomainResolution, ScanRequest, type Layer1Pipeline, type DomainResolver, type PipelineResult } from '@arca/contracts';
 import { issueSessionToken, verifySessionToken } from '../auth/session-token.js';
 import type { ScanRepository, ScanRecord } from '../repositories/types.js';
 import { ScanLimiter } from './rate-limit.js';
-import { ScanRequest } from './schemas.js';
 import { buildOpenApiDocument } from './openapi.js';
 
 export type AppDeps = {
   pipeline: Layer1Pipeline; repository: ScanRepository; sessionSecret: string; corsOrigins: string[];
   domainResolver: DomainResolver;
   clientIp: (request: Request) => string;
-  limiter?: ScanLimiter; now?: () => number;
+  limiter?: ScanLimiter; now?: () => number; scanCacheTtlMs?: number;
 };
 export function createApp(deps: AppDeps) {
   const app = new Hono();
   const now = deps.now ?? Date.now;
+  const scanCacheTtlMs = deps.scanCacheTtlMs ?? 604_800_000;
   const limiter = deps.limiter ?? new ScanLimiter(now);
   const jobs = new Set<Promise<void>>();
   const inFlightByDomain = new Map<string, Promise<PipelineResult>>();
@@ -48,13 +48,14 @@ export function createApp(deps: AppDeps) {
     const timestamp = now();
     const scanId = `sc_${randomUUID().replaceAll('-', '')}`;
     const sessionToken = await issueSessionToken(scanId, email, deps.sessionSecret);
-    const cached = await deps.repository.cached(canonicalDomain, new Date(timestamp - 86400000).toISOString());
+    const cached = await deps.repository.cached(canonicalDomain, new Date(timestamp - scanCacheTtlMs).toISOString());
     // Completed scans are returned immediately. Partial scans warm the website and per-query caches,
     // then run again so only missing or expired external evidence is repaired.
     const cachedResult = cached?.status === 'COMPLETED' && cached.result ? Layer1Result.parse({ ...cached.result, scanId, domain: canonicalDomain, email,
       meta: { ...cached.result.meta, cached: true } }) : null;
     if (cachedResult && cachedResult.domain !== canonicalDomain) throw new Error('Cached domain identity mismatch');
-    // A reused scan keeps the terminal status of the evidence it reuses; partial stays partial.
+    // A cache hit is always COMPLETED. A partial scan is never handed back as it stands:
+    // it is repaired first, so the caller waits and receives the repaired result instead.
     const cachedStatus = 'COMPLETED' as const;
     const scan: ScanRecord = {
       id: randomUUID(), scan_id: scanId, email, canonical_domain: canonicalDomain, domain_resolution: domainResolution,
@@ -80,7 +81,11 @@ export function createApp(deps: AppDeps) {
         const result = Layer1Result.parse({ ...outcome.result, scanId, domain: canonicalDomain, email,
           meta: { ...outcome.result.meta, reusedEvidence } });
         if (result.domain !== canonicalDomain) throw new Error('Assessment domain identity mismatch');
-        await deps.repository.complete(scanId, { status: outcome.status, result,
+        // A failed scan carries no result, whichever way it failed. Every source was unusable,
+        // so the assessment is an empty shell, and PollResponse has no room for one on FAILED.
+        // Raw evidence still lands in scan_raw_data, so nothing diagnostic is lost.
+        await deps.repository.complete(scanId, { status: outcome.status,
+          result: outcome.status === 'FAILED' ? null : result,
           completed_at: result.meta.completedAt, duration_ms: result.meta.scanDurationMs });
       } catch (error) {
         console.error('[scan] scan failed', scanId, error instanceof Error ? error.message : 'Unknown error');

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../../src/pipeline/nvidia-evidence-provider.js';
+import { ExtractionFailure, MAX_TRANSIENT_ATTEMPTS, NvidiaNimEvidenceProvider } from '../../src/pipeline/nvidia-evidence-provider.js';
 import { LLM_ENDPOINTS, openAiEndpoint } from '../../src/pipeline/llm-endpoint.js';
 
 // These tests script every model call; the page plan adds classification calls and floor reads they do not expect.
@@ -60,6 +60,62 @@ describe('NVIDIA evidence provider', () => {
     expect(result.websiteData.firm_name).toBe('Smith Law');
     expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: 'https://firm.com/about', status: 'failed', detail: 'boom' }]);
     expect(result.diagnostics.stopReason).toBe('NO_NEW_EVIDENCE');
+  });
+
+  it('retries a transient provider error within one phase and keeps the failed attempt for audit', async () => {
+    let calls = 0;
+    const create = vi.fn(async (request: Record<string, unknown>) => {
+      calls++;
+      if (calls === 1) {
+        const error = Object.assign(new Error('Service temporarily overloaded'), { status: 503 });
+        throw error;
+      }
+      const user = (request.messages as Array<{ content: string }>)[1]!.content;
+      const content = user.startsWith('CANDIDATE CLAIMS') ? JSON.stringify({ verdicts: [] })
+        : JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } });
+      return { choices: [{ finish_reason: 'stop', message: { content } }] };
+    });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    const result = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }],
+      partial: false }, new AbortController().signal);
+    expect(result.websiteData.firm_name).toBeNull();
+    expect(create).toHaveBeenCalledTimes(2);
+    const failed = result.diagnostics.attempts.find(attempt => attempt.validationIssues?.includes('503'));
+    expect(failed).toBeDefined();
+  });
+
+  it('retries a client-side timeout the same as a 5xx', async () => {
+    let calls = 0;
+    const create = vi.fn(async (request: Record<string, unknown>) => {
+      calls++;
+      if (calls === 1) throw Object.assign(new Error('Request timed out'), { name: 'APIConnectionTimeoutError' });
+      const user = (request.messages as Array<{ content: string }>)[1]!.content;
+      const content = user.startsWith('CANDIDATE CLAIMS') ? JSON.stringify({ verdicts: [] })
+        : JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } });
+      return { choices: [{ finish_reason: 'stop', message: { content } }] };
+    });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }],
+      partial: false }, new AbortController().signal);
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a non-transient provider error', async () => {
+    const create = vi.fn(async () => { throw Object.assign(new Error('Invalid request'), { status: 400 }); });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    const failure = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }],
+      partial: false }, new AbortController().signal).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ExtractionFailure);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up after exhausting the bounded retries for a persistent transient error', async () => {
+    const create = vi.fn(async () => { throw Object.assign(new Error('Service temporarily overloaded'), { status: 503 }); });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    const failure = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }],
+      partial: false }, new AbortController().signal).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ExtractionFailure);
+    expect(create).toHaveBeenCalledTimes(MAX_TRANSIENT_ATTEMPTS);
   });
 
   const scripted = (rounds: Array<(user: string) => Record<string, unknown>>) => {
@@ -251,6 +307,20 @@ describe('NVIDIA evidence provider', () => {
     expect(request).not.toHaveProperty('chat_template_kwargs');
   });
 
+  it('treats every model from GPT-5 onwards as a reasoning model', async () => {
+    // Probed against the API on 2026-09-23: gpt-6-luna answers `max_completion_tokens` alone
+    // and rejects temperature with "does not support 0 with this model. Only the default (1)".
+    // The family test used to be anchored on gpt-5, so a gpt-6 model was sent temperature 0
+    // and every extraction call failed outright.
+    for (const model of ['gpt-6-luna', 'gpt-6-astra', 'gpt-10-whatever']) {
+      const { request } = await firstRequest(LLM_ENDPOINTS.openai, model);
+      expect(request, model).not.toHaveProperty('temperature');
+      expect(request, model).toMatchObject({ max_completion_tokens: expect.any(Number) });
+    }
+    // GPT-4 and earlier keep the deterministic profile they do support.
+    expect((await firstRequest(LLM_ENDPOINTS.openai, 'gpt-4.1-mini')).request).toMatchObject({ temperature: 0 });
+  });
+
   it('keeps the NIM request profile by default', async () => {
     const { provider, request } = await firstRequest(LLM_ENDPOINTS.nvidia, 'z-ai/glm-5.3-flash');
     expect(request).toMatchObject({ temperature: 0, max_tokens: 8000, chat_template_kwargs: { enable_thinking: false } });
@@ -282,5 +352,26 @@ describe('NVIDIA evidence provider', () => {
     const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
     expect(result.websiteData.team_members?.map(member => member.full_name).sort()).toEqual(['Jane Doe', 'John Roe']);
+  });
+
+  it('grounds privacy_policy to true and ai_blog_posts to false when their pages were read end to end', async () => {
+    const pages = [
+      { url: 'https://firm.com/', html: '', text: 'Smith Law is a law firm.' },
+      { url: 'https://firm.com/privacy-policy', html: '', text: 'We collect basic analytics.' },
+      { url: 'https://firm.com/blog', html: '', text: 'Recent wins in court.' },
+    ];
+    const create = vi.fn(async (request: Record<string, unknown>) => {
+      const user = (request.messages as Array<{ content: string }>)[1]!.content;
+      const content = user.startsWith('CANDIDATE CLAIMS') ? JSON.stringify({ verdicts: [] })
+        : JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } });
+      return { choices: [{ finish_reason: 'stop', message: { content } }] };
+    });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    const result = await provider.extractDetailed({ pages, partial: false }, new AbortController().signal);
+    expect(result.websiteData.privacy_policy).toEqual({ found: true, mentions_client_data: null });
+    expect(result.websiteData.ai_blog_posts).toEqual({ found: false, count: 0, titles: [] });
+    expect(result.websiteData.provenance.privacy_policy?.[0]).toMatchObject({
+      sourceUrl: 'https://firm.com/privacy-policy', method: 'derived',
+    });
   });
 });

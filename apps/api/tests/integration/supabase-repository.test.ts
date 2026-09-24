@@ -48,17 +48,21 @@ describe('Supabase Data API adapter', () => {
     const { repository } = setup(() => Response.json({ code: 'PGRST116', message: 'No rows' }, { status: 406 }));
     await expect(repository.complete('sc_missing', { status: 'FAILED', result: null, completed_at: '2026-09-08T00:00:00.000Z', duration_ms: 1 })).rejects.toThrow('Unable to complete scan');
   });
-  it('calls the atomic Apify reservation function with all budget scopes', async () => {
+  it('books the provisional cost on the atomic reservation and sends no spend ceiling', async () => {
     const { repository } = setup((url, init) => {
       expect(url.pathname).toBe('/rest/v1/rpc/reserve_apify_run');
-      expect(JSON.parse(String(init?.body))).toMatchObject({ p_scan_id: 'sc_test',
+      const body = JSON.parse(String(init?.body));
+      expect(body).toMatchObject({ p_scan_id: 'sc_test',
         p_query_fingerprint: 'a'.repeat(64), p_actor: 'owner/actor', p_build: '1.2.3',
-        p_max_cost_usd: 1, p_max_scan_cost_usd: 5, p_max_daily_cost_usd: 20 });
-      return Response.json({ decision: 'budget_exceeded', record: null, chargedToScan: false });
+        p_expected_cost_usd: 1 });
+      // Spend is recorded, not capped: no budget scope may reach the database.
+      expect(body).not.toHaveProperty('p_max_scan_cost_usd');
+      expect(body).not.toHaveProperty('p_max_daily_cost_usd');
+      return Response.json({ decision: 'start', record: null, chargedToScan: true });
     });
     await expect(repository.reserveApifyRun({ scanId: 'sc_test', queryFingerprint: 'a'.repeat(64),
-      actor: 'owner/actor', build: '1.2.3', input: { name: 'Jane' }, maxCostUsd: 1,
-      maxScanCostUsd: 5, maxDailyCostUsd: 20, expiresAt: '2026-09-14T23:00:00.000Z' }))
-      .resolves.toEqual({ decision: 'budget_exceeded', record: null, chargedToScan: false });
+      actor: 'owner/actor', build: '1.2.3', input: { name: 'Jane' }, expectedCostUsd: 1,
+      expiresAt: '2026-09-14T23:00:00.000Z' }))
+      .resolves.toEqual({ decision: 'start', record: null, chargedToScan: true });
   });
 });

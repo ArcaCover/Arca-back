@@ -4,7 +4,7 @@ import { createApp } from '../../src/http/app.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import { issueSessionToken } from '../../src/auth/session-token.js';
 import { fixtureResult } from '../fixtures/result.js';
-import { PollResponse, ScanResponse } from '../../src/http/schemas.js';
+import { PollResponse, ScanResponse } from '@arca/contracts';
 import type { PipelineResult } from '@arca/contracts';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
 const domainResolver = new PublicDomainResolver(async () => {});

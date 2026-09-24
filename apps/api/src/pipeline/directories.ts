@@ -136,8 +136,7 @@ export class ApifyDirectorySource implements DirectorySource {
     const rawResults: { target: string; items: unknown[] | null; error: string | null }[] = [];
     const matches: AttorneyMatch[] = [];
     const providerRuns: NonNullable<SourceStatus['providerRuns']> = [];
-    let failed = 0, successfulQueries = 0, candidatesReceived = 0, recordsValid = 0, budgetExceeded = false,
-      truncated = false;
+    let failed = 0, successfulQueries = 0, candidatesReceived = 0, recordsValid = 0, truncated = false;
     let cursor = 0;
     const worker = async () => {
       while (cursor < targets.length) {
@@ -186,12 +185,10 @@ export class ApifyDirectorySource implements DirectorySource {
           }
         } catch (error) {
           failed++;
-          if (error instanceof ApifyClientError && error.code === 'BUDGET_EXCEEDED') budgetExceeded = true;
           if (error instanceof ApifyClientError && error.metadata) {
             const { ledgerId: _ledgerId, ...publicMetadata } = error.metadata; providerRuns.push(publicMetadata);
           }
-          rawResults.push({ target, items: null, error: signal.aborted ? 'timeout' :
-            error instanceof ApifyClientError && error.code === 'BUDGET_EXCEEDED' ? 'budget_exceeded' : 'source_error' });
+          rawResults.push({ target, items: null, error: signal.aborted ? 'timeout' : 'source_error' });
           if (!fallback) matches.push({ searchedName: target, attorney: null, ambiguous: false, matchConfidence: 'no_match' });
         }
       }
@@ -204,7 +201,7 @@ export class ApifyDirectorySource implements DirectorySource {
     const accountingComplete = chargeableRuns.every(run => run.accountingComplete !== false && run.costUsd !== null);
     const costUsd = accountingComplete ? chargeableRuns.reduce((total, run) => total + run.costUsd!, 0) : null;
     const costPerAcceptedAttorneyUsd = costUsd !== null && found > 0 ? costUsd / found : null;
-    const code = signal.aborted ? 'DEADLINE_REACHED' : budgetExceeded ? 'BUDGET_EXCEEDED' : truncated ? 'TRUNCATED' :
+    const code = signal.aborted ? 'DEADLINE_REACHED' : truncated ? 'TRUNCATED' :
       !successful ? 'PROVIDER_ERROR' : failed ? 'PROVIDER_CONTRACT_ERROR' : found ? undefined : 'NO_MATCH';
     return { data: successful ? matches : null, rawContent: JSON.stringify({
       queries: rawResults.sort((a, b) => a.target.localeCompare(b.target)), providerRuns }),

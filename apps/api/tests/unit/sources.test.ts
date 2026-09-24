@@ -247,7 +247,7 @@ describe('Apify lifecycle', () => {
     expect(recovered.metadata).toMatchObject({ runId: 'run', resumed: true, chargedToScan: false });
     expect(request.mock.calls.filter(call => String(call[0]).includes('/runs?'))).toHaveLength(1);
   });
-  it('blocks new work when unknown accounting has consumed the scan reservation', async () => {
+  it('keeps working past the old scan ceiling and books every run on the ledger', async () => {
     const repository = new InMemoryRepository();
     await repository.create({ id: 'id', scan_id: 'sc_budget', email: 'owner@firm.com', canonical_domain: 'firm.com',
       domain_resolution: { status: 'RESOLVED', canonicalDomain: 'firm.com', source: 'request', reason: null },
@@ -255,10 +255,18 @@ describe('Apify lifecycle', () => {
     const request = vi.fn(async (url: string | URL | Request) => String(url).includes('/runs?')
       ? Response.json({ data: { id: 'run', status: 'SUCCEEDED', defaultDatasetId: 'dataset' } }) : Response.json([]));
     const client = new ApifyClient('token', request as typeof fetch, 2, { store: repository,
-      maxCostUsdPerRun: 1, maxCostUsdPerScan: 1, maxCostUsdPerDay: 2 });
-    await client.run('owner/actor', { name: 'Jane' }, new AbortController().signal, { scanId: 'sc_budget' });
-    await expect(client.run('owner/actor', { name: 'John' }, new AbortController().signal, { scanId: 'sc_budget' }))
-      .rejects.toMatchObject({ code: 'BUDGET_EXCEEDED' });
+      expectedCostUsdPerRun: 1 });
+    // Two runs on one scan: under the old per-scan cap of 1 USD the second was refused.
+    const first = await client.run('owner/actor', { name: 'Jane' }, new AbortController().signal, { scanId: 'sc_budget' });
+    const second = await client.run('owner/actor', { name: 'John' }, new AbortController().signal, { scanId: 'sc_budget' });
+    expect(first.metadata.chargedToScan).toBe(true);
+    expect(second.metadata.chargedToScan).toBe(true);
+    // Both are distinct ledger entries: the spend is recorded, it is simply not refused.
+    expect(second.metadata.ledgerId).not.toBe(first.metadata.ledgerId);
+    for (const entry of [first, second]) {
+      await expect(repository.getApifyRun(entry.metadata.ledgerId!))
+        .resolves.toMatchObject({ reserved_usd: 1 });
+    }
   });
   it('does not repeat a failed paid run during its retry cooldown', async () => {
     const repository = new InMemoryRepository();
@@ -325,5 +333,23 @@ describe('website extraction', () => {
     const result = await source.run('firm.com', new AbortController().signal);
     expect(result.status).toMatchObject({ status: 'error', code: 'ACCESS_BLOCKED', pagesCrawled: 0 });
     expect(provider.extract).not.toHaveBeenCalled();
+  });
+  it('keeps why the extraction failed in the stored evidence', async () => {
+    // A failed extraction takes the whole scan down: without website data the identity is
+    // insufficient, the directories are skipped and the scan ends FAILED. Discarding the
+    // provider's error left no way to tell a token limit from a timeout after the fact.
+    const provider = { id: 'fixture', version: '1',
+      extract: vi.fn(async () => { throw new Error('Model call exceeded the per-call token limit'); }) };
+    const source = new WebsiteExtractionSource(new InMemoryRepository(), provider,
+      async () => ({ pages: [{ url: 'https://firm.com/', html: '<html></html>', text: 'Firm' }], partial: false }));
+    const result = await source.run('firm.com', new AbortController().signal);
+
+    expect(result.data).toBeNull();
+    expect(result.status).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR' });
+    const stored = JSON.parse(result.rawContent!);
+    expect(stored.analysis).toBeNull();
+    expect(stored.diagnostics).toMatchObject({ error: 'Model call exceeded the per-call token limit' });
+    // The public reason stays generic: provider internals do not belong in an API response.
+    expect(result.status.reason).toBe('Website evidence extraction unavailable');
   });
 });

@@ -1,0 +1,28 @@
+{
+  "website": null,
+  "bar": null,
+  "avvo": null,
+  "sources": {
+    "website": {
+      "status": "error",
+      "dataStatus": "UNKNOWN",
+      "durationMs": 1,
+      "code": "ACCESS_BLOCKED",
+      "reason": "The site refused every request"
+    },
+    "bar": {
+      "status": "error",
+      "dataStatus": "UNKNOWN",
+      "durationMs": 1,
+      "code": "PROVIDER_ERROR",
+      "reason": "Directory provider unavailable"
+    },
+    "avvo": {
+      "status": "error",
+      "dataStatus": "UNKNOWN",
+      "durationMs": 1,
+      "code": "PROVIDER_ERROR",
+      "reason": "Directory provider unavailable"
+    }
+  }
+}
