@@ -36,3 +36,29 @@ it('does not requeue the home page under its own www link', async () => {
   });
   expect(result.pages).toHaveLength(1);
 }, 15_000);
+
+it('reserves budget for privacy and blog pages instead of letting many attorney bios crowd them out', async () => {
+  const body = (path: string) => {
+    if (path === '/') {
+      const bios = Array.from({ length: 6 }, (_, i) => `<a href="/team/person-${i + 1}">Person ${i + 1}</a>`).join('');
+      return `<body>${bios}<a href="/privacy">Privacy</a><a href="/blog">Blog</a></body>`;
+    }
+    if (path === '/privacy') return '<body>Privacy policy text</body>';
+    if (path === '/blog') return '<body>Blog index</body>';
+    return '<body>Attorney bio</body>';
+  };
+  const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async () => ({ status: 404, text: '' }),
+    response: async raw => ({
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+      body: Buffer.from(body(new URL(raw).pathname)),
+    }),
+  }, { maxPages: 6 });
+  const paths = result.pages.map(page => new URL(page.url).pathname).sort();
+  expect(paths).toContain('/privacy');
+  expect(paths).toContain('/blog');
+  const attorneyPages = paths.filter(path => path.startsWith('/team/person-'));
+  expect(attorneyPages.length).toBeLessThanOrEqual(3);
+  expect(paths).toHaveLength(6);
+}, 15_000);

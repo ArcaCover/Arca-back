@@ -41,6 +41,11 @@ export function pagePriority(raw: string): number {
   const index = groups.findIndex(group => group.test(path));
   return index < 0 ? 6 : index + 1;
 }
+/** Caps how many pages of one priority group a single crawl will visit. Without it a firm with many
+    attorney bios (priority group 2, muscalaw.com had 15) fills the whole page budget before privacy
+    or blog — lower-priority groups that settle real signals — ever get a turn. Only group 2 is capped:
+    it is the one observed to explode in page count; the others stay uncapped as before. */
+const GROUP_PAGE_LIMITS: Partial<Record<number, number>> = { 2: 3 };
 export function canonicalUrl(raw: string, base: string): string | null {
   try {
     const url = new URL(raw, base);
@@ -132,10 +137,24 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
       issues.push(issue);
       partial = true;
     };
+    const groupCounts = new Map<number, number>();
     while (queue.length && visited.size < maxPages && !signal.aborted) {
       queue.sort((a, b) => a.depth - b.depth || pagePriority(a.url) - pagePriority(b.url) || a.url.localeCompare(b.url));
-      const batch = queue.splice(0, Math.min(3, maxPages - visited.size)).filter(item => !visited.has(item.url));
-      for (const item of batch) visited.add(item.url);
+      const underGroupLimit = (item: { url: string }) => {
+        const limit = GROUP_PAGE_LIMITS[pagePriority(item.url)];
+        return limit === undefined || (groupCounts.get(pagePriority(item.url)) ?? 0) < limit;
+      };
+      const capacity = Math.min(3, maxPages - visited.size);
+      const eligible = queue.filter(underGroupLimit);
+      // Falling back to over-limit items only once nothing else is queued keeps the reservation from
+      // wasting budget: a site with no blog or privacy page should not leave slots unused.
+      const pool = eligible.length ? eligible : queue;
+      const batch = pool.slice(0, capacity).filter(item => !visited.has(item.url));
+      for (const item of batch) queue.splice(queue.indexOf(item), 1);
+      for (const item of batch) {
+        visited.add(item.url);
+        groupCounts.set(pagePriority(item.url), (groupCounts.get(pagePriority(item.url)) ?? 0) + 1);
+      }
       await Promise.all(batch.map(async item => {
         let page: import('playwright').Page | undefined;
         try {
