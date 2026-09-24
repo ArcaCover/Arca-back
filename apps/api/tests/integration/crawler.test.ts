@@ -21,3 +21,18 @@ it('renders real browser pages, respects robots, depth and text visibility witho
   expect(home.text).not.toMatch(/Ignore nav|Hidden policy/);
   expect(home.html).toContain('Hidden policy');
 }, 15_000);
+
+it('does not requeue the home page under its own www link', async () => {
+  const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async () => ({ status: 404, text: '' }),
+    response: async () => ({
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+      // A logo link back to the www form is common on real sites (this is literally what
+      // muscalaw.com does). Without www normalization it looks like a second, unvisited page
+      // even though it points at the page already read.
+      body: Buffer.from('<body>Home<a href="https://www.fixture.example/">Home</a></body>'),
+    }),
+  });
+  expect(result.pages).toHaveLength(1);
+}, 15_000);

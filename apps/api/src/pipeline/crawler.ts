@@ -48,6 +48,10 @@ export function canonicalUrl(raw: string, base: string): string | null {
     if (!['https:', 'http:'].includes(url.protocol) || url.hostname.replace(/^www\./, '') !== host ||
       url.username || url.password || url.port || /\.(pdf|jpg|jpeg|png|gif|webp|zip|svg|mp4|css|js)$/i.test(url.pathname)) return null;
     url.hash = ''; url.search = '';
+    // The same page reached with and without "www." must canonicalize to one identical string, or a
+    // self-link in the other form (common on real sites: muscalaw.com's own home link) gets queued
+    // and crawled a second time, spending a page of budget on content already read.
+    url.hostname = host;
     return url.href;
   } catch { return null; }
 }
