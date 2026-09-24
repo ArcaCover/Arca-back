@@ -320,7 +320,10 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
       signal, attempts)));
     const review = SignalReview.parse({ verdicts: reviews.flatMap(item => item.verdicts) });
     const grounded = acceptClaims(extraction.claims, review, corpus);
-    const accepted = groundNegativeSignals(toWebsiteData(grounded.accepted, corpus), crawl, pageTypes);
+    // Every field the model proposed a claim for, accepted or rejected: a rejected claim means it saw
+    // something ambiguous, which negative grounding must not treat the same as nothing proposed.
+    const claimedFields = new Set(extraction.claims.map(claim => claim.field));
+    const accepted = groundNegativeSignals(toWebsiteData(grounded.accepted, corpus), crawl, pageTypes, claimedFields);
     const urls = [...new Set([...crawl.pages.map(page => page.url), ...corpus.links.map(link => link.url), ...candidates.map(item => item.url)])];
     const team = deriveTeamPageQuality(crawl, pageTypes, accepted.team_members);
     const website = deriveWebsiteQuality(urls, pageTypes, accepted, team.value);

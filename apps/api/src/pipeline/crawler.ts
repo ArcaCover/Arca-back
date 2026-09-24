@@ -176,7 +176,11 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
               ? 'ACCESS_BLOCKED' : 'NO_READABLE_CONTENT', status: response.status() });
             return;
           }
-          pages.push({ url: page.url(), html, text });
+          // Store under the canonical (www-stripped) identity, not the raw post-navigation url: a
+          // site that redirects the bare domain to www (muscalaw.com does) would otherwise leave this
+          // page indexed under a different string than the one every discovered link to it
+          // canonicalizes to, so it would look unread the next time such a link surfaces.
+          pages.push({ url: canonicalUrl(page.url(), rootUrl) ?? page.url(), html, text });
           if (item.depth < maxDepth) for (const link of links) {
             const url = canonicalUrl(link, page.url());
             if (url && !visited.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1, attempt: 0 });

@@ -62,3 +62,25 @@ it('reserves budget for privacy and blog pages instead of letting many attorney 
   expect(attorneyPages.length).toBeLessThanOrEqual(3);
   expect(paths).toHaveLength(6);
 }, 15_000);
+
+it('records a redirected page under its canonical (bare) url, not the raw post-redirect www form', async () => {
+  // muscalaw.com's own server redirects the bare domain to www. Chromium follows the redirect and
+  // page.url() reports the final, www-prefixed address. If that raw address were stored as-is, it
+  // would no longer match the bare form every discovered link canonicalizes to (crawler.ts's own
+  // canonicalUrl), and the page would look unread the next time a link to it surfaces — wasting a
+  // floor-fetch slot re-reading content already in hand. A client-side redirect (rather than an HTTP
+  // 3xx, which route.fulfill cannot reliably simulate against a fake hostname in this harness) drives
+  // the browser through the exact same page.url()-diverges-from-the-request scenario.
+  const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async () => ({ status: 404, text: '' }),
+    response: async raw => {
+      if (new URL(raw).hostname === 'fixture.example') {
+        return { status: 200, headers: { 'content-type': 'text/html' },
+          body: Buffer.from('<body><script>location.href="https://www.fixture.example/"</script></body>') };
+      }
+      return { status: 200, headers: { 'content-type': 'text/html' }, body: Buffer.from('<body>Home</body>') };
+    },
+  });
+  expect(result.pages).toHaveLength(1);
+  expect(result.pages[0]!.url).toBe('https://fixture.example/');
+}, 15_000);

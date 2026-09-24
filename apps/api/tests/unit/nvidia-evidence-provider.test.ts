@@ -354,7 +354,7 @@ describe('NVIDIA evidence provider', () => {
     expect(result.websiteData.team_members?.map(member => member.full_name).sort()).toEqual(['Jane Doe', 'John Roe']);
   });
 
-  it('grounds privacy_policy and ai_blog_posts to false when their pages were read end to end', async () => {
+  it('grounds privacy_policy to true and ai_blog_posts to false when their pages were read end to end', async () => {
     const pages = [
       { url: 'https://firm.com/', html: '', text: 'Smith Law is a law firm.' },
       { url: 'https://firm.com/privacy-policy', html: '', text: 'We collect basic analytics.' },
@@ -368,7 +368,7 @@ describe('NVIDIA evidence provider', () => {
     });
     const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
     const result = await provider.extractDetailed({ pages, partial: false }, new AbortController().signal);
-    expect(result.websiteData.privacy_policy).toEqual({ found: false, mentions_client_data: null });
+    expect(result.websiteData.privacy_policy).toEqual({ found: true, mentions_client_data: null });
     expect(result.websiteData.ai_blog_posts).toEqual({ found: false, count: 0, titles: [] });
     expect(result.websiteData.provenance.privacy_policy?.[0]).toMatchObject({
       sourceUrl: 'https://firm.com/privacy-policy', method: 'derived',
