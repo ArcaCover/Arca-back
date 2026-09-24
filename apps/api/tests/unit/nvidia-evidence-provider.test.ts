@@ -353,4 +353,25 @@ describe('NVIDIA evidence provider', () => {
     const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
     expect(result.websiteData.team_members?.map(member => member.full_name).sort()).toEqual(['Jane Doe', 'John Roe']);
   });
+
+  it('grounds privacy_policy and ai_blog_posts to false when their pages were read end to end', async () => {
+    const pages = [
+      { url: 'https://firm.com/', html: '', text: 'Smith Law is a law firm.' },
+      { url: 'https://firm.com/privacy-policy', html: '', text: 'We collect basic analytics.' },
+      { url: 'https://firm.com/blog', html: '', text: 'Recent wins in court.' },
+    ];
+    const create = vi.fn(async (request: Record<string, unknown>) => {
+      const user = (request.messages as Array<{ content: string }>)[1]!.content;
+      const content = user.startsWith('CANDIDATE CLAIMS') ? JSON.stringify({ verdicts: [] })
+        : JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } });
+      return { choices: [{ finish_reason: 'stop', message: { content } }] };
+    });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    const result = await provider.extractDetailed({ pages, partial: false }, new AbortController().signal);
+    expect(result.websiteData.privacy_policy).toEqual({ found: false, mentions_client_data: null });
+    expect(result.websiteData.ai_blog_posts).toEqual({ found: false, count: 0, titles: [] });
+    expect(result.websiteData.provenance.privacy_policy?.[0]).toMatchObject({
+      sourceUrl: 'https://firm.com/privacy-policy', method: 'derived',
+    });
+  });
 });

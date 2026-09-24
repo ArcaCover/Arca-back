@@ -5,6 +5,7 @@ import { classifyRole, personEvidence } from './attorney-roles.js';
 import type { CrawledPage, CrawlResult } from './crawler.js';
 import { buildCorpus, serializeCorpus, withLinks, withPassages, type EvidenceCorpus } from './evidence-corpus.js';
 import { acceptClaims, toWebsiteData } from './signal-grounding.js';
+import { groundNegativeSignals } from './negative-signal-grounding.js';
 import { createSiteAccess, type SiteAccess, type ToolCall } from './site-access.js';
 import { findPassages } from './site-search.js';
 import { DERIVED_FIELDS, deriveTeamPageQuality, deriveWebsiteQuality, type TeamPageDerivation, type WebsiteDerivation } from './derived-signals.js';
@@ -319,7 +320,7 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
       signal, attempts)));
     const review = SignalReview.parse({ verdicts: reviews.flatMap(item => item.verdicts) });
     const grounded = acceptClaims(extraction.claims, review, corpus);
-    const accepted = toWebsiteData(grounded.accepted, corpus);
+    const accepted = groundNegativeSignals(toWebsiteData(grounded.accepted, corpus), crawl, pageTypes);
     const urls = [...new Set([...crawl.pages.map(page => page.url), ...corpus.links.map(link => link.url), ...candidates.map(item => item.url)])];
     const team = deriveTeamPageQuality(crawl, pageTypes, accepted.team_members);
     const website = deriveWebsiteQuality(urls, pageTypes, accepted, team.value);
