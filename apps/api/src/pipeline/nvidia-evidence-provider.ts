@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises';
 import OpenAI from 'openai';
 import { SignalExtraction, SignalReview, WebsiteData, type Claim, type GroundingReport } from '@arca/contracts';
 import { classifyRole, personEvidence } from './attorney-roles.js';
@@ -15,6 +16,23 @@ import { LLM_ENDPOINTS, type LlmEndpoint } from './llm-endpoint.js';
 export const DEFAULT_NVIDIA_NIM_MODEL = 'nvidia/nemotron-3-super-120b-a12b';
 export const EXTRACTION_VERSION = 'agentic-signals-v5';
 export const MAX_AGENT_ROUNDS = 3;
+/** Bounded so one flaky call cannot loop forever; each phase gets its own budget of attempts. */
+export const MAX_TRANSIENT_ATTEMPTS = 3;
+const TRANSIENT_RETRY_BACKOFF_MS = [250, 750];
+
+/**
+ * A raw transport failure the OpenAI SDK did not retry itself (maxRetries: 0, by design — DN-05
+ * §294/§530 forbid hidden SDK retries). Only 5xx and a client-side connection timeout are worth one
+ * more try: a 4xx means the request itself is wrong, and repeating it only wastes the phase's budget.
+ * Duck-typed rather than `instanceof OpenAI.APIError` so a plain test double does not need to
+ * construct a real SDK error to exercise this path.
+ */
+export function isTransientProviderError(error: unknown): boolean {
+  const status = (error as { status?: unknown } | null)?.status;
+  if (typeof status === 'number' && status >= 500 && status < 600) return true;
+  const name = (error as { name?: unknown } | null)?.name;
+  return name === 'APIConnectionTimeoutError' || name === 'APIConnectionError';
+}
 export type StopReason = 'SUFFICIENT_FOR_EXTRACTION' | 'ROUND_LIMIT' | 'NO_NEW_EVIDENCE';
 
 const FIELDS = `firm_name, firm_aliases, city, county, address_street, phone, office_count, attorneys,
@@ -147,13 +165,25 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
     const request = { model: this.model, stream: false, ...this.endpoint.requestParams(this.model),
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
       response_format: { type: 'json_object' } };
-    const started = Date.now();
-    const response = await this.client.chat.completions.create(request, { signal });
-    // Record the attempt before validating it: truncated or malformed answers are the ones worth auditing.
-    const attempt: Attempt = { phase, request, response, rawContent: '', durationMs: Date.now() - started };
-    attempts.push(attempt);
-    attempt.rawContent = responseText(response);
-    return json(attempt.rawContent);
+    for (let attempt = 1; ; attempt++) {
+      const started = Date.now();
+      const label = attempt === 1 ? phase : `${phase}-attempt-${attempt}`;
+      try {
+        const response = await this.client.chat.completions.create(request, { signal });
+        // Record the attempt before validating it: truncated or malformed answers are the ones worth auditing.
+        const record: Attempt = { phase: label, request, response, rawContent: '', durationMs: Date.now() - started };
+        attempts.push(record);
+        record.rawContent = responseText(response);
+        return json(record.rawContent);
+      } catch (error) {
+        if (!isTransientProviderError(error) || attempt >= MAX_TRANSIENT_ATTEMPTS || signal.aborted) throw error;
+        const status = (error as { status?: unknown }).status;
+        const message = error instanceof Error ? error.message : String(error);
+        attempts.push({ phase: label, request, response: null, rawContent: '', durationMs: Date.now() - started,
+          validationIssues: `Transient provider error${typeof status === 'number' ? ` (status ${status})` : ''}: ${message}` });
+        await delay(TRANSIENT_RETRY_BACKOFF_MS[attempt - 1] ?? TRANSIENT_RETRY_BACKOFF_MS.at(-1)!, undefined, { signal });
+      }
+    }
   }
 
   private async parseWithRepair<T>(phase: string, schema: { safeParse(value: unknown): { success: boolean; data?: T; error?: unknown } },

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../../src/pipeline/nvidia-evidence-provider.js';
+import { ExtractionFailure, MAX_TRANSIENT_ATTEMPTS, NvidiaNimEvidenceProvider } from '../../src/pipeline/nvidia-evidence-provider.js';
 import { LLM_ENDPOINTS, openAiEndpoint } from '../../src/pipeline/llm-endpoint.js';
 
 // These tests script every model call; the page plan adds classification calls and floor reads they do not expect.
@@ -60,6 +60,62 @@ describe('NVIDIA evidence provider', () => {
     expect(result.websiteData.firm_name).toBe('Smith Law');
     expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: 'https://firm.com/about', status: 'failed', detail: 'boom' }]);
     expect(result.diagnostics.stopReason).toBe('NO_NEW_EVIDENCE');
+  });
+
+  it('retries a transient provider error within one phase and keeps the failed attempt for audit', async () => {
+    let calls = 0;
+    const create = vi.fn(async (request: Record<string, unknown>) => {
+      calls++;
+      if (calls === 1) {
+        const error = Object.assign(new Error('Service temporarily overloaded'), { status: 503 });
+        throw error;
+      }
+      const user = (request.messages as Array<{ content: string }>)[1]!.content;
+      const content = user.startsWith('CANDIDATE CLAIMS') ? JSON.stringify({ verdicts: [] })
+        : JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } });
+      return { choices: [{ finish_reason: 'stop', message: { content } }] };
+    });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    const result = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }],
+      partial: false }, new AbortController().signal);
+    expect(result.websiteData.firm_name).toBeNull();
+    expect(create).toHaveBeenCalledTimes(2);
+    const failed = result.diagnostics.attempts.find(attempt => attempt.validationIssues?.includes('503'));
+    expect(failed).toBeDefined();
+  });
+
+  it('retries a client-side timeout the same as a 5xx', async () => {
+    let calls = 0;
+    const create = vi.fn(async (request: Record<string, unknown>) => {
+      calls++;
+      if (calls === 1) throw Object.assign(new Error('Request timed out'), { name: 'APIConnectionTimeoutError' });
+      const user = (request.messages as Array<{ content: string }>)[1]!.content;
+      const content = user.startsWith('CANDIDATE CLAIMS') ? JSON.stringify({ verdicts: [] })
+        : JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } });
+      return { choices: [{ finish_reason: 'stop', message: { content } }] };
+    });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }],
+      partial: false }, new AbortController().signal);
+    expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a non-transient provider error', async () => {
+    const create = vi.fn(async () => { throw Object.assign(new Error('Invalid request'), { status: 400 }); });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    const failure = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }],
+      partial: false }, new AbortController().signal).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ExtractionFailure);
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up after exhausting the bounded retries for a persistent transient error', async () => {
+    const create = vi.fn(async () => { throw Object.assign(new Error('Service temporarily overloaded'), { status: 503 }); });
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    const failure = await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }],
+      partial: false }, new AbortController().signal).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(ExtractionFailure);
+    expect(create).toHaveBeenCalledTimes(MAX_TRANSIENT_ATTEMPTS);
   });
 
   const scripted = (rounds: Array<(user: string) => Record<string, unknown>>) => {
