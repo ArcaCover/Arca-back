@@ -334,4 +334,22 @@ describe('website extraction', () => {
     expect(result.status).toMatchObject({ status: 'error', code: 'ACCESS_BLOCKED', pagesCrawled: 0 });
     expect(provider.extract).not.toHaveBeenCalled();
   });
+  it('keeps why the extraction failed in the stored evidence', async () => {
+    // A failed extraction takes the whole scan down: without website data the identity is
+    // insufficient, the directories are skipped and the scan ends FAILED. Discarding the
+    // provider's error left no way to tell a token limit from a timeout after the fact.
+    const provider = { id: 'fixture', version: '1',
+      extract: vi.fn(async () => { throw new Error('Model call exceeded the per-call token limit'); }) };
+    const source = new WebsiteExtractionSource(new InMemoryRepository(), provider,
+      async () => ({ pages: [{ url: 'https://firm.com/', html: '<html></html>', text: 'Firm' }], partial: false }));
+    const result = await source.run('firm.com', new AbortController().signal);
+
+    expect(result.data).toBeNull();
+    expect(result.status).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR' });
+    const stored = JSON.parse(result.rawContent!);
+    expect(stored.analysis).toBeNull();
+    expect(stored.diagnostics).toMatchObject({ error: 'Model call exceeded the per-call token limit' });
+    // The public reason stays generic: provider internals do not belong in an API response.
+    expect(result.status.reason).toBe('Website evidence extraction unavailable');
+  });
 });
