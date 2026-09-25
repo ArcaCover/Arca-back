@@ -43,4 +43,7 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" arca-contracts-*.tgz --title "$GITHUB_REF_NAME" --notes "Install with: npm install https://github.com/${{ github.repository }}/releases/download/$GITHUB_REF_NAME/$(ls arca-contracts-*.tgz)"
+        run: |
+          tarball=$(ls arca-contracts-*.tgz)
+          gh release create "$GITHUB_REF_NAME" "$tarball" --title "$GITHUB_REF_NAME" \
+            --notes "Install with: npm install https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$tarball"
