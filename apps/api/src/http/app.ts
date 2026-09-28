@@ -42,6 +42,9 @@ export function createApp(deps: AppDeps) {
       return c.json({ error: 'rate_limited', message: 'Scan request limit exceeded' }, 429);
     }
     const domainResolution = DomainResolution.parse(await deps.domainResolver.resolve({ domain, email }));
+    if (domainResolution.reason === 'PERSONAL_EMAIL') {
+      return c.json({ error: 'personal_email_domain', message: 'The domain belongs to an email provider, not a firm' }, 400);
+    }
     if (domainResolution.canonicalDomain === null) {
       return c.json({ error: 'invalid_domain', message: 'The domain could not be resolved' }, 400);
     }

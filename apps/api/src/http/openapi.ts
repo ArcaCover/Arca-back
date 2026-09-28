@@ -63,7 +63,7 @@ export function buildOpenApiDocument() {
         cacheHit: { summary: 'Cached domain result', value: { scanId: 'sc_abc123', sessionToken: 'eyJhbGciOiJIUzI1NiIs...', status: 'COMPLETED', cached: true,
           result: { ...result, meta: { ...result.meta, cached: true } } } },
       }) },
-      400: { description: 'Invalid email, missing domain, or unresolvable domain', content: json(error, invalid) },
+      400: { description: 'Invalid email or missing domain (invalid_request), a domain that belongs to an email provider (personal_email_domain), or an unresolvable domain (invalid_domain)', content: json(error, invalid) },
       429: { description: '10 requests per IP/hour or 3 per email/hour exceeded', content: json(error, {
         rateLimited: { summary: 'Rate limit exceeded', value: { error: 'rate_limited', message: 'Scan request limit exceeded' } },
       }), headers: { 'Retry-After': { schema: { type: 'integer' }, description: 'Seconds until retry' } } },
