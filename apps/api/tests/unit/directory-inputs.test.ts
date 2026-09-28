@@ -19,3 +19,25 @@ it('keeps recognized surname particles in a Bar lookup', () => {
   const [input] = buildDirectoryInputs('bar', query(['María de la Cruz']));
   expect(input?.input).toMatchObject({ firstName: 'Maria', lastNames: ['De La Cruz'] });
 });
+
+// DN-06: "si falta ciudad, evitar expansión nacional automática no presupuestada". The provider
+// cap that used to bound it is gone (D8), so the guard has to hold on its own.
+it('does not plan a nationwide Avvo firm search when no city was verified', () => {
+  expect(buildDirectoryInputs('avvo', { ...query([]), city: null })).toEqual([]);
+});
+
+it('keeps the Avvo firm search when a city scopes it', () => {
+  const [input] = buildDirectoryInputs('avvo', query([]));
+  expect(input).toMatchObject({ fallback: true, input: { searchQueries: ['Duque Immigration Law, PLLC'], cities: ['Miami, FL'] } });
+});
+
+it('keeps named Avvo lookups without a city, because the targeted cap bounds each one', () => {
+  const [input] = buildDirectoryInputs('avvo', { ...query(['Carlos Mauricio Duque']), city: null });
+  expect(input).toMatchObject({ fallback: false, input: { searchQueries: ['Carlos Mauricio Duque'], maxLawyers: 10 } });
+  expect(input?.input).not.toHaveProperty('cities');
+});
+
+it('scopes the Avvo city to the jurisdiction of the query', () => {
+  const [input] = buildDirectoryInputs('avvo', { ...query([]), state: 'GA' });
+  expect(input?.input).toMatchObject({ cities: ['Miami, GA'] });
+});

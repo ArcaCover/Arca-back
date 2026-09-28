@@ -111,11 +111,15 @@ export type SourceStatus = z.infer<typeof SourceStatus>;
 export type SourceResult<T> = { data: T | null; rawContent: string | null; status: SourceStatus };
 export type DirectoryQuery = { canonicalDomain: string; names: string[]; firmName: string | null;
   aliases?: string[]; city: string | null; county?: string | null; addressStreet?: string | null;
-  phone?: string | null; state: 'FL'; scanId?: string };
+  // Two-letter state of the licensing registry the attorneys are checked against, or null when
+  // no state registry is wired. It scopes location-based directory searches.
+  phone?: string | null; state: string | null; scanId?: string };
 export interface WebsiteSource {
   run(domain: string, signal: AbortSignal): Promise<SourceResult<WebsiteData>>;
 }
 export interface DirectorySource {
+  /** Two-letter state whose licensing registry this source reads. Unset for national directories. */
+  readonly jurisdiction?: string;
   run(query: DirectoryQuery, signal: AbortSignal): Promise<SourceResult<AttorneyMatch[]>>;
 }
 

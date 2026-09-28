@@ -42,9 +42,10 @@ export class InProcessPipeline implements Layer1Pipeline {
     try {
       const website = await bounded<WebsiteData>(() => this.deps.website.run(input.canonicalDomain, signal));
       const identity = buildFirmIdentity(input.canonicalDomain, website.data);
+      const jurisdiction = this.deps.bar.jurisdiction ?? null;
       const query = { canonicalDomain: input.canonicalDomain, names: identity.attorneyNames,
         firmName: identity.firmName, aliases: identity.aliases, city: identity.city, county: identity.county,
-        addressStreet: identity.addressStreet, phone: identity.phone, state: 'FL' as const, scanId: input.scanId };
+        addressStreet: identity.addressStreet, phone: identity.phone, state: jurisdiction, scanId: input.scanId };
       const [bar, avvo] = identity.status === 'INSUFFICIENT' ? [insufficientIdentity(), insufficientIdentity()] : await Promise.all([
           bounded<AttorneyMatch[]>(() => this.deps.bar.run(query, signal)),
           bounded<AttorneyMatch[]>(() => this.deps.avvo.run(query, signal)),
@@ -60,7 +61,8 @@ export class InProcessPipeline implements Layer1Pipeline {
         persistenceTimer = setTimeout(() => reject(new Error('Raw evidence persistence deadline reached')), Math.max(1, budget - (now() - start)));
       })]); } finally { clearTimeout(persistenceTimer); }
       const evidence = Layer1Evidence.parse({ identity, website: website.data, bar: bar.data, avvo: avvo.data,
-        sources: { website: website.status, bar: bar.status, avvo: avvo.status }, observedAt: fetchedAt });
+        sources: { website: website.status, bar: bar.status, avvo: avvo.status }, observedAt: fetchedAt,
+        barJurisdiction: jurisdiction });
       // From this boundary onward Layer 1 is a pure transformation of structured evidence.
       const assessment = evaluateLayer1Evidence(evidence);
       const sources = assessment.sources;

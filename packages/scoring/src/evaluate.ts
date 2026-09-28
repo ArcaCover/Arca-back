@@ -22,5 +22,6 @@ export function evaluateLayer1Evidence(rawEvidence: Layer1Evidence) {
     avvo: withFound(evidence.sources.avvo, avvo),
   };
   return { identity: evidence.identity,
-    ...scoreEvidence({ website: evidence.website, bar, avvo, sources, now: evidence.observedAt }), sources };
+    ...scoreEvidence({ website: evidence.website, bar, avvo, sources, now: evidence.observedAt,
+      barJurisdiction: evidence.barJurisdiction ?? null }), sources };
 }
