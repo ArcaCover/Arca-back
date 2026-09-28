@@ -10,8 +10,8 @@ export const ScanRequest = z.object({
 export const StartedScanResponse = z.object({
   scanId: z.string(), sessionToken: z.string(), status: z.literal('RUNNING'),
 }).strict();
-// A cache hit is always COMPLETED. A cached PARTIAL is repaired before it is handed back,
-// so it reaches the caller through polling, never through this response.
+// A cache hit is always COMPLETED. A cached PARTIAL is repaired, or inside the repair cooldown
+// served as it stands, and either way it reaches the caller through polling, never through this response.
 export const CachedScanResponse = z.object({
   scanId: z.string(), sessionToken: z.string(), status: z.literal('COMPLETED'),
   cached: z.literal(true), result: Layer1Result,

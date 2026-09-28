@@ -98,6 +98,35 @@ describe('asynchronous scan API', () => {
     expect(repository.scans.get(body.scanId)?.status).toBe('PARTIAL');
     expect(repository.scans.get(body.scanId)?.cached).toBe(false);
   });
+  it('serves a partial scan repaired within the cooldown without running the pipeline again', async () => {
+    // A source that is down for good would otherwise re-run the pipeline on every request for
+    // the whole cache window. One repair per cooldown still retries it, without making each
+    // visitor wait for the same failure.
+    const repository = new InMemoryRepository();
+    const now = Date.now();
+    const recent = new Date(now - 10 * 60_000).toISOString();
+    const original = fixtureResult('sc_partial', 'original@firm.com');
+    original.meta.completedAt = recent;
+    await repository.create({ id: randomUUID(), scan_id: 'sc_partial', canonical_domain: 'firm.com', email: 'original@firm.com',
+      domain_resolution: { status: 'RESOLVED', canonicalDomain: 'firm.com', source: 'request', reason: null },
+      status: 'PARTIAL', result: original, created_at: recent, completed_at: recent, duration_ms: 10, cached: false });
+    const run = vi.fn();
+    const { app, drain } = createApp({ domainResolver, repository, pipeline: { run }, sessionSecret: secret,
+      corsOrigins: [], clientIp: () => '127.0.0.1', now: () => now, partialRepairCooldownMs: 3_600_000 });
+    const response = await app.request(post('second@firm.com'));
+    // The contract keeps the fast 200 for COMPLETED only, so a partial still arrives by polling.
+    expect(response.status).toBe(202);
+    const body = ScanResponse.parse(await response.json());
+    await drain();
+    expect(run).not.toHaveBeenCalled();
+    const poll = PollResponse.parse(await (await app.request(`/scan/${body.scanId}`,
+      { headers: { Authorization: `Bearer ${body.sessionToken}` } })).json());
+    expect(poll).toMatchObject({ status: 'PARTIAL', cached: true });
+    expect(poll.status === 'PARTIAL' && poll.result).toMatchObject({ scanId: body.scanId, email: 'second@firm.com',
+      meta: { cached: true } });
+    // The served copy never becomes the cache entry itself, so the cooldown runs from the last real repair.
+    expect((await repository.cached('firm.com', new Date(0).toISOString()))?.scan_id).toBe('sc_partial');
+  });
   it('reports failures as terminal HTTP 200 instead of leaving RUNNING forever', async () => {
     const repository = new InMemoryRepository();
     const { app, drain } = createApp({ domainResolver, repository, pipeline: { run: async () => { throw new Error('Fixture failure'); } },

@@ -66,4 +66,11 @@ describe('independent source and storage configuration', () => {
     expect(() => loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory',
       APIFY_RUN_TIMEOUT_SECS: '600', APIFY_ACTIVE_RUN_TTL_MS: '600000' })).toThrow('must exceed');
   });
+  it('repairs a partial scan at most hourly by default, never less often than the cache window', () => {
+    const mock = { ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' };
+    expect(loadEnv(mock).SCAN_PARTIAL_REPAIR_COOLDOWN_MS).toBe(3_600_000);
+    expect(loadEnv({ ...mock, SCAN_PARTIAL_REPAIR_COOLDOWN_MS: '0' }).SCAN_PARTIAL_REPAIR_COOLDOWN_MS).toBe(0);
+    expect(() => loadEnv({ ...mock, SCAN_CACHE_TTL_MS: '3600000', SCAN_PARTIAL_REPAIR_COOLDOWN_MS: '7200000' }))
+      .toThrow('SCAN_PARTIAL_REPAIR_COOLDOWN_MS');
+  });
 });
