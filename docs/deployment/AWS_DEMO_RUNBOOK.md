@@ -21,6 +21,9 @@ Commands below use Git Bash. `arca-deploy` is the CLI profile of the least-privi
 
 ## 1. Bootstrap CDK (once, administrator)
 
+**Done on 2026-09-29** (`CDKToolkit`, bootstrap version 32, execution policy `ArcaCdkExecution`).
+Repeat only in a new account or region.
+
 CDK's default bootstrap gives CloudFormation `AdministratorAccess`, which would let anyone who can
 deploy a CDK stack create anything in the account. Bootstrap with the scoped policy instead:
 
