@@ -1,6 +1,7 @@
 {
   "app": "npx tsx bin/arca-demo.ts",
   "context": {
+    "demoHostname": "api.arcacover.com",
     "@aws-cdk/aws-ec2:uniqueImdsv2TemplateName": true,
     "@aws-cdk/aws-iam:minimizePolicies": true
   }

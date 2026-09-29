@@ -37,6 +37,9 @@ COPY --from=build /app/packages/contracts/package.json ./packages/contracts/pack
 COPY --from=build /app/packages/contracts/dist ./packages/contracts/dist
 COPY --from=build /app/packages/scoring/package.json ./packages/scoring/package.json
 COPY --from=build /app/packages/scoring/dist ./packages/scoring/dist
+# The deployment payload travels with the image it deploys: the host extracts it at deploy time,
+# so a rollback also restores that commit's compose file, Caddyfile and configuration.
+COPY compose.yaml deploy/Caddyfile deploy/production.env deploy/activate.sh deploy/render-env.py ./deploy-payload/
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends dumb-init \
