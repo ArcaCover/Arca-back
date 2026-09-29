@@ -1,0 +1,159 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AssumeCdkBootstrapRoles",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::194633188202:role/cdk-hnb659fds-*-194633188202-us-east-1"
+    },
+    {
+      "Sid": "ReadArcaStacks",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:DescribeStackResources",
+        "cloudformation:GetTemplate"
+      ],
+      "Resource": [
+        "arn:aws:cloudformation:us-east-1:194633188202:stack/ArcaDemoStack/*",
+        "arn:aws:cloudformation:us-east-1:194633188202:stack/CDKToolkit/*"
+      ]
+    },
+    {
+      "Sid": "EcrLogin",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ManageArcaImages",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:DescribeImages",
+        "ecr:ListImages",
+        "ecr:BatchDeleteImage",
+        "ecr:DeleteRepository"
+      ],
+      "Resource": "arn:aws:ecr:us-east-1:194633188202:repository/arca-demo"
+    },
+    {
+      "Sid": "FindTheHost",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeInstances",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    },
+    {
+      "Sid": "RunDeployAndSessionsOnArcaHostOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand",
+        "ssm:StartSession"
+      ],
+      "Resource": "arn:aws:ec2:us-east-1:194633188202:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ssm:resourceTag/aws:cloudformation:stack-name": "ArcaDemoStack"
+        }
+      }
+    },
+    {
+      "Sid": "OnlyTheShellAndSessionDocuments",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:SendCommand",
+        "ssm:StartSession"
+      ],
+      "Resource": [
+        "arn:aws:ssm:us-east-1::document/AWS-RunShellScript",
+        "arn:aws:ssm:us-east-1:194633188202:document/SSM-SessionManagerRunShell"
+      ]
+    },
+    {
+      "Sid": "FollowCommandsAndOwnSessions",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations",
+        "ssm:ListCommands",
+        "ssm:DescribeInstanceInformation",
+        "ssm:DescribeSessions"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    },
+    {
+      "Sid": "EndOwnSessions",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:TerminateSession",
+        "ssm:ResumeSession"
+      ],
+      "Resource": "arn:aws:ssm:us-east-1:194633188202:session/${aws:username}-*"
+    },
+    {
+      "Sid": "ManageArcaParametersOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:PutParameter",
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:GetParametersByPath",
+        "ssm:DeleteParameter",
+        "ssm:DeleteParameters",
+        "ssm:AddTagsToResource",
+        "ssm:ListTagsForResource"
+      ],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:194633188202:parameter/arca",
+        "arn:aws:ssm:us-east-1:194633188202:parameter/arca/*"
+      ]
+    },
+    {
+      "Sid": "ListParameterNames",
+      "Effect": "Allow",
+      "Action": "ssm:DescribeParameters",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    },
+    {
+      "Sid": "NeverBillingBudgetsOrAccount",
+      "Effect": "Deny",
+      "Action": [
+        "aws-portal:*",
+        "billing:*",
+        "budgets:*",
+        "ce:*",
+        "cur:*",
+        "payments:*",
+        "tax:*",
+        "invoicing:*",
+        "freetier:*",
+        "account:*",
+        "organizations:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

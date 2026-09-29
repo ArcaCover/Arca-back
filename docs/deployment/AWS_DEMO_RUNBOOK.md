@@ -16,6 +16,26 @@ balancer, no NAT Gateway and no SSH.
 Because the compose file, Caddyfile and configuration travel inside the image, a rollback restores
 all of them together with the code.
 
+## The short way
+
+`scripts/arca-aws.sh` wraps steps 2 to 6 below. It holds no secret: when one is missing under
+`/arca/prod` it asks for the value hidden, or generates it (the session secret, and the `/docs`
+password hash when Docker is running), and sends it straight to Parameter Store.
+
+```bash
+scripts/arca-aws.sh up                # secrets, stack, GitHub variable, app deploy
+scripts/arca-aws.sh status            # stack, secret names, DNS, health
+scripts/arca-aws.sh down              # delete the stack and the image repository
+scripts/arca-aws.sh down --secrets    # also delete the secrets
+```
+
+`up` stops to show IAM and security-group changes before applying them. The first run asks for
+the alert addresses and keeps them in `infra/aws/.alert-emails`, which is not committed. The DNS
+record in Vercel stays manual; `up` and `status` say which IP it must point to. `down` leaves the
+CDK bootstrap and the IAM user in place.
+
+The steps below are what the script does, for doing them by hand.
+
 Commands below use Git Bash. `arca-deploy` is the CLI profile of the least-privilege IAM user
 `arca_deploy_only`; only step 1 needs an administrator.
 
@@ -48,7 +68,6 @@ put() { read -rsp "$1: " value && echo && aws ssm put-parameter --profile arca-d
 put SUPABASE_URL
 put SUPABASE_SECRET_KEY
 put APIFY_API_TOKEN
-put NVIDIA_NIM_API_KEY
 ```
 
 The session secret and the docs password hash are generated, not typed:
@@ -60,8 +79,9 @@ put DOCS_AUTH_HASH   # paste the output of: docker run --rm -it caddy:2.10.2-alp
 ```
 
 Store the hash exactly as printed. `render-env.py` escapes every `$` for Compose, and refuses to
-deploy if a required secret is missing or the hash is not bcrypt. Optional secrets, such as
-`OPENAI_API_KEY` when `SIGNAL_LLM_ENDPOINT=openai`, go under the same path.
+deploy if a required secret is missing or the hash is not bcrypt. Production extracts with `WEBSITE_EVIDENCE_PROVIDER=rules`, so it needs no
+language-model key. Switching to the agentic extraction through OpenAI (see `deploy/production.env`)
+adds `OPENAI_API_KEY` under the same path. NVIDIA NIM is not used.
 
 ## 3. Create or update the infrastructure
 

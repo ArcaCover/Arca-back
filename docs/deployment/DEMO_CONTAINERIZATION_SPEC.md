@@ -83,7 +83,8 @@ The host's `/opt/arca/.env.demo` is generated at every activation and never edit
   modes, CORS origins, Apify limits, TTLs and timeouts.
 - Every SecureString under `/arca/prod/` in SSM Parameter Store, named after its variable:
   `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `SESSION_TOKEN_SECRET`, `APIFY_API_TOKEN`, `DOCS_AUTH_HASH`,
-  and the provider key the configuration needs (`NVIDIA_NIM_API_KEY`, or `OPENAI_API_KEY`).
+  and `OPENAI_API_KEY` only if the configuration switches to an OpenAI extraction. Production
+  uses `WEBSITE_EVIDENCE_PROVIDER=rules`; NVIDIA NIM is not used.
 - `ARCA_IMAGE`, the immutable image being activated.
 
 A variable defined in both places, a missing required secret or a non-bcrypt docs hash stops the
