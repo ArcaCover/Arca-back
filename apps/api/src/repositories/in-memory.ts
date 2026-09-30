@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ScanRepository, ScanRecord, RawRecord, ApifyRunRecord, ReserveApifyRun, ApifyRunReservation,
   ApifyRunUpdate } from './types.js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
+import { ACTIVE_APIFY_STATUSES } from './types.js';
 
 export class InMemoryRepository implements ScanRepository {
   readonly scans = new Map<string, ScanRecord>();
@@ -47,7 +48,7 @@ export class InMemoryRepository implements ScanRepository {
       (existing.status === 'SUCCEEDED' || existing.partial)) {
       attach(existing.id, false); return { decision: 'reuse', record: structuredClone(existing), chargedToScan: false };
     }
-    if (existing && ['RESERVED', 'READY', 'RUNNING', 'TIMING-OUT', 'ABORTING', 'START_UNCERTAIN'].includes(existing.status)
+    if (existing && ACTIVE_APIFY_STATUSES.includes(existing.status)
       && existing.expires_at > now) {
       attach(existing.id, false); return { decision: 'resume', record: structuredClone(existing), chargedToScan: false };
     }
@@ -63,6 +64,10 @@ export class InMemoryRepository implements ScanRepository {
       updated_at: now, expires_at: request.expiresAt, last_error: null };
     this.apifyRuns.set(record.id, record); attach(record.id, true);
     return { decision: 'start', record: structuredClone(record), chargedToScan: true };
+  }
+  async pendingApifyAccounting(limit: number) {
+    return structuredClone([...this.apifyRuns.values()].filter(run => run.run_id !== null && !run.accounting_complete &&
+      !ACTIVE_APIFY_STATUSES.includes(run.status)).slice(0, limit));
   }
   async getApifyRun(id: string) { return structuredClone(this.apifyRuns.get(id) ?? null); }
   async updateApifyRun(id: string, update: ApifyRunUpdate) {

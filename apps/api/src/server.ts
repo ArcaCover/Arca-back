@@ -58,8 +58,14 @@ const recoverTimer = setInterval(() => {
   void repository.recoverInterrupted(interruptedBefore()).catch(() => console.error('[api] recovery failed'));
 }, 60_000);
 recoverTimer.unref();
+// Books what Apify finally charged for each run: the ledger is the only record of directory spend.
+const costTimer = apify ? setInterval(() => {
+  void apify.reconcileCosts().catch(() => console.error('[api] Apify cost reconciliation failed'));
+}, 60_000) : undefined;
+costTimer?.unref();
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => {
   clearInterval(recoverTimer);
+  clearInterval(costTimer);
   server.close();
   const shutdownTimer = setTimeout(() => process.exit(1), 60_000);
   shutdownTimer.unref();

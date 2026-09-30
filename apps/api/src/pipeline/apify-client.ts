@@ -6,12 +6,13 @@ import { InMemoryRepository } from '../repositories/in-memory.js';
 
 const Run = z.object({ id: z.string(), status: z.string(), defaultDatasetId: z.string().nullish(),
   usageTotalUsd: z.number().nonnegative().nullish(), statusMessage: z.string().nullish(),
-  buildId: z.string().nullish(), buildNumber: z.string().nullish() });
+  buildId: z.string().nullish(), buildNumber: z.string().nullish(), finishedAt: z.string().nullish() });
 type RunState = z.infer<typeof Run>;
 type RunStore = {
   reserveApifyRun(request: ReserveApifyRun): Promise<ApifyRunReservation>;
   getApifyRun(id: string): Promise<ApifyRunRecord | null>;
   updateApifyRun(id: string, update: ApifyRunUpdate): Promise<void>;
+  pendingApifyAccounting(limit: number): Promise<ApifyRunRecord[]>;
 };
 export type ApifyRunMetadata = { provider: 'apify'; actor: string; runId: string; status: string;
   queryFingerprint: string; itemCount: number; acceptedCount: number; costUsd: number | null;
@@ -44,6 +45,9 @@ class ApifyHttpError extends Error {
 // for your current billing cycle") or refuses the start with 402 and a usage error type.
 const USAGE_LIMIT = /maximum usage|usage (hard )?limit|billing cycle|not-enough-usage|insufficient (credit|funds|usage)/i;
 const QUOTA_REASON = 'Apify usage limit reached for the current billing cycle';
+// Apify books pay-per-event charges after a run ends: the cost read at that moment understated one
+// live scan eightfold. A run's cost is final only this long after it finished.
+const CHARGES_SETTLE_MS = 120_000;
 
 export class ApifyClient {
   private active = 0;
@@ -178,15 +182,15 @@ export class ApifyClient {
       const datasetId = run.defaultDatasetId ?? record.dataset_id;
       const items = datasetId ? await this.readDataset(datasetId, signal) : [];
       if (run.status !== 'SUCCEEDED' && USAGE_LIMIT.test(run.statusMessage ?? '')) {
-        const accountingComplete = run.usageTotalUsd !== null && run.usageTotalUsd !== undefined;
         const cut: ApifyRunUpdate = { run_id: run.id, dataset_id: datasetId ?? null, item_count: items.length,
           items: items.length <= this.options.maxCachedItems ? items : null,
-          cost_usd: run.usageTotalUsd ?? null, accounting_complete: accountingComplete };
+          cost_usd: run.usageTotalUsd ?? null, accounting_complete: false };
         await this.quotaExceeded(record, cut, this.metadata({ ...record, ...cut, status: 'QUOTA_EXCEEDED', partial: false },
           { chargedToScan: reservation.chargedToScan }));
       }
       const partial = run.status !== 'SUCCEEDED' && items.length > 0;
-      const accountingComplete = run.usageTotalUsd !== null && run.usageTotalUsd !== undefined;
+      // Provisional: reconcileCosts books the settled figure once the charges are in.
+      const accountingComplete = false;
       const update: ApifyRunUpdate = { run_id: run.id, dataset_id: datasetId ?? null, status: run.status,
         build_id: run.buildId ?? null, build_number: run.buildNumber ?? null,
         items: items.length <= this.options.maxCachedItems ? items : null, item_count: items.length,
@@ -211,6 +215,22 @@ export class ApifyClient {
         record.run_id ? this.metadata(record, { resumed: reservation.decision === 'resume',
           chargedToScan: reservation.chargedToScan }) : null);
     } finally { this.release(); }
+  }
+  /** Books the settled cost of finished runs. The server calls it every minute; a run that finished
+   *  too recently, or that Apify cannot report yet, is left for the next pass. */
+  async reconcileCosts(limit = 50): Promise<number> {
+    let settled = 0;
+    for (const record of await this.store.pendingApifyAccounting(limit)) {
+      try {
+        const state = await this.json(`actor-runs/${encodeURIComponent(record.run_id!)}`, AbortSignal.timeout(15_000));
+        const run = z.object({ data: Run }).parse(state).data;
+        if (!terminal(run.status) || !run.finishedAt || this.options.now() - Date.parse(run.finishedAt) < CHARGES_SETTLE_MS) continue;
+        if (run.usageTotalUsd === null || run.usageTotalUsd === undefined) continue;
+        await this.store.updateApifyRun(record.id, { cost_usd: run.usageTotalUsd, accounting_complete: true });
+        settled++;
+      } catch { /* Apify or the store is unavailable: the next pass tries again. */ }
+    }
+    return settled;
   }
   async recordAccepted(metadata: ApifyRunMetadata, acceptedCount: number) {
     if (metadata.ledgerId) await this.store.updateApifyRun(metadata.ledgerId, { accepted_count: acceptedCount });

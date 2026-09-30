@@ -17,7 +17,9 @@ const EnvSchema = z.object({
     z.enum(['none', 'minimal', 'low', 'medium', 'high']).optional()),
   CORS_ALLOWED_ORIGINS: z.string().min(1),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
-  MAX_APIFY_CONCURRENCY: z.coerce.number().int().min(1).max(2).default(2),
+  // Actor runs in flight at once, across every scan. The account allows 32 jobs and 64 GB, and each
+  // directory run takes 1 GB, so 8 leaves room for other work on the same Apify account.
+  MAX_APIFY_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(8),
   APIFY_ACTOR_BUILD: z.string().min(1).default('latest'),
   // Provisional figure the ledger reserves while a run is in flight, before Apify reports
   // the real cost. Accounting only: spend is recorded, never capped.

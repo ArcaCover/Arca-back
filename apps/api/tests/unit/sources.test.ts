@@ -205,7 +205,8 @@ describe('Apify lifecycle', () => {
       : Response.json([{ name: 'Jane Smith' }]));
     const output = await new ApifyClient('token', request as typeof fetch).run('owner/actor', {}, new AbortController().signal);
     expect(output.items).toEqual([{ name: 'Jane Smith' }]);
-    expect(output.metadata).toMatchObject({ status: 'TIMED-OUT', partial: true, costUsd: .4, accountingComplete: true });
+    // Apify settles actor charges after the run ends, so the figure read at the end is provisional.
+    expect(output.metadata).toMatchObject({ status: 'TIMED-OUT', partial: true, costUsd: .4, accountingComplete: false });
   });
   it('reuses a completed query without a second actor POST', async () => {
     const repository = new InMemoryRepository();
@@ -238,7 +239,8 @@ describe('Apify lifecycle', () => {
     const source = new ApifyDirectorySource('bar', new ApifyClient('token', request as typeof fetch, 2, { store: repository }));
     const first = await source.run({ ...query, scanId: 'sc_one' }, new AbortController().signal);
     const second = await source.run({ ...query, scanId: 'sc_two' }, new AbortController().signal);
-    expect(first.status).toMatchObject({ costUsd: .1, cachedRuns: 0, costPerAcceptedAttorneyUsd: .1 });
+    // The paid run's charges are not settled yet, so its cost is unknown rather than understated.
+    expect(first.status).toMatchObject({ costUsd: null, accountingComplete: false, cachedRuns: 0, costPerAcceptedAttorneyUsd: null });
     expect(second.status).toMatchObject({ costUsd: 0, cachedRuns: 1, costPerAcceptedAttorneyUsd: 0 });
   });
   it('resumes the same remote run after the first caller deadline', async () => {
@@ -364,6 +366,46 @@ describe('Apify usage limit', () => {
     const result = await new ApifyDirectorySource('bar', { run }).run({ ...query, names: ['Jane Smitha', 'Jane Smithb'] },
       new AbortController().signal);
     expect(result.status).toMatchObject({ status: 'partial', code: 'PROVIDER_ERROR' });
+  });
+});
+describe('Apify cost reconciliation', () => {
+  const finished = (secondsAgo: number) => new Date(Date.now() - secondsAgo * 1000).toISOString();
+  const seed = async (repository: InMemoryRepository) => {
+    const reservation = await repository.reserveApifyRun({ queryFingerprint: 'b'.repeat(64), actor: 'owner/actor',
+      build: 'latest', input: { name: 'Jane' }, expectedCostUsd: 1, expiresAt: finished(-600) });
+    await repository.updateApifyRun(reservation.record!.id, { run_id: 'run-1', status: 'SUCCEEDED', cost_usd: 0,
+      accounting_complete: false });
+    return reservation.record!.id;
+  };
+
+  it('books what Apify finally charged once the run has settled', async () => {
+    const repository = new InMemoryRepository();
+    const id = await seed(repository);
+    const request = vi.fn(async () => Response.json({ data: { id: 'run-1', status: 'SUCCEEDED', usageTotalUsd: .4275,
+      finishedAt: finished(180) } }));
+    const settled = await new ApifyClient('token', request as typeof fetch, 2, { store: repository }).reconcileCosts();
+    expect(settled).toBe(1);
+    await expect(repository.getApifyRun(id)).resolves.toMatchObject({ cost_usd: .4275, accounting_complete: true });
+  });
+
+  it('leaves a run that finished moments ago for the next pass', async () => {
+    const repository = new InMemoryRepository();
+    const id = await seed(repository);
+    const request = vi.fn(async () => Response.json({ data: { id: 'run-1', status: 'SUCCEEDED', usageTotalUsd: .02,
+      finishedAt: finished(10) } }));
+    await new ApifyClient('token', request as typeof fetch, 2, { store: repository }).reconcileCosts();
+    await expect(repository.getApifyRun(id)).resolves.toMatchObject({ cost_usd: 0, accounting_complete: false });
+  });
+
+  it('never asks Apify about runs already settled or never started', async () => {
+    const repository = new InMemoryRepository();
+    const id = await seed(repository);
+    await repository.updateApifyRun(id, { accounting_complete: true });
+    await repository.reserveApifyRun({ queryFingerprint: 'c'.repeat(64), actor: 'owner/actor', build: 'latest',
+      input: {}, expectedCostUsd: 1, expiresAt: finished(-600) });
+    const request = vi.fn();
+    await new ApifyClient('token', request as typeof fetch, 2, { store: repository }).reconcileCosts();
+    expect(request).not.toHaveBeenCalled();
   });
 });
 describe('website extraction', () => {
