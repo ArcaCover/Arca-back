@@ -156,7 +156,8 @@ describe('asynchronous scan API', () => {
   it('documents only the current scan contract', async () => {
     const { app } = createApp({ domainResolver, repository: new InMemoryRepository(), pipeline: { run: vi.fn() }, sessionSecret: secret, corsOrigins: [], clientIp: () => '127.0.0.1' });
     const document = await (await app.request('/openapi.json')).json();
-    expect(Object.keys(document.paths).sort()).toEqual(['/scan', '/scan/{scanId}']);
+    expect(Object.keys(document.paths).sort()).toEqual(['/scan', '/scan/{scanId}', '/scan/{scanId}/report.pdf']);
+    expect(document.paths['/scan/{scanId}/report.pdf'].get.security).toEqual([{ sessionToken: [] }]);
     expect(document.paths['/scan'].post.description).toContain('Cache identity is the normalized domain');
     expect(document.paths['/scan'].post.responses['200'].description).toContain('Domain cache hit');
     expect(document.paths['/scan'].post.responses['202'].description).toContain('Fresh scan started');
