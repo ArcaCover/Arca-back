@@ -350,9 +350,9 @@ describe('Apify usage limit', () => {
       if ((input.lastNames as string[])[0] === 'Smithb') throw new ApifyClientError('PROVIDER_QUOTA_EXCEEDED', QUOTA);
       return [{ name: `Jane ${(input.lastNames as string[])[0]}`, status: 'Member in Good Standing' }];
     });
-    const names = ['Jane Smitha', 'Jane Smithb', 'Jane Smithc', 'Jane Smithd', 'Jane Smithe', 'Jane Smithf', 'Jane Smithg'];
+    const names = Array.from({ length: 14 }, (_, index) => `Jane Smith${String.fromCharCode(97 + index)}`);
     const result = await new ApifyDirectorySource('bar', { run }).run({ ...query, names }, new AbortController().signal);
-    // One worker per lookup up to five: the limit stops the queue, not the lookups already in flight.
+    // Up to eight lookups in flight: the limit stops the queue, not the lookups already started.
     expect(run.mock.calls.length).toBeLessThan(names.length);
     expect(result.status).toMatchObject({ status: 'partial', code: 'PROVIDER_ERROR' });
     expect(result.status.reason).toMatch(/usage limit/i);

@@ -14,6 +14,9 @@ export const BAR_TECHNICAL_MAX_LAWYERS = 1_000_000;
 export const AVVO_TECHNICAL_MAX_LAWYERS = 100_000;
 export const BAR_TARGETED_MAX_LAWYERS = 25;
 export const AVVO_TARGETED_MAX_LAWYERS = 10;
+// Lookups one source keeps in flight. Bar and Avvo run side by side, so two sources fill the
+// default MAX_APIFY_CONCURRENCY of 16; the Apify client queues anything beyond its limit.
+export const DIRECTORY_LOOKUPS_IN_FLIGHT = 8;
 const record = z.record(z.unknown());
 const text = (value: unknown): string | null => typeof value === 'string' && value.trim() ? value.trim() : null;
 const availableText = (value: unknown): string | null => {
@@ -216,7 +219,7 @@ export class ApifyDirectorySource implements DirectorySource {
         }
       }
     };
-    await Promise.all(Array.from({ length: Math.min(5, targets.length) }, worker));
+    await Promise.all(Array.from({ length: Math.min(DIRECTORY_LOOKUPS_IN_FLIGHT, targets.length) }, worker));
     const successful = successfulQueries > 0;
     matches.sort((a, b) => a.searchedName.localeCompare(b.searchedName) || (a.attorney?.name ?? '').localeCompare(b.attorney?.name ?? ''));
     const found = matches.filter(match => match.attorney !== null).length;
