@@ -149,11 +149,20 @@ export class ApifyDirectorySource implements DirectorySource {
     const matches: AttorneyMatch[] = [];
     const providerRuns: NonNullable<SourceStatus['providerRuns']> = [];
     let failed = 0, successfulQueries = 0, candidatesReceived = 0, recordsValid = 0, truncated = false;
+    // Lookups that threw (the provider refused or vanished), as opposed to answers in the wrong shape.
+    let providerFailures = 0, quotaReached = false;
     let cursor = 0;
     const worker = async () => {
       while (cursor < targets.length) {
         const target = targets[cursor++]!;
         if (signal.aborted) { failed++; continue; }
+        if (quotaReached) {
+          // Past the usage limit every start is refused; stop the queue instead of failing lookup by lookup.
+          failed++; providerFailures++;
+          rawResults.push({ target, items: null, error: 'provider_quota_exceeded' });
+          if (!fallback) matches.push({ searchedName: target, attorney: null, ambiguous: false, matchConfidence: 'no_match' });
+          continue;
+        }
         try {
           const plan = planned.find(item => item.target === target)!;
           const output = await this.client.run(plan.actor, plan.input, signal, { scanId: query.scanId });
@@ -196,11 +205,13 @@ export class ApifyDirectorySource implements DirectorySource {
             catch { failed++; rawResults[rawResults.length - 1]!.error = 'ledger_update_failed'; }
           }
         } catch (error) {
-          failed++;
+          failed++; providerFailures++;
+          const quota = error instanceof ApifyClientError && error.code === 'PROVIDER_QUOTA_EXCEEDED';
+          if (quota) quotaReached = true;
           if (error instanceof ApifyClientError && error.metadata) {
             const { ledgerId: _ledgerId, ...publicMetadata } = error.metadata; providerRuns.push(publicMetadata);
           }
-          rawResults.push({ target, items: null, error: signal.aborted ? 'timeout' : 'source_error' });
+          rawResults.push({ target, items: null, error: signal.aborted ? 'timeout' : quota ? 'provider_quota_exceeded' : 'source_error' });
           if (!fallback) matches.push({ searchedName: target, attorney: null, ambiguous: false, matchConfidence: 'no_match' });
         }
       }
@@ -213,8 +224,9 @@ export class ApifyDirectorySource implements DirectorySource {
     const accountingComplete = chargeableRuns.every(run => run.accountingComplete !== false && run.costUsd !== null);
     const costUsd = accountingComplete ? chargeableRuns.reduce((total, run) => total + run.costUsd!, 0) : null;
     const costPerAcceptedAttorneyUsd = costUsd !== null && found > 0 ? costUsd / found : null;
-    const code = signal.aborted ? 'DEADLINE_REACHED' : truncated ? 'TRUNCATED' :
-      !successful ? 'PROVIDER_ERROR' : failed ? 'PROVIDER_CONTRACT_ERROR' : found ? undefined : 'NO_MATCH';
+    const code = signal.aborted ? 'DEADLINE_REACHED' : quotaReached ? 'PROVIDER_ERROR' : truncated ? 'TRUNCATED' :
+      !successful ? 'PROVIDER_ERROR' : failed > providerFailures ? 'PROVIDER_CONTRACT_ERROR' : failed ? 'PROVIDER_ERROR'
+        : found ? undefined : 'NO_MATCH';
     return { data: successful ? matches : null, rawContent: JSON.stringify({
       queries: rawResults.sort((a, b) => a.target.localeCompare(b.target)), providerRuns }),
       status: { status: failed ? successful ? 'partial' : signal.aborted ? 'timeout' : 'error' : 'ok',
@@ -223,7 +235,8 @@ export class ApifyDirectorySource implements DirectorySource {
         candidatesReceived, recordsValid, providerRuns, costUsd, accountingComplete,
         cachedRuns: providerRuns.filter(run => run.cached).length, resumedRuns: providerRuns.filter(run => run.resumed).length,
         costPerAcceptedAttorneyUsd, ...(code ? { code } : {}),
-        reason: failed ? 'One or more targeted lookups were incomplete; raw responses retained' :
+        reason: quotaReached ? 'Apify usage limit reached for the current billing cycle; lookups after it were not started' :
+          failed ? 'One or more targeted lookups were incomplete; raw responses retained' :
           found ? null : 'Provider completed successfully with no accepted identity match' } };
   }
 }

@@ -3,7 +3,7 @@ import { unknownWebsite } from '@arca/contracts';
 import { ApifyDirectorySource, AVVO_ACTOR, BAR_ACTOR, AVVO_TECHNICAL_MAX_LAWYERS, BAR_TECHNICAL_MAX_LAWYERS,
   AVVO_TARGETED_MAX_LAWYERS, BAR_TARGETED_MAX_LAWYERS, parseBar, parseAvvo,
   parseDisciplineSummary } from '../../src/pipeline/directories.js';
-import { ApifyClient } from '../../src/pipeline/apify-client.js';
+import { ApifyClient, ApifyClientError } from '../../src/pipeline/apify-client.js';
 import { RagWebsiteSource, WebsiteExtractionSource } from '../../src/pipeline/website-source.js';
 import { RuleBasedEvidenceProvider } from '../../src/pipeline/website-evidence-provider.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
@@ -287,6 +287,83 @@ describe('Apify lifecycle', () => {
     await expect(client.run('owner/actor', { name: 'Jane' }, new AbortController().signal)).rejects.toThrow('FAILED');
     await expect(client.run('owner/actor', { name: 'Jane' }, new AbortController().signal)).rejects.toThrow('cooldown');
     expect(request.mock.calls.filter(call => String(call[0]).includes('/runs?'))).toHaveLength(1);
+  });
+});
+describe('Apify usage limit', () => {
+  const QUOTA = "Actor aborted. You've reached the maximum usage for your current billing cycle.";
+  const started = (calls: unknown[][]) => calls.filter(call => String(call[0]).includes('/runs?')).length;
+
+  it('does not cache a run the usage limit cut short, and says why', async () => {
+    const repository = new InMemoryRepository();
+    const request = vi.fn(async (url: string | URL | Request) => String(url).includes('/runs?')
+      ? Response.json({ data: { id: 'run', status: 'ABORTED', defaultDatasetId: 'dataset', usageTotalUsd: .05, statusMessage: QUOTA } })
+      : Response.json([{ name: 'Jane Smith' }]));
+    const client = new ApifyClient('token', request as typeof fetch, 2, { store: repository });
+    const error = await client.run('owner/actor', { name: 'Jane' }, new AbortController().signal).catch(caught => caught);
+    expect(error).toBeInstanceOf(ApifyClientError);
+    expect(error).toMatchObject({ code: 'PROVIDER_QUOTA_EXCEEDED' });
+    // The cut is not a property of the query: the rows must not be reused as partial evidence for a week.
+    const [row] = [...repository.apifyRuns.values()];
+    expect(row).toMatchObject({ status: 'QUOTA_EXCEEDED', partial: false, cost_usd: .05 });
+    expect(Date.parse(row!.expires_at)).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('treats a start refused for usage as the limit, not as an uncertain start', async () => {
+    const repository = new InMemoryRepository();
+    const request = vi.fn(async () => Response.json({ error: { type: 'not-enough-usage-to-run-paid-actor',
+      message: 'You have reached your monthly usage hard limit.' } }, { status: 402 }));
+    const client = new ApifyClient('token', request as typeof fetch, 2, { store: repository });
+    await expect(client.run('owner/actor', { name: 'Jane' }, new AbortController().signal))
+      .rejects.toMatchObject({ code: 'PROVIDER_QUOTA_EXCEEDED' });
+    expect([...repository.apifyRuns.values()][0]).toMatchObject({ status: 'QUOTA_EXCEEDED' });
+  });
+
+  it('starts no run while the limit holds, still serves cached queries, and tries again afterwards', async () => {
+    const repository = new InMemoryRepository();
+    let clock = 1_000_000;
+    let limited = false;
+    const request = vi.fn(async (url: string | URL | Request) => {
+      if (!String(url).includes('/runs?')) return Response.json([{ name: 'Jane Smith' }]);
+      return limited
+        ? Response.json({ data: { id: `run${clock}`, status: 'ABORTED', defaultDatasetId: 'dataset', statusMessage: QUOTA } })
+        : Response.json({ data: { id: `run${clock}`, status: 'SUCCEEDED', defaultDatasetId: 'dataset', usageTotalUsd: .1 } });
+    });
+    const client = new ApifyClient('token', request as typeof fetch, 2, { store: repository,
+      quotaCooldownMs: 300_000, now: () => clock });
+    const signal = new AbortController().signal;
+    await client.run('owner/actor', { name: 'Cached' }, signal);
+    limited = true;
+    await expect(client.run('owner/actor', { name: 'First' }, signal)).rejects.toMatchObject({ code: 'PROVIDER_QUOTA_EXCEEDED' });
+    const before = started(request.mock.calls);
+    await expect(client.run('owner/actor', { name: 'Second' }, signal)).rejects.toMatchObject({ code: 'PROVIDER_QUOTA_EXCEEDED' });
+    expect(started(request.mock.calls)).toBe(before);
+    await expect(client.run('owner/actor', { name: 'Cached' }, signal)).resolves.toMatchObject({ metadata: { cached: true } });
+    // Once the limit is raised, the next run after the cooldown goes through.
+    limited = false; clock += 300_001;
+    await expect(client.run('owner/actor', { name: 'Second' }, signal)).resolves.toMatchObject({ metadata: { status: 'SUCCEEDED' } });
+  });
+
+  it('stops a directory search at the limit and reports a provider error with the reason', async () => {
+    const run = vi.fn(async (_actor: string, input: Record<string, unknown>) => {
+      if ((input.lastNames as string[])[0] === 'Smithb') throw new ApifyClientError('PROVIDER_QUOTA_EXCEEDED', QUOTA);
+      return [{ name: `Jane ${(input.lastNames as string[])[0]}`, status: 'Member in Good Standing' }];
+    });
+    const names = ['Jane Smitha', 'Jane Smithb', 'Jane Smithc', 'Jane Smithd', 'Jane Smithe', 'Jane Smithf', 'Jane Smithg'];
+    const result = await new ApifyDirectorySource('bar', { run }).run({ ...query, names }, new AbortController().signal);
+    // One worker per lookup up to five: the limit stops the queue, not the lookups already in flight.
+    expect(run.mock.calls.length).toBeLessThan(names.length);
+    expect(result.status).toMatchObject({ status: 'partial', code: 'PROVIDER_ERROR' });
+    expect(result.status.reason).toMatch(/usage limit/i);
+  });
+
+  it('reports a lookup that threw as a provider error, not a contract error', async () => {
+    const run = vi.fn(async (_actor: string, input: Record<string, unknown>) => {
+      if ((input.lastNames as string[])[0] === 'Smithb') throw new ApifyClientError('PROVIDER_ERROR', 'Apify run unavailable');
+      return [{ name: `Jane ${(input.lastNames as string[])[0]}`, status: 'Member in Good Standing' }];
+    });
+    const result = await new ApifyDirectorySource('bar', { run }).run({ ...query, names: ['Jane Smitha', 'Jane Smithb'] },
+      new AbortController().signal);
+    expect(result.status).toMatchObject({ status: 'partial', code: 'PROVIDER_ERROR' });
   });
 });
 describe('website extraction', () => {
