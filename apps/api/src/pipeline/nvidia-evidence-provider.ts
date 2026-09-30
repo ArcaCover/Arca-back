@@ -149,6 +149,7 @@ function normalizeClaims(claims: Claim[]): Claim[] {
   });
 }
 
+const TEAM_PATH = /attorney|lawyer|abogad|equipo|team/i;
 export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
   readonly id: string;
   readonly version: string;
@@ -251,6 +252,16 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
       }
       corpus = assemble();
     }
+    // The roster reads only team pages, which the page plan has already fetched, so it runs alongside the
+    // extraction rounds instead of after them (about 15 s saved). If a round reads a new team page, the
+    // roster runs once more on the final corpus.
+    const teamSegments = (current: EvidenceCorpus) => current.segments.filter(segment => TEAM_PATH.test(new URL(segment.url).pathname));
+    const extractRoster = (phase: string, current: EvidenceCorpus) => this.parseWithRepair(phase, SignalExtraction, ROSTER_PROMPT,
+      serializeCorpus({ ...current, segments: teamSegments(current), links: [] }), signal, attempts);
+    const earlyTeam = teamSegments(corpus).map(segment => segment.id).join(',');
+    const earlyRoster = earlyTeam ? extractRoster('extract-roster', corpus) : null;
+    // Awaited after the rounds; this only keeps an early failure from surfacing as an unhandled rejection.
+    earlyRoster?.catch(() => {});
     let extraction!: SignalExtraction;
     let stopReason: StopReason = 'ROUND_LIMIT', rounds = 0;
     for (let round = 1; round <= MAX_AGENT_ROUNDS; round++) {
@@ -294,11 +305,10 @@ export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
       }
       corpus = assemble();
     }
-    const teamSegments = corpus.segments.filter(segment => /attorney|lawyer|abogad|equipo|team/i.test(new URL(segment.url).pathname));
-    if (teamSegments.length) {
-      const teamCorpus: EvidenceCorpus = { ...corpus, segments: teamSegments, links: [] };
-      const roster = await this.parseWithRepair('extract-roster', SignalExtraction, ROSTER_PROMPT,
-        serializeCorpus(teamCorpus), signal, attempts);
+    const finalTeam = teamSegments(corpus).map(segment => segment.id).join(',');
+    if (finalTeam) {
+      const roster = finalTeam === earlyTeam ? await earlyRoster!
+        : await extractRoster(earlyTeam ? 'extract-roster-refresh' : 'extract-roster', corpus);
       extraction = { ...extraction, claims: [...extraction.claims.filter(claim =>
         !['attorneys', 'attorney_count', 'team_page_quality'].includes(claim.field)), ...roster.claims.filter(claim =>
         ['attorneys', 'attorney_count', 'team_page_quality'].includes(claim.field))] };

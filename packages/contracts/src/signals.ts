@@ -16,14 +16,17 @@ export const Claim = z.object({
 }).strict();
 export type Claim = z.infer<typeof Claim>;
 
-const targetFields = z.array(Claim.shape.field).min(1).max(8);
+// The action only steers the next round, and the loop never uses more than these. A longer list
+// is trimmed rather than rejected: a rejection costs a full repair call to learn nothing.
+const upTo = <T extends z.ZodTypeAny>(item: T, max: number) => z.array(item).min(1).transform(values => values.slice(0, max));
+const targetFields = upTo(Claim.shape.field, 8);
 const actionReason = z.string().trim().min(1).max(1600);
 export const ExtractionAction = z.discriminatedUnion('type', [
   z.object({ type: z.literal('finish'), reason: actionReason }).strict(),
-  z.object({ type: z.literal('fetch_pages'), linkIds: z.array(z.string().min(1)).min(1).max(4), targetFields, reason: actionReason }).strict(),
-  z.object({ type: z.literal('read_document'), linkIds: z.array(z.string().min(1)).min(1).max(2), targetFields, reason: actionReason }).strict(),
+  z.object({ type: z.literal('fetch_pages'), linkIds: upTo(z.string().min(1), 4), targetFields, reason: actionReason }).strict(),
+  z.object({ type: z.literal('read_document'), linkIds: upTo(z.string().min(1), 2), targetFields, reason: actionReason }).strict(),
   z.object({ type: z.literal('read_sitemap'), targetFields, reason: actionReason }).strict(),
-  z.object({ type: z.literal('find_in_site'), terms: z.array(z.string().trim().min(2).max(60)).min(1).max(6), targetFields, reason: actionReason }).strict(),
+  z.object({ type: z.literal('find_in_site'), terms: upTo(z.string().trim().min(2).max(60), 6), targetFields, reason: actionReason }).strict(),
 ]);
 export type ExtractionAction = z.infer<typeof ExtractionAction>;
 export const SignalExtraction = z.object({ claims: z.array(Claim).max(160), action: ExtractionAction }).strict();
