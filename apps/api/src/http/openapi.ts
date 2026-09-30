@@ -52,7 +52,7 @@ export function buildOpenApiDocument() {
   };
   const invalid = { invalidRequest: { summary: 'Invalid request', value: { error: 'invalid_request', message: 'A valid email and a non-empty domain are required' } } };
   registry.registerPath({ method: 'post', path: '/scan', summary: 'Start a domain scan or reuse a cached domain result',
-    description: 'Cache identity is the normalized domain. A cache miss returns 202 RUNNING. A hit inside the cache window (SCAN_CACHE_TTL_MS, 7 days by default) returns 200 immediately with cached=true, a new scanId, a new sessionToken and status COMPLETED. A cached partial scan is never returned as it stands: it is repaired first, so it arrives through polling.',
+    description: 'Cache identity is the normalized domain. A cache miss returns 202 RUNNING. A hit inside the cache window (SCAN_CACHE_TTL_MS, 7 days by default) returns 200 immediately with cached=true, a new scanId, a new sessionToken and status COMPLETED. A cached partial scan never gets the 200: it is repaired first, at most once per SCAN_PARTIAL_REPAIR_COOLDOWN_MS (1 hour by default), and inside that cooldown the last repair is served. Either way it returns 202 and arrives through polling, as PARTIAL.',
     request: { body: { required: true, content: json(ScanRequest, { lawFirm: { summary: 'Start a firm scan',
       value: { email: 'contact@smithlaw.com', domain: 'smithlaw.com' } } }) } },
     responses: {
@@ -63,7 +63,7 @@ export function buildOpenApiDocument() {
         cacheHit: { summary: 'Cached domain result', value: { scanId: 'sc_abc123', sessionToken: 'eyJhbGciOiJIUzI1NiIs...', status: 'COMPLETED', cached: true,
           result: { ...result, meta: { ...result.meta, cached: true } } } },
       }) },
-      400: { description: 'Invalid email, missing domain, or unresolvable domain', content: json(error, invalid) },
+      400: { description: 'Invalid email or missing domain (invalid_request), a domain that belongs to an email provider (personal_email_domain), or an unresolvable domain (invalid_domain)', content: json(error, invalid) },
       429: { description: '10 requests per IP/hour or 3 per email/hour exceeded', content: json(error, {
         rateLimited: { summary: 'Rate limit exceeded', value: { error: 'rate_limited', message: 'Scan request limit exceeded' } },
       }), headers: { 'Retry-After': { schema: { type: 'integer' }, description: 'Seconds until retry' } } },

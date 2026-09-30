@@ -7,6 +7,8 @@ import { validDate } from '@arca/scoring';
 
 export const BAR_ACTOR = 'scrapers_lat/florida-bar-lawyers-scraper';
 export const AVVO_ACTOR = 'scrapers_lat/avvo-lawyers-scraper';
+// The Bar actor reads the Florida Bar's registry, so a Bar match certifies a Florida licence.
+export const BAR_JURISDICTION = 'FL';
 // Actor-defined maxima, not application budgets. The Apify client paginates every completed dataset.
 export const BAR_TECHNICAL_MAX_LAWYERS = 1_000_000;
 export const AVVO_TECHNICAL_MAX_LAWYERS = 100_000;
@@ -102,7 +104,12 @@ export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQue
   source === 'bar' ? BAR_TARGETED_MAX_LAWYERS : AVVO_TARGETED_MAX_LAWYERS): DirectoryInput[] {
   const names = stableSample(query.names);
   const fallback = names.length === 0;
-  const targets = fallback ? (query.firmName ? [query.firmName] : []) : names;
+  // DN-06: without a verified city an Avvo firm search expands to the whole country with a
+  // technical maximum of 100,000 lawyers. Nothing caps that spend any more (D8), so it is not run.
+  // Named lookups stay: the targeted maximum bounds each one whether or not a city is known.
+  const location = query.city && query.state ? `${query.city}, ${query.state}` : null;
+  const unscopedFirmSearch = fallback && source === 'avvo' && location === null;
+  const targets = unscopedFirmSearch ? [] : fallback ? (query.firmName ? [query.firmName] : []) : names;
   return targets.map(target => {
     const parts = normalizeName(target).split(' ');
     // The Bar actor matches on the whole first name: an initial alone returns "No lawyers matched".
@@ -113,7 +120,7 @@ export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQue
       lastNames: fallback ? [] : [surname(target).split(' ').map(title).join(' ')], firstName: fallback ? '' : title(parts[0]!),
       ...(fallback ? { firm: target } : {}), maxLawyers: resultLimit, withDetails: true,
       withLeadScore: false, withProfileSummary: false, eligibleOnly: false, includeDeceased: true,
-    } : { searchQueries: [target], ...(query.city ? { cities: [`${query.city}, FL`] } : {}),
+    } : { searchQueries: [target], ...(location ? { cities: [location] } : {}),
       withDetails: true, maxLawyers: resultLimit };
     return { target, actor: source === 'bar' ? BAR_ACTOR : AVVO_ACTOR, input, fallback, resultLimit };
   });
@@ -122,8 +129,11 @@ type DirectoryClient = { run(actor: string, input: Record<string, unknown>, sign
   context?: { scanId?: string }): Promise<unknown[] | ApifyRunResult>;
   recordAccepted?(metadata: ApifyRunMetadata, acceptedCount: number): Promise<void> };
 export class ApifyDirectorySource implements DirectorySource {
+  readonly jurisdiction?: string;
   constructor(private readonly source: 'bar' | 'avvo', private readonly client: DirectoryClient,
-    private readonly options: { targetedMaxLawyers?: number } = {}) {}
+    private readonly options: { targetedMaxLawyers?: number } = {}) {
+    if (source === 'bar') this.jurisdiction = BAR_JURISDICTION;
+  }
   async run(query: DirectoryQuery, signal: AbortSignal): Promise<SourceResult<AttorneyMatch[]>> {
     const started = Date.now();
     const planned = buildDirectoryInputs(this.source, query, this.options.targetedMaxLawyers);
@@ -131,7 +141,9 @@ export class ApifyDirectorySource implements DirectorySource {
     const fallback = names.length === 0;
     const targets = planned.map(item => item.target);
     if (!targets.length) return { data: null, rawContent: null, status: { status: 'skipped', dataStatus: 'UNKNOWN',
-      durationMs: 0, code: 'INSUFFICIENT_IDENTITY', reason: 'No verified firm or attorney identity available',
+      durationMs: 0, code: 'INSUFFICIENT_IDENTITY', reason: fallback && query.firmName
+        ? 'A firm-wide search needs a verified city; a nationwide search is not run'
+        : 'No verified firm or attorney identity available',
       attorneysSearched: 0, attorneysFound: 0, candidatesReceived: 0, recordsValid: 0, providerRuns: [], costUsd: 0 } };
     const rawResults: { target: string; items: unknown[] | null; error: string | null }[] = [];
     const matches: AttorneyMatch[] = [];

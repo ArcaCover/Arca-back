@@ -23,7 +23,8 @@ export class PublicDomainResolver implements DomainResolver {
     const candidate = source === 'request' ? input.domain! : input.email.slice(input.email.lastIndexOf('@') + 1);
     const canonicalDomain = normalizeDomain(candidate);
     if (!canonicalDomain) return { status: 'UNRESOLVED', canonicalDomain: null, source, reason: 'INVALID_DOMAIN' };
-    if (source === 'email' && PERSONAL_EMAIL_DOMAINS.has(canonicalDomain)) {
+    // A mail provider is never a firm, whether it came from the email or was typed in as the website.
+    if (PERSONAL_EMAIL_DOMAINS.has(canonicalDomain)) {
       return { status: 'UNRESOLVED', canonicalDomain: null, source, reason: 'PERSONAL_EMAIL' };
     }
     let timer: ReturnType<typeof setTimeout> | undefined;

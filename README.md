@@ -82,6 +82,10 @@ La caché dura `SCAN_CACHE_TTL_MS` por dominio canónico, 7 días por defecto, y
 devuelve tal cual: se re-ejecuta reutilizando el análisis de website por hash de contenido y las
 consultas de directorio vigentes, de modo que solo se repara la evidencia que falta, y el solicitante
 recibe el resultado reparado. Devolverlo sin reparar congelaría el fallo durante toda la ventana.
+La reparación se intenta como mucho una vez por `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` (1 hora por defecto):
+dentro de ese intervalo se sirve la última reparación como PARTIAL con `cached=true`, siempre por
+polling (202 y después `GET /scan/:scanId`), nunca en el 200 rápido. Una fuente caída de forma
+permanente se sigue reintentando, pero no a costa de hacer esperar a cada visitante.
 Un scan solo queda PARTIAL después de que cada página recuperable agotó sus reintentos.
 `APIFY_QUERY_CACHE_TTL_MS` se mantiene acoplado a `SCAN_CACHE_TTL_MS`: si expirara antes, cada
 reparación volvería a pagar las consultas de directorio que debía reutilizar.

@@ -13,7 +13,8 @@ async function load(domain: string) {
   return Scenario.parse(JSON.parse(raw.replaceAll('$RECENT_SANCTION_DATE', new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10))));
 }
 export function mockSources(): { website: WebsiteSource; bar: DirectorySource; avvo: DirectorySource } {
-  const directory = (source: 'bar' | 'avvo'): DirectorySource => ({ run: async (query, signal) => {
+  const directory = (source: 'bar' | 'avvo'): DirectorySource => ({
+    ...(source === 'bar' ? { jurisdiction: 'FL' } : {}), run: async (query, signal) => {
     signal.throwIfAborted(); const scenario = await load(query.canonicalDomain);
     return { data: scenario[source], rawContent: JSON.stringify(scenario[source]), status: scenario.sources[source] };
   } });

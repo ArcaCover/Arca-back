@@ -34,6 +34,9 @@ const EnvSchema = z.object({
   // Domain scan cache window. Layer 1 evidence (a published AI policy, bar standing, an
   // Avvo rating) changes in weeks, not hours.
   SCAN_CACHE_TTL_MS: z.coerce.number().int().positive().default(604_800_000),
+  // A PARTIAL scan is re-run to repair its missing evidence at most once per this window;
+  // inside it the last repair is served. 0 repairs on every request.
+  SCAN_PARTIAL_REPAIR_COOLDOWN_MS: z.coerce.number().int().nonnegative().default(3_600_000),
 });
 export function loadEnv(source = process.env) {
   const env = EnvSchema.parse(source);
@@ -58,6 +61,9 @@ export function loadEnv(source = process.env) {
   for (const origin of corsOrigins) if (new URL(origin).origin !== origin) throw new Error('CORS entries must be exact origins');
   if (env.SUPABASE_URL) z.string().url().parse(env.SUPABASE_URL);
   const signalModel = env.SIGNAL_LLM_MODEL?.trim() || (env.SIGNAL_LLM_ENDPOINT === 'nvidia' ? env.NVIDIA_NIM_MODEL?.trim() : undefined) || undefined;
+  if (env.SCAN_PARTIAL_REPAIR_COOLDOWN_MS > env.SCAN_CACHE_TTL_MS) {
+    throw new Error('SCAN_PARTIAL_REPAIR_COOLDOWN_MS cannot exceed SCAN_CACHE_TTL_MS');
+  }
   if (env.APIFY_ACTIVE_RUN_TTL_MS < (env.APIFY_RUN_TIMEOUT_SECS + 60) * 1000) {
     throw new Error('APIFY_ACTIVE_RUN_TTL_MS must exceed the remote run timeout by at least 60 seconds');
   }

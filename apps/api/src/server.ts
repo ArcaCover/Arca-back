@@ -45,7 +45,7 @@ const clientIps = new WeakMap<Request, string>();
 const { app, drain } = createApp({ repository, domainResolver,
   pipeline: new InProcessPipeline({ ...sources, repository, timeoutMs: env.PIPELINE_TIMEOUT_MS }),
   sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
-  scanCacheTtlMs: env.SCAN_CACHE_TTL_MS,
+  scanCacheTtlMs: env.SCAN_CACHE_TTL_MS, partialRepairCooldownMs: env.SCAN_PARTIAL_REPAIR_COOLDOWN_MS,
   clientIp: request => clientIps.get(request) ?? 'unknown' });
 const server = serve({ port: env.PORT, fetch: (request, bindings) => {
   const connection = bindings as HttpBindings;

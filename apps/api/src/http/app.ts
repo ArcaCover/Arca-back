@@ -12,12 +12,13 @@ export type AppDeps = {
   pipeline: Layer1Pipeline; repository: ScanRepository; sessionSecret: string; corsOrigins: string[];
   domainResolver: DomainResolver;
   clientIp: (request: Request) => string;
-  limiter?: ScanLimiter; now?: () => number; scanCacheTtlMs?: number;
+  limiter?: ScanLimiter; now?: () => number; scanCacheTtlMs?: number; partialRepairCooldownMs?: number;
 };
 export function createApp(deps: AppDeps) {
   const app = new Hono();
   const now = deps.now ?? Date.now;
   const scanCacheTtlMs = deps.scanCacheTtlMs ?? 604_800_000;
+  const partialRepairCooldownMs = deps.partialRepairCooldownMs ?? 3_600_000;
   const limiter = deps.limiter ?? new ScanLimiter(now);
   const jobs = new Set<Promise<void>>();
   const inFlightByDomain = new Map<string, Promise<PipelineResult>>();
@@ -41,6 +42,9 @@ export function createApp(deps: AppDeps) {
       return c.json({ error: 'rate_limited', message: 'Scan request limit exceeded' }, 429);
     }
     const domainResolution = DomainResolution.parse(await deps.domainResolver.resolve({ domain, email }));
+    if (domainResolution.reason === 'PERSONAL_EMAIL') {
+      return c.json({ error: 'personal_email_domain', message: 'The domain belongs to an email provider, not a firm' }, 400);
+    }
     if (domainResolution.canonicalDomain === null) {
       return c.json({ error: 'invalid_domain', message: 'The domain could not be resolved' }, 400);
     }
@@ -51,12 +55,16 @@ export function createApp(deps: AppDeps) {
     const cached = await deps.repository.cached(canonicalDomain, new Date(timestamp - scanCacheTtlMs).toISOString());
     // Completed scans are returned immediately. Partial scans warm the website and per-query caches,
     // then run again so only missing or expired external evidence is repaired.
-    const cachedResult = cached?.status === 'COMPLETED' && cached.result ? Layer1Result.parse({ ...cached.result, scanId, domain: canonicalDomain, email,
-      meta: { ...cached.result.meta, cached: true } }) : null;
+    // A partial scan is repaired at most once per cooldown. Inside it, the last repair is served
+    // as it stands: a source that is down for good would otherwise re-run the whole pipeline for
+    // every visitor, all cache window long, and make each one wait for the same failure.
+    const recentlyRepaired = cached?.status === 'PARTIAL' && cached.completed_at !== null &&
+      Date.parse(cached.completed_at) > timestamp - partialRepairCooldownMs;
+    const reusable = cached?.result && (cached.status === 'COMPLETED' || recentlyRepaired) ? cached : null;
+    const cachedResult = reusable ? Layer1Result.parse({ ...reusable.result, scanId, domain: canonicalDomain, email,
+      meta: { ...reusable.result!.meta, cached: true } }) : null;
     if (cachedResult && cachedResult.domain !== canonicalDomain) throw new Error('Cached domain identity mismatch');
-    // A cache hit is always COMPLETED. A partial scan is never handed back as it stands:
-    // it is repaired first, so the caller waits and receives the repaired result instead.
-    const cachedStatus = 'COMPLETED' as const;
+    const cachedStatus = reusable?.status === 'PARTIAL' ? 'PARTIAL' as const : 'COMPLETED' as const;
     const scan: ScanRecord = {
       id: randomUUID(), scan_id: scanId, email, canonical_domain: canonicalDomain, domain_resolution: domainResolution,
       status: cachedResult ? cachedStatus : 'RUNNING', result: cachedResult,
@@ -65,7 +73,12 @@ export function createApp(deps: AppDeps) {
       duration_ms: cachedResult ? 0 : null, cached: cachedResult !== null,
     };
     await deps.repository.create(scan);
-    if (cachedResult) return c.json({ scanId, sessionToken, status: cachedStatus, cached: true, result: cachedResult }, 200);
+    // The fast 200 carries COMPLETED only. A partial, even one served from cache, reaches the
+    // caller through polling, where the PARTIAL status and its warning already live.
+    if (cachedResult && cachedStatus === 'COMPLETED') {
+      return c.json({ scanId, sessionToken, status: cachedStatus, cached: true, result: cachedResult }, 200);
+    }
+    if (cachedResult) return c.json({ scanId, sessionToken, status: 'RUNNING' as const }, 202);
     // Persist RUNNING before dispatch. Requests never wait for the scan's external I/O.
     const job = Promise.resolve().then(async () => {
       try {

@@ -15,6 +15,9 @@ function uniqueMatches(matches: AttorneyMatch[] | null): AttorneyMatch[] | null 
     seen.add(key); return match;
   });
 }
+// Commercial factor per licensing jurisdiction. A state without an entry is reported but stays
+// neutral and unknown until a factor is set for it; see DN-01 on reviewing multiplier values.
+export const JURISDICTION_MULTIPLIERS: Readonly<Record<string, number>> = { FL: 1.25 };
 export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore' | 'signals' | 'multipliers'> {
   const usable = (name: keyof ScoringInput['sources']) => ['ok', 'partial'].includes(input.sources[name].status);
   const website = (usable('website') ? input.website : null) ?? unknownWebsite();
@@ -92,11 +95,14 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
   const areas = avvoAreas?.length ? avvoAreas : normalizeAreas(website.practice_areas);
   const candidates = PRACTICE_AREAS.filter(item => areas?.includes(item.area)).sort((a, b) => b.value - a.value || a.area.localeCompare(b.area));
   const selected = candidates[0];
+  // Only a Bar match certifies a licence, and only in the state whose registry produced it.
+  const licensedIn = barPeople.some(Boolean) ? input.barJurisdiction ?? null : null;
+  const factor = licensedIn === null ? undefined : JURISDICTION_MULTIPLIERS[licensedIn];
   const size = website.team_size;
   const sizeKnown = size !== null && size >= 1;
   return { preScore, signals, multipliers: {
     practiceArea: { area: selected?.area ?? null, value: selected?.value ?? 1, known: selected !== undefined },
-    jurisdiction: { state: barPeople.some(Boolean) ? 'FL' : null, value: barPeople.some(Boolean) ? 1.25 : 1, known: barPeople.some(Boolean) },
+    jurisdiction: { state: licensedIn, value: factor ?? 1, known: factor !== undefined },
     size: { teamSize: size, known: sizeKnown, value: !sizeKnown ? 1 : size === 1 ? .9 : size <= 5 ? 1 : size <= 15 ? 1.1 : size <= 30 ? 1.2 : 1.3 },
   } };
 }

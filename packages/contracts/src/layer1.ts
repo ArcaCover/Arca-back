@@ -91,6 +91,8 @@ export type ScoringInput = {
   avvo: z.infer<typeof AttorneyMatch>[] | null;
   sources: Layer1Result['sources'];
   now: string;
+  /** Two-letter state of the registry the Bar matches came from. Absent means unknown. */
+  barJurisdiction?: string | null;
 };
 
 /** Structured, provider-agnostic input consumed by the deterministic Layer 1 core. */
@@ -101,5 +103,7 @@ export const Layer1Evidence = z.object({
   avvo: z.array(AttorneyMatch).nullable(),
   sources: z.object({ website: SourceStatus, bar: SourceStatus, avvo: SourceStatus }).strict(),
   observedAt: z.string().datetime(),
+  // The state whose licensing registry the Bar source read. A match there certifies that licence.
+  barJurisdiction: z.string().regex(/^[A-Z]{2}$/).nullable().optional(),
 }).strict();
 export type Layer1Evidence = z.infer<typeof Layer1Evidence>;

@@ -63,6 +63,17 @@ describe('provider evidence boundaries', () => {
     expect(run).toHaveBeenNthCalledWith(3, BAR_ACTOR, expect.objectContaining({ maxLawyers: BAR_TECHNICAL_MAX_LAWYERS }), signal, { scanId: undefined });
     expect(run).toHaveBeenNthCalledWith(4, AVVO_ACTOR, expect.objectContaining({ maxLawyers: AVVO_TECHNICAL_MAX_LAWYERS }), signal, { scanId: undefined });
   });
+  it('skips an Avvo firm search it could only run nationwide, and says why', async () => {
+    const run = vi.fn(async () => []);
+    const result = await new ApifyDirectorySource('avvo', { run }).run({ ...query, names: [], city: null }, new AbortController().signal);
+    expect(run).not.toHaveBeenCalled();
+    expect(result.status).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY', costUsd: 0,
+      reason: 'A firm-wide search needs a verified city; a nationwide search is not run' });
+  });
+  it('declares the Florida Bar as the jurisdiction of the Bar source only', () => {
+    expect(new ApifyDirectorySource('bar', { run: vi.fn() }).jurisdiction).toBe('FL');
+    expect(new ApifyDirectorySource('avvo', { run: vi.fn() }).jurisdiction).toBeUndefined();
+  });
   it('treats a complete seven-record response as valid evidence', async () => {
     const candidates = Array.from({ length: 7 }, (_, index) => ({
       name: index === 0 ? 'Jane Smith' : `Other Lawyer ${index}`,

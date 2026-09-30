@@ -17,6 +17,20 @@ describe('complete Layer 1 mathematics', () => {
     expect(preScore.tier).toBe('FORTRESS');
     expect(signals.website).not.toHaveProperty('W10_domainType');
   });
+  it('takes the jurisdiction from the registry the Bar matches came from', () => {
+    expect(scoreEvidence({ ...robust(), barJurisdiction: 'FL' }).multipliers.jurisdiction)
+      .toEqual({ state: 'FL', value: 1.25, known: true });
+    // A state with no configured factor is still reported, with a neutral, unknown multiplier.
+    expect(scoreEvidence({ ...robust(), barJurisdiction: 'GA' }).multipliers.jurisdiction)
+      .toEqual({ state: 'GA', value: 1, known: false });
+    expect(scoreEvidence({ ...robust(), barJurisdiction: null }).multipliers.jurisdiction)
+      .toEqual({ state: null, value: 1, known: false });
+  });
+  it('reports no jurisdiction when no Bar match certifies one', () => {
+    const input = { ...robust(), barJurisdiction: 'FL' };
+    input.bar = input.bar!.map(match => ({ ...match, attorney: null, matchConfidence: 'no_match' as const }));
+    expect(scoreEvidence(input).multipliers.jurisdiction).toEqual({ state: null, value: 1, known: false });
+  });
   it('scores the robust mock at 82 with the revised reputation table', () => { expect(scoreEvidence(robust()).preScore.total).toBe(82); });
   it('forces score zero after an active-investigation override', () => {
     const input = robust(), before = scoreEvidence(input);

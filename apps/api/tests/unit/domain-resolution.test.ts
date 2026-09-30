@@ -19,6 +19,23 @@ describe('Request → DomainResolution → Assessment', () => {
     expect(await resolver.resolve({ email: 'user@gmail.com' })).toMatchObject({ canonicalDomain: null, reason: 'PERSONAL_EMAIL' });
     expect(check).not.toHaveBeenCalled();
   });
+  it('does not scan a personal email provider typed in as the firm website', async () => {
+    const check = vi.fn(), resolver = new PublicDomainResolver(check);
+    expect(await resolver.resolve({ domain: 'https://www.Gmail.com', email: 'user@firm.com' }))
+      .toEqual({ status: 'UNRESOLVED', canonicalDomain: null, source: 'request', reason: 'PERSONAL_EMAIL' });
+    expect(check).not.toHaveBeenCalled();
+  });
+  it('tells the caller the website is a personal email provider, apart from an unreachable one', async () => {
+    const run = vi.fn(), repository = new InMemoryRepository();
+    const { app } = createApp({ repository, pipeline: { run }, domainResolver: new PublicDomainResolver(async () => {}),
+      sessionSecret: 's'.repeat(40), corsOrigins: [], clientIp: () => '127.0.0.1' });
+    const response = await app.request('/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'user@gmail.com', domain: 'gmail.com' }) });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: 'personal_email_domain' });
+    expect(run).not.toHaveBeenCalled();
+    expect(repository.scans.size).toBe(0);
+  });
   it('does not fall back to another identity after an explicitly invalid domain', async () => {
     const resolver = new PublicDomainResolver(async () => {});
     expect(await resolver.resolve({ domain: 'bad domain', email: 'user@firm.com' })).toMatchObject({ canonicalDomain: null, reason: 'INVALID_DOMAIN' });

@@ -30,6 +30,8 @@ describe('mock scenarios cover every terminal status the frontend renders', () =
     const poll = await scan('robust.arca.example');
     expect(poll.status).toBe('COMPLETED');
     expect(poll.result?.preScore.tier).toBe('FORTRESS');
+    // The state comes from the Bar source's registry, carried through the pipeline.
+    expect(poll.result?.multipliers.jurisdiction).toEqual({ state: 'FL', value: 1.25, known: true });
   });
 
   it('stays partial when one directory is down, and blocks the commercial decision', async () => {
