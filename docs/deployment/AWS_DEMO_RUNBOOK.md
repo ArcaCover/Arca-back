@@ -18,21 +18,23 @@ all of them together with the code.
 
 ## The short way
 
-`scripts/arca-aws.sh` wraps steps 2 to 6 below. It holds no secret: when one is missing under
-`/arca/prod` it asks for the value hidden, or generates it (the session secret, and the `/docs`
-password hash when Docker is running), and sends it straight to Parameter Store.
+`scripts/arca-aws.ps1` (Windows PowerShell 5.1) wraps steps 2 to 6 below. It holds no secret: when
+one is missing under `/arca/prod` it asks for the value hidden, or generates it (the session
+secret, and the `/docs` password hash when Docker Desktop is running), and sends it straight to
+Parameter Store.
 
-```bash
-scripts/arca-aws.sh up                # secrets, stack, GitHub variable, app deploy
-scripts/arca-aws.sh status            # stack, secret names, DNS, health
-scripts/arca-aws.sh down              # delete the stack and the image repository
-scripts/arca-aws.sh down --secrets    # also delete the secrets
+```powershell
+.\scripts\arca-aws.ps1 up              # secrets, stack, GitHub variable, app deploy
+.\scripts\arca-aws.ps1 status          # stack, secret names, DNS, health
+.\scripts\arca-aws.ps1 down            # delete the stack and the image repository
+.\scripts\arca-aws.ps1 down -Secrets   # also delete the secrets
 ```
 
 `up` stops to show IAM and security-group changes before applying them. The first run asks for
 the alert addresses and keeps them in `infra/aws/.alert-emails`, which is not committed. The DNS
 record in Vercel stays manual; `up` and `status` say which IP it must point to. `down` leaves the
-CDK bootstrap and the IAM user in place.
+CDK bootstrap and the IAM user in place. Set `ARCA_AWS_PROFILE` to use a profile other than
+`arca-deploy`.
 
 The steps below are what the script does, for doing them by hand.
 

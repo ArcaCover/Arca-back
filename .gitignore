@@ -152,5 +152,5 @@ vite.config.ts.timestamp-*
 # Generated reports
 output/
 
-# Alert addresses for scripts/arca-aws.sh; kept out of the public repository.
+# Alert addresses for scripts/arca-aws.ps1; kept out of the public repository.
 infra/aws/.alert-emails
