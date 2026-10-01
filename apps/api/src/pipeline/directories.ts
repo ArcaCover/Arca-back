@@ -151,7 +151,7 @@ export class ApifyDirectorySource implements DirectorySource {
     const rawResults: { target: string; items: unknown[] | null; error: string | null }[] = [];
     const matches: AttorneyMatch[] = [];
     const providerRuns: NonNullable<SourceStatus['providerRuns']> = [];
-    let failed = 0, successfulQueries = 0, candidatesReceived = 0, recordsValid = 0, truncated = false;
+    let failed = 0, successfulQueries = 0, candidatesReceived = 0, recordsValid = 0, truncations = 0;
     // Lookups that threw (the provider refused or vanished), as opposed to answers in the wrong shape.
     let providerFailures = 0, quotaReached = false;
     let cursor = 0;
@@ -185,7 +185,7 @@ export class ApifyDirectorySource implements DirectorySource {
           if (errorRecords.length || candidates.some(person => person === null) || metadata?.partial) failed++;
           const valid = candidates.filter((person): person is Attorney => person !== null);
           recordsValid += valid.length;
-          if (!plan.fallback && items.length >= plan.resultLimit) { failed++; truncated = true; }
+          if (!plan.fallback && items.length >= plan.resultLimit) { failed++; truncations++; }
           if (items.length === 0 || noMatchRecords.length === items.length || valid.length > 0) successfulQueries++;
           let accepted = 0;
           if (fallback) {
@@ -227,7 +227,10 @@ export class ApifyDirectorySource implements DirectorySource {
     const accountingComplete = chargeableRuns.every(run => run.accountingComplete !== false && run.costUsd !== null);
     const costUsd = accountingComplete ? chargeableRuns.reduce((total, run) => total + run.costUsd!, 0) : null;
     const costPerAcceptedAttorneyUsd = costUsd !== null && found > 0 ? costUsd / found : null;
-    const code = signal.aborted ? 'DEADLINE_REACHED' : quotaReached ? 'PROVIDER_ERROR' : truncated ? 'TRUNCATED' :
+    // TRUNCATED means a full result page was the only problem, so scoring may clear it once the
+    // accepted attorneys are independently confirmed. Any other failure keeps its own code.
+    const code = signal.aborted ? 'DEADLINE_REACHED' : quotaReached ? 'PROVIDER_ERROR' :
+      truncations > 0 && failed === truncations ? 'TRUNCATED' :
       !successful ? 'PROVIDER_ERROR' : failed > providerFailures ? 'PROVIDER_CONTRACT_ERROR' : failed ? 'PROVIDER_ERROR'
         : found ? undefined : 'NO_MATCH';
     return { data: successful ? matches : null, rawContent: JSON.stringify({
