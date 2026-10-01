@@ -15,6 +15,7 @@ import { ApifyClient } from './pipeline/apify-client.js';
 import { ApifyDirectorySource } from './pipeline/directories.js';
 import { PublicDomainResolver } from './pipeline/domain-resolution.js';
 import { mockSources, MOCK_DOMAINS } from './pipeline/mock-sources.js';
+import { renderPdf } from './report/pdf.js';
 
 const envPath = fileURLToPath(new URL('../../../.env.local', import.meta.url));
 if (existsSync(envPath)) loadEnvFile(envPath);
@@ -45,6 +46,7 @@ const clientIps = new WeakMap<Request, string>();
 const { app, drain } = createApp({ repository, domainResolver,
   pipeline: new InProcessPipeline({ ...sources, repository, timeoutMs: env.PIPELINE_TIMEOUT_MS }),
   sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
+  renderReport: renderPdf,
   scanCacheTtlMs: env.SCAN_CACHE_TTL_MS, partialRepairCooldownMs: env.SCAN_PARTIAL_REPAIR_COOLDOWN_MS,
   clientIp: request => clientIps.get(request) ?? 'unknown' });
 const server = serve({ port: env.PORT, fetch: (request, bindings) => {
@@ -58,8 +60,14 @@ const recoverTimer = setInterval(() => {
   void repository.recoverInterrupted(interruptedBefore()).catch(() => console.error('[api] recovery failed'));
 }, 60_000);
 recoverTimer.unref();
+// Books what Apify finally charged for each run: the ledger is the only record of directory spend.
+const costTimer = apify ? setInterval(() => {
+  void apify.reconcileCosts().catch(() => console.error('[api] Apify cost reconciliation failed'));
+}, 60_000) : undefined;
+costTimer?.unref();
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => {
   clearInterval(recoverTimer);
+  clearInterval(costTimer);
   server.close();
   const shutdownTimer = setTimeout(() => process.exit(1), 60_000);
   shutdownTimer.unref();

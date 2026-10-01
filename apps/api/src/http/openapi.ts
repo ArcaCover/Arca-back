@@ -81,6 +81,14 @@ export function buildOpenApiDocument() {
       401: { description: 'Missing or invalid session', content: json(error) },
       404: { description: 'Scan not found', content: json(error) },
       500: { description: 'Internal failure', content: json(error) } } });
+  registry.registerPath({ method: 'get', path: '/scan/{scanId}/report.pdf', summary: 'Download the Quick Scan Report',
+    description: 'One-page PDF of a COMPLETED or PARTIAL scan, with the same score, categories and findings /score shows. Content-Disposition names the file after the domain and the scan date.',
+    security: [{ sessionToken: [] }], request: { params: z.object({ scanId: z.string() }) },
+    responses: { 200: { description: 'The report', content: { 'application/pdf': { schema: { type: 'string', format: 'binary' } } } },
+      401: { description: 'Missing or invalid session', content: json(error) },
+      404: { description: 'Scan not found', content: json(error) },
+      409: { description: 'The scan is still running or failed, so there is no report (report_unavailable)', content: json(error) },
+      503: { description: 'Report rendering is not configured on this server', content: json(error) } } });
   return new OpenApiGeneratorV31(registry.definitions).generateDocument({ openapi: '3.1.0',
     info: { title: 'ARCA Layer 1 API', version: '1.0.0', description: 'Domain evidence scoring. Unknown fields remain null while unavailable scoring rules contribute zero points. Tier and decision are separate.' } });
 }

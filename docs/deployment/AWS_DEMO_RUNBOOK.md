@@ -1,157 +1,154 @@
-# AWS demo runbook
+# AWS runbook
 
-This runbook deploys one EC2 host with Docker Compose and Caddy. It creates no load balancer.
+One EC2 host runs the API and Caddy with Docker Compose. GitHub Actions deploys every push to
+`main` that touches the API (`.github/workflows/deploy-api.yml`): it tests, builds one image tagged
+with the commit SHA, pushes it to ECR and activates it on the host through SSM. There is no load
+balancer, no NAT Gateway and no SSH.
 
-## 1. Prerequisites
+| Piece | Where |
+| --- | --- |
+| Infrastructure | `infra/aws` (CDK stack `ArcaDemoStack`, account `194633188202`, `us-east-1`) |
+| Non-secret configuration | `deploy/production.env`, shipped inside each image |
+| Secrets | SSM Parameter Store, one SecureString per variable under `/arca/prod/` |
+| Host bootstrap | `deploy/deploy-image.sh`, installed once by EC2 user data |
+| Activation | `deploy/activate.sh` and `deploy/render-env.py`, shipped inside each image |
 
-- Docker Desktop running locally.
-- AWS CLI v2.32 or newer and an authenticated short-lived session.
-- Node.js 22 and npm.
-- Control of the final demo hostname.
-- A clean, committed `main` checkout.
+Because the compose file, Caddyfile and configuration travel inside the image, a rollback restores
+all of them together with the code.
 
-Set the deployment coordinates in PowerShell. Replace the hostname if a different DNS name is chosen:
+## The short way
+
+`scripts/arca-aws.ps1` (Windows PowerShell 5.1) wraps steps 2 to 6 below. It holds no secret: when
+one is missing under `/arca/prod` it asks for the value hidden, or generates it (the session
+secret, and the `/docs` password hash when Docker Desktop is running), and sends it straight to
+Parameter Store.
 
 ```powershell
-$AwsRegion = 'us-east-1'
-$DemoHostname = 'api.arcacover.com'
-$AwsAccount = aws sts get-caller-identity --query Account --output text
-$env:CDK_DEFAULT_ACCOUNT = $AwsAccount
-$env:CDK_DEFAULT_REGION = $AwsRegion
+.\scripts\arca-aws.ps1 up              # secrets, stack, GitHub variable, app deploy
+.\scripts\arca-aws.ps1 status          # stack, secret names, DNS, health
+.\scripts\arca-aws.ps1 down            # delete the stack and the image repository
+.\scripts\arca-aws.ps1 down -Secrets   # also delete the secrets
 ```
 
-## 2. Verify locally
+`up` stops to show IAM and security-group changes before applying them. The first run asks for
+the alert addresses and keeps them in `infra/aws/.alert-emails`, which is not committed. The DNS
+record in Vercel stays manual; `up` and `status` say which IP it must point to. `down` leaves the
+CDK bootstrap and the IAM user in place. Set `ARCA_AWS_PROFILE` to use a profile other than
+`arca-deploy`.
 
-These checks use mock sources and do not call Apify, Supabase or OpenAI:
+The steps below are what the script does, for doing them by hand.
 
-```powershell
-npm ci
-npm run build
-npm test
-npm run test:container
-npm audit --omit=dev
-npm run build --prefix infra/aws
-npm run synth --prefix infra/aws -- -c demoHostname=$DemoHostname
+Commands below use Git Bash. `arca-deploy` is the CLI profile of the least-privilege IAM user
+`arca_deploy_only`; only step 1 needs an administrator.
+
+## 1. Bootstrap CDK (once, administrator)
+
+**Done on 2026-09-29** (`CDKToolkit`, bootstrap version 32, execution policy `ArcaCdkExecution`).
+Repeat only in a new account or region.
+
+CDK's default bootstrap gives CloudFormation `AdministratorAccess`, which would let anyone who can
+deploy a CDK stack create anything in the account. Bootstrap with the scoped policy instead:
+
+```bash
+aws iam create-policy --policy-name ArcaCdkExecution \
+  --policy-document file://infra/aws/cdk-execution-policy.json
+cd infra/aws && npm ci
+npx cdk bootstrap aws://194633188202/us-east-1 \
+  --cloudformation-execution-policies arn:aws:iam::194633188202:policy/ArcaCdkExecution
 ```
 
-## 3. Bootstrap and provision AWS
+If the stack later needs a new kind of resource, extend `cdk-execution-policy.json` and update the
+policy's version with an administrator before deploying.
 
-Bootstrap once per account and region, inspect the diff, then deploy:
+## 2. Store the secrets
 
-```powershell
-npx --prefix infra/aws cdk bootstrap "aws://$AwsAccount/$AwsRegion"
-npm run diff --prefix infra/aws -- -c demoHostname=$DemoHostname
-npm run deploy --prefix infra/aws -- -c demoHostname=$DemoHostname --require-approval broadening
+Each value is typed without echo, so it stays out of the shell history:
+
+```bash
+put() { read -rsp "$1: " value && echo && aws ssm put-parameter --profile arca-deploy --region us-east-1 \
+  --name "/arca/prod/$1" --type SecureString --overwrite --value "$value" > /dev/null; unset value; }
+put SUPABASE_URL
+put SUPABASE_SECRET_KEY
+put APIFY_API_TOKEN
 ```
 
-If the hostname is in Route 53, add both contexts so CDK creates the A record:
+The session secret and the docs password hash are generated, not typed:
 
-```powershell
-npm run deploy --prefix infra/aws -- `
-  -c demoHostname=$DemoHostname `
-  -c hostedZoneId=Z1234567890 `
-  -c hostedZoneName=arcacover.com `
+```bash
+aws ssm put-parameter --profile arca-deploy --region us-east-1 --name /arca/prod/SESSION_TOKEN_SECRET \
+  --type SecureString --overwrite --value "$(openssl rand -hex 32)" > /dev/null
+put DOCS_AUTH_HASH   # paste the output of: docker run --rm -it caddy:2.10.2-alpine caddy hash-password
+```
+
+Store the hash exactly as printed. `render-env.py` escapes every `$` for Compose, and refuses to
+deploy if a required secret is missing or the hash is not bcrypt. Production extracts with `WEBSITE_EVIDENCE_PROVIDER=rules`, so it needs no
+language-model key. Switching to the agentic extraction through OpenAI (see `deploy/production.env`)
+adds `OPENAI_API_KEY` under the same path. NVIDIA NIM is not used.
+
+## 3. Create or update the infrastructure
+
+```bash
+cd infra/aws
+npx cdk diff --profile arca-deploy --method template -c alertEmails=neoprotecciones@gmail.com,jesusdel1611@gmail.com
+npx cdk deploy --profile arca-deploy -c alertEmails=neoprotecciones@gmail.com,jesusdel1611@gmail.com \
   --require-approval broadening
 ```
 
-Otherwise, create an external DNS A record from `$DemoHostname` to the `ElasticIpAddress` stack output.
+`alertEmails` is required on every deploy, because leaving it out would remove the subscriptions.
+Each address receives an AWS email and must confirm it before alerts arrive.
 
-Record these stack outputs:
+Record the outputs `ElasticIpAddress` and `GithubDeployRoleArn`.
 
-- `EcrRepositoryUri`
-- `InstanceId`
-- `ElasticIpAddress`
-- `DemoUrl`
+## 4. DNS
 
-## 4. Configure runtime values
+In Vercel, add an `A` record for `api.arcacover.com` pointing to `ElasticIpAddress`. Caddy obtains
+the TLS certificate on its own once the name resolves.
 
-Open the EC2 instance in AWS Systems Manager → Session Manager. No SSH port or key pair is used.
-
-Inside the session:
+## 5. Connect GitHub
 
 ```bash
-sudo cp /opt/arca/.env.demo.example /opt/arca/.env.demo
-sudo chmod 0600 /opt/arca/.env.demo
-sudoedit /opt/arca/.env.demo
+gh variable set AWS_DEPLOY_ROLE_ARN -R ArcaCover/Arca-back --body '<GithubDeployRoleArn>'
 ```
 
-Set the real Supabase and Apify values, generate a unique session secret, set the final hostname and
-leave `WEBSITE_EVIDENCE_PROVIDER=rules`. Do not paste these values into tickets, logs or SSM Run Command.
+Until this variable exists the workflow tests but skips the deploy. The role can only be assumed
+by workflows running on `main` of `ArcaCover/Arca-back`.
 
-Generate the documentation basic-auth hash in the same session and set `DOCS_AUTH_USER` and
-`DOCS_AUTH_HASH`. The command prompts for the password; it is never passed as an argument:
+## 6. Deploy, roll back, change a secret
+
+- **Deploy:** merge to `main`. Actions → *Deploy API* shows the run.
+- **Roll back:** Actions → *Deploy API* → *Run workflow*, with `image_tag` set to the full SHA of an
+  earlier healthy commit. The image is not rebuilt. ECR keeps the last 20.
+- **Change a secret:** `put NAME` as in step 2, then run the workflow with `image_tag` set to the
+  SHA currently deployed. Secrets are read at activation, never baked into an image.
+
+A deploy restarts the API container. A scan in flight at that moment is lost and ends `FAILED`
+once the new process recovers it; the visitor can start it again, and the website and directory
+caches make the retry cheaper.
+
+## 7. Checks after the first deploy
 
 ```bash
-docker run --rm -it caddy:2.10.2-alpine caddy hash-password
+curl -fsS https://api.arcacover.com/health
+curl -s -o /dev/null -w '%{http_code}\n' https://api.arcacover.com/docs          # 401
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://api.arcacover.com/scan  # 400
 ```
 
-Compose interpolates every value in this file, so each `$` of the hash must be doubled when it is
-written to `.env.demo`: `$2a$14$...` is stored as `$$2a$$14$$...`. An unescaped hash reaches Caddy
-truncated and leaves the documentation open, so `deploy-image.sh` refuses to deploy without the
-escaped form.
+Do not submit a real scan until its external cost (Apify, the LLM provider) is approved.
 
-## 5. Publish the current commit
-
-From the clean local checkout:
-
-```powershell
-$RepositoryUri = '<EcrRepositoryUri output>'
-$InstanceId = '<InstanceId output>'
-./deploy/publish-demo.ps1 `
-  -Region $AwsRegion `
-  -RepositoryUri $RepositoryUri `
-  -InstanceId $InstanceId
-```
-
-The script refuses a dirty tree or a tag different from the current Git SHA.
-
-Windows PowerShell 5.1 cannot complete the ECR login: the token reaches `docker login` corrupted and
-the registry answers HTTP 400. Until that is resolved, run the login and push from a POSIX shell and
-then activate separately:
+## 8. On the host
 
 ```bash
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <registry>
-docker push <RepositoryUri>:<sha>
+aws ssm start-session --profile arca-deploy --region us-east-1 --target <InstanceId>
+sudo docker compose -f /opt/arca/compose.yaml --env-file /opt/arca/.env.demo ps
+sudo docker compose -f /opt/arca/compose.yaml --env-file /opt/arca/.env.demo logs --tail 200 api
 ```
 
-```powershell
-./deploy/activate-demo.ps1 -Region $AwsRegion -RepositoryUri $RepositoryUri `
-  -InstanceId $InstanceId -ImageTag '<sha>'
+Session Manager needs the AWS CLI Session Manager plugin installed locally.
+
+If GitHub is unavailable, the same activation can be sent by hand:
+
+```bash
+aws ssm send-command --profile arca-deploy --region us-east-1 --instance-ids <InstanceId> \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["/opt/arca/deploy/deploy-image.sh <EcrRepositoryUri>:<sha> us-east-1"]'
 ```
-
-## 6. Non-paid HTTPS smoke checks
-
-After DNS and TLS are active:
-
-```powershell
-Invoke-RestMethod "https://$DemoHostname/health"
-$DocsAuth = Get-Credential -UserName arca -Message "Documentation basic auth"
-Invoke-WebRequest "https://$DemoHostname/openapi.json" -Authentication Basic -Credential $DocsAuth -UseBasicParsing
-Invoke-WebRequest "https://$DemoHostname/docs" -Authentication Basic -Credential $DocsAuth -UseBasicParsing
-```
-
-Confirm that `/docs` and `/openapi.json` return HTTP 401 without credentials, and that requests sent to
-the Elastic IP instead of the hostname never reach the API.
-
-Verify that an invalid body returns HTTP 400 and an unauthenticated scan read returns HTTP 401. Do not
-submit the final valid live scan until its external cost is explicitly approved.
-
-## 7. Final paid test
-
-Use one pre-approved public law-firm domain. Record scan ID, terminal status, source durations, each
-Apify run ID, returned count, accepted count and reported cost. Repeat the same domain once to prove the
-24-hour cache without another provider run.
-
-## 8. Rollback
-
-Activate a previous image already retained in ECR:
-
-```powershell
-./deploy/activate-demo.ps1 `
-  -Region $AwsRegion `
-  -RepositoryUri $RepositoryUri `
-  -InstanceId $InstanceId `
-  -ImageTag '<previous healthy Git SHA>'
-```
-
-Then confirm `https://$DemoHostname/health` and inspect container status through Session Manager.

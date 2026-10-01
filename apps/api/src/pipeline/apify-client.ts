@@ -6,12 +6,13 @@ import { InMemoryRepository } from '../repositories/in-memory.js';
 
 const Run = z.object({ id: z.string(), status: z.string(), defaultDatasetId: z.string().nullish(),
   usageTotalUsd: z.number().nonnegative().nullish(), statusMessage: z.string().nullish(),
-  buildId: z.string().nullish(), buildNumber: z.string().nullish() });
+  buildId: z.string().nullish(), buildNumber: z.string().nullish(), finishedAt: z.string().nullish() });
 type RunState = z.infer<typeof Run>;
 type RunStore = {
   reserveApifyRun(request: ReserveApifyRun): Promise<ApifyRunReservation>;
   getApifyRun(id: string): Promise<ApifyRunRecord | null>;
   updateApifyRun(id: string, update: ApifyRunUpdate): Promise<void>;
+  pendingApifyAccounting(limit: number): Promise<ApifyRunRecord[]>;
 };
 export type ApifyRunMetadata = { provider: 'apify'; actor: string; runId: string; status: string;
   queryFingerprint: string; itemCount: number; acceptedCount: number; costUsd: number | null;
@@ -22,7 +23,9 @@ export type ApifyRunResult = { items: unknown[]; metadata: ApifyRunMetadata };
 export type ApifyRunContext = { scanId?: string };
 export type ApifyClientOptions = { store?: RunStore; build?: string; expectedCostUsdPerRun?: number;
   cacheTtlMs?: number; activeTtlMs?: number;
-  runTimeoutSecs?: number; pollWaitSecs?: number; maxCachedItems?: number };
+  runTimeoutSecs?: number; pollWaitSecs?: number; maxCachedItems?: number;
+  /** How long no new run is started after Apify reports the account's usage limit. */
+  quotaCooldownMs?: number; now?: () => number };
 
 const canonical = (value: unknown): string => value !== null && typeof value === 'object'
   ? Array.isArray(value) ? `[${value.map(canonical).join(',')}]`
@@ -32,12 +35,25 @@ const canonical = (value: unknown): string => value !== null && typeof value ===
 const terminal = (status: string) => !['RESERVED', 'READY', 'RUNNING', 'TIMING-OUT', 'ABORTING'].includes(status);
 
 export class ApifyClientError extends Error {
-  constructor(readonly code: 'PROVIDER_ERROR', message: string,
+  constructor(readonly code: 'PROVIDER_ERROR' | 'PROVIDER_QUOTA_EXCEEDED', message: string,
     readonly metadata: ApifyRunMetadata | null = null) { super(message); }
 }
+class ApifyHttpError extends Error {
+  constructor(readonly status: number, readonly detail: string) { super(`Apify request failed (${status})`); }
+}
+// Apify states an exhausted account in the run's status message ("You've reached the maximum usage
+// for your current billing cycle") or refuses the start with 402 and a usage error type.
+const USAGE_LIMIT = /maximum usage|usage (hard )?limit|billing cycle|not-enough-usage|insufficient (credit|funds|usage)/i;
+const QUOTA_REASON = 'Apify usage limit reached for the current billing cycle';
+// Apify books pay-per-event charges after a run ends: the cost read at that moment understated one
+// live scan eightfold. A run's cost is final only this long after it finished.
+const CHARGES_SETTLE_MS = 120_000;
 
 export class ApifyClient {
   private active = 0;
+  // Shared by every source and scan using this client: once Apify reports the usage limit, no run
+  // is started until the cooldown ends, so a scan stops at the limit instead of failing one by one.
+  private quotaBlockedUntil = 0;
   private readonly waiters: Array<() => void> = [];
   private readonly store: RunStore;
   private readonly options: Required<Omit<ApifyClientOptions, 'store'>>;
@@ -47,7 +63,8 @@ export class ApifyClient {
     this.options = { build: options.build ?? 'latest', expectedCostUsdPerRun: options.expectedCostUsdPerRun ?? 1,
       cacheTtlMs: options.cacheTtlMs ?? 604_800_000, activeTtlMs: options.activeTtlMs ?? 900_000,
       runTimeoutSecs: options.runTimeoutSecs ?? 300, pollWaitSecs: options.pollWaitSecs ?? 10,
-      maxCachedItems: options.maxCachedItems ?? 1000 };
+      maxCachedItems: options.maxCachedItems ?? 1000, quotaCooldownMs: options.quotaCooldownMs ?? 300_000,
+      now: options.now ?? Date.now };
   }
   private async acquire(signal: AbortSignal) {
     signal.throwIfAborted();
@@ -64,7 +81,7 @@ export class ApifyClient {
   private async json(path: string, signal: AbortSignal, init: RequestInit = {}) {
     const response = await this.request(`https://api.apify.com/v2/${path}`, { ...init, signal,
       headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' } });
-    if (!response.ok) throw new Error(`Apify request failed (${response.status})`);
+    if (!response.ok) throw new ApifyHttpError(response.status, await response.text().catch(() => ''));
     return response.json();
   }
   private metadata(record: ApifyRunRecord, overrides: Partial<ApifyRunMetadata> = {}): ApifyRunMetadata {
@@ -91,6 +108,17 @@ export class ApifyClient {
       current = await this.store.getApifyRun(record.id) ?? current;
     }
     return current;
+  }
+  private async quotaExceeded(record: ApifyRunRecord, update: ApifyRunUpdate = {},
+    metadata: ApifyRunMetadata | null = null): Promise<never> {
+    if (this.options.now() >= this.quotaBlockedUntil) {
+      console.error(`[apify] ${QUOTA_REASON}; no new run starts for ${Math.round(this.options.quotaCooldownMs / 1000)}s`);
+    }
+    this.quotaBlockedUntil = this.options.now() + this.options.quotaCooldownMs;
+    // Expired at once: the cut says nothing about the query, so it is neither reused nor held in cooldown.
+    await this.store.updateApifyRun(record.id, { ...update, status: 'QUOTA_EXCEEDED', partial: false,
+      expires_at: new Date(this.options.now()).toISOString(), last_error: QUOTA_REASON });
+    throw new ApifyClientError('PROVIDER_QUOTA_EXCEEDED', QUOTA_REASON, metadata);
   }
   async run(actor: string, input: Record<string, unknown>, signal: AbortSignal,
     context: ApifyRunContext = {}): Promise<ApifyRunResult> {
@@ -120,6 +148,7 @@ export class ApifyClient {
         const state = await this.json(`actor-runs/${encodeURIComponent(record.run_id)}?waitForFinish=${this.options.pollWaitSecs}`, signal);
         run = z.object({ data: Run }).parse(state).data;
       } else if (reservation.decision === 'start') {
+        if (this.options.now() < this.quotaBlockedUntil) await this.quotaExceeded(record);
         // No maxTotalChargeUsd: spend is recorded in the ledger, not capped at the provider.
         // The run timeout is what bounds a single run.
         const parameters = new URLSearchParams({ waitForFinish: '60', timeout: String(this.options.runTimeoutSecs),
@@ -129,6 +158,8 @@ export class ApifyClient {
           start = await this.json(`acts/${encodeURIComponent(actor.replace('/', '~'))}/runs?${parameters}`, signal,
             { method: 'POST', body: JSON.stringify(input) });
         } catch (error) {
+          // An HTTP refusal proves the run never started; only a lost response leaves it uncertain.
+          if (error instanceof ApifyHttpError && (error.status === 402 || USAGE_LIMIT.test(error.detail))) await this.quotaExceeded(record);
           await this.store.updateApifyRun(record.id, { status: 'START_UNCERTAIN', last_error: 'Actor start response unavailable' });
           throw error;
         }
@@ -150,8 +181,16 @@ export class ApifyClient {
       }
       const datasetId = run.defaultDatasetId ?? record.dataset_id;
       const items = datasetId ? await this.readDataset(datasetId, signal) : [];
+      if (run.status !== 'SUCCEEDED' && USAGE_LIMIT.test(run.statusMessage ?? '')) {
+        const cut: ApifyRunUpdate = { run_id: run.id, dataset_id: datasetId ?? null, item_count: items.length,
+          items: items.length <= this.options.maxCachedItems ? items : null,
+          cost_usd: run.usageTotalUsd ?? null, accounting_complete: false };
+        await this.quotaExceeded(record, cut, this.metadata({ ...record, ...cut, status: 'QUOTA_EXCEEDED', partial: false },
+          { chargedToScan: reservation.chargedToScan }));
+      }
       const partial = run.status !== 'SUCCEEDED' && items.length > 0;
-      const accountingComplete = run.usageTotalUsd !== null && run.usageTotalUsd !== undefined;
+      // Provisional: reconcileCosts books the settled figure once the charges are in.
+      const accountingComplete = false;
       const update: ApifyRunUpdate = { run_id: run.id, dataset_id: datasetId ?? null, status: run.status,
         build_id: run.buildId ?? null, build_number: run.buildNumber ?? null,
         items: items.length <= this.options.maxCachedItems ? items : null, item_count: items.length,
@@ -176,6 +215,22 @@ export class ApifyClient {
         record.run_id ? this.metadata(record, { resumed: reservation.decision === 'resume',
           chargedToScan: reservation.chargedToScan }) : null);
     } finally { this.release(); }
+  }
+  /** Books the settled cost of finished runs. The server calls it every minute; a run that finished
+   *  too recently, or that Apify cannot report yet, is left for the next pass. */
+  async reconcileCosts(limit = 50): Promise<number> {
+    let settled = 0;
+    for (const record of await this.store.pendingApifyAccounting(limit)) {
+      try {
+        const state = await this.json(`actor-runs/${encodeURIComponent(record.run_id!)}`, AbortSignal.timeout(15_000));
+        const run = z.object({ data: Run }).parse(state).data;
+        if (!terminal(run.status) || !run.finishedAt || this.options.now() - Date.parse(run.finishedAt) < CHARGES_SETTLE_MS) continue;
+        if (run.usageTotalUsd === null || run.usageTotalUsd === undefined) continue;
+        await this.store.updateApifyRun(record.id, { cost_usd: run.usageTotalUsd, accounting_complete: true });
+        settled++;
+      } catch { /* Apify or the store is unavailable: the next pass tries again. */ }
+    }
+    return settled;
   }
   async recordAccepted(metadata: ApifyRunMetadata, acceptedCount: number) {
     if (metadata.ledgerId) await this.store.updateApifyRun(metadata.ledgerId, { accepted_count: acceptedCount });

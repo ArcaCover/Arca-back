@@ -354,6 +354,53 @@ describe('NVIDIA evidence provider', () => {
     expect(result.websiteData.team_members?.map(member => member.full_name).sort()).toEqual(['Jane Doe', 'John Roe']);
   });
 
+  it('extracts the roster while the extraction rounds run, not after them', async () => {
+    const pages = [{ url: 'https://firm.com/', html: '', text: 'Smith Law' }, { url: 'https://firm.com/attorneys', html: '', text: 'Jane Doe\nLawyer' }];
+    let rosterStarted = false, rosterBeforeFirstRound = false;
+    const create = vi.fn(async (request: Record<string, unknown>) => {
+      const [system, user] = (request.messages as Array<{ content: string }>).map(message => message.content) as [string, string];
+      if (user.startsWith('CANDIDATE CLAIMS')) return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ verdicts: [] }) } }] };
+      if (system.includes('This pass is only for attorneys')) {
+        rosterStarted = true;
+        return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } }) } }] };
+      }
+      // Hold the first round until the roster call arrives, or give up after a moment.
+      for (let wait = 0; wait < 20 && !rosterStarted; wait++) await new Promise(resolve => setTimeout(resolve, 10));
+      rosterBeforeFirstRound ||= rosterStarted;
+      return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } }) } }] };
+    });
+    const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn() };
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
+    const result = await provider.extractDetailed({ pages, partial: false }, new AbortController().signal);
+    expect(rosterBeforeFirstRound).toBe(true);
+    expect(result.diagnostics.attempts.filter(attempt => attempt.phase === 'extract-roster')).toHaveLength(1);
+  });
+
+  it('extracts the roster again when a round reads a new team page', async () => {
+    const pages = [{ url: 'https://firm.com/', html: '', text: 'Smith Law' }, { url: 'https://firm.com/attorneys', html: '', text: 'Jane Doe\nLawyer' }];
+    const bio = { url: 'https://firm.com/attorneys/john-roe', html: '', text: 'John Roe\nLawyer' };
+    let round = 0;
+    const create = vi.fn(async (request: Record<string, unknown>) => {
+      const [system, user] = (request.messages as Array<{ content: string }>).map(message => message.content) as [string, string];
+      if (user.startsWith('CANDIDATE CLAIMS')) return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ verdicts: [] }) } }] };
+      if (system.includes('This pass is only for attorneys')) {
+        return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } }) } }] };
+      }
+      round++;
+      const link = /\[(L-[^\]]+)\] PAGE [^\n]*john-roe/.exec(user)?.[1];
+      const action = round === 1 && link ? { type: 'fetch_pages', linkIds: [link], targetFields: ['attorneys'], reason: 'bio' } : { type: 'finish', reason: 'done' };
+      return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ claims: [], action }) } }] };
+    });
+    const access = { fetchPages: vi.fn(async () => ({ pages: [bio], calls: [{ tool: 'fetch_pages', target: bio.url, status: 'read', detail: null }] })),
+      readDocuments: vi.fn(), readSitemap: vi.fn() };
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } }, access as never);
+    const home = { ...pages[0]!, html: '<a href="/attorneys/john-roe">John Roe</a>' };
+    const result = await provider.extractDetailed({ pages: [home, pages[1]!], partial: false }, new AbortController().signal);
+    expect(access.fetchPages).toHaveBeenCalled();
+    expect(result.diagnostics.attempts.map(attempt => attempt.phase).filter(phase => phase.startsWith('extract-roster')))
+      .toEqual(['extract-roster', 'extract-roster-refresh']);
+  });
+
   it('grounds privacy_policy to true and ai_blog_posts to false when their pages were read end to end', async () => {
     const pages = [
       { url: 'https://firm.com/', html: '', text: 'Smith Law is a law firm.' },

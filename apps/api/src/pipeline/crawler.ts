@@ -60,10 +60,14 @@ export function canonicalUrl(raw: string, base: string): string | null {
     return url.href;
   } catch { return null; }
 }
+// Measured on gallardolawyers.com: 3 pages at once took 21-25 s, 6 took 14 s for the same 19 pages.
+export const CRAWL_CONCURRENCY = 6;
 export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, transport: {
   response: typeof fetchPublicResponse; robots: typeof fetchPublicText;
 } = { response: fetchPublicResponse, robots: fetchPublicText }, options: {
   timeoutMs?: number; maxPages?: number; maxDepth?: number;
+  /** Pages fetched at once. */
+  concurrency?: number;
   /** Start from the requested URL only. Without it the root page is queued first and wins a one-page budget. */
   seedOnly?: boolean;
 } = {}): Promise<CrawlResult> {
@@ -140,16 +144,21 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
     const groupCounts = new Map<number, number>();
     while (queue.length && visited.size < maxPages && !signal.aborted) {
       queue.sort((a, b) => a.depth - b.depth || pagePriority(a.url) - pagePriority(b.url) || a.url.localeCompare(b.url));
-      const underGroupLimit = (item: { url: string }) => {
-        const limit = GROUP_PAGE_LIMITS[pagePriority(item.url)];
-        return limit === undefined || (groupCounts.get(pagePriority(item.url)) ?? 0) < limit;
-      };
-      const capacity = Math.min(3, maxPages - visited.size);
-      const eligible = queue.filter(underGroupLimit);
+      const capacity = Math.min(options.concurrency ?? CRAWL_CONCURRENCY, maxPages - visited.size);
+      // Group limits count the pages picked for this batch too: with a wide batch, counting only pages
+      // already read would let one batch fill up with attorney bios.
+      const picked = new Map<number, number>();
+      const batch: typeof queue = [];
+      for (const item of queue) {
+        if (batch.length >= capacity) break;
+        if (visited.has(item.url)) continue;
+        const group = pagePriority(item.url), limit = GROUP_PAGE_LIMITS[group];
+        if (limit !== undefined && (groupCounts.get(group) ?? 0) + (picked.get(group) ?? 0) >= limit) continue;
+        batch.push(item); picked.set(group, (picked.get(group) ?? 0) + 1);
+      }
       // Falling back to over-limit items only once nothing else is queued keeps the reservation from
       // wasting budget: a site with no blog or privacy page should not leave slots unused.
-      const pool = eligible.length ? eligible : queue;
-      const batch = pool.slice(0, capacity).filter(item => !visited.has(item.url));
+      if (!batch.length) batch.push(...queue.filter(item => !visited.has(item.url)).slice(0, capacity));
       for (const item of batch) queue.splice(queue.indexOf(item), 1);
       for (const item of batch) {
         visited.add(item.url);

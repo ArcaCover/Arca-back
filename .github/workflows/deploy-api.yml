@@ -1,0 +1,140 @@
+name: Deploy API
+
+# Every push to main that touches the API builds one image tagged with the commit SHA, pushes it
+# to ECR and activates it on the host through SSM. Running the workflow by hand with an image tag
+# rolls back to that image without rebuilding it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'packages/**'
+      - 'deploy/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'compose.yaml'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig*.json'
+      - '.github/workflows/deploy-api.yml'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Roll back: full commit SHA of an image already in ECR. Leave empty to build and deploy main.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+# Deploys queue behind each other and are never cancelled halfway through.
+concurrency:
+  group: deploy-api
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: ArcaDemoStack
+
+jobs:
+  test:
+    if: github.event_name == 'push' || inputs.image_tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            infra/aws/package-lock.json
+      - run: npm ci
+      - run: npm ci --prefix infra/aws
+      - run: npm run typecheck
+      - run: npm test
+
+  deploy:
+    needs: test
+    # A rollback skips the tests: its image was tested when it was built.
+    if: >-
+      always() && vars.AWS_DEPLOY_ROLE_ARN != '' &&
+      (needs.test.result == 'success' || (needs.test.result == 'skipped' && inputs.image_tag != ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: deploy-${{ github.run_id }}
+
+      - name: Read the stack outputs
+        id: stack
+        run: |
+          output() {
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+          }
+          echo "repository=$(output EcrRepositoryUri)" >> "$GITHUB_OUTPUT"
+          echo "instance=$(output InstanceId)" >> "$GITHUB_OUTPUT"
+          echo "url=$(output DemoUrl)" >> "$GITHUB_OUTPUT"
+
+      - name: Choose the image
+        id: image
+        env:
+          ROLLBACK_TAG: ${{ inputs.image_tag }}
+          REPOSITORY: ${{ steps.stack.outputs.repository }}
+        run: |
+          if [ -n "$ROLLBACK_TAG" ]; then
+            if ! printf '%s' "$ROLLBACK_TAG" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::image_tag must be a full 40-character commit SHA"; exit 1
+            fi
+            aws ecr describe-images --repository-name "${REPOSITORY#*/}" --image-ids "imageTag=$ROLLBACK_TAG" > /dev/null
+            tag="$ROLLBACK_TAG"
+          else
+            tag="$GITHUB_SHA"
+          fi
+          echo "uri=$REPOSITORY:$tag" >> "$GITHUB_OUTPUT"
+          echo "Deploying $REPOSITORY:$tag" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to ECR
+        if: inputs.image_tag == ''
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the image
+        if: inputs.image_tag == ''
+        env:
+          IMAGE: ${{ steps.image.outputs.uri }}
+        run: |
+          docker build --build-arg "VCS_REF=$GITHUB_SHA" --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Activate the image on the host
+        env:
+          IMAGE: ${{ steps.image.outputs.uri }}
+          INSTANCE: ${{ steps.stack.outputs.instance }}
+        run: |
+          parameters=$(jq -cn --arg command "/opt/arca/deploy/deploy-image.sh '$IMAGE' '$AWS_REGION'" \
+            '{commands: [$command], executionTimeout: ["900"]}')
+          command_id=$(aws ssm send-command --instance-ids "$INSTANCE" --document-name AWS-RunShellScript \
+            --comment "Deploy ${IMAGE##*:}" --parameters "$parameters" --query Command.CommandId --output text)
+          status=Pending
+          for _ in $(seq 1 180); do
+            sleep 5
+            status=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in Pending|InProgress|Delayed) ;; *) break ;; esac
+          done
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text
+          if [ "$status" != Success ]; then echo "::error::Activation ended as $status"; exit 1; fi
+
+      - name: Check the public health endpoint
+        env:
+          URL: ${{ steps.stack.outputs.url }}
+        run: curl --fail --silent --show-error --retry 10 --retry-delay 6 --retry-all-errors "$URL/health"

@@ -1,5 +1,8 @@
 import type { Layer1Result, ScanStatus, SourceName, DomainResolution } from '@arca/contracts';
 
+// Ledger statuses of a run that may still start, run or be resumed.
+export const ACTIVE_APIFY_STATUSES = ['RESERVED', 'READY', 'RUNNING', 'TIMING-OUT', 'ABORTING', 'START_UNCERTAIN'];
+
 export type ScanRecord = {
   id: string; scan_id: string; email: string; canonical_domain: string; domain_resolution: DomainResolution; status: ScanStatus;
   result: Layer1Result | null; created_at: string; completed_at: string | null;
@@ -35,5 +38,7 @@ export interface ScanRepository {
   recoverInterrupted(before: string): Promise<void>;
   reserveApifyRun(request: ReserveApifyRun): Promise<ApifyRunReservation>;
   getApifyRun(id: string): Promise<ApifyRunRecord | null>;
+  /** Finished runs whose charges are not booked yet: started (a run id exists) and no longer active. */
+  pendingApifyAccounting(limit: number): Promise<ApifyRunRecord[]>;
   updateApifyRun(id: string, update: ApifyRunUpdate): Promise<void>;
 }

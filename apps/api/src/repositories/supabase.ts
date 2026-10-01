@@ -1,5 +1,6 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
+import { ACTIVE_APIFY_STATUSES } from './types.js';
 import type { ScanRepository, ScanRecord, RawRecord, ReserveApifyRun, ApifyRunReservation, ApifyRunRecord,
   ApifyRunUpdate } from './types.js';
 
@@ -53,6 +54,13 @@ export class SupabaseRepository implements ScanRepository {
     const { data, error } = await this.client.from('apify_runs').select('*').eq('id', id).maybeSingle();
     if (error) throw new Error('Unable to read Apify run', { cause: error });
     return data;
+  }
+  async pendingApifyAccounting(limit: number): Promise<ApifyRunRecord[]> {
+    const { data, error } = await this.client.from('apify_runs').select('*').eq('accounting_complete', false)
+      .not('run_id', 'is', null).not('status', 'in', `(${ACTIVE_APIFY_STATUSES.join(',')})`)
+      .order('updated_at', { ascending: true }).limit(limit);
+    if (error) throw new Error('Unable to read unbooked Apify runs', { cause: error });
+    return (data ?? []) as ApifyRunRecord[];
   }
   async updateApifyRun(id: string, update: ApifyRunUpdate) {
     const { data, error } = await this.client.from('apify_runs').update({ ...update, updated_at: new Date().toISOString() })

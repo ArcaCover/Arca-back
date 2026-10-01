@@ -1,0 +1,95 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "NetworkAndHostInThisRegion",
+      "Effect": "Allow",
+      "Action": "ec2:*",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "us-east-1" } }
+    },
+    {
+      "Sid": "LatestAmazonLinuxImage",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameters",
+      "Resource": "arn:aws:ssm:us-east-1::parameter/aws/service/ami-amazon-linux-latest/*"
+    },
+    {
+      "Sid": "CdkBootstrapVersionCheck",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameters",
+      "Resource": "arn:aws:ssm:us-east-1:194633188202:parameter/cdk-bootstrap/hnb659fds/version"
+    },
+    {
+      "Sid": "ImageRepository",
+      "Effect": "Allow",
+      "Action": "ecr:*",
+      "Resource": "arn:aws:ecr:us-east-1:194633188202:repository/arca-demo"
+    },
+    {
+      "Sid": "ListRepositories",
+      "Effect": "Allow",
+      "Action": ["ecr:DescribeRepositories", "ecr:CreateRepository"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "StackRolesProfilesAndGithubOidc",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole", "iam:DeleteRole", "iam:GetRole", "iam:UpdateRole", "iam:UpdateAssumeRolePolicy",
+        "iam:TagRole", "iam:UntagRole", "iam:ListRoleTags",
+        "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:GetRolePolicy",
+        "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:ListAttachedRolePolicies", "iam:ListRolePolicies",
+        "iam:CreateInstanceProfile", "iam:DeleteInstanceProfile", "iam:GetInstanceProfile",
+        "iam:AddRoleToInstanceProfile", "iam:RemoveRoleFromInstanceProfile",
+        "iam:CreateOpenIDConnectProvider", "iam:DeleteOpenIDConnectProvider", "iam:GetOpenIDConnectProvider",
+        "iam:UpdateOpenIDConnectProviderThumbprint", "iam:AddClientIDToOpenIDConnectProvider",
+        "iam:RemoveClientIDFromOpenIDConnectProvider", "iam:TagOpenIDConnectProvider", "iam:UntagOpenIDConnectProvider"
+      ],
+      "Resource": [
+        "arn:aws:iam::194633188202:role/ArcaDemoStack-*",
+        "arn:aws:iam::194633188202:role/arca-github-deploy",
+        "arn:aws:iam::194633188202:instance-profile/ArcaDemoStack-*",
+        "arn:aws:iam::194633188202:oidc-provider/token.actions.githubusercontent.com"
+      ]
+    },
+    {
+      "Sid": "HandTheHostRoleToEc2Only",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::194633188202:role/ArcaDemoStack-*",
+      "Condition": { "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" } }
+    },
+    {
+      "Sid": "AlarmActionsServiceLinkedRole",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "iam:AWSServiceName": "events.amazonaws.com" } }
+    },
+    {
+      "Sid": "AlertTopic",
+      "Effect": "Allow",
+      "Action": "sns:*",
+      "Resource": "arn:aws:sns:us-east-1:194633188202:ArcaDemoStack-*"
+    },
+    {
+      "Sid": "HostAlarms",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms", "cloudwatch:DescribeAlarms",
+        "cloudwatch:TagResource", "cloudwatch:UntagResource", "cloudwatch:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:cloudwatch:us-east-1:194633188202:alarm:ArcaDemoStack-*"
+    },
+    {
+      "Sid": "NeverBillingBudgetsOrAccount",
+      "Effect": "Deny",
+      "Action": [
+        "aws-portal:*", "billing:*", "budgets:*", "ce:*", "cur:*", "payments:*", "tax:*",
+        "invoicing:*", "freetier:*", "account:*", "organizations:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

@@ -7,12 +7,15 @@ import { issueSessionToken, verifySessionToken } from '../auth/session-token.js'
 import type { ScanRepository, ScanRecord } from '../repositories/types.js';
 import { ScanLimiter } from './rate-limit.js';
 import { buildOpenApiDocument } from './openapi.js';
+import { renderQuickScanHtml, reportFilename } from '../report/quick-scan.js';
 
 export type AppDeps = {
   pipeline: Layer1Pipeline; repository: ScanRepository; sessionSecret: string; corsOrigins: string[];
   domainResolver: DomainResolver;
   clientIp: (request: Request) => string;
   limiter?: ScanLimiter; now?: () => number; scanCacheTtlMs?: number; partialRepairCooldownMs?: number;
+  /** Turns the report's HTML into a PDF. Without it the report endpoint answers 503. */
+  renderReport?: (html: string) => Promise<Uint8Array<ArrayBuffer>>;
 };
 export function createApp(deps: AppDeps) {
   const app = new Hono();
@@ -24,7 +27,7 @@ export function createApp(deps: AppDeps) {
   const inFlightByDomain = new Map<string, Promise<PipelineResult>>();
   app.use('*', cors({ origin: origin => deps.corsOrigins.includes(origin) ? origin : null,
     allowMethods: ['GET', 'POST', 'OPTIONS'], allowHeaders: ['Content-Type', 'Authorization'],
-    exposeHeaders: ['Retry-After'], maxAge: 86400 }));
+    exposeHeaders: ['Retry-After', 'Content-Disposition'], maxAge: 86400 }));
   app.onError((error, c) => {
     console.error('[api] request failed', error.message);
     return c.json({ error: 'internal_error', message: 'Unexpected server error' }, 500);
@@ -110,13 +113,32 @@ export function createApp(deps: AppDeps) {
     void job.finally(() => jobs.delete(job));
     return c.json({ scanId, sessionToken, status: 'RUNNING' as const }, 202);
   });
-  app.get('/scan/:scanId', async c => {
-    const token = /^Bearer\s+(.+)$/i.exec(c.req.header('Authorization') ?? '')?.[1];
+  // A scan is readable only with the capability token issued for it, and by the email it was issued to.
+  async function authorizedScan(authorization: string | undefined, scanId: string) {
+    const token = /^Bearer\s+(.+)$/i.exec(authorization ?? '')?.[1];
     const claims = token ? await verifySessionToken(token, deps.sessionSecret) : null;
-    if (!claims || claims.scanId !== c.req.param('scanId')) return c.json({ error: 'unauthorized', message: 'Invalid or missing session token' }, 401);
+    if (!claims || claims.scanId !== scanId) return { ok: false, error: 'unauthorized', message: 'Invalid or missing session token', status: 401 } as const;
     const scan = await deps.repository.get(claims.scanId);
-    if (!scan) return c.json({ error: 'not_found', message: 'Scan not found' }, 404);
-    if (scan.email !== claims.email) return c.json({ error: 'unauthorized', message: 'Invalid session token' }, 401);
+    if (!scan) return { ok: false, error: 'not_found', message: 'Scan not found', status: 404 } as const;
+    if (scan.email !== claims.email) return { ok: false, error: 'unauthorized', message: 'Invalid session token', status: 401 } as const;
+    return { ok: true, scan } as const;
+  }
+  app.get('/scan/:scanId/report.pdf', async c => {
+    const access = await authorizedScan(c.req.header('Authorization'), c.req.param('scanId'));
+    if (!access.ok) return c.json({ error: access.error, message: access.message }, access.status);
+    const { scan } = access;
+    if ((scan.status !== 'COMPLETED' && scan.status !== 'PARTIAL') || !scan.result) {
+      return c.json({ error: 'report_unavailable', message: 'The report exists once the scan has a result' }, 409);
+    }
+    if (!deps.renderReport) return c.json({ error: 'report_unavailable', message: 'Report rendering is not configured' }, 503);
+    const pdf = await deps.renderReport(renderQuickScanHtml(scan.result, scan.status));
+    return c.body(pdf, 200, { 'Content-Type': 'application/pdf', 'Cache-Control': 'no-store',
+      'Content-Disposition': `attachment; filename="${reportFilename(scan.result)}"` });
+  });
+  app.get('/scan/:scanId', async c => {
+    const access = await authorizedScan(c.req.header('Authorization'), c.req.param('scanId'));
+    if (!access.ok) return c.json({ error: access.error, message: access.message }, access.status);
+    const { scan } = access;
     if (scan.status === 'RUNNING') return c.json({ scanId: scan.scan_id, status: scan.status,
       elapsed: Math.max(0, now() - Date.parse(scan.created_at)) });
     return c.json({ scanId: scan.scan_id, status: scan.status, cached: scan.cached, ...(scan.result ? { result: scan.result } : {}) });

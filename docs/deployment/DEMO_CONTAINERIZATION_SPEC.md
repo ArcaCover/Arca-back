@@ -1,6 +1,6 @@
 # ARCA Layer 1 — AWS demo deployment specification
 
-Status: implemented locally; AWS provisioning and the final paid smoke scan remain pending.
+Status: implemented and deployable from GitHub; AWS provisioning and the final paid smoke scan remain pending.
 
 ## 1. Objective
 
@@ -34,17 +34,17 @@ jobs and rate limits in process, so one replica is also the correct consistency 
 ## 3. Implemented artifacts
 
 - Multi-stage, non-root production `Dockerfile` with pinned Node 22 base digest and Playwright Chromium.
+  The runtime image also carries the deployment payload in `/app/deploy-payload`.
 - `compose.yaml` with private API networking, health checks, read-only filesystems, bounded logs and
   pinned Caddy image digest.
 - `deploy/Caddyfile` for automatic HTTPS, compression, a 32 KiB request limit, security headers and
   basic auth on the documentation routes.
-- `.env.demo.example` with placeholders only.
+- `deploy/production.env` with the non-secret runtime configuration.
+- `deploy/deploy-image.sh`, the only file installed on the host by EC2 user data: it pulls an image
+  and runs the payload's `deploy/activate.sh`, which renders the env file with `deploy/render-env.py`.
 - `scripts/container-smoke.mjs` for local mock-only container validation.
-- `infra/aws` CDK application for ECR, one-AZ VPC, EC2, encrypted gp3 disk, Elastic IP, security
-  group, SSM role and optional Route 53 record.
-- `deploy/publish-demo.ps1` for test, immutable build, ECR push and activation through SSM.
-- `deploy/activate-demo.ps1` for deployment or rollback to an existing SHA.
-- `deploy/deploy-image.sh` installed on the host by EC2 user data.
+- `infra/aws` CDK application, and `infra/aws/cdk-execution-policy.json` for a scoped bootstrap.
+- `.github/workflows/deploy-api.yml` for test, build, push, activation and rollback.
 - `docs/deployment/AWS_DEMO_RUNBOOK.md` for provisioning, secrets, release, verification and rollback.
 
 ## 4. Container requirements
@@ -66,58 +66,41 @@ The `ArcaDemoStack` creates:
 - One `t3.medium` x86_64 Amazon Linux 2023 instance with 20 GiB encrypted gp3 storage and IMDSv2.
 - One Elastic IP.
 - One security group allowing only TCP 80/443 and UDP 443 inbound.
-- One EC2 role with the managed SSM core policy and pull-only permission to this ECR repository.
+- One EC2 role with the managed SSM core policy and pull-only permission to this ECR repository, plus read access to `/arca/prod` parameters.
 - An optional Route 53 A record when both hosted-zone context values are supplied.
+- A GitHub OIDC provider and the `arca-github-deploy` role, assumable only from `main` of
+  `ArcaCover/Arca-back`: push to this ECR repository and `SendCommand` to this instance only.
+- An SNS topic with the alert addresses, and two status-check alarms that recover (hardware) or
+  reboot (operating system) the instance and notify the topic.
 
 The stack uses termination protection. ECR is retained if the stack is removed.
 
 ## 6. Runtime configuration
 
-Required values in `/opt/arca/.env.demo`:
+The host's `/opt/arca/.env.demo` is generated at every activation and never edited by hand. It merges:
 
-| Variable | Value |
-| --- | --- |
-| `ARCA_IMAGE` | Immutable ECR URI tagged with the deployed Git SHA |
-| `DEMO_HOSTNAME` | Public DNS hostname pointing to the Elastic IP |
-| `DOCS_AUTH_USER` | Basic-auth user for `/docs` and `/openapi.json` |
-| `DOCS_AUTH_HASH` | bcrypt hash produced by `caddy hash-password` |
-| `NODE_ENV` | `production` |
-| `PORT` | `8080` |
-| `SOURCE_MODE` | `live` |
-| `STORAGE_BACKEND` | `supabase` |
-| `WEBSITE_EVIDENCE_PROVIDER` | `rules` |
-| `SUPABASE_URL` | Managed Supabase URL |
-| `SUPABASE_SECRET_KEY` | Backend-only secret key |
-| `SESSION_TOKEN_SECRET` | Random value of at least 32 characters |
-| `APIFY_API_TOKEN` | Backend-only Apify token |
-| `CORS_ALLOWED_ORIGINS` | `https://arcacover.com,http://localhost:3000` |
-| `TRUST_PROXY_HOPS` | `1`, because Caddy is the only ingress |
-| `MAX_APIFY_CONCURRENCY` | `2` |
-| `APIFY_ACTOR_BUILD` | `latest` hasta fijar un build validado por el canario |
-| `APIFY_MAX_COST_USD_PER_RUN` | `1` |
-| `APIFY_MAX_COST_USD_PER_SCAN` | `10` |
-| `APIFY_MAX_COST_USD_PER_DAY` | `100` |
-| `APIFY_QUERY_CACHE_TTL_MS` | `86400000` |
-| `APIFY_ACTIVE_RUN_TTL_MS` | `900000` |
-| `APIFY_RUN_TIMEOUT_SECS` | `300` |
-| `APIFY_BAR_TARGETED_MAX_RESULTS` | `25` |
-| `APIFY_AVVO_TARGETED_MAX_RESULTS` | `10` |
-| `APIFY_MAX_CACHED_ITEMS` | `1000` |
-| `PIPELINE_TIMEOUT_MS` | `600000` |
+- `deploy/production.env` from the image being deployed: hostname, docs user, source and storage
+  modes, CORS origins, Apify limits, TTLs and timeouts.
+- Every SecureString under `/arca/prod/` in SSM Parameter Store, named after its variable:
+  `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `SESSION_TOKEN_SECRET`, `APIFY_API_TOKEN`, `DOCS_AUTH_HASH`,
+  and `OPENAI_API_KEY` only if the configuration switches to an OpenAI extraction. Production
+  uses `WEBSITE_EVIDENCE_PROVIDER=rules`; NVIDIA NIM is not used.
+- `ARCA_IMAGE`, the immutable image being activated.
 
-Each paid provider run requests at most ten records. A scan starts no more than four directory runs.
-
-Secrets are not passed through CDK, user data, container layers or SSM command arguments. They are
-entered interactively on the host through Session Manager and the file is mode `0600` owned by root.
+A variable defined in both places, a missing required secret or a non-bcrypt docs hash stops the
+activation before anything running is touched. Secrets never pass through CDK, user data, image
+layers, GitHub or SSM command arguments.
 
 ## 7. Release and rollback
 
-Every release must come from a clean, committed checkout. The image tag must equal `git rev-parse HEAD`.
-The release script runs `npm ci`, TypeScript build, the full test suite and a linux/amd64 image build,
-then pushes the image and activates it over SSM. Activation validates Compose, waits for health and
-retains older immutable ECR images for rollback.
+A push to `main` touching the API runs `deploy-api.yml`: `npm ci`, typecheck and the full test suite,
+then a linux/amd64 build tagged with the commit SHA, a push to ECR and activation over SSM, then an
+HTTPS health check. Deploys are serialized and never cancelled halfway.
 
-Rollback calls `activate-demo.ps1` with a prior healthy SHA. It never rebuilds or retags that image.
+Rollback runs the same workflow by hand with the SHA of an earlier image. It never rebuilds or
+retags that image, and restores that commit's compose file, Caddyfile and configuration with it.
+
+A deploy restarts the API container, so a scan in flight is lost and recovers to `FAILED`.
 
 ## 8. Acceptance
 
@@ -130,14 +113,13 @@ Before the first public demo:
    `/openapi.json` return HTTP 401 without credentials and render with them.
 5. Supabase persistence and cache pass using the deployed API.
 6. One pre-approved live law-firm scan completes with run IDs, duration and reported cost recorded.
-7. Repeating that domain proves the 24-hour cache without paid provider calls.
+7. Repeating that domain proves the 7-day cache without paid provider calls.
 8. A restart proves stale RUNNING scans recover to a terminal state.
 
 Item 6 is explicitly gated on user confirmation because it makes paid external calls.
 
 ## 9. Remaining external inputs
 
-- An authenticated AWS CLI session with rights to bootstrap and deploy CDK.
-- AWS region; `us-east-1` is the operational default for this demo.
-- Final demo hostname and control of its DNS zone.
-- Runtime secret values entered by the user after the instance exists.
+- A one-time administrator session for the scoped CDK bootstrap (runbook step 1).
+- The runtime secrets, stored under `/arca/prod/` with the `arca-deploy` profile.
+- The Vercel DNS record for `api.arcacover.com`, and the `AWS_DEPLOY_ROLE_ARN` repository variable.

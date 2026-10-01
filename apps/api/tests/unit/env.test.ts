@@ -66,6 +66,12 @@ describe('independent source and storage configuration', () => {
     expect(() => loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory',
       APIFY_RUN_TIMEOUT_SECS: '600', APIFY_ACTIVE_RUN_TTL_MS: '600000' })).toThrow('must exceed');
   });
+  it('runs sixteen Apify actors at once by default and allows up to the account limit of 32', () => {
+    const mock = { ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' };
+    expect(loadEnv(mock).MAX_APIFY_CONCURRENCY).toBe(16);
+    expect(loadEnv({ ...mock, MAX_APIFY_CONCURRENCY: '32' }).MAX_APIFY_CONCURRENCY).toBe(32);
+    expect(() => loadEnv({ ...mock, MAX_APIFY_CONCURRENCY: '33' })).toThrow();
+  });
   it('repairs a partial scan at most hourly by default, never less often than the cache window', () => {
     const mock = { ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' };
     expect(loadEnv(mock).SCAN_PARTIAL_REPAIR_COOLDOWN_MS).toBe(3_600_000);
