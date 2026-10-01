@@ -181,8 +181,10 @@ function Deploy-Stack {
   $emails = Get-AlertEmails
   Push-Location $Infra
   try {
-    if (-not (Test-Path 'node_modules')) { & npm ci; if ($LASTEXITCODE -ne 0) { Fail 'npm ci failed' } }
-    & npx cdk deploy --profile $AwsProfile -c "alertEmails=$emails" --require-approval broadening
+    # The .cmd shims are called directly: through npx.ps1, Windows PowerShell 5.1 mangles the
+    # arguments and npm ends up looking for a package named "px".
+    if (-not (Test-Path 'node_modules')) { & npm.cmd ci; if ($LASTEXITCODE -ne 0) { Fail 'npm ci failed' } }
+    & .\node_modules\.bin\cdk.cmd deploy --profile $AwsProfile -c "alertEmails=$emails" --require-approval broadening
     if ($LASTEXITCODE -ne 0) { Fail 'cdk deploy failed or was declined' }
   } finally { Pop-Location }
 }
