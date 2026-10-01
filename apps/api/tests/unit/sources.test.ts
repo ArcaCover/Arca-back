@@ -70,6 +70,17 @@ describe('provider evidence boundaries', () => {
     expect(result.status).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY', costUsd: 0,
       reason: 'A firm-wide search needs a verified city; a nationwide search is not run' });
   });
+  it('reports TRUNCATED only when a full result page was the sole problem', async () => {
+    const page = (extra: unknown[] = []) => [...Array.from({ length: AVVO_TARGETED_MAX_LAWYERS }, (_, index) =>
+      ({ name: `John Other${index}`, city: 'Miami' })), ...extra];
+    const full = await new ApifyDirectorySource('avvo', { run: vi.fn(async () => page()) })
+      .run(query, new AbortController().signal);
+    expect(full.status).toMatchObject({ status: 'partial', code: 'TRUNCATED' });
+    // A record in the wrong shape is a contract failure, and a full page must not hide it.
+    const broken = await new ApifyDirectorySource('avvo', { run: vi.fn(async () => page([{ name: 42 }])) })
+      .run(query, new AbortController().signal);
+    expect(broken.status).toMatchObject({ status: 'partial', code: 'PROVIDER_CONTRACT_ERROR' });
+  });
   it('declares the Florida Bar as the jurisdiction of the Bar source only', () => {
     expect(new ApifyDirectorySource('bar', { run: vi.fn() }).jurisdiction).toBe('FL');
     expect(new ApifyDirectorySource('avvo', { run: vi.fn() }).jurisdiction).toBeUndefined();

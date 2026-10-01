@@ -127,6 +127,21 @@ function crossDirectoryIdentity(left: Attorney, right: Attorney) {
     sameAdmissionYear(left, right);
 }
 
+/**
+ * True when an accepted directory match is pinned to the person by an identifier that a name
+ * search cannot fake: the other directory agrees on address, phone or admission year, or the
+ * firm's own phone or street matches. More candidates past a truncated result page cannot
+ * displace such a match, which a name-only acceptance would not survive.
+ */
+export function independentlyConfirmed(match: AttorneyMatch, other: AttorneyMatch[] | null,
+  identity: string | null | IdentityContext): boolean {
+  if (!match.attorney) return false;
+  const context = asContext(identity);
+  const counterpart = other?.find(item => normalizeName(item.searchedName) === normalizeName(match.searchedName))?.attorney;
+  return (counterpart ? crossDirectoryIdentity(match.attorney, counterpart) : false) ||
+    sameKnown(match.attorney.phone, context.phone ?? null) || sameKnown(match.attorney.addressStreet, context.addressStreet ?? null);
+}
+
 const asContext = (value: string | null | IdentityContext): IdentityContext => typeof value === 'object' && value !== null
   ? value : { firmName: value, aliases: [], city: null, county: null, addressStreet: null, phone: null };
 export function reconcileBarMatches(bar: AttorneyMatch[] | null, identity: string | null | IdentityContext,
