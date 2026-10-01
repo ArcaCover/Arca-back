@@ -12,9 +12,8 @@ import { DERIVED_FIELDS, deriveTeamPageQuality, deriveWebsiteQuality, type TeamP
 import { PAGE_CLASSIFICATION_PROMPT, PAGE_TYPE_VOTES, PageClassification, acquisitionFloor, majorityPageTypes, pageCandidates,
   serializeCandidates, type PageCandidate, type PageType } from './page-types.js';
 import type { WebsiteEvidenceProvider } from './website-evidence-provider.js';
-import { LLM_ENDPOINTS, type LlmEndpoint } from './llm-endpoint.js';
+import { DEFAULT_SIGNAL_LLM_MODEL, openAiEndpoint, type LlmEndpoint } from './llm-endpoint.js';
 
-export const DEFAULT_NVIDIA_NIM_MODEL = 'nvidia/nemotron-3-super-120b-a12b';
 export const EXTRACTION_VERSION = 'agentic-signals-v5';
 export const MAX_AGENT_ROUNDS = 3;
 /** Bounded so one flaky call cannot loop forever; each phase gets its own budget of attempts. */
@@ -150,17 +149,17 @@ function normalizeClaims(claims: Claim[]): Claim[] {
 }
 
 const TEAM_PATH = /attorney|lawyer|abogad|equipo|team/i;
-export class NvidiaNimEvidenceProvider implements WebsiteEvidenceProvider {
+export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
   readonly id: string;
   readonly version: string;
   private readonly client: CompletionClient;
-  constructor(apiKey: string, readonly model = DEFAULT_NVIDIA_NIM_MODEL, client?: CompletionClient,
-    private readonly access: SiteAccess = createSiteAccess(), private readonly endpoint: LlmEndpoint = LLM_ENDPOINTS.nvidia,
+  constructor(apiKey: string, readonly model = DEFAULT_SIGNAL_LLM_MODEL, client?: CompletionClient,
+    private readonly access: SiteAccess = createSiteAccess(), private readonly endpoint: LlmEndpoint = openAiEndpoint(),
     private readonly options: { planPages?: boolean } = {}) {
-    this.id = endpoint.id === 'nvidia' ? 'nvidia-nim' : `${endpoint.id}-agentic`;
+    this.id = 'openai-agentic';
+    // Keep this format stable: stored website analyses are reused only while it matches.
     this.version = `${EXTRACTION_VERSION}:${endpoint.id}:${model}`;
-    this.client = client ?? new OpenAI({ apiKey, baseURL: endpoint.baseURL, maxRetries: 0,
-      timeout: 120_000 }) as unknown as CompletionClient;
+    this.client = client ?? new OpenAI({ apiKey, maxRetries: 0, timeout: 120_000 }) as unknown as CompletionClient;
   }
 
   private async complete(phase: string, system: string, user: string, signal: AbortSignal, attempts: Attempt[]) {

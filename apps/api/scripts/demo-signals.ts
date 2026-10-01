@@ -3,13 +3,14 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
 import { crawlWebsite } from '../src/pipeline/crawler.js';
-import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../src/pipeline/nvidia-evidence-provider.js';
+import { AgenticEvidenceProvider, ExtractionFailure } from '../src/pipeline/agentic-evidence-provider.js';
+import { DEFAULT_SIGNAL_LLM_MODEL, openAiEndpoint } from '../src/pipeline/llm-endpoint.js';
 import { buildFirmIdentity } from '../src/pipeline/firm-identity.js';
 import { buildDirectoryInputs } from '../src/pipeline/directories.js';
 
 if (existsSync('.env.local')) loadEnvFile('.env.local');
-const key = process.env.NVIDIA_NIM_API_KEY?.trim();
-if (!key) throw new Error('NVIDIA_NIM_API_KEY is required');
+const key = process.env.OPENAI_API_KEY?.trim();
+if (!key) throw new Error('OPENAI_API_KEY is required');
 const targets = process.argv.slice(2);
 if (!targets.length) throw new Error('Usage: npm run demo:signals -- <domain-or-url> [...]');
 
@@ -32,7 +33,8 @@ for (const target of targets) {
     const crawl = await crawlWebsite(url.href, controller.signal, undefined, { maxPages: 12, maxDepth: 2, timeoutMs: 30_000 });
     await writeFile(resolve(output, 'crawl.json'), json(crawl));
     console.log(`[${domain}] 2/5 extracting and reviewing ${crawl.pages.length} pages`);
-    const provider = new NvidiaNimEvidenceProvider(key, process.env.NVIDIA_NIM_MODEL?.trim() || undefined);
+    const provider = new AgenticEvidenceProvider(key, process.env.SIGNAL_LLM_MODEL?.trim() || DEFAULT_SIGNAL_LLM_MODEL,
+      undefined, undefined, openAiEndpoint());
     const result = await provider.extractDetailed(crawl, controller.signal);
     await writeFile(resolve(output, 'corpus.json'), json(result.diagnostics.corpus));
     for (const [index, attempt] of result.diagnostics.attempts.entries()) {

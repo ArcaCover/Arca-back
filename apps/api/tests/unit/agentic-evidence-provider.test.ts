@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ExtractionFailure, MAX_TRANSIENT_ATTEMPTS, NvidiaNimEvidenceProvider } from '../../src/pipeline/nvidia-evidence-provider.js';
-import { LLM_ENDPOINTS, openAiEndpoint } from '../../src/pipeline/llm-endpoint.js';
+import { AgenticEvidenceProvider, ExtractionFailure, MAX_TRANSIENT_ATTEMPTS } from '../../src/pipeline/agentic-evidence-provider.js';
+import { openAiEndpoint, type LlmEndpoint } from '../../src/pipeline/llm-endpoint.js';
 
 // These tests script every model call; the page plan adds classification calls and floor reads they do not expect.
-const withoutPagePlan = (...args: ConstructorParameters<typeof NvidiaNimEvidenceProvider>) =>
-  new NvidiaNimEvidenceProvider(args[0], args[1], args[2], args[3], args[4], { planPages: false });
+const withoutPagePlan = (...args: ConstructorParameters<typeof AgenticEvidenceProvider>) =>
+  new AgenticEvidenceProvider(args[0], args[1], args[2], args[3], args[4], { planPages: false });
 
-describe('NVIDIA evidence provider', () => {
+describe('Agentic evidence provider', () => {
   it('uses the probed endpoint parameters and maps reviewed grounded claims', async () => {
     const page = { url: 'https://firm.com/', html: '', text: 'Smith Law is a law firm.' };
     let segmentId = '';
@@ -23,8 +23,7 @@ describe('NVIDIA evidence provider', () => {
     expect(result.websiteData.firm_name).toBe('Smith Law');
     expect(result.websiteData.provenance.firm_name?.[0]?.method).toBe('provider');
     expect(create).toHaveBeenCalledTimes(2);
-    expect(create.mock.calls[0]?.[0]).toMatchObject({ stream: false, response_format: { type: 'json_object' },
-      chat_template_kwargs: { enable_thinking: false } });
+    expect(create.mock.calls[0]?.[0]).toMatchObject({ stream: false, response_format: { type: 'json_object' } });
   });
 
   it('keeps every rejected attempt when the answer never matches the schema', async () => {
@@ -285,7 +284,7 @@ describe('NVIDIA evidence provider', () => {
       : JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } });
     return { choices: [{ finish_reason: 'stop', message: { content } }] };
   });
-  const firstRequest = async (endpoint: (typeof LLM_ENDPOINTS)[keyof typeof LLM_ENDPOINTS], model: string) => {
+  const firstRequest = async (endpoint: LlmEndpoint, model: string) => {
     const create = finishing();
     const provider = withoutPagePlan('key', model, { chat: { completions: { create } } }, undefined, endpoint);
     await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }], partial: false }, new AbortController().signal);
@@ -293,7 +292,7 @@ describe('NVIDIA evidence provider', () => {
   };
 
   it('sends only parameters an OpenAI reasoning model accepts', async () => {
-    const { provider, request } = await firstRequest(LLM_ENDPOINTS.openai, 'gpt-5.6-luna');
+    const { provider, request } = await firstRequest(openAiEndpoint(), 'gpt-5.6-luna');
     expect(request).toMatchObject({ model: 'gpt-5.6-luna', max_completion_tokens: expect.any(Number), response_format: { type: 'json_object' } });
     expect(request).not.toHaveProperty('temperature');
     expect(request).not.toHaveProperty('max_tokens');
@@ -302,7 +301,7 @@ describe('NVIDIA evidence provider', () => {
   });
 
   it('keeps a deterministic temperature for OpenAI models that support it', async () => {
-    const { request } = await firstRequest(LLM_ENDPOINTS.openai, 'gpt-4.1-mini');
+    const { request } = await firstRequest(openAiEndpoint(), 'gpt-4.1-mini');
     expect(request).toMatchObject({ model: 'gpt-4.1-mini', temperature: 0, max_completion_tokens: expect.any(Number) });
     expect(request).not.toHaveProperty('chat_template_kwargs');
   });
@@ -313,24 +312,28 @@ describe('NVIDIA evidence provider', () => {
     // The family test used to be anchored on gpt-5, so a gpt-6 model was sent temperature 0
     // and every extraction call failed outright.
     for (const model of ['gpt-6-luna', 'gpt-6-astra', 'gpt-10-whatever']) {
-      const { request } = await firstRequest(LLM_ENDPOINTS.openai, model);
+      const { request } = await firstRequest(openAiEndpoint(), model);
       expect(request, model).not.toHaveProperty('temperature');
       expect(request, model).toMatchObject({ max_completion_tokens: expect.any(Number) });
     }
     // GPT-4 and earlier keep the deterministic profile they do support.
-    expect((await firstRequest(LLM_ENDPOINTS.openai, 'gpt-4.1-mini')).request).toMatchObject({ temperature: 0 });
+    expect((await firstRequest(openAiEndpoint(), 'gpt-4.1-mini')).request).toMatchObject({ temperature: 0 });
   });
 
-  it('keeps the NIM request profile by default', async () => {
-    const { provider, request } = await firstRequest(LLM_ENDPOINTS.nvidia, 'z-ai/glm-5.3-flash');
-    expect(request).toMatchObject({ temperature: 0, max_tokens: 8000, chat_template_kwargs: { enable_thinking: false } });
-    expect(provider.id).toBe('nvidia-nim');
+  it('uses OpenAI with gpt-6-luna by default', async () => {
+    const create = finishing();
+    const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+    await provider.extractDetailed({ pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }], partial: false }, new AbortController().signal);
+    expect(create.mock.calls[0]![0]).toMatchObject({ model: 'gpt-6-luna', max_completion_tokens: expect.any(Number) });
+    expect(create.mock.calls[0]![0]).not.toHaveProperty('temperature');
+    expect(provider.id).toBe('openai-agentic');
+    expect(provider.version).toMatch(/:openai:gpt-6-luna$/);
   });
 
   it('asks OpenAI reasoning models for the configured reasoning effort only', async () => {
     expect((await firstRequest(openAiEndpoint('low'), 'gpt-5-mini')).request).toMatchObject({ reasoning_effort: 'low' });
     expect((await firstRequest(openAiEndpoint('low'), 'gpt-4.1-mini')).request).not.toHaveProperty('reasoning_effort');
-    expect((await firstRequest(LLM_ENDPOINTS.openai, 'gpt-5-mini')).request).not.toHaveProperty('reasoning_effort');
+    expect((await firstRequest(openAiEndpoint(), 'gpt-5-mini')).request).not.toHaveProperty('reasoning_effort');
   });
 
   it('accepts a roster returned as one short-cited claim per person', async () => {

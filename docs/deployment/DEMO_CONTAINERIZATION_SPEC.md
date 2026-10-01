@@ -5,7 +5,7 @@ Status: implemented and deployable from GitHub; AWS provisioning and the final p
 ## 1. Objective
 
 Run the Layer 1 API as a reproducible container on a small AWS demo host, expose HTTPS and retain
-Supabase as managed persistence. OpenAI remains disabled. The deployment must not make port 8080,
+Supabase as managed persistence. The website extraction runs on OpenAI. The deployment must not make port 8080,
 AWS credentials, Supabase credentials or Apify credentials public.
 
 ## 2. Architecture
@@ -83,8 +83,7 @@ The host's `/opt/arca/.env.demo` is generated at every activation and never edit
   modes, CORS origins, Apify limits, TTLs and timeouts.
 - Every SecureString under `/arca/prod/` in SSM Parameter Store, named after its variable:
   `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `SESSION_TOKEN_SECRET`, `APIFY_API_TOKEN`, `DOCS_AUTH_HASH`,
-  and `OPENAI_API_KEY` only if the configuration switches to an OpenAI extraction. Production
-  uses `WEBSITE_EVIDENCE_PROVIDER=rules`; NVIDIA NIM is not used.
+  and `OPENAI_API_KEY`, which the agentic website extraction (`WEBSITE_EVIDENCE_PROVIDER=agentic`) needs.
 - `ARCA_IMAGE`, the immutable image being activated.
 
 A variable defined in both places, a missing required secret or a non-bcrypt docs hash stops the

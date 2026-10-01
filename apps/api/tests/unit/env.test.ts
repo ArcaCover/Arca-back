@@ -23,28 +23,25 @@ describe('independent source and storage configuration', () => {
     expect(() => loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'supabase', SUPABASE_URL: database.SUPABASE_URL })).toThrow('SUPABASE_SECRET_KEY');
     expect(() => loadEnv({ ...base, ...database, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'supabase', SUPABASE_SECRET_KEY: 'sb_publishable_fixture' })).toThrow('server secret');
   });
-  it('defaults live extraction to NVIDIA and validates credentials for the selected provider', () => {
+  it('defaults live extraction to the agentic OpenAI extraction and validates credentials for the selected provider', () => {
     expect(loadEnv({ ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test',
-      NVIDIA_NIM_API_KEY: 'nim-test' })).toMatchObject({ WEBSITE_EVIDENCE_PROVIDER: 'nvidia' });
+      OPENAI_API_KEY: 'sk-test' })).toMatchObject({ WEBSITE_EVIDENCE_PROVIDER: 'agentic', SIGNAL_LLM_MODEL: 'gpt-6-luna' });
     expect(() => loadEnv({ ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory' })).toThrow('APIFY_API_TOKEN');
     expect(() => loadEnv({ ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test' }))
-      .toThrow('NVIDIA_NIM_API_KEY');
+      .toThrow('OPENAI_API_KEY');
     expect(loadEnv({ ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test',
       WEBSITE_EVIDENCE_PROVIDER: 'rules' })).toMatchObject({ WEBSITE_EVIDENCE_PROVIDER: 'rules' });
     expect(() => loadEnv({ ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test',
       WEBSITE_EVIDENCE_PROVIDER: 'openai' })).toThrow('OPENAI_API_KEY');
   });
-  it('lets the agentic extraction run on OpenAI with its own key and model', () => {
-    const live = { ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test' };
-    expect(() => loadEnv({ ...live, SIGNAL_LLM_ENDPOINT: 'openai', NVIDIA_NIM_API_KEY: 'nim-test' })).toThrow('OPENAI_API_KEY');
-    expect(() => loadEnv({ ...live, SIGNAL_LLM_ENDPOINT: 'openai', OPENAI_API_KEY: 'sk-test' })).toThrow('SIGNAL_LLM_MODEL');
-    expect(loadEnv({ ...live, SIGNAL_LLM_ENDPOINT: 'openai', OPENAI_API_KEY: 'sk-test', SIGNAL_LLM_MODEL: ' gpt-5.6-luna ' }))
-      .toMatchObject({ SIGNAL_LLM_ENDPOINT: 'openai', signalModel: 'gpt-5.6-luna' });
-    expect(loadEnv({ ...live, NVIDIA_NIM_API_KEY: 'nim-test', NVIDIA_NIM_MODEL: 'z-ai/glm-5.3-flash' }))
-      .toMatchObject({ SIGNAL_LLM_ENDPOINT: 'nvidia', signalModel: 'z-ai/glm-5.3-flash' });
+  it('runs the agentic extraction on the configured OpenAI model, and knows no NVIDIA provider', () => {
+    const live = { ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test', OPENAI_API_KEY: 'sk-test' };
+    expect(loadEnv({ ...live, SIGNAL_LLM_MODEL: ' gpt-5.6-luna ' }).SIGNAL_LLM_MODEL).toBe('gpt-5.6-luna');
+    expect(loadEnv({ ...live, SIGNAL_LLM_MODEL: '' }).SIGNAL_LLM_MODEL).toBe('gpt-6-luna');
+    expect(() => loadEnv({ ...live, WEBSITE_EVIDENCE_PROVIDER: 'nvidia' })).toThrow();
   });
   it('accepts only known reasoning efforts for the agentic extraction', () => {
-    const openai = { ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test', SIGNAL_LLM_ENDPOINT: 'openai',
+    const openai = { ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test',
       OPENAI_API_KEY: 'sk-test', SIGNAL_LLM_MODEL: 'gpt-5-mini' };
     expect(loadEnv({ ...openai, SIGNAL_LLM_REASONING_EFFORT: 'low' })).toMatchObject({ SIGNAL_LLM_REASONING_EFFORT: 'low' });
     expect(loadEnv(openai).SIGNAL_LLM_REASONING_EFFORT).toBeUndefined();

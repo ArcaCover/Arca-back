@@ -70,6 +70,7 @@ put() { read -rsp "$1: " value && echo && aws ssm put-parameter --profile arca-d
 put SUPABASE_URL
 put SUPABASE_SECRET_KEY
 put APIFY_API_TOKEN
+put OPENAI_API_KEY
 ```
 
 The session secret and the docs password hash are generated, not typed:
@@ -81,9 +82,9 @@ put DOCS_AUTH_HASH   # paste the output of: docker run --rm -it caddy:2.10.2-alp
 ```
 
 Store the hash exactly as printed. `render-env.py` escapes every `$` for Compose, and refuses to
-deploy if a required secret is missing or the hash is not bcrypt. Production extracts with `WEBSITE_EVIDENCE_PROVIDER=rules`, so it needs no
-language-model key. Switching to the agentic extraction through OpenAI (see `deploy/production.env`)
-adds `OPENAI_API_KEY` under the same path. NVIDIA NIM is not used.
+deploy if a required secret is missing or the hash is not bcrypt. Production runs the agentic
+website extraction through OpenAI (`WEBSITE_EVIDENCE_PROVIDER=agentic` in `deploy/production.env`),
+so `OPENAI_API_KEY` is required too.
 
 ## 3. Create or update the infrastructure
 

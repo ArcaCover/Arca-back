@@ -9,8 +9,8 @@ import { createRepository } from './repositories/supabase.js';
 import { InProcessPipeline } from './pipeline/in-process-pipeline.js';
 import { WebsiteExtractionSource } from './pipeline/website-source.js';
 import { OpenAIEvidenceProvider, RuleBasedEvidenceProvider } from './pipeline/website-evidence-provider.js';
-import { NvidiaNimEvidenceProvider } from './pipeline/nvidia-evidence-provider.js';
-import { LLM_ENDPOINTS, openAiEndpoint } from './pipeline/llm-endpoint.js';
+import { AgenticEvidenceProvider } from './pipeline/agentic-evidence-provider.js';
+import { openAiEndpoint } from './pipeline/llm-endpoint.js';
 import { ApifyClient } from './pipeline/apify-client.js';
 import { ApifyDirectorySource } from './pipeline/directories.js';
 import { PublicDomainResolver } from './pipeline/domain-resolution.js';
@@ -25,9 +25,8 @@ const interruptedBefore = () => new Date(Date.now() - env.PIPELINE_TIMEOUT_MS - 
 await repository.recoverInterrupted(interruptedBefore());
 const websiteEvidenceProvider = env.sourceMode === 'mock' ? null : env.WEBSITE_EVIDENCE_PROVIDER === 'openai'
   ? new OpenAIEvidenceProvider(env.OPENAI_API_KEY!) : env.WEBSITE_EVIDENCE_PROVIDER === 'rules'
-    ? new RuleBasedEvidenceProvider() : new NvidiaNimEvidenceProvider(
-      env.SIGNAL_LLM_ENDPOINT === 'openai' ? env.OPENAI_API_KEY! : env.NVIDIA_NIM_API_KEY!, env.signalModel, undefined, undefined,
-      env.SIGNAL_LLM_ENDPOINT === 'openai' ? openAiEndpoint(env.SIGNAL_LLM_REASONING_EFFORT) : LLM_ENDPOINTS.nvidia);
+    ? new RuleBasedEvidenceProvider() : new AgenticEvidenceProvider(env.OPENAI_API_KEY!, env.SIGNAL_LLM_MODEL, undefined,
+      undefined, openAiEndpoint(env.SIGNAL_LLM_REASONING_EFFORT));
 const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY, {
   store: repository, build: env.APIFY_ACTOR_BUILD, expectedCostUsdPerRun: env.APIFY_EXPECTED_COST_USD_PER_RUN,
   cacheTtlMs: env.APIFY_QUERY_CACHE_TTL_MS, activeTtlMs: env.APIFY_ACTIVE_RUN_TTL_MS,
