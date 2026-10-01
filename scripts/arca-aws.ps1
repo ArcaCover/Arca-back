@@ -88,10 +88,8 @@ function Get-Setting([string]$Name) {
 
 function Get-RequiredSecrets {
   $names = @('SUPABASE_URL', 'SUPABASE_SECRET_KEY', 'SESSION_TOKEN_SECRET', 'APIFY_API_TOKEN', 'DOCS_AUTH_HASH')
-  $provider = Get-Setting 'WEBSITE_EVIDENCE_PROVIDER'
-  $endpoint = Get-Setting 'SIGNAL_LLM_ENDPOINT'
-  if ($provider -eq 'openai' -or ($provider -eq 'nvidia' -and $endpoint -eq 'openai')) { $names += 'OPENAI_API_KEY' }
-  if ($provider -eq 'nvidia' -and ($endpoint -eq '' -or $endpoint -eq 'nvidia')) { $names += 'NVIDIA_NIM_API_KEY' }
+  # Every extraction but 'rules' runs on OpenAI; an unset provider means the agentic default.
+  if ((Get-Setting 'WEBSITE_EVIDENCE_PROVIDER') -ne 'rules') { $names += 'OPENAI_API_KEY' }
   $names
 }
 

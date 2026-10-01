@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { NvidiaNimEvidenceProvider } from '../../src/pipeline/nvidia-evidence-provider.js';
+import { AgenticEvidenceProvider } from '../../src/pipeline/agentic-evidence-provider.js';
 
 const reply = (body: unknown) => ({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(body) } }] });
 
@@ -40,7 +40,7 @@ describe('agentic page plan', () => {
         calls: urls.map(target => ({ tool: 'read_document' as const, target, status: 'failed' as const, detail: 'HTTP_ERROR' })) })),
       readSitemap: vi.fn(),
     };
-    const provider = new NvidiaNimEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
+    const provider = new AgenticEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [home], partial: false }, new AbortController().signal);
     expect(classifications).toHaveLength(3);
     expect(access.fetchPages).toHaveBeenCalledWith(['https://firm.com/our-lawyers'], expect.anything());

@@ -1,6 +1,7 @@
-/** Request profile of an OpenAI-compatible chat endpoint: each endpoint and model family accepts different parameters. */
-export type LlmEndpointId = 'nvidia' | 'openai';
-export type LlmEndpoint = { id: LlmEndpointId; baseURL?: string; requestParams(model: string): Record<string, unknown> };
+/** Request profile of the OpenAI chat endpoint: each model family accepts different parameters. */
+export type LlmEndpoint = { id: 'openai'; requestParams(model: string): Record<string, unknown> };
+/** The model the agentic website extraction uses unless SIGNAL_LLM_MODEL says otherwise. */
+export const DEFAULT_SIGNAL_LLM_MODEL = 'gpt-6-luna';
 export const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high'] as const;
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
@@ -17,8 +18,3 @@ export function openAiEndpoint(reasoningEffort?: ReasoningEffort): LlmEndpoint {
     : { temperature: 0, max_completion_tokens: 8000 } };
 }
 
-export const LLM_ENDPOINTS: Record<LlmEndpointId, LlmEndpoint> = {
-  nvidia: { id: 'nvidia', baseURL: 'https://integrate.api.nvidia.com/v1',
-    requestParams: () => ({ temperature: 0, max_tokens: 8000, chat_template_kwargs: { enable_thinking: false } }) },
-  openai: openAiEndpoint(),
-};

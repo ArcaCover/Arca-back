@@ -45,7 +45,12 @@ def main():
             fail(f"Parameter {parameter['Name']} is not named after an environment variable")
         secrets[key] = parameter["Value"]
 
-    missing = [key for key in REQUIRED_SECRETS if not secrets.get(key)]
+    required = list(REQUIRED_SECRETS)
+    # Every extraction but 'rules' runs on OpenAI, and the API refuses to start without its key;
+    # name the missing key here instead of leaving an unhealthy container to explain it.
+    if settings.get("WEBSITE_EVIDENCE_PROVIDER", "agentic") != "rules":
+        required.append("OPENAI_API_KEY")
+    missing = [key for key in required if not secrets.get(key)]
     if missing:
         fail("Missing parameters under /arca/prod: " + ", ".join(missing))
     overlap = sorted(set(secrets) & (set(settings) | {"ARCA_IMAGE"}))

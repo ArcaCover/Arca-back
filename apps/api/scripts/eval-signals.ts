@@ -3,19 +3,17 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
 import OpenAI from 'openai';
-import { ExtractionFailure, NvidiaNimEvidenceProvider } from '../src/pipeline/nvidia-evidence-provider.js';
-import { LLM_ENDPOINTS, REASONING_EFFORTS, openAiEndpoint, type ReasoningEffort } from '../src/pipeline/llm-endpoint.js';
+import { AgenticEvidenceProvider, ExtractionFailure } from '../src/pipeline/agentic-evidence-provider.js';
+import { DEFAULT_SIGNAL_LLM_MODEL, REASONING_EFFORTS, openAiEndpoint, type ReasoningEffort } from '../src/pipeline/llm-endpoint.js';
 import { GoldLabels, evaluateWebsiteData } from '../src/pipeline/signal-evaluation.js';
 
 if (existsSync('.env.local')) loadEnvFile('.env.local');
 const effort = process.env.SIGNAL_LLM_REASONING_EFFORT?.trim() || undefined;
 if (effort && !(REASONING_EFFORTS as readonly string[]).includes(effort)) throw new Error(`Unknown SIGNAL_LLM_REASONING_EFFORT ${effort}`);
-const endpoint = process.env.SIGNAL_LLM_ENDPOINT === 'openai' ? openAiEndpoint(effort as ReasoningEffort | undefined) : LLM_ENDPOINTS.nvidia;
-const keyName = endpoint.id === 'openai' ? 'OPENAI_API_KEY' : 'NVIDIA_NIM_API_KEY';
-const key = process.env[keyName]?.trim();
-if (!key) throw new Error(`${keyName} is required`);
-const model = process.env.SIGNAL_LLM_MODEL?.trim() || (endpoint.id === 'nvidia' ? process.env.NVIDIA_NIM_MODEL?.trim() : undefined) || undefined;
-if (endpoint.id === 'openai' && !model) throw new Error('SIGNAL_LLM_MODEL is required for the openai endpoint');
+const endpoint = openAiEndpoint(effort as ReasoningEffort | undefined);
+const key = process.env.OPENAI_API_KEY?.trim();
+if (!key) throw new Error('OPENAI_API_KEY is required');
+const model = process.env.SIGNAL_LLM_MODEL?.trim() || DEFAULT_SIGNAL_LLM_MODEL;
 const args = process.argv.slice(2);
 const runsFlag = args.indexOf('--runs');
 const runs = runsFlag >= 0 ? Number(args[runsFlag + 1]) : 3;
@@ -35,7 +33,7 @@ for (const domain of domains) {
   const crawl = JSON.parse(readFileSync(`output/eval/snapshots/${domain}.crawl.json`, 'utf8'));
   for (let run = 1; run <= runs; run++) {
     const started = Date.now();
-    const provider = new NvidiaNimEvidenceProvider(key, model, client as never, undefined, endpoint);
+    const provider = new AgenticEvidenceProvider(key, model, client as never, undefined, endpoint);
     try {
       const result = await provider.extractDetailed(crawl, AbortSignal.timeout(2_700_000));
       const evaluation = evaluateWebsiteData(result.websiteData, gold);
