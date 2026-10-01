@@ -7,6 +7,7 @@ const template = () => Template.fromStack(new ArcaDemoStack(new cdk.App(), 'Test
   env: { account: '111111111111', region: 'us-east-1' },
   demoHostname: 'api.example.com',
   githubRepository: 'ArcaCover/Arca-back',
+  githubRepositoryIds: { owner: 317962260, repository: 1341243286 },
   alertEmails: ['ops@example.com', 'founder@example.com'],
 }));
 
@@ -53,7 +54,11 @@ describe('AWS demo infrastructure', () => {
         Action: 'sts:AssumeRoleWithWebIdentity',
         Condition: { StringEquals: {
           'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-          'token.actions.githubusercontent.com:sub': 'repo:ArcaCover/Arca-back:ref:refs/heads/main',
+          // Classic and immutable subject formats, both pinned to main of this one repository.
+          'token.actions.githubusercontent.com:sub': [
+            'repo:ArcaCover/Arca-back:ref:refs/heads/main',
+            'repo:ArcaCover@317962260/Arca-back@1341243286:ref:refs/heads/main',
+          ],
         } },
       })] },
     });

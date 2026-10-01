@@ -16,6 +16,11 @@ export interface ArcaDemoStackProps extends cdk.StackProps {
   readonly demoHostname: string;
   /** owner/name of the only GitHub repository allowed to deploy, from its main branch. */
   readonly githubRepository: string;
+  /**
+   * Numeric owner and repository ids. Repositories on GitHub's immutable OIDC subjects sign
+   * `repo:Owner@ownerId/Name@repoId:...` instead of `repo:Owner/Name:...`; both are accepted.
+   */
+  readonly githubRepositoryIds?: { readonly owner: number; readonly repository: number };
   /** Addresses that receive host health alerts. Each one confirms its subscription by email. */
   readonly alertEmails: string[];
   readonly hostedZoneId?: string;
@@ -132,6 +137,11 @@ export class ArcaDemoStack extends cdk.Stack {
       url: 'https://token.actions.githubusercontent.com',
       clientIds: ['sts.amazonaws.com'],
     });
+    const [owner, name] = props.githubRepository.split('/');
+    const subjects = [`repo:${props.githubRepository}:ref:refs/heads/main`];
+    if (props.githubRepositoryIds) {
+      subjects.push(`repo:${owner}@${props.githubRepositoryIds.owner}/${name}@${props.githubRepositoryIds.repository}:ref:refs/heads/main`);
+    }
     const deployRole = new iam.Role(this, 'GithubDeployRole', {
       roleName: GITHUB_DEPLOY_ROLE_NAME,
       description: `Push images and activate them on the ARCA host, from ${props.githubRepository} main only`,
@@ -139,7 +149,7 @@ export class ArcaDemoStack extends cdk.Stack {
       assumedBy: new iam.WebIdentityPrincipal(github.oidcProviderArn, {
         StringEquals: {
           'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-          'token.actions.githubusercontent.com:sub': `repo:${props.githubRepository}:ref:refs/heads/main`,
+          'token.actions.githubusercontent.com:sub': subjects.length === 1 ? subjects[0]! : subjects,
         },
       }),
     });

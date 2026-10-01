@@ -15,6 +15,10 @@ if (!alertEmails.length || alertEmails.some(email => !/^[^\s@]+@[^\s@]+\.[^\s@]+
   throw new Error('Provide -c alertEmails=first@example.com,second@example.com');
 }
 const githubRepository = (app.node.tryGetContext('githubRepository') as string | undefined) ?? 'ArcaCover/Arca-back';
+// GitHub signs this repository's OIDC tokens with immutable subjects, which carry these ids.
+// Look them up with: gh api repos/OWNER/NAME --jq '[.owner.id, .id]'
+const githubOwnerId = Number(app.node.tryGetContext('githubOwnerId') ?? 317962260);
+const githubRepositoryId = Number(app.node.tryGetContext('githubRepositoryId') ?? 1341243286);
 
 const hostedZoneId = app.node.tryGetContext('hostedZoneId') as string | undefined;
 const hostedZoneName = app.node.tryGetContext('hostedZoneName') as string | undefined;
@@ -29,6 +33,7 @@ new ArcaDemoStack(app, 'ArcaDemoStack', {
   },
   demoHostname,
   githubRepository,
+  githubRepositoryIds: { owner: githubOwnerId, repository: githubRepositoryId },
   alertEmails,
   hostedZoneId,
   hostedZoneName,
