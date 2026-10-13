@@ -194,3 +194,21 @@ e infraestructura. Supabase se valida directamente con `npm run db:verify`; el s
 sintéticos, comprueba evidencia/caché y elimina únicamente esos registros. El adaptador OpenAI no forma parte
 de la validación inicial.
 Los documentos históricos de `private` se conservan sin cambios.
+
+
+## Layer 2: cuestionario adaptativo de demostración
+
+El backend incluye el banco fijo versionado, planificador por reglas (agente opcional), validación
+por tipo, preguntas condicionales, guardado auditado y resultado determinista de Layer 2.
+El banco y la fórmula compuesta son fixtures de ingeniería pendientes de aprobación de negocio:
+todos los resultados bloquean la decisión comercial automática. La evidencia pública no acredita
+por sí sola prácticas internas ni contesta preguntas sin confirmación.
+
+Usar `SOURCE_MODE=mock`, `STORAGE_BACKEND=memory` y `ASSESSMENT_PLANNER=rules` para desarrollo sin
+servicios externos. El modo memory pierde los datos al reiniciar el proceso; el adaptador Supabase
+usa una migración nueva con CAS y transacciones para persistencia durable.
+
+Las cinco rutas nuevas se documentan en Swagger y en
+[Layer 2: operación, persistencia y límites](docs/LAYER2_ASSESSMENT.md). Usan el mismo Bearer del scan,
+con una ventana de 24 horas, creación/completado idempotentes y registro de invalidaciones cuando
+una pregunta deja de ser visible. El informe PDF y los enlaces de reanudación quedan fuera de esta entrega.

@@ -5,11 +5,14 @@ WORKDIR /app
 COPY package.json package-lock.json tsconfig.json tsconfig.base.json ./
 COPY packages/contracts/package.json packages/contracts/package.json
 COPY packages/scoring/package.json packages/scoring/package.json
+COPY packages/questions/package.json packages/questions/package.json
 COPY apps/api/package.json apps/api/package.json
 RUN --mount=type=cache,target=/root/.npm npm ci
 
 COPY packages/contracts/src packages/contracts/src
 COPY packages/contracts/tsconfig.json packages/contracts/tsconfig.json
+COPY packages/questions/src packages/questions/src
+COPY packages/questions/tsconfig.json packages/questions/tsconfig.json
 COPY packages/scoring/src packages/scoring/src
 COPY packages/scoring/tsconfig.json packages/scoring/tsconfig.json
 COPY apps/api/src apps/api/src
@@ -37,6 +40,8 @@ COPY --from=build /app/packages/contracts/package.json ./packages/contracts/pack
 COPY --from=build /app/packages/contracts/dist ./packages/contracts/dist
 COPY --from=build /app/packages/scoring/package.json ./packages/scoring/package.json
 COPY --from=build /app/packages/scoring/dist ./packages/scoring/dist
+COPY --from=build /app/packages/questions/package.json ./packages/questions/package.json
+COPY --from=build /app/packages/questions/dist ./packages/questions/dist
 # The deployment payload travels with the image it deploys: the host extracts it at deploy time,
 # so a rollback also restores that commit's compose file, Caddyfile and configuration.
 COPY compose.yaml deploy/Caddyfile deploy/production.env deploy/activate.sh deploy/render-env.py ./deploy-payload/

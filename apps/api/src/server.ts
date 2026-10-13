@@ -5,7 +5,8 @@ import { serve, type HttpBindings } from '@hono/node-server';
 import { loadEnv } from './config/env.js';
 import { createApp } from './http/app.js';
 import { InMemoryRepository } from './repositories/in-memory.js';
-import { createRepository } from './repositories/supabase.js';
+import { SupabaseRepository, createStorageClient } from './repositories/supabase.js';
+import { InMemoryAssessmentRepository, SupabaseAssessmentRepository } from './assessment/repository.js';
 import { InProcessPipeline } from './pipeline/in-process-pipeline.js';
 import { WebsiteExtractionSource } from './pipeline/website-source.js';
 import { OpenAIEvidenceProvider, RuleBasedEvidenceProvider } from './pipeline/website-evidence-provider.js';
@@ -15,12 +16,15 @@ import { ApifyClient } from './pipeline/apify-client.js';
 import { ApifyDirectorySource } from './pipeline/directories.js';
 import { PublicDomainResolver } from './pipeline/domain-resolution.js';
 import { mockSources, MOCK_DOMAINS } from './pipeline/mock-sources.js';
+import { createOpenAIPlanner } from '@arca/questions';
 import { renderPdf } from './report/pdf.js';
 
 const envPath = fileURLToPath(new URL('../../../.env.local', import.meta.url));
 if (existsSync(envPath)) loadEnvFile(envPath);
 const env = loadEnv();
-const repository = env.storageBackend === 'memory' ? new InMemoryRepository() : createRepository(env.SUPABASE_URL!, env.supabaseKey!);
+const storageClient = env.storageBackend === 'supabase' ? createStorageClient(env.SUPABASE_URL!, env.supabaseKey!) : null;
+const repository = storageClient ? new SupabaseRepository(storageClient) : new InMemoryRepository();
+const assessmentRepository = storageClient ? new SupabaseAssessmentRepository(storageClient) : new InMemoryAssessmentRepository();
 const interruptedBefore = () => new Date(Date.now() - env.PIPELINE_TIMEOUT_MS - 120_000).toISOString();
 await repository.recoverInterrupted(interruptedBefore());
 const websiteEvidenceProvider = env.sourceMode === 'mock' ? null : env.WEBSITE_EVIDENCE_PROVIDER === 'openai'
@@ -42,12 +46,15 @@ const domainResolver = env.sourceMode === 'mock' ? new PublicDomainResolver(asyn
   if (!(MOCK_DOMAINS as readonly string[]).includes(new URL(url).hostname)) throw new Error('Unknown mock domain');
 }) : new PublicDomainResolver();
 const clientIps = new WeakMap<Request, string>();
-const { app, drain } = createApp({ repository, domainResolver,
+const { app, drain, recoverAssessments } = createApp({ repository, assessmentRepository, domainResolver,
+  assessmentAgent: env.sourceMode === 'live' && env.ASSESSMENT_PLANNER === 'agent'
+    ? createOpenAIPlanner({ apiKey: env.OPENAI_API_KEY!, model: env.SIGNAL_LLM_MODEL }) : undefined,
   pipeline: new InProcessPipeline({ ...sources, repository, timeoutMs: env.PIPELINE_TIMEOUT_MS }),
   sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
   renderReport: renderPdf,
   scanCacheTtlMs: env.SCAN_CACHE_TTL_MS, partialRepairCooldownMs: env.SCAN_PARTIAL_REPAIR_COOLDOWN_MS,
   clientIp: request => clientIps.get(request) ?? 'unknown' });
+await recoverAssessments();
 const server = serve({ port: env.PORT, fetch: (request, bindings) => {
   const connection = bindings as HttpBindings;
   const remote = connection.incoming.socket.remoteAddress ?? 'unknown';
@@ -57,6 +64,7 @@ const server = serve({ port: env.PORT, fetch: (request, bindings) => {
 } }, info => console.log(`[api] sources=${env.sourceMode} storage=${env.storageBackend} on port ${info.port}`));
 const recoverTimer = setInterval(() => {
   void repository.recoverInterrupted(interruptedBefore()).catch(() => console.error('[api] recovery failed'));
+  void recoverAssessments().catch(() => console.error('[api] assessment recovery failed'));
 }, 60_000);
 recoverTimer.unref();
 // Books what Apify finally charged for each run: the ledger is the only record of directory spend.

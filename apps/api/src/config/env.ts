@@ -5,6 +5,8 @@ const EnvSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
   SOURCE_MODE: z.enum(['mock', 'live']).optional(),
   STORAGE_BACKEND: z.enum(['memory', 'supabase']).optional(),
+  // Layer 2 is rules-only by default; mock mode also disables the optional agent.
+  ASSESSMENT_PLANNER: z.enum(['rules', 'agent']).default('rules'),
   // agentic: the multi-round extraction through OpenAI. openai: the earlier single-pass extraction.
   // rules: deterministic, no language model.
   WEBSITE_EVIDENCE_PROVIDER: z.enum(['agentic', 'rules', 'openai']).default('agentic'),
@@ -56,6 +58,9 @@ export function loadEnv(source = process.env) {
   if (sourceMode === 'live' && !env.APIFY_API_TOKEN?.trim()) throw new Error('APIFY_API_TOKEN is required for live directory sources');
   if (sourceMode === 'live' && env.WEBSITE_EVIDENCE_PROVIDER !== 'rules' && !env.OPENAI_API_KEY?.trim()) {
     throw new Error(`OPENAI_API_KEY is required when WEBSITE_EVIDENCE_PROVIDER=${env.WEBSITE_EVIDENCE_PROVIDER}`);
+  }
+  if (sourceMode === 'live' && env.ASSESSMENT_PLANNER === 'agent' && !env.OPENAI_API_KEY?.trim()) {
+    throw new Error('OPENAI_API_KEY is required when ASSESSMENT_PLANNER=agent');
   }
   const corsOrigins = env.CORS_ALLOWED_ORIGINS.split(',').map(value => value.trim()).filter(Boolean);
   for (const origin of corsOrigins) if (new URL(origin).origin !== origin) throw new Error('CORS entries must be exact origins');
