@@ -8,11 +8,17 @@ import type { ScanRepository, ScanRecord } from '../repositories/types.js';
 import { ScanLimiter } from './rate-limit.js';
 import { buildOpenApiDocument } from './openapi.js';
 import { renderQuickScanHtml, reportFilename } from '../report/quick-scan.js';
+import { InMemoryRepository } from '../repositories/in-memory.js';
+import { InMemoryAssessmentRepository, type AssessmentRepository } from '../assessment/repository.js';
+import { AssessmentService, type AssessmentAgent } from '../assessment/service.js';
+import { assessmentRoutes } from '../assessment/routes.js';
 
 export type AppDeps = {
   pipeline: Layer1Pipeline; repository: ScanRepository; sessionSecret: string; corsOrigins: string[];
   domainResolver: DomainResolver;
   clientIp: (request: Request) => string;
+  assessmentRepository?: AssessmentRepository; assessmentAgent?: AssessmentAgent; assessmentPlanningTimeoutMs?: number;
+  assessmentMaxWritesPerMinute?: number;
   limiter?: ScanLimiter; now?: () => number; scanCacheTtlMs?: number; partialRepairCooldownMs?: number;
   /** Turns the report's HTML into a PDF. Without it the report endpoint answers 503. */
   renderReport?: (html: string) => Promise<Uint8Array<ArrayBuffer>>;
@@ -26,7 +32,7 @@ export function createApp(deps: AppDeps) {
   const jobs = new Set<Promise<void>>();
   const inFlightByDomain = new Map<string, Promise<PipelineResult>>();
   app.use('*', cors({ origin: origin => deps.corsOrigins.includes(origin) ? origin : null,
-    allowMethods: ['GET', 'POST', 'OPTIONS'], allowHeaders: ['Content-Type', 'Authorization'],
+    allowMethods: ['GET', 'POST', 'PUT', 'OPTIONS'], allowHeaders: ['Content-Type', 'Authorization'],
     exposeHeaders: ['Retry-After', 'Content-Disposition'], maxAge: 86400 }));
   app.onError((error, c) => {
     console.error('[api] request failed', error.message);
@@ -143,5 +149,11 @@ export function createApp(deps: AppDeps) {
       elapsed: Math.max(0, now() - Date.parse(scan.created_at)) });
     return c.json({ scanId: scan.scan_id, status: scan.status, cached: scan.cached, ...(scan.result ? { result: scan.result } : {}) });
   });
-  return { app, drain: () => Promise.all([...jobs]) };
+  const assessmentRepository = deps.assessmentRepository ?? (deps.repository instanceof InMemoryRepository ? new InMemoryAssessmentRepository() : null);
+  if (!assessmentRepository) throw new Error('An assessment repository is required with durable scan storage');
+  const assessments = new AssessmentService({ repository: assessmentRepository, now, agent: deps.assessmentAgent,
+    planningTimeoutMs: deps.assessmentPlanningTimeoutMs, maxWritesPerMinute: deps.assessmentMaxWritesPerMinute });
+  app.route('/', assessmentRoutes({ scans: deps.repository, repository: assessmentRepository, service: assessments, sessionSecret: deps.sessionSecret }));
+  return { app, drain: async () => { await Promise.all([...jobs]); await assessments.drain(); },
+    recoverAssessments: () => assessments.recoverInterrupted() };
 }

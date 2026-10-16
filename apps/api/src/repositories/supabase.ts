@@ -68,8 +68,11 @@ export class SupabaseRepository implements ScanRepository {
     if (error || !data) throw new Error('Unable to update Apify run', { cause: error });
   }
 }
-export function createRepository(url: string, key: string) {
-  return new SupabaseRepository(createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false },
+export function createStorageClient(url: string, key: string) {
+  return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false },
     global: { fetch: (input, init) => fetch(input, { ...init,
-      signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000) }) } }));
+      signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000) }) } });
+}
+export function createRepository(url: string, key: string) {
+  return new SupabaseRepository(createStorageClient(url, key));
 }

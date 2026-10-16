@@ -1,6 +1,6 @@
 import { extendZodWithOpenApi, OpenAPIRegistry, OpenApiGeneratorV31 } from '@asteasolutions/zod-to-openapi';
 import { z } from 'zod';
-import { CachedScanResponse, StartedScanResponse, PollResponse, ScanRequest } from '@arca/contracts';
+import { CachedScanResponse, StartedScanResponse, PollResponse, ScanRequest, StartedAssessmentResponse, AssessmentView, AssessmentResult, SaveAnswerRequest, CompleteRequest, AssessmentError } from '@arca/contracts';
 extendZodWithOpenApi(z);
 export function buildOpenApiDocument() {
   const registry = new OpenAPIRegistry();
@@ -89,6 +89,38 @@ export function buildOpenApiDocument() {
       404: { description: 'Scan not found', content: json(error) },
       409: { description: 'The scan is still running or failed, so there is no report (report_unavailable)', content: json(error) },
       503: { description: 'Report rendering is not configured on this server', content: json(error) } } });
+  const assessmentErrors = {
+    401: { description: 'Missing, invalid, expired, or wrong-scan capability token', content: json(AssessmentError) },
+    404: { description: 'Assessment not found', content: json(AssessmentError) },
+    409: { description: 'Invalid assessment state, incomplete answers, or concurrent write conflict', content: json(AssessmentError) },
+    410: { description: 'The 24-hour assessment session expired', content: json(AssessmentError) },
+    500: { description: 'Persistence or internal failure; the answer and audit event are atomic', content: json(AssessmentError) },
+  };
+  const assessmentParams = z.object({ assessmentId: z.string() });
+  registry.registerPath({ method: 'post', path: '/scan/{scanId}/assessment', summary: 'Create or resume the scan’s single assessment',
+    description: 'One assessment per scan, including completed assessments. First creation returns PLANNING and schedules a grounded agent plan only when explicitly enabled; rules are the default and fallback. All bank, Layer 1 and evidence snapshots are frozen. Repeated creation returns the existing identifier. Session expires 24 hours after scan creation.',
+    security: [{ sessionToken: [] }], request: { params: z.object({ scanId: z.string() }) },
+    responses: { ...assessmentErrors,
+      202: { description: 'Planning asynchronously; poll GET /assessment/{assessmentId}', content: json(StartedAssessmentResponse) },
+      200: { description: 'The assessment already exists and is no longer planning', content: json(StartedAssessmentResponse) } } });
+  registry.registerPath({ method: 'get', path: '/assessment/{assessmentId}', summary: 'Read visible questions, saved answers and progress',
+    security: [{ sessionToken: [] }], request: { params: assessmentParams },
+    responses: { ...assessmentErrors, 200: { description: 'Assessment view; PLANNING can be polled until READY', content: json(AssessmentView) } } });
+  registry.registerPath({ method: 'put', path: '/assessment/{assessmentId}/answers/{questionId}', summary: 'Atomically save an answer and audit event',
+    description: 'Only currently visible questions accept answers. Answer changes invalidate newly hidden descendants in the same transaction, retaining invalidation history. No LLM is invoked. Limited to 120 requests per assessment per minute in one process and 1,000 accepted writes per assessment in shared storage.',
+    security: [{ sessionToken: [] }], request: { params: z.object({ assessmentId: z.string(), questionId: z.string() }), body: { required: true, content: json(SaveAnswerRequest) } },
+    responses: { ...assessmentErrors, 200: { description: 'Updated visible questions and progress', content: json(AssessmentView) },
+      400: { description: 'Wrong answer kind, unknown option, or invalid numeric value', content: json(AssessmentError) },
+      413: { description: 'Request exceeds 16 KiB', content: json(AssessmentError) },
+      429: { description: 'Answer write limit exceeded', content: json(AssessmentError), headers: { 'Retry-After': { schema: { type: 'integer' } } } } } });
+  registry.registerPath({ method: 'post', path: '/assessment/{assessmentId}/complete', summary: 'Attest and complete an assessment exactly once',
+    description: 'All visible questions must be answered and attestation must be true. The deterministic demo result is persisted with the attestation in one CAS transaction. Repeated requests return the original immutable result. Demo scoring cannot authorize a commercial decision.',
+    security: [{ sessionToken: [] }], request: { params: assessmentParams, body: { required: true, content: json(CompleteRequest) } },
+    responses: { ...assessmentErrors, 200: { description: 'Immutable assessment result', content: json(AssessmentResult) },
+      400: { description: 'Explicit truthfulness attestation is missing', content: json(AssessmentError) } } });
+  registry.registerPath({ method: 'get', path: '/assessment/{assessmentId}/result', summary: 'Read the saved completed assessment result',
+    security: [{ sessionToken: [] }], request: { params: assessmentParams },
+    responses: { ...assessmentErrors, 200: { description: 'Immutable assessment result', content: json(AssessmentResult) } } });
   return new OpenApiGeneratorV31(registry.definitions).generateDocument({ openapi: '3.1.0',
-    info: { title: 'ARCA Layer 1 API', version: '1.0.0', description: 'Domain evidence scoring. Unknown fields remain null while unavailable scoring rules contribute zero points. Tier and decision are separate.' } });
+    info: { title: 'ARCA Layer 1 + Layer 2 API', version: '2.0.0', description: 'Domain evidence scoring. Unknown fields remain null while unavailable scoring rules contribute zero points. Tier and decision are separate.' } });
 }
