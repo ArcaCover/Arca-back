@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import type { DirectorySource, Layer1Pipeline, Layer1Result, WebsiteSource } from '@arca/contracts';
-import { DebugModeResponse, DebugScanState, DebugScenario, isInjected } from '@arca/contracts/debug';
+import { DEBUG_REQUEST_HEADER, DebugModeResponse, DebugScanState, DebugScenario, isInjected } from '@arca/contracts/debug';
 import { verifySessionToken } from '../auth/session-token.js';
 import type { AssessmentAgent } from '../assessment/service.js';
 import type { ScanLimiter } from '../http/rate-limit.js';
@@ -53,8 +53,11 @@ export function createDebugTools(options: {
       try { value = JSON.parse(header); } catch { return { ok: false }; }
       const parsed = DebugScenario.safeParse(value);
       if (!parsed.success) return { ok: false };
+      // Latency only exists in mock (DN-09 5.3). Elsewhere it is dropped before it can count as an injection: a value left
+      // over from a mock session in the same tab would otherwise move a clean live-debug scan to memory, off the cache.
+      const scenario = options.mode === 'mock' ? parsed.data : { ...parsed.data, latency: 'instant' as const };
       // A scenario that injects nothing is a normal scan: it keeps the domain cache and durable storage.
-      return { ok: true, scenario: isInjected(parsed.data) ? parsed.data : null };
+      return { ok: true, scenario: isInjected(scenario) ? scenario : null };
     },
     beginScan(scanId, scenario) {
       scans.isolate(scanId);
@@ -100,12 +103,20 @@ export function createDebugTools(options: {
           // Null while the scan runs, and for a failure no source reported on: a thrown pipeline, or one this process did not run.
           sources: scan.result?.sources ?? failedSources.get(scanId) ?? null }));
       });
-      // Only the limiter and this process's memory. Supabase is never touched.
+      // The custom header forces a CORS preflight, which only the allowed origins pass: without it any page open in the
+      // browser could fire this as a simple request.
+      // The limiter always; this process's memory only in mock (DN-09 5.2). Supabase is never touched. The isolated ids
+      // are never forgotten, so a wiped injected scan answers 404 and never falls through to durable storage.
       app.post('/reset', c => {
+        if (c.req.header(DEBUG_REQUEST_HEADER) !== '1') {
+          return c.json({ error: 'invalid_request', message: `A debug reset needs the ${DEBUG_REQUEST_HEADER}: 1 header` }, 400);
+        }
         limiter.clear();
-        scans.overlay.clear();
-        assessments.overlay.clear();
-        options.clearDurableMemory?.();
+        if (options.mode === 'mock') {
+          scans.overlay.clear();
+          assessments.overlay.clear();
+          options.clearDurableMemory?.();
+        }
         return c.json({ ok: true });
       });
       return app;

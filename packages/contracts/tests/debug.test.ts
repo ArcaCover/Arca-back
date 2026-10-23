@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import * as root from '@arca/contracts';
 import {
-  DEBUG_PRESETS, DEBUG_SCENARIO_HEADER, DebugModeResponse, DebugScanState, DebugScenario, isInjected,
+  DEBUG_PRESETS, DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, DebugModeResponse, DebugScanState, DebugScenario, isInjected,
 } from '@arca/contracts/debug';
 
 const okSource = { status: 'ok', dataStatus: 'PRESENT', durationMs: 12 } as const;
@@ -83,18 +83,36 @@ describe('DEBUG_PRESETS', () => {
 
 describe('DebugModeResponse', () => {
   const mode = {
-    mode: 'live-debug', sourceMode: 'live', storageBackend: 'supabase', websiteEvidenceProvider: 'firecrawl',
-    assessmentPlanner: 'agent', signalLlmModel: 'gpt-5.4-mini', configured: { openai: true, apify: true, supabase: false },
+    mode: 'live-debug', sourceMode: 'live', storageBackend: 'supabase', websiteEvidenceProvider: 'agentic',
+    assessmentPlanner: 'agent', signalLlmModel: 'gpt-5.4-mini', inUse: { openai: true, apify: true, supabase: false },
   };
 
   it('accepts a complete description of the running back', () => {
     expect(DebugModeResponse.parse(mode)).toEqual(mode);
   });
 
+  it('describes mock as running no evidence provider and no language model', () => {
+    const mock = { ...mode, mode: 'mock', sourceMode: 'mock', storageBackend: 'memory', websiteEvidenceProvider: 'mock',
+      assessmentPlanner: 'rules', signalLlmModel: null, inUse: { openai: false, apify: false, supabase: false } };
+    expect(DebugModeResponse.parse(mock)).toEqual(mock);
+  });
+
   it('never reports production, and rejects unknown keys', () => {
     expect(DebugModeResponse.safeParse({ ...mode, mode: 'production' }).success).toBe(false);
     expect(DebugModeResponse.safeParse({ ...mode, extra: 1 }).success).toBe(false);
-    expect(DebugModeResponse.safeParse({ ...mode, configured: { ...mode.configured, anthropic: true } }).success).toBe(false);
+    expect(DebugModeResponse.safeParse({ ...mode, inUse: { ...mode.inUse, anthropic: true } }).success).toBe(false);
+  });
+
+  it('only knows the evidence providers compose can build, and what is in use rather than what is configured', () => {
+    expect(DebugModeResponse.safeParse({ ...mode, websiteEvidenceProvider: 'firecrawl' }).success).toBe(false);
+    const { inUse, ...rest } = mode;
+    expect(DebugModeResponse.safeParse({ ...rest, configured: inUse }).success).toBe(false);
+  });
+});
+
+describe('DEBUG_REQUEST_HEADER', () => {
+  it('names the custom header a debug write must carry, so a browser has to preflight it', () => {
+    expect(DEBUG_REQUEST_HEADER).toBe('X-Arca-Debug');
   });
 });
 
@@ -125,7 +143,8 @@ describe('DebugScanState', () => {
 
 describe('the package root', () => {
   it('does not expose the debug contract: it lives only on the @arca/contracts/debug subpath', () => {
-    for (const name of ['DebugScenario', 'DEBUG_SCENARIO_HEADER', 'DEBUG_PRESETS', 'DebugModeResponse', 'DebugScanState', 'isInjected']) {
+    for (const name of ['DebugScenario', 'DEBUG_SCENARIO_HEADER', 'DEBUG_REQUEST_HEADER', 'DEBUG_PRESETS', 'DebugModeResponse',
+      'DebugScanState', 'isInjected']) {
       expect(root, name).not.toHaveProperty(name);
     }
   });

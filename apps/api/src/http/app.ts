@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { swaggerUI } from '@hono/swagger-ui';
 import { Layer1Result, DomainResolution, ScanRequest, type Layer1Pipeline, type DomainResolver, type PipelineResult } from '@arca/contracts';
-import { DEBUG_SCENARIO_HEADER } from '@arca/contracts/debug';
+import { DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER } from '@arca/contracts/debug';
 import { issueSessionToken, verifySessionToken } from '../auth/session-token.js';
 import type { DebugTools } from '../debug/tools.js';
 import type { ScanRepository, ScanRecord } from '../repositories/types.js';
@@ -38,7 +38,7 @@ export function createApp(deps: AppDeps) {
   const inFlightByDomain = new Map<string, Promise<PipelineResult>>();
   app.use('*', cors({ origin: origin => deps.corsOrigins.includes(origin) ? origin : null,
     allowMethods: ['GET', 'POST', 'PUT', 'OPTIONS'],
-    allowHeaders: debug ? ['Content-Type', 'Authorization', DEBUG_SCENARIO_HEADER] : ['Content-Type', 'Authorization'],
+    allowHeaders: debug ? ['Content-Type', 'Authorization', DEBUG_SCENARIO_HEADER, DEBUG_REQUEST_HEADER] : ['Content-Type', 'Authorization'],
     exposeHeaders: ['Retry-After', 'Content-Disposition'], maxAge: 86400 }));
   app.onError((error, c) => {
     console.error('[api] request failed', error.message);

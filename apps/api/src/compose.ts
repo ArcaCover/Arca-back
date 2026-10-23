@@ -8,7 +8,7 @@ import type { ScanRepository } from './repositories/types.js';
 import { InMemoryAssessmentRepository, SupabaseAssessmentRepository } from './assessment/repository.js';
 import { InProcessPipeline } from './pipeline/in-process-pipeline.js';
 import { WebsiteExtractionSource } from './pipeline/website-source.js';
-import { OpenAIEvidenceProvider, RuleBasedEvidenceProvider } from './pipeline/website-evidence-provider.js';
+import { OPENAI_EVIDENCE_MODEL, OpenAIEvidenceProvider, RuleBasedEvidenceProvider } from './pipeline/website-evidence-provider.js';
 import { AgenticEvidenceProvider } from './pipeline/agentic-evidence-provider.js';
 import { openAiEndpoint } from './pipeline/llm-endpoint.js';
 import { ApifyClient } from './pipeline/apify-client.js';
@@ -42,8 +42,10 @@ export async function compose(env: ReturnType<typeof loadEnv>): Promise<{ app: H
   const repository = scans ?? durable;
   const assessmentRepository = assessments ?? durableAssessments;
   await repository.recoverInterrupted(interruptedBefore(env.PIPELINE_TIMEOUT_MS));
-  const websiteEvidenceProvider = env.sourceMode === 'mock' ? null : env.WEBSITE_EVIDENCE_PROVIDER === 'openai'
-    ? new OpenAIEvidenceProvider(env.OPENAI_API_KEY!) : env.WEBSITE_EVIDENCE_PROVIDER === 'rules'
+  // The fixtures read the website in mock; otherwise the configured provider does. /__debug/mode reports this very value.
+  const evidence = env.sourceMode === 'mock' ? 'mock' as const : env.WEBSITE_EVIDENCE_PROVIDER;
+  const websiteEvidenceProvider = evidence === 'mock' ? null : evidence === 'openai'
+    ? new OpenAIEvidenceProvider(env.OPENAI_API_KEY!) : evidence === 'rules'
       ? new RuleBasedEvidenceProvider() : new AgenticEvidenceProvider(env.OPENAI_API_KEY!, env.SIGNAL_LLM_MODEL, undefined,
         undefined, openAiEndpoint(env.SIGNAL_LLM_REASONING_EFFORT));
   const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY, {
@@ -60,19 +62,24 @@ export async function compose(env: ReturnType<typeof loadEnv>): Promise<{ app: H
   const domainResolver = env.sourceMode === 'mock' ? new PublicDomainResolver(async url => {
     if (!(MOCK_DOMAINS as readonly string[]).includes(new URL(url).hostname)) throw new Error('Unknown mock domain');
   }) : new PublicDomainResolver();
+  const assessmentAgent = env.sourceMode === 'live' && env.ASSESSMENT_PLANNER === 'agent'
+    ? createOpenAIPlanner({ apiKey: env.OPENAI_API_KEY!, model: env.SIGNAL_LLM_MODEL }) : undefined;
+  // The model a built component calls: the extraction's first, then the planner's. Rules and fixtures call none.
+  const signalLlmModel = evidence === 'agentic' ? env.SIGNAL_LLM_MODEL : evidence === 'openai' ? OPENAI_EVIDENCE_MODEL
+    : assessmentAgent?.model ?? null;
   const debug = mode !== 'production' && scans && assessments ? createDebugTools({ mode, sources, scans, assessments,
     pipelineTimeoutMs: env.PIPELINE_TIMEOUT_MS,
-    // Whether each service is configured, never a key or a URL (DN-09 7).
-    describe: { mode, sourceMode: env.sourceMode, storageBackend: env.storageBackend, websiteEvidenceProvider: env.WEBSITE_EVIDENCE_PROVIDER,
-      assessmentPlanner: env.ASSESSMENT_PLANNER, signalLlmModel: env.SIGNAL_LLM_MODEL,
-      configured: { openai: Boolean(env.OPENAI_API_KEY?.trim()), apify: Boolean(env.APIFY_API_TOKEN?.trim()), supabase: Boolean(env.supabaseKey) } },
+    // What this process built, so the label cannot lie (DN-09 4): a key sitting in .env.local is not a service in use.
+    // Enums, booleans and a model name only, never a key or a URL (DN-09 7).
+    describe: { mode, sourceMode: env.sourceMode, storageBackend: env.storageBackend, websiteEvidenceProvider: evidence,
+      assessmentPlanner: assessmentAgent ? 'agent' : 'rules', signalLlmModel,
+      inUse: { openai: evidence === 'agentic' || evidence === 'openai' || assessmentAgent !== undefined, apify: apify !== null,
+        supabase: storageClient !== null } },
     // Only mock keeps its durable side in memory. Supabase is never cleared by a reset.
     clearDurableMemory: durable instanceof InMemoryRepository && durableAssessments instanceof InMemoryAssessmentRepository
       ? () => { durable.clear(); durableAssessments.clear(); } : undefined }) : undefined;
   const clientIps = new WeakMap<Request, string>();
-  const { app, drain, recoverAssessments } = createApp({ repository, assessmentRepository, domainResolver, debug,
-    assessmentAgent: env.sourceMode === 'live' && env.ASSESSMENT_PLANNER === 'agent'
-      ? createOpenAIPlanner({ apiKey: env.OPENAI_API_KEY!, model: env.SIGNAL_LLM_MODEL }) : undefined,
+  const { app, drain, recoverAssessments } = createApp({ repository, assessmentRepository, domainResolver, debug, assessmentAgent,
     pipeline: new InProcessPipeline({ ...sources, repository, timeoutMs: env.PIPELINE_TIMEOUT_MS }),
     sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
     renderReport: renderPdf,

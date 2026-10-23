@@ -30,6 +30,9 @@ team_members must contain attorneys only, not administrative staff. Do not infer
 Detect Harvey, CoCounsel, Copilot, ChatGPT, Westlaw Edge, ROSS, Luminance, Kira, Lex Machina,
 vLex Vincent, Relativity and Everlaw when actually present. Do not infer establishment year from copyright dates.`;
 
+/** The single-pass extraction calls this model whatever SIGNAL_LLM_MODEL says. */
+export const OPENAI_EVIDENCE_MODEL = 'gpt-4o-mini';
+
 export class OpenAIEvidenceProvider implements WebsiteEvidenceProvider {
   readonly id = 'openai';
   readonly version = 'gpt-4o-mini-layer1-2026-09-05-uncertainty-v1';
@@ -40,7 +43,7 @@ export class OpenAIEvidenceProvider implements WebsiteEvidenceProvider {
   async extract(input: CrawlResult, signal: AbortSignal): Promise<WebsiteData> {
     const corpus = input.pages.map(page => `URL: ${page.url}\n${page.text}`).join('\n\n');
     if (corpus.length > 300_000) throw new Error('Website corpus exceeds analysis budget');
-    const response = await this.client.chat.completions.parse({ model: 'gpt-4o-mini', temperature: 0,
+    const response = await this.client.chat.completions.parse({ model: OPENAI_EVIDENCE_MODEL, temperature: 0,
       messages: [{ role: 'system', content: WEBSITE_PROMPT }, { role: 'user', content: corpus }],
       response_format: zodResponseFormat(OpenAIWebsiteData, 'website_signals') }, { signal });
     return WebsiteData.parse(response.choices[0]?.message.parsed);

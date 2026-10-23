@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { AssessmentView, PollResponse, ScanResponse, StartedAssessmentResponse, type DirectorySource,
   type PipelineResult } from '@arca/contracts';
-import { DEBUG_PRESETS, DEBUG_SCENARIO_HEADER, DebugModeResponse, DebugScanState, DebugScenario,
+import { DEBUG_PRESETS, DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, DebugModeResponse, DebugScanState, DebugScenario,
   type DebugScenarioInput } from '@arca/contracts/debug';
 import { rulesPlan, type PlanningAgent } from '@arca/questions';
 import { createApp } from '../../src/http/app.js';
@@ -18,8 +18,8 @@ import { fixtureResult } from '../fixtures/result.js';
 const secret = 's'.repeat(40);
 const origin = 'http://localhost:3000';
 type App = ReturnType<typeof createApp>['app'];
-const preflight = (app: App) => app.request('/scan', { method: 'OPTIONS', headers: { Origin: origin,
-  'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type, x-arca-debug-scenario' } });
+const preflight = (app: App, path = '/scan', headers = 'content-type, x-arca-debug-scenario') => app.request(path, { method: 'OPTIONS',
+  headers: { Origin: origin, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': headers } });
 // Lets the scan's own timers run on a fake clock while authorization and file reads still run on real I/O.
 async function untilTimers(count: number) {
   for (let turn = 0; turn < 1000 && vi.getTimerCount() < count; turn++) await new Promise(resolve => setImmediate(resolve));
@@ -72,12 +72,19 @@ describe('production wiring', () => {
     expect(response.status).toBe(204);
     expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Content-Type,Authorization');
   });
+
+  it('never admits the debug request header in CORS either', async () => {
+    const response = await preflight(production().app, '/__debug/reset', 'x-arca-debug');
+    expect(response.status).toBe(204);
+    expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Content-Type,Authorization');
+  });
 });
 
 const DOMAIN = 'robust.arca.example';
 const description = (mode: 'mock' | 'live-debug'): DebugModeResponse => ({ mode, sourceMode: mode === 'mock' ? 'mock' : 'live',
-  storageBackend: mode === 'mock' ? 'memory' : 'supabase', websiteEvidenceProvider: 'agentic', assessmentPlanner: 'rules',
-  signalLlmModel: 'fixture-model', configured: { openai: mode !== 'mock', apify: mode !== 'mock', supabase: mode !== 'mock' } });
+  storageBackend: mode === 'mock' ? 'memory' : 'supabase', websiteEvidenceProvider: mode === 'mock' ? 'mock' : 'agentic',
+  assessmentPlanner: 'rules', signalLlmModel: mode === 'mock' ? null : 'fixture-model',
+  inUse: { openai: mode !== 'mock', apify: mode !== 'mock', supabase: mode !== 'mock' } });
 
 function debugSetup(options: { mode?: 'mock' | 'live-debug'; gate?: Promise<void>; assessmentAgent?: PlanningAgent;
   assessmentPlanningTimeoutMs?: number } = {}) {
@@ -137,10 +144,15 @@ function debugSetup(options: { mode?: 'mock' | 'live-debug'; gate?: Promise<void
 }
 
 describe('debug wiring', () => {
-  it('admits the scenario header in CORS', async () => {
-    const response = await preflight(debugSetup().app);
-    expect(response.status).toBe(204);
-    expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Content-Type,Authorization,X-Arca-Debug-Scenario');
+  it('admits the scenario header and the debug request header in CORS', async () => {
+    for (const app of [debugSetup().app, debugSetup({ mode: 'mock' }).app]) {
+      for (const [path, headers] of [['/scan', 'content-type, x-arca-debug-scenario'], ['/__debug/reset', 'x-arca-debug']] as const) {
+        const response = await preflight(app, path, headers);
+        expect(response.status).toBe(204);
+        expect(response.headers.get('Access-Control-Allow-Headers')).toBe('Content-Type,Authorization,X-Arca-Debug-Scenario,X-Arca-Debug');
+        expect(response.headers.get('Access-Control-Allow-Origin')).toBe(origin);
+      }
+    }
   });
 
   it('injected scan is isolated and ends as its sources dictate', async () => {
@@ -242,6 +254,38 @@ describe('debug wiring', () => {
     const final = await s.final(started);
     expect(final.status).toBe('COMPLETED');
     expect(final.result?.sources.website.status).toBe('ok');
+  });
+
+  // DN-09 5.3 and 5.5: latency only exists in mock. A value left over from a mock session in the same tab must not turn
+  // a clean live-debug scan into an uncached, never-persisted one.
+  it('a leftover latency injects nothing in live-debug: the scan stays clean, reads the cache and joins an in-flight run', async () => {
+    let release!: () => void;
+    const s = debugSetup({ gate: new Promise<void>(resolve => { release = resolve; }) });
+    const clean = await s.start(undefined, `clean@${DOMAIN}`);
+    const slow = await s.start({ latency: 'slow' }, `slow@${DOMAIN}`);
+    release();
+    await s.drain();
+    expect(s.scans.isIsolated(slow.scanId)).toBe(false);
+    expect(s.durableSpy.create).toHaveBeenCalledTimes(2);
+    expect(s.durableSpy.create).toHaveBeenLastCalledWith(expect.objectContaining({ scan_id: slow.scanId }));
+    expect(s.durableSpy.cached).toHaveBeenCalledTimes(2);
+    const final = await s.final(slow);
+    expect(final.status).toBe('COMPLETED');
+    expect(final.result?.meta.reusedEvidence).toBe(true);
+    expect(s.run).toHaveBeenCalledTimes(1);
+    expect((await s.final(clean)).status).toBe('COMPLETED');
+    const state = DebugScanState.parse(await (await s.app.request(`/__debug/scan/${slow.scanId}`, { headers: s.auth(slow) })).json());
+    expect(state).toMatchObject({ injected: false, scenario: null, storage: 'supabase' });
+  });
+
+  it('live-debug stores an injected scenario without its latency, which only mock applies', async () => {
+    const s = debugSetup();
+    const { started } = await s.finish({ latency: 'slow', avvo: 'error' });
+    const state = DebugScanState.parse(await (await s.app.request(`/__debug/scan/${started.scanId}`, { headers: s.auth(started) })).json());
+    expect(state).toMatchObject({ injected: true, storage: 'memory', scenario: DebugScenario.parse({ avvo: 'error' }) });
+    // Mock keeps it: there the latency is real.
+    const mock = debugSetup({ mode: 'mock' });
+    expect(mock.debug.parseScenario(JSON.stringify({ latency: 'slow' }))).toEqual({ ok: true, scenario: DebugScenario.parse({ latency: 'slow' }) });
   });
 
   it('start faults answer before the limiter', async () => {
@@ -405,23 +449,68 @@ describe('debug wiring', () => {
     expect(s.scans.overlay.scans.size).toBe(0);
   });
 
-  it('reset clears the limiter and what lives in memory', async () => {
-    const s = debugSetup();
-    const email = `owner@${DOMAIN}`;
-    const first = await s.start({ avvo: 'error' }, email);
-    for (let attempt = 0; attempt < 2; attempt++) await s.start({ avvo: 'error' }, email);
-    expect((await s.post({ avvo: 'error' }, email)).status).toBe(429);
-    await s.drain();
-    const clearAssessments = vi.spyOn(s.assessments.overlay, 'clear');
-    const reset = await s.app.request('/__debug/reset', { method: 'POST' });
-    expect(reset.status).toBe(200);
-    expect(await reset.json()).toEqual({ ok: true });
-    expect(clearAssessments).toHaveBeenCalledTimes(1);
-    expect(s.clearDurableMemory).toHaveBeenCalledTimes(1);
-    // The wiped scan is gone, and its id never falls through to durable storage.
-    expect((await s.poll(first)).status).toBe(404);
-    expect((await s.app.request(`/__debug/scan/${first.scanId}`, { headers: s.auth(first) })).status).toBe(404);
-    expect((await s.post({ avvo: 'error' }, email)).status).toBe(202);
-    await s.drain();
+  describe('reset', () => {
+    const reset = (s: ReturnType<typeof debugSetup>, headers: Record<string, string> = { [DEBUG_REQUEST_HEADER]: '1' }) =>
+      s.app.request('/__debug/reset', { method: 'POST', headers });
+    // Spends this email's three attempts, so only a cleared limiter lets the fourth through.
+    async function exhaust(s: ReturnType<typeof debugSetup>, email: string) {
+      const first = await s.start({ avvo: 'error' }, email);
+      for (let attempt = 0; attempt < 2; attempt++) await s.start({ avvo: 'error' }, email);
+      expect((await s.post({ avvo: 'error' }, email)).status).toBe(429);
+      await s.drain();
+      return first;
+    }
+
+    it('in mock clears the limiter and what lives in memory', async () => {
+      const s = debugSetup({ mode: 'mock' });
+      const email = `owner@${DOMAIN}`;
+      const first = await exhaust(s, email);
+      const clearScans = vi.spyOn(s.scans.overlay, 'clear');
+      const clearAssessments = vi.spyOn(s.assessments.overlay, 'clear');
+      const response = await reset(s);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ ok: true });
+      expect(clearScans).toHaveBeenCalledTimes(1);
+      expect(clearAssessments).toHaveBeenCalledTimes(1);
+      expect(s.clearDurableMemory).toHaveBeenCalledTimes(1);
+      // The wiped scan is gone, and its id never falls through to durable storage.
+      expect((await s.poll(first)).status).toBe(404);
+      expect((await s.app.request(`/__debug/scan/${first.scanId}`, { headers: s.auth(first) })).status).toBe(404);
+      expect((await s.post({ avvo: 'error' }, email)).status).toBe(202);
+      await s.drain();
+    });
+
+    // DN-09 5.2: only mock wipes memory. In live-debug an injected scan someone is looking at must survive a reset.
+    it('in live-debug clears the limiter only, and keeps the injected scans in memory', async () => {
+      const s = debugSetup();
+      const email = `owner@${DOMAIN}`;
+      const first = await exhaust(s, email);
+      const clearScans = vi.spyOn(s.scans.overlay, 'clear');
+      const clearAssessments = vi.spyOn(s.assessments.overlay, 'clear');
+      const response = await reset(s);
+      expect(response.status).toBe(200);
+      expect(clearScans).not.toHaveBeenCalled();
+      expect(clearAssessments).not.toHaveBeenCalled();
+      expect(s.clearDurableMemory).not.toHaveBeenCalled();
+      expect((await s.poll(first)).status).toBe(200);
+      expect(s.scans.overlay.scans.has(first.scanId)).toBe(true);
+      expect((await s.post({ avvo: 'error' }, email)).status).toBe(202);
+      await s.drain();
+    });
+
+    // Without a custom header the reset is a CORS simple request, which any page open in the browser could fire.
+    it.each(['mock', 'live-debug'] as const)('in %s refuses a reset without X-Arca-Debug: 1, and clears nothing', async mode => {
+      const s = debugSetup({ mode });
+      const email = `owner@${DOMAIN}`;
+      const first = await exhaust(s, email);
+      for (const headers of [{}, { [DEBUG_REQUEST_HEADER]: '0' }, { 'Content-Type': 'text/plain' }]) {
+        const response = await reset(s, headers);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: 'invalid_request', message: 'A debug reset needs the X-Arca-Debug: 1 header' });
+      }
+      expect(s.clearDurableMemory).not.toHaveBeenCalled();
+      expect((await s.poll(first)).status).toBe(200);
+      expect((await s.post({ avvo: 'error' }, email)).status).toBe(429);
+    });
   });
 });

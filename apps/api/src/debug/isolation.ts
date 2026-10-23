@@ -33,20 +33,31 @@ export class RoutingScanRepository implements ScanRepository {
   updateApifyRun(id: string, update: ApifyRunUpdate) { return this.durable.updateApifyRun(id, update); }
 }
 
-/** Follows the scan routing: the assessment of an isolated scan never reaches durable storage. */
+/**
+ * Follows the scan routing: the assessment of an isolated scan never reaches durable storage. Its id is remembered as
+ * isolated and, like the scan ids, never forgotten: after a reset wipes the overlay it answers "not found" from memory
+ * instead of falling through to Supabase.
+ */
 export class RoutingAssessmentRepository implements AssessmentRepository {
+  private readonly isolated = new Set<string>();
   constructor(private readonly durable: AssessmentRepository, readonly overlay: InMemoryAssessmentRepository,
     private readonly scans: RoutingScanRepository) {}
-  create(record: AssessmentRecord) {
-    return (this.scans.isIsolated(record.scan_id) ? this.overlay : this.durable).create(record);
+  private of(id: string): AssessmentRepository { return this.isolated.has(id) ? this.overlay : this.durable; }
+  async create(record: AssessmentRecord) {
+    if (!this.scans.isIsolated(record.scan_id)) return this.durable.create(record);
+    // Before the write, so the id is never routed anywhere else.
+    this.isolated.add(record.id);
+    const created = await this.overlay.create(record);
+    // An assessment that already existed for the scan is returned instead of the new one; that id is isolated too.
+    this.isolated.add(created.id);
+    return created;
   }
-  async get(id: string) { return await this.overlay.get(id) ?? this.durable.get(id); }
+  get(id: string) { return this.of(id).get(id); }
   getByScan(scanId: string) {
     return (this.scans.isIsolated(scanId) ? this.overlay : this.durable).getByScan(scanId);
   }
-  async commit(id: string, revision: number, update: AssessmentUpdate, events?: AnswerEvent[]) {
-    const target = await this.overlay.get(id) ? this.overlay : this.durable;
-    return target.commit(id, revision, update, events);
+  commit(id: string, revision: number, update: AssessmentUpdate, events?: AnswerEvent[]) {
+    return this.of(id).commit(id, revision, update, events);
   }
   async planningBefore(before: string) {
     return [...await this.durable.planningBefore(before), ...await this.overlay.planningBefore(before)];

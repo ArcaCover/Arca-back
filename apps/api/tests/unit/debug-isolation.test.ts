@@ -158,6 +158,18 @@ describe('assessment repository routing', () => {
     expect(await overlay.get('as_c')).toBeNull();
   });
 
+  // A reset wipes the overlay. The assessment's id must stay routed to memory, as an isolated scan id does, so that
+  // isolation never rests on Supabase happening not to know the id.
+  it('an isolated assessment never reaches durable storage, even after the overlay is wiped', async () => {
+    const { durable, overlay, repository } = setupAssessments();
+    await repository.create(assessment('as_i', 'sc_i'));
+    overlay.clear();
+    expect(await repository.get('as_i')).toBeNull();
+    expect(await repository.commit('as_i', 0, { status: 'READY', updated_at: NOW })).toBeNull();
+    expect(await repository.getByScan('sc_i')).toBeNull();
+    for (const spy of Object.values(durable)) expect(spy).not.toHaveBeenCalled();
+  });
+
   it('planning recovery sees the durable and the in-memory assessments', async () => {
     const { durable, repository } = setupAssessments();
     durable.planningBefore.mockResolvedValue([assessment('as_c', 'sc_c')]);

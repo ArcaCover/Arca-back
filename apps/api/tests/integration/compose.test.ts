@@ -11,6 +11,7 @@ import type { ScanRecord } from '../../src/repositories/types.js';
 import { InMemoryAssessmentRepository, SupabaseAssessmentRepository } from '../../src/assessment/repository.js';
 import { ApifyClient } from '../../src/pipeline/apify-client.js';
 import { DEFAULT_SIGNAL_LLM_MODEL } from '../../src/pipeline/llm-endpoint.js';
+import { OPENAI_EVIDENCE_MODEL } from '../../src/pipeline/website-evidence-provider.js';
 
 // Observed, not replaced: compose still builds the real app and tools.
 vi.mock('../../src/http/app.js', async importOriginal => {
@@ -110,15 +111,36 @@ describe('compose', () => {
       .toBe('[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only)');
   });
 
+  // DN-09 4 and 7: the panel's 'Back mode' row must say what this process built, never which keys merely sit in the file.
   it.each([
-    { keys: live, configured: true },
-    { keys: {}, configured: false },
-  ])('/__debug/mode describes what mock resolved to, with keys as booleans only (configured: $configured)', async ({ keys, configured }) => {
+    { name: 'every key present', keys: { ...live, WEBSITE_EVIDENCE_PROVIDER: 'openai', ASSESSMENT_PLANNER: 'agent', SIGNAL_LLM_MODEL: 'gpt-x' } },
+    { name: 'no key at all', keys: {} },
+  ])('/__debug/mode in mock reports no provider, no model and nothing in use ($name)', async ({ keys }) => {
     const { app } = await compose(loadEnv({ ...base, ...keys, ARCA_MODE: 'mock' }));
     const body = await (await app.request('/__debug/mode')).json();
     expect(DebugModeResponse.parse(body)).toEqual({ mode: 'mock', sourceMode: 'mock', storageBackend: 'memory',
-      websiteEvidenceProvider: 'agentic', assessmentPlanner: 'rules', signalLlmModel: DEFAULT_SIGNAL_LLM_MODEL,
-      configured: { openai: configured, apify: configured, supabase: configured } });
+      websiteEvidenceProvider: 'mock', assessmentPlanner: 'rules', signalLlmModel: null,
+      inUse: { openai: false, apify: false, supabase: false } });
+    for (const secret of ['sk-x', 'sb_secret_x', 'apify_x', 'x.supabase.co']) expect(JSON.stringify(body)).not.toContain(secret);
+  });
+
+  it.each([
+    { name: 'rules extraction and rules planner', env: { WEBSITE_EVIDENCE_PROVIDER: 'rules', ASSESSMENT_PLANNER: 'rules' },
+      provider: 'rules', planner: 'rules', model: null, openai: false },
+    { name: 'the default agentic extraction', env: {},
+      provider: 'agentic', planner: 'rules', model: DEFAULT_SIGNAL_LLM_MODEL, openai: true },
+    { name: 'the agentic extraction on a chosen model', env: { SIGNAL_LLM_MODEL: 'gpt-x' },
+      provider: 'agentic', planner: 'rules', model: 'gpt-x', openai: true },
+    { name: 'the single-pass OpenAI extraction, which calls its own fixed model', env: { WEBSITE_EVIDENCE_PROVIDER: 'openai', SIGNAL_LLM_MODEL: 'gpt-x' },
+      provider: 'openai', planner: 'rules', model: OPENAI_EVIDENCE_MODEL, openai: true },
+    { name: 'rules extraction with the agent planner', env: { WEBSITE_EVIDENCE_PROVIDER: 'rules', ASSESSMENT_PLANNER: 'agent', SIGNAL_LLM_MODEL: 'gpt-x' },
+      provider: 'rules', planner: 'agent', model: 'gpt-x', openai: true },
+  ] as const)('/__debug/mode in live-debug reports what compose built: $name', async ({ env, provider, planner, model, openai }) => {
+    const { app } = await compose(loadEnv({ ...base, ...live, ...env, ARCA_MODE: 'live-debug' }));
+    const body = await (await app.request('/__debug/mode')).json();
+    expect(DebugModeResponse.parse(body)).toEqual({ mode: 'live-debug', sourceMode: 'live', storageBackend: 'supabase',
+      websiteEvidenceProvider: provider, assessmentPlanner: planner, signalLlmModel: model,
+      inUse: { openai, apify: true, supabase: true } });
     for (const secret of ['sk-x', 'sb_secret_x', 'apify_x', 'x.supabase.co']) expect(JSON.stringify(body)).not.toContain(secret);
   });
 });

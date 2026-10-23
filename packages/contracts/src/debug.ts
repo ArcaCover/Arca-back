@@ -7,6 +7,12 @@ import { DomainResolution, Layer1Result, ScanStatus } from './layer1.js';
 /** Request header that carries a DebugScenario as JSON. Only POST /scan reads it, and only when debug is wired. */
 export const DEBUG_SCENARIO_HEADER = 'X-Arca-Debug-Scenario';
 
+/**
+ * Request header, with the value "1", that POST /__debug/reset requires. A custom header makes the browser preflight the
+ * request, and the preflight only passes for the allowed origins, so a page on another site cannot fire the reset.
+ */
+export const DEBUG_REQUEST_HEADER = 'X-Arca-Debug';
+
 const sourceFault = z.enum(['default', 'empty', 'apify_quota', 'error', 'timeout']);
 
 /** The faults to inject into one scan. Every axis defaults to "no fault", so `{}` is the real behavior. */
@@ -37,15 +43,18 @@ const differs = (value: unknown, base: unknown): boolean => {
 /** True when any axis differs from its default. A latency other than "instant" counts as injected. */
 export const isInjected = (scenario: DebugScenario): boolean => differs(scenario, DEFAULT_SCENARIO);
 
-/** What GET /__debug/mode reports about the running back. */
+/** What GET /__debug/mode reports about the running back: what it built and uses, never what its configuration merely holds. */
 export const DebugModeResponse = z.object({
   mode: z.enum(['mock', 'live-debug']),
   sourceMode: z.enum(['mock', 'live']),
   storageBackend: z.enum(['memory', 'supabase']),
-  websiteEvidenceProvider: z.string(),
+  /** `mock` when the fixtures read the website and no evidence provider exists. */
+  websiteEvidenceProvider: z.enum(['agentic', 'openai', 'rules', 'mock']),
   assessmentPlanner: z.enum(['rules', 'agent']),
-  signalLlmModel: z.string(),
-  configured: z.object({ openai: z.boolean(), apify: z.boolean(), supabase: z.boolean() }).strict(),
+  /** The OpenAI model a built component calls; null when nothing calls one. */
+  signalLlmModel: z.string().nullable(),
+  /** Which external services this process built a client for. Booleans only, never a key or a URL. */
+  inUse: z.object({ openai: z.boolean(), apify: z.boolean(), supabase: z.boolean() }).strict(),
 }).strict();
 export type DebugModeResponse = z.infer<typeof DebugModeResponse>;
 
