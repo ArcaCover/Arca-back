@@ -113,11 +113,11 @@ Catálogo:
 
 | Eje | Valores | Notas |
 |---|---|---|
-| `website` | `default`, `empty`, `no_identity`, `error`, `timeout` | `default` es el fixture en mock y el crawler real en live-debug. `no_identity` produce el caso muscalaw: identidad INSUFFICIENT, Bar y Avvo `skipped` y FAILED. |
+| `website` | `default`, `no_identity`, `blocked`, `error`, `timeout` | `default` es el fixture en mock y el crawler real en live-debug. `no_identity` produce el caso muscalaw: se leyó la web pero no hay firma ni abogados, así que la identidad sale INSUFFICIENT, Bar y Avvo `skipped` y el scan FAILED. `blocked` imita un sitio que bloquea el crawler (`ACCESS_BLOCKED`). |
 | `bar`, `avvo` | `default`, `empty`, `apify_quota`, `error`, `timeout` | `apify_quota` devuelve **exactamente** el `SourceResult` que produce hoy `ApifyDirectorySource` al llegar al límite de uso: status `error`, code `PROVIDER_ERROR` y la misma `reason`. **No pasa por el `ApifyClient`**, porque su cortacircuitos de cuota es compartido por todo el proceso y bloquearía también los scans limpios. |
 | `latency` | `instant`, `normal` (~8 s), `slow` (~70 s) | Solo en mock. `slow` cruza los 60 s para ver el mensaje de "más lento de lo habitual". |
 | `http.start` | `none`, `rate_limited`, `server_error` | `POST /scan` responde 429 con `Retry-After`, o 500, sin crear el scan. |
-| `http.poll` | `none`, `unauthorized`, `server_error`, `hang` | Afecta a los polls de ese scan. `hang` retiene la respuesta más de 15 s, así que el front la ve como caída de red. |
+| `http.poll` | `none`, `unauthorized`, `server_error`, `hang` | Afecta a los polls de ese scan. `unauthorized` dura siempre (sesión vencida). `server_error` y `hang` solo afectan a los 2 primeros polls, para ver cómo el front se recupera de un corte. `hang` retiene la respuesta 16 s, así que el front la ve como caída de red. |
 | `http.report` | `none`, `unavailable` | El PDF responde 503 `report_unavailable`. |
 | `planner` | `default`, `timeout` | Un planner que no responde a tiempo, para ver el fallback a reglas del assessment. |
 
