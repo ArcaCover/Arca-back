@@ -123,10 +123,10 @@
   - `isInjected(scenario: DebugScenario): boolean`. Es true si algún eje difiere de su default. `latency` cuenta.
   - `DebugModeResponse`, `.strict()`: `{ mode: z.enum(['mock','live-debug']), sourceMode: z.enum(['mock','live']), storageBackend: z.enum(['memory','supabase']), websiteEvidenceProvider: z.string(), assessmentPlanner: z.enum(['rules','agent']), signalLlmModel: z.string(), configured: z.object({ openai: z.boolean(), apify: z.boolean(), supabase: z.boolean() }).strict() }`.
   - `DebugScanState`, `.strict()`: `{ scanId, status: ScanStatus, canonicalDomain: z.string(), createdAt: z.string(), completedAt: z.string().nullable(), durationMs: z.number().nullable(), cached: z.boolean(), storage: z.enum(['memory','supabase']), injected: z.boolean(), scenario: DebugScenario.nullable(), sources: Layer1Result.shape.sources.nullable() }`. Sin email, por diseño.
-  - `DEBUG_PRESETS: Record<'apify_quota'|'partial'|'identity_failed'|'all_down'|'session_expired', { label: string; scenario: Partial<DebugScenario> }>`, con las etiquetas en inglés:
+  - `DEBUG_PRESETS: Record<'apify_quota'|'partial'|'no_identity'|'all_down'|'session_expired', { label: string; scenario: DebugScenarioInput }>`, con las etiquetas en inglés:
     - "Apify out of credit": `{ bar:'apify_quota', avvo:'apify_quota' }`;
     - "Partial scan": `{ avvo:'error' }`;
-    - "Failed: no firm identity": `{ website:'no_identity' }`;
+    - "No firm identity": `{ website:'no_identity' }`;
     - "Every source down": `{ website:'error', bar:'error', avvo:'error' }`;
     - "Session expired": `{ http:{ poll:'unauthorized' } }`.
 
@@ -177,7 +177,7 @@ Comportamiento (en todos los casos sin datos, `rawContent` es JSON con `{ inject
 
 - [ ] **Step 1: Write the failing tests:**
   - `website default delegates and waits the latency`: con fake timers, `latency:'normal'` no resuelve antes de 8000 ms; `real.run` se llama una vez.
-  - `website no_identity yields insufficient identity through the real pipeline`: un `InProcessPipeline` con `injectWebsite` y directorios espía termina `FAILED`, y los dos directorios salen con `code === 'INSUFFICIENT_IDENTITY'` y sin llamadas.
+  - `website no_identity yields insufficient identity through the real pipeline`: un `InProcessPipeline` con `injectWebsite` y directorios espía termina `PARTIAL` (la web legible cuenta como fuente útil), y los dos directorios salen con `code === 'INSUFFICIENT_IDENTITY'` y sin llamadas.
   - `website error goes through the pipeline's own unavailable path`: `result.sources.website.status === 'error'` y `code === 'PROVIDER_ERROR'`.
   - `apify_quota matches the real directory source at the usage limit`:
     - construye `new ApifyDirectorySource('bar', fakeClient)`, con un `fakeClient.run` que lanza `new ApifyClientError('PROVIDER_QUOTA_EXCEEDED', …)` (usa el constructor real de `apify-client.ts`);
@@ -251,7 +251,7 @@ Comportamiento (en todos los casos sin datos, `rawContent` es JSON con `{ inject
   - `DebugTools`:
     - `parseScenario(header: string | undefined): { ok: true; scenario: DebugScenario | null } | { ok: false }`. Da `null` si no hay cabecera o si `!isInjected`, y `ok:false` con JSON inválido o con schema que no valida.
     - `beginScan(scanId: string, scenario: DebugScenario): void`. Hace `scans.isolate` y guarda el escenario.
-    - `pipelineFor(scenario: DebugScenario): Layer1Pipeline`. Es un `InProcessPipeline` con `injectWebsite(…, { latency: mode === 'mock' })`, `injectDirectory` y `repository: scans`.
+    - `pipelineFor(scenario: DebugScenario): Layer1Pipeline`. Es un `InProcessPipeline` con `injectWebsite(…, { latency: mode === 'mock' })`, `injectDirectory`, `repository: scans` y **`timeoutMs: pipelineTimeoutMs`**. Sin él, el presupuesto por defecto de 55 s corta la latencia `slow` (70 s) y el scan acabaría en timeout. Un test lo fija: con `latency:'slow'` y fake timers, la web no sale en `timeout`.
     - `takePollFault(scanId: string): 'unauthorized' | 'server_error' | 'hang' | null`. `unauthorized` es permanente; `server_error` y `hang` solo en los 2 primeros polls de ese scan.
     - `reportFault(scanId: string): boolean`
     - `assessmentAgentFor(scanId: string): AssessmentAgent | undefined`. Con `planner:'timeout'` devuelve un agente que nunca resuelve, salvo por su `signal`.
@@ -285,7 +285,8 @@ Comportamiento (en todos los casos sin datos, `rawContent` es JSON con `{ inject
   **Debug wiring.** Las fuentes base son `mockSources()`. Usa `RoutingScanRepository(durableSpy, new InMemoryRepository())` y dominio `robust.arca.example`:
   - `injected scan is isolated and ends as its sources dictate`: con `{ avvo:'error' }` → el poll final es `PARTIAL` y ningún espía de escritura del durable se llama.
   - `apify quota preset ends PARTIAL with the real quota reason`: `result.sources.bar.reason` contiene `'Apify usage limit reached'`.
-  - `identity preset ends FAILED`: con `{ website:'no_identity' }` → `FAILED`.
+  - `identity preset ends PARTIAL with skipped directories`: con `{ website:'no_identity' }` → `PARTIAL`, y `bar`/`avvo` con `code === 'INSUFFICIENT_IDENTITY'`.
+  - `every source down ends FAILED`: con `{ website:'error', bar:'error', avvo:'error' }` → `FAILED`.
   - `a scan without a scenario still uses the durable repository and the cache`: `durableSpy.create` se llama una vez y `cached` se consulta.
   - `injected scans never share an in-flight pipeline`: dos POST concurrentes al mismo dominio, uno limpio y otro con escenario, dan resultados distintos; el inyectado tiene `meta.reusedEvidence === false`.
   - `start faults answer before the limiter`: `rate_limited` da 429 con `Retry-After: '120'` y 4 llamadas seguidas con el mismo email no agotan el limiter real; `server_error` da 500.
@@ -543,7 +544,7 @@ Comportamiento (en todos los casos sin datos, `rawContent` es JSON con `{ inject
      - abre el assessment, pulsa "Auto-answer" y luego "Attest & complete";
      - llega a `/assessment/results` con un `compositeScore` visible.
   2. **Preset "Apify out of credit":** `/score` muestra el aviso de evidencia incompleta, y el panel muestra `bar.reason` con "Apify usage limit reached".
-  3. **Preset "Failed: no firm identity":** pantalla "We couldn't finish your scan".
+  3. **Preset "Every source down":** pantalla "We couldn't finish your scan".
   4. **Preset "Session expired":** vuelve a `/quote`.
   5. **Desalineación:** con `ARCA_API_URL` apuntando a un puerto sin servidor, la franja dice `MODE MISMATCH · front=mock, back unreachable or production`.
 

@@ -113,7 +113,7 @@ Catálogo:
 
 | Eje | Valores | Notas |
 |---|---|---|
-| `website` | `default`, `no_identity`, `blocked`, `error`, `timeout` | `default` es el fixture en mock y el crawler real en live-debug. `no_identity` produce el caso muscalaw: se leyó la web pero no hay firma ni abogados, así que la identidad sale INSUFFICIENT, Bar y Avvo `skipped` y el scan FAILED. `blocked` imita un sitio que bloquea el crawler (`ACCESS_BLOCKED`). |
+| `website` | `default`, `no_identity`, `blocked`, `error`, `timeout` | `default` es el fixture en mock y el crawler real en live-debug. `no_identity`: se leyó la web pero no hay firma ni abogados, así que la identidad sale INSUFFICIENT y Bar y Avvo quedan `skipped` (`INSUFFICIENT_IDENTITY`). El código real cuenta la web legible como fuente útil, así que el scan termina **PARTIAL**. El FAILED de muscalaw vino de que falló la extracción: eso es `website: error`. `blocked` imita un sitio que bloquea el crawler (`ACCESS_BLOCKED`). |
 | `bar`, `avvo` | `default`, `empty`, `apify_quota`, `error`, `timeout` | `apify_quota` devuelve **exactamente** el `SourceResult` que produce hoy `ApifyDirectorySource` al llegar al límite de uso: status `error`, code `PROVIDER_ERROR` y la misma `reason`. **No pasa por el `ApifyClient`**, porque su cortacircuitos de cuota es compartido por todo el proceso y bloquearía también los scans limpios. |
 | `latency` | `instant`, `normal` (~8 s), `slow` (~70 s) | Solo en mock. `slow` cruza los 60 s para ver el mensaje de "más lento de lo habitual". |
 | `http.start` | `none`, `rate_limited`, `server_error` | `POST /scan` responde 429 con `Retry-After`, o 500, sin crear el scan. |
@@ -126,7 +126,7 @@ El desenlace global (COMPLETED, PARTIAL o FAILED) **no se elige: sale de lo ante
 El panel trae preajustes con nombre, que solo rellenan los ejes:
 - "Apify sin crédito": Bar y Avvo en `apify_quota`;
 - "PARTIAL": solo Avvo en `error`;
-- "FAILED por identidad": website en `no_identity`;
+- "Sin identidad de firma": website en `no_identity` (PARTIAL, directorios saltados);
 - "Todo cae": las tres fuentes en `error`;
 - "Sesión vencida": `http.poll` en `unauthorized`.
 
@@ -267,7 +267,7 @@ Una franja fija arriba, sobre todo lo demás. Se mantiene dentro de la paleta de
     - el cliente no añade la cabecera de escenario en producción;
     - la barra pasa a desalineado ante 404 o un modo distinto;
     - el panel no muestra el email.
-12. Smoke de navegador en mock (Playwright): flujo completo con los botones, más los preajustes "Apify sin crédito", "FAILED por identidad" y "Sesión vencida".
+12. Smoke de navegador en mock (Playwright): flujo completo con los botones, más los preajustes "Apify sin crédito", "Todo cae" (FAILED) y "Sesión vencida".
 
 ## 9. Decisiones tomadas por el asistente (revisar)
 
