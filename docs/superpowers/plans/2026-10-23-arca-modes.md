@@ -8,7 +8,7 @@
 - **Back.** Lee `ARCA_MODE` en `loadEnv`. Solo fuera de producción, `server.ts` construye un objeto `DebugTools` y se lo pasa a `createApp`. Sin `debug`, `createApp` no registra rutas `/__debug`, no lee la cabecera de escenario y no la admite en CORS.
   - Un scan con escenario corre por un `InProcessPipeline` con fuentes envueltas.
   - Vive en repositorios en memoria enrutados por `scanId`.
-- **Front.** Fija `NEXT_PUBLIC_ARCA_MODE` como literal en `next.config.ts`. Carga el UI de debug con `next/dynamic` dentro de una comparación literal con allowlist, y un `postbuild` verifica que el build de producción no contiene ningún centinela de debug.
+- **Front.** Fija `NEXT_PUBLIC_ARCA_MODE` como literal en `next.config.ts`. Carga el UI de debug con `next/dynamic` dentro de una comparación literal con allowlist, y el script `build` (`next build && node scripts/check-no-debug.mjs`) verifica que el build de producción no contiene ningún centinela de debug. Va en `build` y no en `postbuild` porque el `~/.npmrc` de esta máquina tiene `ignore-scripts=true`, que se salta los hooks (ruling de la Task 7).
 
 **Tech Stack:**
 - Back: Node 22, Hono 4.13, zod 3, vitest 3, tsx.
@@ -396,7 +396,7 @@ Comportamiento (en todos los casos sin datos, `rawContent` es JSON con `{ inject
   - `store.ts`: `createDebugStore()` → `{ publish, subscribe, getSnapshot }` para `useSyncExternalStore`, y `installDebugStore()`, que asigna `window.__arcaDebug`.
   - `DebugMount.tsx` (`"use client"`): `const DebugRoot = process.env.NEXT_PUBLIC_ARCA_MODE === "mock" || process.env.NEXT_PUBLIC_ARCA_MODE === "live-debug" ? dynamic(() => import("./DebugRoot"), { ssr: false }) : null;` y devuelve `DebugRoot ? <DebugRoot /> : null`.
   - `check-no-debug.mjs`:
-    - exporta `findDebugLeaks(dir: string): string[]` (los archivos con alguna coincidencia);
+    - `findDebugLeaks(dir: string): string[]` (los archivos con alguna coincidencia) vive en `scripts/debug-leaks.mjs`, por el ruling de la Task 7. En los `.map` solo se buscan los marcadores exclusivos de debug: el centinela, `/__debug/`, `LIVE DEBUG` y `MODE MISMATCH`. Los marcadores del puente no se buscan ahí;
     - patrones: `arca-debug-sentinel-7f3c`, `__arcaDebug`, `X-Arca-Debug-Scenario` (sin distinguir mayúsculas), `/__debug/`, `LIVE DEBUG`, `MODE MISMATCH`;
     - como script: resuelve el modo con la misma regla que `resolveArcaMode`; si es `production`, analiza `.next/static` y `.next/server`, imprime las fugas y sale con 1 si hay alguna; si no, imprime `skipped (mode=<m>)` y sale con 0.
 
