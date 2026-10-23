@@ -17,6 +17,8 @@ export const AVVO_TARGETED_MAX_LAWYERS = 10;
 // Lookups one source keeps in flight. Bar and Avvo run side by side, so two sources fill the
 // default MAX_APIFY_CONCURRENCY of 16; the Apify client queues anything beyond its limit.
 export const DIRECTORY_LOOKUPS_IN_FLIGHT = 8;
+// The reason of a directory stopped by the usage limit. The debug sources fabricate the same status, so it is shared.
+export const APIFY_QUOTA_REASON = 'Apify usage limit reached for the current billing cycle; lookups after it were not started';
 const record = z.record(z.unknown());
 const text = (value: unknown): string | null => typeof value === 'string' && value.trim() ? value.trim() : null;
 const availableText = (value: unknown): string | null => {
@@ -241,7 +243,7 @@ export class ApifyDirectorySource implements DirectorySource {
         candidatesReceived, recordsValid, providerRuns, costUsd, accountingComplete,
         cachedRuns: providerRuns.filter(run => run.cached).length, resumedRuns: providerRuns.filter(run => run.resumed).length,
         costPerAcceptedAttorneyUsd, ...(code ? { code } : {}),
-        reason: quotaReached ? 'Apify usage limit reached for the current billing cycle; lookups after it were not started' :
+        reason: quotaReached ? APIFY_QUOTA_REASON :
           failed ? 'One or more targeted lookups were incomplete; raw responses retained' :
           found ? null : 'Provider completed successfully with no accepted identity match' } };
   }
