@@ -1,8 +1,13 @@
 import { z } from 'zod';
 import { DEFAULT_SIGNAL_LLM_MODEL } from '../pipeline/llm-endpoint.js';
+import { ARCA_MODES } from './mode.js';
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
+  // Absent means production; an unknown value stops the start instead of falling into a mode (DN-09 §4).
+  ARCA_MODE: z.enum(ARCA_MODES).default('production'),
+  // Set by deploy/production.env, which ships inside the image. Any value refuses the debug modes.
+  ARCA_DEPLOYMENT: z.string().optional(),
   SOURCE_MODE: z.enum(['mock', 'live']).optional(),
   STORAGE_BACKEND: z.enum(['memory', 'supabase']).optional(),
   // Layer 2 is rules-only by default; mock mode also disables the optional agent.
@@ -47,8 +52,24 @@ const EnvSchema = z.object({
 });
 export function loadEnv(source = process.env) {
   const env = EnvSchema.parse(source);
-  const sourceMode = env.SOURCE_MODE ?? (env.MOCK_MODE === 'true' ? 'mock' : 'live');
-  const storageBackend = env.STORAGE_BACKEND ?? (env.MOCK_MODE === 'true' ? 'memory' : 'supabase');
+  const mode = env.ARCA_MODE;
+  if (mode !== 'production' && env.ARCA_DEPLOYMENT !== undefined) {
+    throw new Error(`ARCA_MODE=${mode} cannot start while ARCA_DEPLOYMENT is set: a deployment only runs production`);
+  }
+  // What the configuration alone would run with, before a mode touches it.
+  const inheritedSourceMode = env.SOURCE_MODE ?? (env.MOCK_MODE === 'true' ? 'mock' : 'live');
+  const inheritedStorageBackend = env.STORAGE_BACKEND ?? (env.MOCK_MODE === 'true' ? 'memory' : 'supabase');
+  // live-debug is the costly direction, so it forces nothing: it only checks that the real thing is configured.
+  if (mode === 'live-debug') {
+    if (inheritedSourceMode !== 'live') throw new Error(`ARCA_MODE=live-debug requires SOURCE_MODE=live, but it resolves to ${inheritedSourceMode}`);
+    if (inheritedStorageBackend !== 'supabase') throw new Error(`ARCA_MODE=live-debug requires STORAGE_BACKEND=supabase, but it resolves to ${inheritedStorageBackend}`);
+  }
+  // mock is the safe direction: it wins over whatever the environment says, and loadEnv reports what it replaced.
+  const sourceMode = mode === 'mock' ? 'mock' : inheritedSourceMode;
+  const storageBackend = mode === 'mock' ? 'memory' : inheritedStorageBackend;
+  const assessmentPlanner = mode === 'mock' ? 'rules' : env.ASSESSMENT_PLANNER;
+  const overridden = [['SOURCE_MODE', inheritedSourceMode, sourceMode], ['STORAGE_BACKEND', inheritedStorageBackend, storageBackend], ['ASSESSMENT_PLANNER', env.ASSESSMENT_PLANNER, assessmentPlanner]]
+    .filter(([, was, now]) => was !== now).map(([name, was, now]) => `${name}=${was}→${now}`);
   const supabaseKey = env.SUPABASE_SECRET_KEY?.trim() || env.SUPABASE_SERVICE_ROLE_KEY?.trim();
   if (storageBackend === 'supabase') {
     if (!env.SUPABASE_URL?.trim()) throw new Error('SUPABASE_URL is required for Supabase storage');
@@ -59,7 +80,7 @@ export function loadEnv(source = process.env) {
   if (sourceMode === 'live' && env.WEBSITE_EVIDENCE_PROVIDER !== 'rules' && !env.OPENAI_API_KEY?.trim()) {
     throw new Error(`OPENAI_API_KEY is required when WEBSITE_EVIDENCE_PROVIDER=${env.WEBSITE_EVIDENCE_PROVIDER}`);
   }
-  if (sourceMode === 'live' && env.ASSESSMENT_PLANNER === 'agent' && !env.OPENAI_API_KEY?.trim()) {
+  if (sourceMode === 'live' && assessmentPlanner === 'agent' && !env.OPENAI_API_KEY?.trim()) {
     throw new Error('OPENAI_API_KEY is required when ASSESSMENT_PLANNER=agent');
   }
   const corsOrigins = env.CORS_ALLOWED_ORIGINS.split(',').map(value => value.trim()).filter(Boolean);
@@ -71,5 +92,5 @@ export function loadEnv(source = process.env) {
   if (env.APIFY_ACTIVE_RUN_TTL_MS < (env.APIFY_RUN_TIMEOUT_SECS + 60) * 1000) {
     throw new Error('APIFY_ACTIVE_RUN_TTL_MS must exceed the remote run timeout by at least 60 seconds');
   }
-  return { ...env, sourceMode, storageBackend, supabaseKey, corsOrigins };
+  return { ...env, ASSESSMENT_PLANNER: assessmentPlanner, mode, overridden, sourceMode, storageBackend, supabaseKey, corsOrigins };
 }
