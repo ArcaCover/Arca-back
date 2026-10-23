@@ -122,7 +122,7 @@
   - `type DebugScenario = z.infer<…>`.
   - `isInjected(scenario: DebugScenario): boolean`. Es true si algún eje difiere de su default. `latency` cuenta.
   - `DebugModeResponse`, `.strict()`: `{ mode: z.enum(['mock','live-debug']), sourceMode: z.enum(['mock','live']), storageBackend: z.enum(['memory','supabase']), websiteEvidenceProvider: z.string(), assessmentPlanner: z.enum(['rules','agent']), signalLlmModel: z.string(), configured: z.object({ openai: z.boolean(), apify: z.boolean(), supabase: z.boolean() }).strict() }`.
-  - `DebugScanState`, `.strict()`: `{ scanId, status: ScanStatus, canonicalDomain: z.string(), createdAt: z.string(), completedAt: z.string().nullable(), durationMs: z.number().nullable(), cached: z.boolean(), storage: z.enum(['memory','supabase']), injected: z.boolean(), scenario: DebugScenario.nullable(), sources: Layer1Result.shape.sources.nullable() }`. Sin email, por diseño.
+  - `DebugScanState`, `.strict()` (en la Task 5 se le añadió `domainResolution: DomainResolution`, y para un FAILED, `sources` lleva el diagnóstico por fuente que guarda el proceso): `{ scanId, status: ScanStatus, canonicalDomain: z.string(), createdAt: z.string(), completedAt: z.string().nullable(), durationMs: z.number().nullable(), cached: z.boolean(), storage: z.enum(['memory','supabase']), injected: z.boolean(), scenario: DebugScenario.nullable(), sources: Layer1Result.shape.sources.nullable() }`. Sin email, por diseño.
   - `DEBUG_PRESETS: Record<'apify_quota'|'partial'|'no_identity'|'all_down'|'session_expired', { label: string; scenario: DebugScenarioInput }>`, con las etiquetas en inglés:
     - "Apify out of credit": `{ bar:'apify_quota', avvo:'apify_quota' }`;
     - "Partial scan": `{ avvo:'error' }`;
