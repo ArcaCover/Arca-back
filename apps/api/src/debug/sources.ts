@@ -1,7 +1,7 @@
 import { unknownWebsite, type AttorneyMatch, type DirectoryQuery, type DirectorySource, type SourceResult, type WebsiteData,
   type WebsiteSource } from '@arca/contracts';
 import type { DebugScenario } from '@arca/contracts/debug';
-import { APIFY_QUOTA_REASON, buildDirectoryInputs } from '../pipeline/directories.js';
+import { APIFY_QUOTA_REASON, buildDirectoryInputs, nothingToLookUp } from '../pipeline/directories.js';
 import { stableSample } from '../pipeline/matching.js';
 
 // How long a scan appears to take. `slow` crosses the 60 s the front waits before saying the scan is slower than usual.
@@ -30,10 +30,9 @@ export function injectWebsite(real: WebsiteSource, scenario: DebugScenario, opti
         if (options.latency) await wait(LATENCY_MS[scenario.latency], signal);
         return real.run(domain, signal);
       case 'no_identity':
-        // The site was read but names no firm and no attorney, so the identity comes out INSUFFICIENT. The status is
-        // 'error' because the pipeline counts an 'ok' source as a success, and one success makes the scan PARTIAL
-        // where the "no firm identity" scenario is meant to end FAILED (DN-09 5.3).
-        return { data: unknownWebsite(), rawContent: injected('no_identity'), status: { status: 'error', dataStatus: 'EMPTY',
+        // A readable site that names no firm and no attorney. The pipeline counts it as a useful source, so the scan
+        // ends PARTIAL and both directories are skipped for lack of identity, exactly as for a real site like that (DN-09 5.3).
+        return { data: unknownWebsite(), rawContent: injected('no_identity'), status: { status: 'ok', dataStatus: 'EMPTY',
           durationMs: 0, pagesCrawled: 1, reason: null } };
       case 'blocked':
         return { data: null, rawContent: injected('blocked'), status: { status: 'error', dataStatus: 'UNKNOWN', durationMs: 0,
@@ -52,6 +51,8 @@ export function injectWebsite(real: WebsiteSource, scenario: DebugScenario, opti
 // A test compares it with the real source, so the two cannot drift apart.
 function quotaExceeded(name: 'bar' | 'avvo', query: DirectoryQuery): SourceResult<AttorneyMatch[]> {
   const targets = buildDirectoryInputs(name, query).map(item => item.target).sort((a, b) => a.localeCompare(b));
+  // With nothing to look up the real source never reaches Apify, so no quota error can occur: it skips instead.
+  if (!targets.length) return nothingToLookUp(query);
   const names = stableSample(query.names);
   return { data: null, rawContent: JSON.stringify({
     queries: targets.map(target => ({ target, items: null, error: 'provider_quota_exceeded' })), providerRuns: [] }),

@@ -61,7 +61,7 @@ describe('injected website source', () => {
     expect(LATENCY_MS).toEqual({ instant: 0, normal: 8_000, slow: 70_000 });
   });
   it.each([
-    ['no_identity', { data: unknownWebsite(), status: { status: 'error', dataStatus: 'EMPTY', durationMs: 0, pagesCrawled: 1, reason: null } }],
+    ['no_identity', { data: unknownWebsite(), status: { status: 'ok', dataStatus: 'EMPTY', durationMs: 0, pagesCrawled: 1, reason: null } }],
     ['blocked', { data: null, status: { status: 'error', dataStatus: 'UNKNOWN', durationMs: 0, pagesCrawled: 0,
       code: 'ACCESS_BLOCKED', reason: 'Website access was blocked' } }],
     ['timeout', { data: null, status: { status: 'timeout', dataStatus: 'UNKNOWN', durationMs: 0,
@@ -89,7 +89,9 @@ describe('injected website source inside the real pipeline', () => {
     const pipeline = new InProcessPipeline({ website: injectWebsite(real, scenario({ website: 'no_identity' }), { latency: false }),
       bar, avvo, repository: new InMemoryRepository() });
     const outcome = await pipeline.run(input);
-    expect(outcome.status).toBe('FAILED');
+    // A readable site counts as a useful source, so the scan is PARTIAL and not FAILED; the directories had nothing to look up.
+    expect(outcome.status).toBe('PARTIAL');
+    expect(outcome.result.sources.website).toMatchObject({ status: 'ok', dataStatus: 'EMPTY' });
     expect(outcome.result.sources.bar).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY' });
     expect(outcome.result.sources.avvo).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY' });
     expect(bar.run).not.toHaveBeenCalled();
@@ -215,5 +217,22 @@ describe('apify_quota', () => {
     expect(injected.data).toBe(real.data);
     expect(injected.rawContent).toBe(real.rawContent);
     expect(injected.status).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR', reason: APIFY_QUOTA_REASON });
+  });
+  // With nothing to look up the real source skips before it reaches Apify, so a quota error would be a lie.
+  it.each([
+    ['bar', 'no names and no firm', { ...query, names: [], firmName: null }],
+    ['avvo', 'no names and no firm', { ...query, names: [], firmName: null }],
+    ['avvo', 'a firm but no city, so no nationwide search', { ...query, names: [], city: null }],
+  ] as const)('apify_quota mirrors the real directory source when there is nothing to look up (%s, %s)', async (name, _case, lookup) => {
+    const client = quotaClient();
+    const real = await new ApifyDirectorySource(name, client).run(lookup, signal);
+    const unused = vi.fn(async () => directoryResult);
+    const injected = await injectDirectory(name, { run: unused }, scenario({ [name]: 'apify_quota' })).run(lookup, signal);
+    expect(client.run).not.toHaveBeenCalled();
+    expect(unused).not.toHaveBeenCalled();
+    expect(real.status).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY' });
+    expect(withoutDuration(injected)).toEqual(withoutDuration(real));
+    expect(injected.data).toBe(real.data);
+    expect(injected.rawContent).toBe(real.rawContent);
   });
 });

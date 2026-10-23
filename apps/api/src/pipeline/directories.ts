@@ -130,6 +130,16 @@ export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQue
     return { target, actor: source === 'bar' ? BAR_ACTOR : AVVO_ACTOR, input, fallback, resultLimit };
   });
 }
+// What a directory returns when its query yields no lookup target: Apify is never called. The debug sources reuse it
+// so an injected quota error cannot claim a lookup that the real source would not have made.
+export function nothingToLookUp(query: DirectoryQuery): SourceResult<AttorneyMatch[]> {
+  const fallback = stableSample(query.names).length === 0;
+  return { data: null, rawContent: null, status: { status: 'skipped', dataStatus: 'UNKNOWN',
+    durationMs: 0, code: 'INSUFFICIENT_IDENTITY', reason: fallback && query.firmName
+      ? 'A firm-wide search needs a verified city; a nationwide search is not run'
+      : 'No verified firm or attorney identity available',
+    attorneysSearched: 0, attorneysFound: 0, candidatesReceived: 0, recordsValid: 0, providerRuns: [], costUsd: 0 } };
+}
 type DirectoryClient = { run(actor: string, input: Record<string, unknown>, signal: AbortSignal,
   context?: { scanId?: string }): Promise<unknown[] | ApifyRunResult>;
   recordAccepted?(metadata: ApifyRunMetadata, acceptedCount: number): Promise<void> };
@@ -145,11 +155,7 @@ export class ApifyDirectorySource implements DirectorySource {
     const names = stableSample(query.names);
     const fallback = names.length === 0;
     const targets = planned.map(item => item.target);
-    if (!targets.length) return { data: null, rawContent: null, status: { status: 'skipped', dataStatus: 'UNKNOWN',
-      durationMs: 0, code: 'INSUFFICIENT_IDENTITY', reason: fallback && query.firmName
-        ? 'A firm-wide search needs a verified city; a nationwide search is not run'
-        : 'No verified firm or attorney identity available',
-      attorneysSearched: 0, attorneysFound: 0, candidatesReceived: 0, recordsValid: 0, providerRuns: [], costUsd: 0 } };
+    if (!targets.length) return nothingToLookUp(query);
     const rawResults: { target: string; items: unknown[] | null; error: string | null }[] = [];
     const matches: AttorneyMatch[] = [];
     const providerRuns: NonNullable<SourceStatus['providerRuns']> = [];

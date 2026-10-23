@@ -65,11 +65,11 @@ export const DebugScanState = z.object({
 }).strict();
 export type DebugScanState = z.infer<typeof DebugScanState>;
 
-export const DEBUG_PRESETS: Record<'apify_quota' | 'partial' | 'identity_failed' | 'all_down' | 'session_expired',
+export const DEBUG_PRESETS: Record<'apify_quota' | 'partial' | 'no_identity' | 'all_down' | 'session_expired',
   { label: string; scenario: DebugScenarioInput }> = {
   apify_quota: { label: 'Apify out of credit', scenario: { bar: 'apify_quota', avvo: 'apify_quota' } },
   partial: { label: 'Partial scan', scenario: { avvo: 'error' } },
-  identity_failed: { label: 'Failed: no firm identity', scenario: { website: 'no_identity' } },
+  no_identity: { label: 'No firm identity', scenario: { website: 'no_identity' } },
   all_down: { label: 'Every source down', scenario: { website: 'error', bar: 'error', avvo: 'error' } },
   session_expired: { label: 'Session expired', scenario: { http: { poll: 'unauthorized' } } },
 };

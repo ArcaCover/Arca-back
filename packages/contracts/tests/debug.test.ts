@@ -56,9 +56,9 @@ describe('isInjected', () => {
 
 describe('DEBUG_PRESETS', () => {
   it('has the five presets, with English labels', () => {
-    expect(Object.keys(DEBUG_PRESETS).sort()).toEqual(['all_down', 'apify_quota', 'identity_failed', 'partial', 'session_expired']);
+    expect(Object.keys(DEBUG_PRESETS).sort()).toEqual(['all_down', 'apify_quota', 'no_identity', 'partial', 'session_expired']);
     expect(Object.fromEntries(Object.entries(DEBUG_PRESETS).map(([key, preset]) => [key, preset.label]))).toEqual({
-      apify_quota: 'Apify out of credit', partial: 'Partial scan', identity_failed: 'Failed: no firm identity',
+      apify_quota: 'Apify out of credit', partial: 'Partial scan', no_identity: 'No firm identity',
       all_down: 'Every source down', session_expired: 'Session expired',
     });
   });
@@ -74,7 +74,7 @@ describe('DEBUG_PRESETS', () => {
   it('builds the scenarios the brief describes', () => {
     expect(DEBUG_PRESETS.apify_quota.scenario).toEqual({ bar: 'apify_quota', avvo: 'apify_quota' });
     expect(DEBUG_PRESETS.partial.scenario).toEqual({ avvo: 'error' });
-    expect(DEBUG_PRESETS.identity_failed.scenario).toEqual({ website: 'no_identity' });
+    expect(DEBUG_PRESETS.no_identity.scenario).toEqual({ website: 'no_identity' });
     expect(DEBUG_PRESETS.all_down.scenario).toEqual({ website: 'error', bar: 'error', avvo: 'error' });
     expect(DEBUG_PRESETS.session_expired.scenario).toEqual({ http: { poll: 'unauthorized' } });
   });
