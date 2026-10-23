@@ -8,6 +8,11 @@
       "arca-source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./debug": {
+      "arca-source": "./src/debug.ts",
+      "types": "./dist/debug.d.ts",
+      "default": "./dist/debug.js"
     }
   },
   "files": [
