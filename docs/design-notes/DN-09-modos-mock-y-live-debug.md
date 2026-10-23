@@ -98,14 +98,16 @@ Nombres **[mía]**. `live-debug` es lo que en la conversación se llamó "dev-li
 
 | Ruta | Auth | Qué devuelve / hace |
 |---|---|---|
-| `GET /__debug/mode` | ninguna (solo loopback) | `{ mode, sourceMode, storageBackend, websiteEvidenceProvider, assessmentPlanner, signalLlmModel, configured: { openai, apify, supabase } }`. Los `configured` son solo booleanos, **nunca** valores ni URLs. |
+| `GET /__debug/mode` | ninguna (solo loopback) | `{ mode, sourceMode, storageBackend, websiteEvidenceProvider, assessmentPlanner, signalLlmModel, inUse: { openai, apify, supabase } }`. Describe lo que el proceso **construyó**, no lo que dice la configuración: `websiteEvidenceProvider` es `agentic`, `openai`, `rules` o `mock`; `signalLlmModel` es el modelo de OpenAI que llama un componente construido, o `null` si ninguno lo llama; `inUse` dice para qué servicios se construyó un cliente. Solo enums, booleanos y el nombre del modelo, **nunca** claves ni URLs. |
 | `GET /__debug/scan/:scanId` | Bearer del scan, igual que el poll | Estado interno: el `ScanRecord` (tiempos, resolución de dominio, `cached`), el escenario inyectado, si está en el overlay de memoria y el resumen de diagnósticos crudos (fuentes, códigos, razones, duraciones). Todo como JSON; el front lo pinta como texto. |
-| `POST /__debug/reset` | ninguna (solo loopback) | Vacía el rate limiter. En `mock` también vacía los repositorios en memoria. **No toca Supabase.** |
+| `POST /__debug/reset` | cabecera `X-Arca-Debug: 1` (solo loopback) | Vacía el rate limiter. **Solo en `mock`** vacía además los repositorios en memoria; en `live-debug` los scans inyectados siguen en memoria. **No toca Supabase.** Sin la cabecera responde 400: así deja de ser una petición CORS simple, el navegador hace preflight y solo pasan los orígenes permitidos. |
 
 ### 5.3 Escenarios de fallo
 
 El front manda el escenario en la cabecera `X-Arca-Debug-Scenario` (JSON) **solo** en `POST /scan`.
+- Es de **un solo uso**: el front lo saca del `sessionStorage` de la pestaña al mandarlo con el próximo `POST /scan`, aunque ese arranque falle. El siguiente scan es normal salvo que se vuelva a elegir uno. Así un escenario olvidado no sigue cambiando scans sin que nadie lo vea.
 - El back lo valida con zod; si es inválido responde 400 `invalid_request`.
+- Fuera de `mock`, el back pone `latency` en `instant` antes de decidir si el escenario inyecta algo. Un `latency` que sobró de una sesión mock en la misma pestaña ya no aísla un scan limpio de `live-debug`.
 - Lo guarda junto al scan y lo aplica a ese scan y a todo lo que cuelga de él: los polls, el PDF y su assessment.
 - Sin cabecera, el scan es normal: los fixtures por dominio en `mock`, todo real en `live-debug`.
 
@@ -140,11 +142,14 @@ El panel trae preajustes con nombre, que solo rellenan los ejes:
 
 Jesús confirmó que dev y producción comparten el mismo Supabase. Regla: **un scan con cualquier eje inyectado vive entero en memoria.** Eso implica:
 - su registro, su evidencia cruda y su assessment van a repositorios en memoria del proceso, enrutados por `scanId`;
+- los ids aislados, de scan y de assessment, no se olvidan nunca, ni tras un reset: un id que ya no está en memoria responde 404 y nunca cae a Supabase;
 - **no lee la caché de dominio**, porque si no se vería el resultado cacheado y no el fallo, y **no entra en ella**: nunca se escribe en Supabase;
 - no comparte el pipeline en vuelo con un scan limpio del mismo dominio;
 - las fuentes inyectadas no llaman a Apify, así que no dejan rastro en el ledger de gasto.
 
-Las fuentes **no** inyectadas del mismo scan sí corren de verdad. Lo que escriben en la caché de consultas de Apify o en el análisis del crawler es evidencia genuina, igual que hoy.
+Las fuentes **no** inyectadas del mismo scan sí corren de verdad, pero no todo lo que producen dura:
+- la caché de consultas de Apify y el ledger de gasto son durables, como hoy;
+- el análisis de la web de un scan inyectado se guarda con su `scanId`, así que vive y muere en memoria. El próximo scan limpio de ese dominio vuelve a pagar la extracción con OpenAI.
 
 **Gasto real dentro de un scan inyectado [mía, sobre lo que pidió Jesús: "registrar el gasto internamente"].**
 
@@ -190,9 +195,12 @@ Una franja fija arriba, sobre todo lo demás. Se mantiene dentro de la paleta de
 | `mock` | `oro` con rayas diagonales `marino` (patrón que no aparece en ningún otro sitio de la UI) | **MOCK** · no real APIs · in-memory data |
 | `live-debug` | `rojo` sólido con texto blanco (el rojo ya está reservado para alertas) | **LIVE DEBUG** · real APIs & real database |
 | Desalineado | `marino` sólido con texto `oro` e icono de alerta | **MODE MISMATCH** · front=`mock`, back=`live-debug` (o "back unreachable / production") |
+| Comprobando | `bruma` liso con texto `marino`, sin rayas ni icono: no pertenece a ningún modo | Checking the back's mode · front=`mock` |
 
-- El front pregunta `GET /__debug/mode` al cargar.
-- Si el back no tiene esa ruta (404: producción) o responde otro modo, la barra pasa a desalineado. **Nunca afirma un modo que no comprobó.**
+- El front pregunta `GET /__debug/mode` al cargar y vuelve a preguntar en cada cambio de página, cuando la pestaña recupera el foco o vuelve a ser visible, y cada 10 s mientras está visible. Así, si el back se reinicia en otro modo con la pestaña abierta, la barra lo dice.
+- Mientras una pregunta está en curso, la barra conserva el último estado confirmado; cualquier cambio se ve en cuanto llega la respuesta.
+- Si el back no tiene esa ruta (404: producción) o responde otro modo, la barra pasa a desalineado. **Nunca afirma un modo que no comprobó**, ni con el texto ni con el aspecto: las rayas y el rojo esperan a que el back confirme el modo.
+- Mientras hay un escenario armado para el próximo scan, la barra lo añade: `· next scan injects: Bar apify_quota, Avvo apify_quota`. En `live-debug` no nombra `latency`, que allí no existe.
 - El texto de debug va en inglés, como el código y la UI del producto. **[mía]**
 
 ### 6.3 Panel de estado
@@ -210,13 +218,14 @@ Una franja fija arriba, sobre todo lo demás. Se mantiene dentro de la paleta de
 | Siempre | modo del back (`/__debug/mode`), `scanId`, `iat` y `exp` del token (**nunca el email ni el token completo**), botón "ver estado interno" (`GET /__debug/scan/:id`) |
 
 - Todo lo que viene de webs de terceros (razones, nombres) se pinta como texto, nunca como HTML.
+- Cada página publica su estado junto con el `scanId` al que pertenece. Si la URL lleva otro `?scan`, el panel dice `Nothing published for this scan yet` en vez de enseñar el estado de otro scan. `/quote` no lleva scan en la URL, así que enseña el último arranque que hizo, con el escenario que mandó (`sentScenario`).
 
 ### 6.4 Botones especiales
 
 | Dónde | Botón | Qué hace |
 |---|---|---|
-| `/quote` | Selector de escenario y preajustes (§5.3) | Se guarda en `sessionStorage` y viaja en la cabecera del próximo `POST /scan`. En mock también rellena email y dominio con un `*.arca.example`. |
-| `/quote` | Reset | `POST /__debug/reset`: libera el rate limit y, en mock, la memoria. |
+| `/quote` | Selector de escenario y preajustes (§5.3) | Se guarda en `sessionStorage` y viaja en la cabecera del próximo `POST /scan`, y solo en ese: el envío lo borra. En mock también rellena email y dominio con un `*.arca.example`. |
+| `/quote` | Reset | `POST /__debug/reset` con `X-Arca-Debug: 1`: libera el rate limit y, en mock, la memoria. |
 | `/assessment` | Auto-responder | Contesta cada pregunta visible con su respuesta sugerida (o la primera válida) por la API normal, hasta completar. |
 | `/assessment` | Atestar y completar | Marca la atestación y llama a `complete`. |
 | Panel | Ver estado interno | Muestra el JSON de `GET /__debug/scan/:id`. |
@@ -232,7 +241,9 @@ Una franja fija arriba, sobre todo lo demás. Se mantiene dentro de la paleta de
 | Debug alcanzable desde la red local | El back escucha solo en `127.0.0.1` en los modos de debug |
 | Fallo inyectado contamina la caché o el ledger de producción (Supabase compartido) | Overlay en memoria + sin caché + sin Apify para lo inyectado (§5.5) |
 | Panel de debug en un build de producción o en un preview de Vercel | Literal + eliminación de código muerto; el build falla en Vercel con modo de debug; centinela verificado (§6.1, §8) |
-| Fuga de secretos por `/__debug/mode` | Solo enums y booleanos |
+| Una página de producción importa un módulo de debug que el centinela no conoce | Regla de ESLint: fuera de `components/debug` y `lib/debug` solo se importan `DebugMount` y `lib/debug/bridge`, y `@arca/contracts/debug` en ningún otro sitio, también con `import()` |
+| Una página ajena, abierta en el navegador del desarrollador, dispara `POST /__debug/reset` | El reset exige `X-Arca-Debug: 1`: deja de ser una petición simple, y el preflight solo lo pasan los orígenes permitidos |
+| Fuga de secretos por `/__debug/mode` | Solo enums, booleanos y el nombre del modelo |
 | Fuga del email por el panel | Del token solo se muestran `iat` y `exp` |
 | XSS con contenido de webs ajenas en el panel | Siempre texto, nunca `dangerouslySetInnerHTML`; la API de debug responde solo JSON |
 | Mock que sale a la red | No se construye ningún cliente real; un test bloquea toda salida de red y recorre el flujo entero |
@@ -322,7 +333,8 @@ npm run stack -- mock
   - el back con `ARCA_MODE=mock`, que impone `SOURCE_MODE=mock` y `STORAGE_BACKEND=memory`;
   - el front con `NEXT_PUBLIC_ARCA_MODE=mock`, `NEXT_PUBLIC_API_URL=http://localhost:8080` y `next dev --webpack`, porque Turbopack se cuelga en esta máquina.
 - Está listo cuando salen `[back] [api] MODE=mock sources=mock storage=memory (debug routes on 127.0.0.1 only)` y `[front] ✓ Ready`. Abre `http://localhost:3000/quote`.
-- `Ctrl+C` para los dos. Si uno se cae, el lanzador para el otro.
+- `Ctrl+C` para los dos.
+- Si un proceso termina, el lanzador para el otro. Pero un error de arranque del back no lo termina: `tsx watch` se queda esperando cambios. El error del back pasa entre las líneas del front, el front sigue corriendo y la franja dice MODE MISMATCH. Si la ves así nada más arrancar, busca el error en las líneas `[back]`.
 
 ### 11.2 Mock con cada repo en su terminal
 
@@ -355,11 +367,13 @@ npm run stack -- live-debug
 
 O por separado: `npm run dev:live-debug` en Arca-back y `npm run dev:live-debug` en Arca-front.
 
+- Por separado vale lo mismo que en la §11.2: si el `.env.local` del front apunta a otra API, pon antes `$env:NEXT_PUBLIC_API_URL = 'http://localhost:8080'` en la terminal del front. Si no, el front habla con esa otra API y la franja dice MODE MISMATCH.
 - El back no arranca si `SOURCE_MODE` y `STORAGE_BACKEND` no resuelven a `live` y `supabase`, y el error explica el conflicto. Con el `.env.local` de Jesús resuelven bien.
 - Línea de arranque: `[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only)`.
 - Al arrancar recupera los scans y assessments interrumpidos contra la base compartida, igual que hoy `npm run dev`.
 - Un scan **sin** escenario es un scan real: escribe en Supabase y gasta crédito.
 - Un scan **con** escenario vive en memoria (§5.5). Aun así, sus fuentes en `default` (que el panel llama "real") llaman a las APIs reales.
+- El escenario es de un solo uso: el scan siguiente vuelve a ser real si no eliges otro. Mira la franja antes de lanzar: si dice `next scan injects: …`, el próximo scan lleva ese escenario.
 
 ### 11.4 Comprobar que back y front están en el mismo modo
 
@@ -367,8 +381,11 @@ O por separado: `npm run dev:live-debug` en Arca-back y `npm run dev:live-debug`
    - `MOCK · no real APIs · in-memory data` (oro a rayas): los dos en mock;
    - `LIVE DEBUG · real APIs & real database` (rojo): los dos en live-debug;
    - `MODE MISMATCH · front=<f>, back=<b>` o `MODE MISMATCH · front=<f>, back unreachable or production` (marino): no coinciden, el back no responde o está en producción;
-   - mientras pregunta al back dice `Checking the back's mode · front=<f>`, porque nunca afirma un modo que el back no confirmó;
+   - mientras pregunta al back por primera vez dice `Checking the back's mode · front=<f>` sobre bruma liso, porque nunca afirma un modo que el back no confirmó;
+   - si al final lleva `· next scan injects: …`, hay un escenario armado para el próximo scan;
    - sin franja: el front está en producción.
+
+   La franja vuelve a preguntar en cada cambio de página, al volver a la pestaña y cada 10 s, así que reiniciar el back en otro modo se ve sin recargar.
 2. **El back mismo:**
 
    ```powershell
@@ -377,18 +394,21 @@ O por separado: `npm run dev:live-debug` en Arca-back y `npm run dev:live-debug`
    curl.exe -s http://127.0.0.1:8080/__debug/mode
    ```
 
-   - Responde `mode`, `sourceMode`, `storageBackend`, `websiteEvidenceProvider`, `assessmentPlanner`, `signalLlmModel` y `configured`, que solo lleva booleanos, nunca valores.
+   - Responde `mode`, `sourceMode`, `storageBackend`, `websiteEvidenceProvider`, `assessmentPlanner`, `signalLlmModel` e `inUse`.
+   - Son los valores efectivos: en mock, `websiteEvidenceProvider: "mock"`, `signalLlmModel: null` e `inUse` todo en `false`, aunque el `.env.local` tenga todas las claves. `inUse` solo lleva booleanos, nunca valores.
    - En producción la ruta no existe: 404. Con `Invoke-RestMethod`, el 404 sale como error.
 3. **El panel:** el botón `State` de la franja lo abre, y su fila "Back mode" muestra esa misma respuesta.
 
 ### 11.5 Volver a producción local
 
 1. Para los procesos de debug con `Ctrl+C`.
-2. Si pusiste a mano las variables de modo en esa terminal, quítalas:
+2. Si pusiste a mano variables en esa terminal (las de modo, las del paso 5 o las de Supabase de la §11.7), quítalas:
 
    ```powershell
-   Remove-Item Env:ARCA_MODE, Env:NEXT_PUBLIC_ARCA_MODE -ErrorAction SilentlyContinue
+   Remove-Item Env:ARCA_MODE, Env:NEXT_PUBLIC_ARCA_MODE, Env:SOURCE_MODE, Env:STORAGE_BACKEND, Env:SUPABASE_URL, Env:SUPABASE_SECRET_KEY -ErrorAction SilentlyContinue
    ```
+
+   Con `SOURCE_MODE` o `STORAGE_BACKEND` puestas, `live-debug` no arranca y producción local corre con lo que digan, no con el `.env.local`. Con las de Supabase, apunta a `Arca-dev` en vez de a lo que diga el `.env.local`.
 
 3. Arranca en producción, con los dos a la vez:
 
@@ -420,6 +440,7 @@ npm run test:browser:modes
 
 - Corre los escenarios 1 a 4 y deja las capturas en `Arca-front\artifacts\modes\`.
 - Cada escenario pulsa "Reset limits", que en mock también vacía la memoria del back: los scans hechos a mano en esa sesión desaparecen.
+- Los escenarios con preajuste comprueban que la franja nombra el escenario armado y que el scan se lo lleva: después, la pestaña no guarda ninguno y la franja ya no lo nombra. El escenario 2 lanza además un segundo scan, que tiene que salir sin cabecera.
 - El escenario 5 (desalineado) necesita el back parado. El front fija su URL de la API al compilar, así que no basta con apuntar el smoke a otro puerto. Se corre así:
   1. para el stack;
   2. arranca solo el front: `$env:NEXT_PUBLIC_API_URL = 'http://localhost:8080'; npm run dev:mock` en Arca-front;
@@ -439,42 +460,51 @@ Con un proyecto propio, desaparecen los riesgos de compartir la base que lista l
    ```
 
    `link` deja enlazado ese proyecto. Antes de la próxima migración de producción, enlaza otra vez el de producción con `supabase link --project-ref <ref-de-producción>`.
-3. Para correr live-debug contra `Arca-dev`, pon su URL y su clave secreta solo en esa terminal. Ganan al `.env.local`, que no se edita:
+3. Para correr live-debug contra `Arca-dev`, pon su URL y su clave secreta solo en esa terminal. Ganan al `.env.local`, que no se edita. La clave se lee con `Read-Host -AsSecureString`, que no la muestra en pantalla y no la deja en el historial de PowerShell:
 
    ```powershell
    $env:SUPABASE_URL = 'https://<ref-de-Arca-dev>.supabase.co'
-   $env:SUPABASE_SECRET_KEY = '<clave secreta de Arca-dev>'
+   $s = Read-Host -AsSecureString 'Arca-dev secret key'; $env:SUPABASE_SECRET_KEY = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
    npm run stack -- live-debug
    ```
 
-4. Comprueba el destino en el panel de `Arca-dev`: la fila de un scan de prueba tiene que aparecer en su tabla `scans`. `/__debug/mode` no lo puede decir, porque solo informa `configured.supabase: true`, nunca la URL.
+   - No escribas la clave en la línea de comandos: esta máquina usa PSReadLine 2.0.0, que guarda cada línea en texto plano en el historial, sin filtrar las que parecen secretas.
+   - Si ya la escribiste así, bórrala del historial. `(Get-PSReadLineOption).HistorySavePath` dice dónde está el archivo (normalmente `ConsoleHost_history.txt`). Ábrelo, borra esa línea y guarda; después cierra la terminal, porque la sesión abierta la conserva en memoria.
+4. Comprueba el destino en el panel de `Arca-dev`: la fila de un scan de prueba tiene que aparecer en su tabla `scans`. `/__debug/mode` no lo puede decir, porque solo informa `inUse.supabase: true`, nunca la URL.
 5. OpenAI y Apify siguen siendo reales y gastan crédito. El ledger de Apify pasa a ser el de `Arca-dev`.
 
 ## 12. Verificaciones de seguridad realizadas
 
 Hechas el 2026-10-23 en la máquina de Jesús (Windows 11, Node 22.19.0), sobre `feat/arca-modes`: back desde `395f1fe` y front desde `088645e`, más el commit de esta verificación. Las salidas están recortadas y no llevan ningún valor secreto.
 
+Tras la revisión final de la rama se corrigieron los hallazgos F1 a F13 (back `87b224f`, front `16b6a2f` y `c6136da`), y se repitieron las verificaciones a las que afectan: la columna "Repetido" lo dice paso a paso.
+
 ### 12.1 Resumen
 
-| Paso | Punto de §8 | Qué se comprobó | Resultado |
-|---|---|---|---|
-| (a) | 1 a 8 | `npm run build && npm test` en Arca-back | OK: 48 archivos, 483 tests |
-| (b) | 11 | `npm test`, `npm run typecheck` y `npm run lint` en Arca-front | OK: 20 archivos y 225 tests; typecheck limpio; lint con 0 errores y 6 avisos previos |
-| (c) | 9 | build de producción del front, sin modo, más búsqueda manual en `.next` | OK: `0 debug leak(s)`; la búsqueda manual no encuentra nada |
-| (d) | 10 | build con `VERCEL=1` y mock; build con un modo inválido | OK: los dos fallan, con `local-only` y `is not a mode` |
-| (e) | 1 | back en producción local (`SOURCE_MODE=mock`, `STORAGE_BACKEND=memory`, sin `ARCA_MODE`) | OK: las tres rutas `/__debug` dan 404; el scan con cabecera de escenario es normal (202); el preflight no admite la cabecera |
-| (f) | 2 | `ARCA_MODE=mock` (y `live-debug`) con `ARCA_DEPLOYMENT=aws` | OK: el arranque falla |
-| (g) | 7 | `netstat` con el stack en mock | OK: el back solo en `127.0.0.1:8080` |
-| (h) | 3 | test `mock-offline` | OK: 0 intentos de red |
-| (i) | — | arranque de live-debug, **sin ningún scan** | OK: banner `MODE=live-debug`; `/__debug/mode` responde |
-| smoke | 12 | `npm run test:browser:modes`, escenarios 1 a 5 | OK: 5 de 5 |
+| Paso | Punto de §8 | Qué se comprobó | Repetido | Resultado |
+|---|---|---|---|---|
+| (a) | 1 a 8 | `npm run build && npm test` en Arca-back | sí | OK: 49 archivos, 501 tests |
+| (b) | 11 | `npm test`, `npm run typecheck` y `npm run lint` en Arca-front | sí | OK: 23 archivos y 270 tests; typecheck limpio; lint con 0 errores y los 6 avisos previos |
+| (c) | 9 | build de producción del front, sin modo, más búsqueda manual en `.next` | sí | OK: `0 debug leak(s)`; la búsqueda manual no encuentra nada |
+| (d) | 10 | build con `VERCEL=1` y mock; build con un modo inválido | no: `next.config.ts` no cambió | OK: los dos fallan, con `local-only` y `is not a mode` |
+| (e) | 1 | back en producción local (`SOURCE_MODE=mock`, `STORAGE_BACKEND=memory`, sin `ARCA_MODE`) | no; el preflight de producción lo fija un test, en (a) | OK: las tres rutas `/__debug` dan 404; el scan con cabecera de escenario es normal (202); el preflight no admite la cabecera |
+| (f) | 2 | `ARCA_MODE=mock` (y `live-debug`) con `ARCA_DEPLOYMENT=aws` | no: `env.ts` no cambió | OK: el arranque falla |
+| (g) | 7 | `netstat` con el stack en mock | sí | OK: el back solo en `127.0.0.1:8080` |
+| (h) | 3 | test `mock-offline` | sí, dentro de (a) | OK: 0 intentos de red |
+| (i) | — | arranque de live-debug, **sin ningún scan** | no: tocaría el Supabase compartido; la forma nueva la fija `compose.test.ts` | OK: banner `MODE=live-debug`; `/__debug/mode` responde |
+| (j) | 1, 8 | stack en mock con el `.env.local` de Jesús: `/__debug/mode`, reset sin cabecera, preflight | nuevo | OK: valores efectivos (`mock`, `null`, `inUse` en `false`); reset sin cabecera → 400; el preflight admite las dos cabeceras de debug |
+| (k) | — | frontera de imports del front: test `lint-boundary.test.mjs` y `npm run lint` | nuevo | OK: 15 tests; lint con 0 errores |
+| (l) | — | marcador de despliegue: test `deploy-marker.test.ts` | nuevo, dentro de (a) | OK: `ARCA_DEPLOYMENT=aws` y ninguna clave `ARCA_MODE` |
+| (m) | — | el script `build` del front lleva el chequeo de fugas y no hay `postbuild` | nuevo, dentro de (b) | OK |
+| smoke | 12 | `npm run test:browser:modes`, escenarios 1 a 5 | sí | OK: 5 de 5, con las comprobaciones nuevas de la franja y del escenario de un solo uso |
 
 Qué test cubre cada punto de §8 del back:
 - **8.1:** `debug-mode.test.ts`, en "production wiring":
   - "registers no debug route";
   - "runs a scan that carries a scenario header as a normal scan";
   - "ignores a malformed scenario header instead of rejecting the scan";
-  - "never admits the scenario header in CORS".
+  - "never admits the scenario header in CORS";
+  - "never admits the debug request header in CORS either".
 - **8.2:** `env.test.ts`, en el bloque `ARCA_MODE`:
   - producción por defecto;
   - un modo desconocido;
@@ -498,25 +528,38 @@ En el front, el punto **8.11** lo cubren estos tests:
 - `mode-check.test.ts`: un 404 es "absent", y un modo distinto nombra los dos;
 - `StatePanel.test.tsx`: "never prints an email or a session token that a page published".
 
+Protecciones añadidas en la revisión final, con su test:
+- **La franja vuelve a preguntar (F1):** `DebugRoot.test.tsx`: un 404 da desalineado y `State` abre el panel; nueva pregunta al cambiar de página, al recuperar el foco, al volver a ser visible y cada 10 s (nunca oculta); el último estado confirmado se mantiene mientras una pregunta está en curso.
+- **Escenario de un solo uso y visible (F2):** `bridge.test.ts` ("is one-shot"), `client.test.ts` ("sends the scenario with the next scan only"), `DebugRoot.test.tsx` (la franja nombra el escenario armado y lo suelta cuando un scan se lo lleva), `ModeBanner.test.tsx`, `page-state.test.tsx` (`/quote` publica `sentScenario`). Producción: `bridge.test.ts` comprueba que no lee, no borra y no informa nada.
+- **`latency` fuera de mock (F3):** `debug-mode.test.ts`, "a leftover latency injects nothing in live-debug" y "live-debug stores an injected scenario without its latency"; en el front, `ScenarioControls.test.tsx` y `scenario.test.ts`.
+- **`/__debug/mode` efectivo (F4):** `compose.test.ts`: mock con todas las claves → `mock`/`null`/todo `false`; live-debug con cada combinación de extracción y planner. El contrato rechaza proveedores desconocidos y la forma vieja con `configured` (`debug.test.ts`, `mode-check.test.ts`).
+- **Reset (F5, F7):** `debug-mode.test.ts`, bloque "reset": en mock vacía límites y memoria; en live-debug solo límites; sin `X-Arca-Debug: 1` responde 400 y no vacía nada; el preflight de debug admite las dos cabeceras.
+- **Assessments aislados tras un reset (F6):** `debug-isolation.test.ts`, "an isolated assessment never reaches durable storage, even after the overlay is wiped".
+- **Franja neutra mientras comprueba (F8):** `ModeBanner.test.tsx`.
+- **Estado por scan (F9):** `StatePanel.test.tsx` y `page-state.test.tsx`.
+- **Marcador de despliegue (F10):** `deploy-marker.test.ts`.
+- **Frontera de imports (F11):** `lint-boundary.test.mjs`.
+- **Script `build` (F12):** `check-no-debug.test.mjs`, "the build script".
+
 ### 12.2 Salidas
 
-**(a) Back completo.** `npm run build && npm test` en Arca-back:
+**(a) Back completo.** `npm run build && npm test` en Arca-back, repetido sobre `87b224f`:
 
 ```
 > tsc -b
- Test Files  48 passed (48)
-      Tests  483 passed (483)
+ Test Files  49 passed (49)
+      Tests  501 passed (501)
 ```
 
-**(b) Front completo.** En Arca-front:
+**(b) Front completo.** En Arca-front, repetido sobre `c6136da`:
 
 ```
-npm test            → Test Files  20 passed (20) · Tests  225 passed (225)
+npm test            → Test Files  23 passed (23) · Tests  270 passed (270)
 npm run typecheck   → tsc --noEmit, sin errores
 npm run lint        → ✖ 6 problems (0 errors, 6 warnings)
 ```
 
-Los 6 avisos son los `react-hooks/set-state-in-effect` que ya existían: la página de assessment, la de resultados, AiGapSection, OceanPanel, ScoreGauge y useInView.
+Los 6 avisos son los `react-hooks/set-state-in-effect` que ya existían: la página de assessment, la de resultados, AiGapSection, OceanPanel, ScoreGauge y useInView. La revisión final no añadió ninguno.
 
 **(c) Build de producción del front, sin modo.**
 - Se corrió con `Remove-Item Env:NEXT_PUBLIC_ARCA_MODE` antes de `npm run build`. El `build` es `next build && node scripts/check-no-debug.mjs`.
@@ -531,6 +574,14 @@ Los 6 avisos son los `react-hooks/set-state-in-effect` que ya existían: la pág
   - La misma búsqueda recursiva, `Get-ChildItem .next\static -Recurse -Filter *.js | Select-String …`: 0 coincidencias en 24 archivos.
   - En todo el `.js` de `.next\static` y `.next\server`, añadiendo `x-arca-debug-scenario`, `LIVE DEBUG` y `MODE MISMATCH`: 0.
   - Control positivo: `Scan my firm` sí aparece en 1 archivo, así que la búsqueda recorre el código que se publica.
+- Repetido tras la revisión final, con el front ya en `16b6a2f` (`c6136da` solo toca la configuración de ESLint y su test):
+
+  ```
+  ○ /assessment  ○ /assessment/results  ○ /quote  ○ /quote/scanning  ○ /score
+  [check-no-debug] 0 debug leak(s) in the production build
+  ```
+
+  Búsqueda manual en todo el `.js` de `.next\static` y `.next\server`: 0 archivos para `arca-debug-sentinel`, `/__debug/`, `LIVE DEBUG`, `MODE MISMATCH`, `__arcaDebug`, `x-arca-debug` (sin distinguir mayúsculas, cubre la cabecera nueva `X-Arca-Debug`), `next scan injects`, `Nothing published for this scan` y `arca.debug.scenario`. Control positivo: `Scan my firm` aparece en 2 archivos.
 
 **(d) Builds que deben fallar.**
 
@@ -603,16 +654,31 @@ curl.exe -s http://127.0.0.1:8080/__debug/mode
 TCP    127.0.0.1:8080   0.0.0.0:0   LISTENING
 ```
 
+- Esa respuesta es de antes de la revisión final, con el campo `configured`. No se repitió, porque el arranque de live-debug toca el Supabase compartido.
+- Con esta configuración (extracción agéntica, planner por reglas), la respuesta ahora lleva `"inUse":{"openai":true,"apify":true,"supabase":true}` en lugar de `configured`. Lo fija `compose.test.ts`, "/__debug/mode in live-debug reports what compose built: the default agentic extraction".
+
+**(j) Mock con claves reales en el `.env.local`.** Con `npm run stack -- mock` corriendo sobre `87b224f`/`16b6a2f`. El `.env.local` de Jesús tiene las claves de OpenAI, Apify y Supabase, y no se usan:
+
+```
+curl -s http://127.0.0.1:8080/__debug/mode
+{"mode":"mock","sourceMode":"mock","storageBackend":"memory","websiteEvidenceProvider":"mock","assessmentPlanner":"rules","signalLlmModel":null,"inUse":{"openai":false,"apify":false,"supabase":false}}
+curl -X POST http://127.0.0.1:8080/__debug/reset                      → 400
+OPTIONS /__debug/reset (Origin http://localhost:3000, pide x-arca-debug) → 204 | access-control-allow-headers: Content-Type,Authorization,X-Arca-Debug-Scenario,X-Arca-Debug
+```
+
+`netstat -ano` con ese stack: `0.0.0.0:3000` y `[::]:3000` (front), `127.0.0.1:8080` (back), igual que en (g).
+
 **Smoke de navegador (§8.12).**
 - Usa el Chromium de Playwright de Arca-back contra los servidores reales.
 - Cualquier petición a un host que no sea local (salvo las fuentes de Google) se bloquea y hace fallar el escenario. Un control negativo con `ARCA_FRONTEND_URL=http://example.com` falló los 4 escenarios con `requested hosts off this machine: example.com`.
 
-Escenarios 1 a 4, con `npm run stack -- mock`:
+Escenarios 1 a 4, con `npm run stack -- mock`, repetidos tras la revisión final (back `87b224f`, front `16b6a2f`):
 
 ```
   compositeScore 70.63 (layer 1 82, layer 2 65.75), tier FORTIFIED
 PASS 1 happy path in mock
   status PARTIAL; bar error/PROVIDER_ERROR: Apify usage limit reached for the current billing cycle; lookups after it were not started
+  one-shot: the second POST /scan carried no scenario header
 PASS 2 preset "Apify out of credit"
 PASS 3 preset "Every source down"
 PASS 4 preset "Session expired"
@@ -628,13 +694,16 @@ Qué comprueba cada escenario:
    - "Auto-answer" deja respondidas todas las preguntas (`answered = total`) y recarga en el repaso;
    - "Attest & complete" lleva a `/assessment/results`, con `compositeScore` numérico en el panel y el mismo número en el indicador de la página.
 2. **"Apify out of credit":**
+   - antes de lanzar, la franja dice `MOCK · no real APIs · in-memory data · next scan injects: Bar apify_quota, Avvo apify_quota`;
    - la cabecera lleva `bar` y `avvo` en `apify_quota`;
+   - después, la pestaña ya no guarda escenario, la franja vuelve a `MOCK · no real APIs · in-memory data` y `/quote` publicó ese escenario como `sentScenario`;
    - `/score` muestra el aviso de evidencia incompleta;
-   - `sources.bar.reason` contiene "Apify usage limit reached".
-3. **"Every source down":** la cabecera lleva las tres fuentes en `error` y `/quote/scanning` muestra "We couldn't finish your scan".
+   - `sources.bar.reason` contiene "Apify usage limit reached";
+   - un segundo scan desde la misma pestaña, sin elegir nada, sale sin cabecera.
+3. **"Every source down":** la franja nombra las tres fuentes en `error`, la cabecera las lleva y `/quote/scanning` muestra "We couldn't finish your scan".
 4. **"Session expired":**
-   - la cabecera lleva `http.poll: unauthorized`;
-   - tras pasar por `/quote/scanning`, vuelve a `/quote`;
+   - la franja nombra `Polls unauthorized` y la cabecera lleva `http.poll: unauthorized`;
+   - tras pasar por `/quote/scanning`, vuelve a `/quote`, donde ya no queda escenario armado;
    - el token rechazado ya no está en `sessionStorage`.
 
 Escenario 5:
@@ -645,6 +714,8 @@ Escenario 5:
 PASS 5 mode mismatch
 1/1 scenario(s) passed; screenshots in C:\Users\jesus\projects\Arca-front\artifacts\modes
 ```
+
+Repetido tras la revisión final, de la misma forma: `PASS 5 mode mismatch`, `1/1`.
 
 - El smoke exige que el front haya pedido `http://localhost:8080/__debug/mode` y que esa petición fallara.
 - Control negativo: con el back corriendo y `ARCA_API_URL=http://localhost:8099`, la franja siguió en MOCK y el escenario falló. Eso confirma que apuntar el smoke a un puerto vacío no basta: hay que parar el back.
@@ -657,6 +728,12 @@ PASS 5 mode mismatch
 - **Gasto real dentro de un scan inyectado:** los directorios en `default` reservan en el ledger de Apify con `scanId` nulo (§5.5).
 - **El escenario 5 del smoke se corre aparte, con el back parado.** El front fija su URL de la API al compilar, así que no se puede apuntar a un puerto vacío sin reiniciarlo.
 
-### 12.4 Observado y pendiente
+Decisiones de la revisión final:
+- **`configured` pasa a llamarse `inUse`.** El valor cambió de significado (un cliente construido, no una clave presente), así que el nombre viejo habría mentido. El cambio toca el contrato, `compose.ts`, sus tests y los del front. Un back que todavía mande la forma vieja es "absent" para el front nuevo, así que la franja dice MODE MISMATCH en vez de dar por bueno un modo.
+- **`signalLlmModel`:** el modelo de la extracción si llama a OpenAI (la agéntica usa `SIGNAL_LLM_MODEL`; la de una pasada, su modelo fijo `gpt-4o-mini`); si no, el del planner `agent`; si no, `null`.
+- **El escenario se gasta al enviarse, aunque el arranque falle** (429, 500 o red). Así un `http.start` inyectado tampoco se queda armado, y para repetir basta con volver a elegirlo. Si `sessionStorage` no deja borrarlo, no se envía: mejor ningún escenario que uno en cada scan.
+- **La franja relee el escenario armado** al montar, en cada nueva pregunta al back, cada vez que una página publica (que es cuando un scan se lo lleva) y cuando lo cambian los controles del panel. Un valor que no entiende lo señala como `an unreadable scenario`, porque el puente lo enviaría igual y el back respondería 400.
+- **Estado por scan:** con un `?scan` en la URL, el panel solo enseña el estado publicado para ese scan. `/quote` no tiene scan en la URL y enseña su último arranque. `/assessment/results` publica también su error.
+- **Frontera de imports:** `no-restricted-imports` no mira `import()`, así que la frontera añade una regla `no-restricted-syntax` para las importaciones dinámicas. Los imports relativos se cubren cuando la ruta nombra `components/debug` o `lib/debug`, o es `./debug/…` desde un archivo de `components/` o `lib/`.
 
-- **En mock, `/__debug/mode` informa `websiteEvidenceProvider: "agentic"` y `signalLlmModel: "gpt-6-luna"`,** aunque mock no construye ningún proveedor ni LLM. Las fuentes y el almacenamiento sí son los efectivos (`mock`/`memory`). Queda para la revisión final, por la regla de que la etiqueta no mienta (§4).
+Ya no queda nada pendiente de esta verificación. Lo único que se había dejado abierto (en mock, `/__debug/mode` decía `agentic` y `gpt-6-luna`) quedó resuelto con `inUse` y los valores efectivos: ver (j).
