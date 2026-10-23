@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { AssessmentView, PollResponse, ScanResponse, StartedAssessmentResponse, type PipelineResult } from '@arca/contracts';
+import { AssessmentView, PollResponse, ScanResponse, StartedAssessmentResponse, type DirectorySource,
+  type PipelineResult } from '@arca/contracts';
 import { DEBUG_PRESETS, DEBUG_SCENARIO_HEADER, DebugModeResponse, DebugScanState, DebugScenario,
   type DebugScenarioInput } from '@arca/contracts/debug';
 import { rulesPlan, type PlanningAgent } from '@arca/questions';
@@ -88,11 +89,16 @@ function debugSetup(options: { mode?: 'mock' | 'live-debug'; gate?: Promise<void
   const scans = new RoutingScanRepository(durable, new InMemoryRepository());
   const assessments = new RoutingAssessmentRepository(new InMemoryAssessmentRepository(), new InMemoryAssessmentRepository(), scans);
   const base = mockSources();
+  // Records each query the real directories receive. Mock sources ignore `scanId`, so only this shows which id
+  // would reach the Apify ledger in live-debug.
+  const directoryRuns = { bar: vi.fn<DirectorySource['run']>((query, signal) => base.bar.run(query, signal)),
+    avvo: vi.fn<DirectorySource['run']>((query, signal) => base.avvo.run(query, signal)) };
+  const observed = { ...base, bar: { ...base.bar, run: directoryRuns.bar }, avvo: { ...base.avvo, run: directoryRuns.avvo } };
   const gate = options.gate;
   // The gate holds every website read, clean or injected, so two scans can be kept in flight together.
-  const sources = gate ? { ...base, website: { run: async (domain: string, signal: AbortSignal) => {
+  const sources = gate ? { ...observed, website: { run: async (domain: string, signal: AbortSignal) => {
     await gate; return base.website.run(domain, signal);
-  } } } : base;
+  } } } : observed;
   const clearDurableMemory = vi.fn();
   const toolOptions = { mode, describe: description(mode), sources, scans, assessments, pipelineTimeoutMs: 600_000, clearDurableMemory };
   const debug = createDebugTools(toolOptions);
@@ -105,11 +111,11 @@ function debugSetup(options: { mode?: 'mock' | 'live-debug'; gate?: Promise<void
     }),
     sessionSecret: secret, corsOrigins: [origin], clientIp: () => '127.0.0.1',
     assessmentAgent: options.assessmentAgent, assessmentPlanningTimeoutMs: options.assessmentPlanningTimeoutMs });
-  const post = (scenario?: DebugScenarioInput | string, email = `owner@${DOMAIN}`) => application.app.request('/scan', {
-    method: 'POST', body: JSON.stringify({ email, domain: DOMAIN }), headers: { 'Content-Type': 'application/json',
+  const post = (scenario?: DebugScenarioInput | string, email = `owner@${DOMAIN}`, domain = DOMAIN) => application.app.request('/scan', {
+    method: 'POST', body: JSON.stringify({ email, domain }), headers: { 'Content-Type': 'application/json',
       ...(scenario === undefined ? {} : { [DEBUG_SCENARIO_HEADER]: typeof scenario === 'string' ? scenario : JSON.stringify(scenario) }) } });
-  async function start(scenario?: DebugScenarioInput, email?: string) {
-    const response = await post(scenario, email);
+  async function start(scenario?: DebugScenarioInput, email?: string, domain?: string) {
+    const response = await post(scenario, email, domain);
     expect(response.status).toBe(202);
     return ScanResponse.parse(await response.json());
   }
@@ -126,7 +132,7 @@ function debugSetup(options: { mode?: 'mock' | 'live-debug'; gate?: Promise<void
     await application.drain();
     return { started, final: await final(started) };
   }
-  return { ...application, debug, toolOptions, durableSpy, scans, assessments, run, renderReport, clearDurableMemory,
+  return { ...application, debug, toolOptions, durableSpy, scans, assessments, run, directoryRuns, renderReport, clearDurableMemory,
     post, start, auth, poll, final, finish };
 }
 
@@ -199,6 +205,30 @@ describe('debug wiring', () => {
     expect(injectedFinal.status).toBe('PARTIAL');
     expect(injectedFinal.result?.meta.reusedEvidence).toBe(false);
     expect(s.run).toHaveBeenCalledTimes(1);
+  });
+
+  // DN-09 5.5 and 8.5: an injected scan has no row in `scans`, so a real directory left on `default` must reserve in the
+  // Apify ledger without its scanId. With the id, the reservation would hit the foreign key and show an error nobody injected.
+  it.each([
+    { real: 'bar', scenario: { avvo: 'error' } },
+    { real: 'avvo', scenario: { bar: 'error' } },
+  ] as const)('the real $real directory of an injected scan is asked without its scanId', async ({ real, scenario }) => {
+    const s = debugSetup();
+    const injected = real === 'bar' ? 'avvo' : 'bar';
+    const { started, final } = await s.finish(scenario);
+    expect(final.status).toBe('PARTIAL');
+    expect(final.result?.sources[real].status).toBe('ok');
+    expect(s.directoryRuns[injected]).not.toHaveBeenCalled();
+    expect(s.directoryRuns[real]).toHaveBeenCalledTimes(1);
+    const [query] = s.directoryRuns[real].mock.calls[0]!;
+    expect(query.canonicalDomain).toBe(DOMAIN);
+    expect(query.scanId).toBeUndefined();
+    expect(JSON.stringify(query)).not.toContain(started.scanId);
+    // A clean scan still hands the real directory its own id, as production does.
+    const clean = await s.start(undefined, `clean@${DOMAIN}`);
+    await s.drain();
+    expect(s.directoryRuns[real]).toHaveBeenCalledTimes(2);
+    expect(s.directoryRuns[real].mock.calls[1]![0].scanId).toBe(clean.scanId);
   });
 
   it('a slow scan runs on the configured budget, so the website does not end in timeout', async () => {
@@ -319,9 +349,38 @@ describe('debug wiring', () => {
     expect(JSON.stringify(body)).not.toContain(`owner@${DOMAIN}`);
     expect(state).toMatchObject({ scanId: started.scanId, status: 'PARTIAL', canonicalDomain: DOMAIN, cached: false,
       storage: 'memory', injected: true, scenario: DebugScenario.parse({ avvo: 'error' }) });
+    expect(state.domainResolution).toEqual({ status: 'RESOLVED', canonicalDomain: DOMAIN, source: 'request', reason: null });
     expect(state.sources?.avvo.status).toBe('error');
     const cleanState = DebugScanState.parse(await (await s.app.request(`/__debug/scan/${clean.scanId}`, { headers: s.auth(clean) })).json());
     expect(cleanState).toMatchObject({ status: 'COMPLETED', storage: 'supabase', injected: false, scenario: null });
+  });
+
+  // DN-09 5.2: the per-source codes, reasons and durations matter most when the scan failed, and a FAILED record stores no result.
+  it('/__debug/scan keeps the per-source diagnostics of a failed scan, which its poll does not carry', async () => {
+    const s = debugSetup();
+    const internal = async (started: Parameters<typeof s.auth>[0]) => {
+      const response = await s.app.request(`/__debug/scan/${started.scanId}`, { headers: s.auth(started) });
+      expect(response.status).toBe(200);
+      return DebugScanState.parse(await response.json());
+    };
+    const { started, final } = await s.finish(DEBUG_PRESETS.all_down.scenario);
+    expect(final.status).toBe('FAILED');
+    expect(final.result).toBeUndefined();
+    const state = await internal(started);
+    expect(state).toMatchObject({ status: 'FAILED', storage: 'memory', injected: true });
+    expect(state.sources?.website).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR', reason: 'Source unavailable' });
+    // With the site unreadable there is no identity to look up, so the real pipeline skips both directories.
+    expect(state.sources?.bar).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY' });
+    expect(state.sources?.avvo).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY' });
+    expect(typeof state.sources?.website.durationMs).toBe('number');
+    // A clean failure keeps them too: the fixture's site refuses every request.
+    const clean = await s.start(undefined, 'owner@failed.arca.example', 'failed.arca.example');
+    await s.drain();
+    expect((await s.final(clean)).status).toBe('FAILED');
+    const cleanState = await internal(clean);
+    expect(cleanState).toMatchObject({ status: 'FAILED', storage: 'supabase', injected: false, canonicalDomain: 'failed.arca.example' });
+    expect(cleanState.sources?.website).toMatchObject({ status: 'error', code: 'ACCESS_BLOCKED', reason: 'The site refused every request' });
+    expect(JSON.stringify(cleanState)).not.toContain('owner@failed.arca.example');
   });
 
   it('/__debug/mode answers with the description only', async () => {

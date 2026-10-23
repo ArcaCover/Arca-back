@@ -6,7 +6,8 @@ import {
 
 const okSource = { status: 'ok', dataStatus: 'PRESENT', durationMs: 12 } as const;
 const scanState = {
-  scanId: 'scan-1', status: 'COMPLETED', canonicalDomain: 'smithlaw.com', createdAt: '2026-10-23T10:00:00.000Z',
+  scanId: 'scan-1', status: 'COMPLETED', canonicalDomain: 'smithlaw.com',
+  domainResolution: { status: 'RESOLVED', canonicalDomain: 'smithlaw.com', source: 'request', reason: null }, createdAt: '2026-10-23T10:00:00.000Z',
   completedAt: '2026-10-23T10:00:05.000Z', durationMs: 5000, cached: false, storage: 'memory', injected: true,
   scenario: DebugScenario.parse({ bar: 'apify_quota' }), sources: { website: okSource, bar: okSource, avvo: okSource },
 };
@@ -112,6 +113,13 @@ describe('DebugScanState', () => {
     expect(DebugScanState.safeParse({ ...scanState, status: 'DONE' }).success).toBe(false);
     expect(DebugScanState.safeParse({ ...scanState, sources: { ...scanState.sources, bar: { status: 'bogus' } } }).success).toBe(false);
     expect(DebugScanState.safeParse({ ...scanState, sources: { website: okSource, bar: okSource } }).success).toBe(false);
+  });
+
+  it('carries the domain resolution of the scan record, in its Layer 1 shape', () => {
+    const withoutResolution: Record<string, unknown> = { ...scanState };
+    delete withoutResolution.domainResolution;
+    expect(DebugScanState.safeParse(withoutResolution).success).toBe(false);
+    expect(DebugScanState.safeParse({ ...scanState, domainResolution: { ...scanState.domainResolution, source: 'guess' } }).success).toBe(false);
   });
 });
 

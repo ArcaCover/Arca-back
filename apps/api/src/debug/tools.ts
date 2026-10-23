@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import type { DirectorySource, Layer1Pipeline, WebsiteSource } from '@arca/contracts';
+import type { DirectorySource, Layer1Pipeline, Layer1Result, WebsiteSource } from '@arca/contracts';
 import { DebugModeResponse, DebugScanState, DebugScenario, isInjected } from '@arca/contracts/debug';
 import { verifySessionToken } from '../auth/session-token.js';
 import type { AssessmentAgent } from '../assessment/service.js';
@@ -15,6 +15,8 @@ export type DebugTools = {
   /** Moves the scan to in-memory storage before its first write and remembers its scenario. */
   beginScan(scanId: string, scenario: DebugScenario): void;
   pipelineFor(scenario: DebugScenario): Layer1Pipeline;
+  /** A FAILED scan is stored without its result, so the debug view keeps the per-source diagnostics here (DN-09 5.2). */
+  keepFailedSources(scanId: string, sources: Layer1Result['sources']): void;
   takePollFault(scanId: string): 'unauthorized' | 'server_error' | 'hang' | null;
   reportFault(scanId: string): boolean;
   assessmentAgentFor(scanId: string): AssessmentAgent | undefined;
@@ -43,6 +45,7 @@ export function createDebugTools(options: {
   const description = DebugModeResponse.parse(options.describe);
   const scenarios = new Map<string, DebugScenario>();
   const polls = new Map<string, number>();
+  const failedSources = new Map<string, Layer1Result['sources']>();
   return {
     parseScenario(header) {
       if (header === undefined) return { ok: true, scenario: null };
@@ -63,6 +66,7 @@ export function createDebugTools(options: {
         bar: injectDirectory('bar', sources.bar, scenario), avvo: injectDirectory('avvo', sources.avvo, scenario),
         repository: scans, timeoutMs: options.pipelineTimeoutMs });
     },
+    keepFailedSources(scanId, sources) { failedSources.set(scanId, sources); },
     takePollFault(scanId) {
       const fault = scenarios.get(scanId)?.http.poll ?? 'none';
       if (fault === 'none') return null;
@@ -90,9 +94,11 @@ export function createDebugTools(options: {
         const scenario = scenarios.get(scanId) ?? null;
         // Parsed against the strict contract, which has no field for the email.
         return c.json(DebugScanState.parse({ scanId, status: scan.status, canonicalDomain: scan.canonical_domain,
-          createdAt: scan.created_at, completedAt: scan.completed_at, durationMs: scan.duration_ms, cached: scan.cached,
+          domainResolution: scan.domain_resolution, createdAt: scan.created_at, completedAt: scan.completed_at,
+          durationMs: scan.duration_ms, cached: scan.cached,
           storage: scans.isIsolated(scanId) ? 'memory' : description.storageBackend, injected: scenario !== null, scenario,
-          sources: scan.result?.sources ?? null }));
+          // Null while the scan runs, and for a failure no source reported on: a thrown pipeline, or one this process did not run.
+          sources: scan.result?.sources ?? failedSources.get(scanId) ?? null }));
       });
       // Only the limiter and this process's memory. Supabase is never touched.
       app.post('/reset', c => {

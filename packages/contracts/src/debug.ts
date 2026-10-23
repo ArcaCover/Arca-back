@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { Layer1Result, ScanStatus } from './layer1.js';
+import { DomainResolution, Layer1Result, ScanStatus } from './layer1.js';
 
 // The debug contract is reachable only through the `@arca/contracts/debug` subpath. It is not re-exported from
 // index.ts, so production code that imports the package root never bundles it.
@@ -49,11 +49,16 @@ export const DebugModeResponse = z.object({
 }).strict();
 export type DebugModeResponse = z.infer<typeof DebugModeResponse>;
 
-/** What GET /__debug/scan/:scanId reports about one scan. It carries no email, by design. */
+/**
+ * What GET /__debug/scan/:scanId reports about one scan. It carries no email, by design.
+ * `sources` holds the per-source diagnostics (codes, reasons, durations). A FAILED scan keeps them too, although its
+ * stored record has no result.
+ */
 export const DebugScanState = z.object({
   scanId: z.string(),
   status: ScanStatus,
   canonicalDomain: z.string(),
+  domainResolution: DomainResolution,
   createdAt: z.string(),
   completedAt: z.string().nullable(),
   durationMs: z.number().nullable(),

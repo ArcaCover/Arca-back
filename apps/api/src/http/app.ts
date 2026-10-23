@@ -127,6 +127,8 @@ export function createApp(deps: AppDeps) {
         // A failed scan carries no result, whichever way it failed. Every source was unusable,
         // so the assessment is an empty shell, and PollResponse has no room for one on FAILED.
         // Raw evidence still lands in scan_raw_data, so nothing diagnostic is lost.
+        // The debug view keeps the per-source summary the record drops; it is set before a poll can see FAILED.
+        if (outcome.status === 'FAILED') debug?.keepFailedSources(scanId, result.sources);
         await deps.repository.complete(scanId, { status: outcome.status,
           result: outcome.status === 'FAILED' ? null : result,
           completed_at: result.meta.completedAt, duration_ms: result.meta.scanDurationMs });
