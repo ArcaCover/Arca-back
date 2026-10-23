@@ -1,6 +1,8 @@
 export class ScanLimiter {
   private readonly hits = new Map<string, number[]>();
   constructor(private readonly now = Date.now) {}
+  /** Forgets every attempt. The debug reset uses it; production never calls it. */
+  clear(): void { this.hits.clear(); }
   check(ip: string, email: string): { allowed: boolean; retryAfter: number } {
     const now = this.now();
     for (const [key, hits] of this.hits) {

@@ -35,6 +35,8 @@ export class InMemoryAssessmentRepository implements AssessmentRepository {
   private readonly records = new Map<string, AssessmentRecord>();
   private readonly byScan = new Map<string, string>();
   readonly events: Array<AnswerEvent & { assessment_id: string }> = [];
+  /** Forgets everything. The debug reset uses it; production never calls it. */
+  clear(): void { this.records.clear(); this.byScan.clear(); this.events.length = 0; }
   async create(record: AssessmentRecord) {
     const existing = this.byScan.get(record.scan_id);
     if (existing) return structuredClone(this.records.get(existing)!);

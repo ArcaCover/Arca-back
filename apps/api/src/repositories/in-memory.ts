@@ -9,6 +9,10 @@ export class InMemoryRepository implements ScanRepository {
   readonly raw: RawRecord[] = [];
   readonly apifyRuns = new Map<string, ApifyRunRecord>();
   readonly scanApifyRuns = new Map<string, Map<string, boolean>>();
+  /** Forgets everything. The debug reset uses it; production never calls it. */
+  clear(): void {
+    this.scans.clear(); this.raw.length = 0; this.apifyRuns.clear(); this.scanApifyRuns.clear();
+  }
   async create(scan: ScanRecord) {
     if (this.scans.has(scan.scan_id)) throw new Error('Duplicate scan');
     this.scans.set(scan.scan_id, structuredClone(scan));
