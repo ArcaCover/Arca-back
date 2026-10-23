@@ -107,11 +107,11 @@
 
 **Files:**
 - Create: `Arca-back/packages/contracts/src/debug.ts`
-- Modify: `Arca-back/packages/contracts/src/index.ts` (añadir `export * from './debug.js';`)
+- Modify: `Arca-back/packages/contracts/package.json`. Añade a `exports` la entrada `"./debug": { "arca-source": "./src/debug.ts", "types": "./dist/debug.d.ts", "default": "./dist/debug.js" }`. **No** se toca `index.ts`: el contrato de debug no se reexporta desde la raíz. Así ningún código de producción del front lo arrastra a su bundle al importar `@arca/contracts` (ruling del controlador, ver el ledger).
 - Test: `Arca-back/packages/contracts/tests/debug.test.ts`
 
 **Interfaces:**
-- Produces (todo exportado desde `@arca/contracts`):
+- Produces (todo exportado **solo** desde el subpath `@arca/contracts/debug`; los consumidores de las Tasks 3-9 importan de ahí):
   - `DEBUG_SCENARIO_HEADER = 'X-Arca-Debug-Scenario'`
   - `DebugScenario`, zod `.strict()` con defaults:
     - `website: z.enum(['default','no_identity','blocked','error','timeout']).default('default')`
@@ -137,7 +137,8 @@
   - `DebugScenario.safeParse({ bar:'nope' }).success === false`;
   - `DebugScenario.safeParse({ extra:1 }).success === false`;
   - cada preset parsea con `DebugScenario.parse(preset.scenario)`;
-  - `DebugScanState` rechaza un objeto con `email`.
+  - `DebugScanState` rechaza un objeto con `email`;
+  - `import * as root from '@arca/contracts'` no expone `DebugScenario` ni `DEBUG_SCENARIO_HEADER`: el contrato vive solo en el subpath.
 - [ ] **Step 2: Run** `npx vitest run packages/contracts/tests/debug.test.ts`. Expected: FAIL.
 - [ ] **Step 3: Implement** `debug.ts` y el export.
 - [ ] **Step 4: Run** `npm run build && npx vitest run packages/contracts/tests/debug.test.ts`. Expected: PASS.
@@ -327,7 +328,7 @@ Comportamiento (en todos los casos sin datos, `rawContent` es JSON con `{ inject
     - `new RoutingAssessmentRepository(supabaseAssessments, new InMemoryAssessmentRepository(), routing)`.
 
     El `ApifyClient.store` y `recoverInterrupted` usan el repositorio enrutado. `WebsiteExtractionSource` recibe el enrutado: su `latestRaw` va al durable.
-  - En `mock`, el durable es un `InMemoryRepository` y se pasa `clearDurableMemory`.
+  - En `mock` también se envuelve con los repositorios enrutados: el durable es un `InMemoryRepository` (y un `InMemoryAssessmentRepository`), y se pasa `clearDurableMemory`. `createDebugTools` siempre recibe repositorios enrutados.
   - Scripts:
     - `"dev:mock": "node scripts/with-mode.mjs mock npm run dev"`;
     - `"dev:live-debug": "node scripts/with-mode.mjs live-debug npm run dev"`;
@@ -437,7 +438,7 @@ Comportamiento (en todos los casos sin datos, `rawContent` es JSON con `{ inject
 - Test: `Arca-front/lib/debug/mode-check.test.ts`, `Arca-front/lib/debug/token.test.ts`, `Arca-front/components/debug/ModeBanner.test.tsx`
 
 **Interfaces:**
-- Consumes: `DebugModeResponse`, `DebugScanState` (Task 2); `installDebugStore` y `createDebugStore` (Task 7).
+- Consumes: `DebugModeResponse` y `DebugScanState` de `@arca/contracts/debug` (Task 2); `installDebugStore` y `createDebugStore` (Task 7).
 - Produces:
   - `type BackModeProbe = { kind: "ok"; body: DebugModeResponse } | { kind: "absent" } | { kind: "unreachable" }`
   - `probeBackMode(baseUrl: string, fetcher = fetch): Promise<BackModeProbe>`. Un 404 o un body que no parsea da `absent`; un error de red da `unreachable`. Timeout de 5 s.
@@ -481,7 +482,7 @@ Comportamiento (en todos los casos sin datos, `rawContent` es JSON con `{ inject
 - Test: `Arca-front/lib/debug/auto-answer.test.ts`, `Arca-front/lib/api/client.test.ts` (añadir casos)
 
 **Interfaces:**
-- Consumes: `DEBUG_PRESETS`, `DebugScenario`, `RenderedQuestion`, `AnswerValue` y `AssessmentView` de `@arca/contracts`; las funciones de `lib/api/client.ts`; `SCENARIO_STORAGE_KEY`.
+- Consumes: `DEBUG_PRESETS` y `DebugScenario` de `@arca/contracts/debug`; `RenderedQuestion`, `AnswerValue` y `AssessmentView` de `@arca/contracts`; las funciones de `lib/api/client.ts`; `SCENARIO_STORAGE_KEY`.
 - Produces:
   - `chooseAnswer(question: RenderedQuestion): AnswerValue`. Usa `question.suggestedAnswer` si existe. Si no:
     - `single_select` / `yes_no` → la primera opción;
