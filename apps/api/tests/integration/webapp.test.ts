@@ -278,6 +278,26 @@ describe('the webapp API in mock', () => {
     expect(await s.call('POST', `/admin/deletion-requests/${requested.id}/reject`, { token: ops.token })).toEqual(failure(409, 'conflict'));
   });
 
+  it('an unpaid organization answers 402 on every paid route, and only there', async () => {
+    const s = await mockApp();
+    const { owner, org } = await s.ownedOrg(OWNER, { paid: false });
+    // Paying is how an organization gets in, and asking for its deletion needs no payment either (DN-10 §4.4).
+    const exempt = new Set([`GET /orgs/${org.id}`, `POST /orgs/${org.id}/billing/checkout`, `POST /orgs/${org.id}/billing/portal`,
+      `POST /orgs/${org.id}/deletion-request`]);
+    const routes = orgRoutes({ orgId: org.id, memberId: owner.user.userId, invitationId: crypto.randomUUID() });
+    expect(routes.filter(([method, path]) => exempt.has(`${method} ${path}`))).toHaveLength(exempt.size);
+    for (const [method, path, body] of routes.filter(([method, path]) => !exempt.has(`${method} ${path}`))) {
+      expect(await s.call(method, path, { token: owner.token, body }), `${method} ${path}`).toEqual(failure(402, 'payment_required'));
+    }
+    for (const [method, path, body] of routes.filter(([method, path]) => exempt.has(`${method} ${path}`))) {
+      const reply = await s.call(method, path, { token: owner.token, body });
+      expect(reply.status, `${method} ${path}`).toBeGreaterThanOrEqual(200);
+      expect(reply.status, `${method} ${path}`).toBeLessThan(300);
+    }
+    expect(OrgView.parse((await s.call('GET', `/orgs/${org.id}`, { token: owner.token })).body))
+      .toMatchObject({ billingStatus: 'pending_payment', paidAccess: false, deletionPending: true });
+  });
+
   describe('routes refuse every role the matrix refuses', () => {
     type Team = { orgId: string; ids: Record<Role, string>; tokens: Record<Role, string>; invitationId: string; deletionId: string };
     let team: Team;
