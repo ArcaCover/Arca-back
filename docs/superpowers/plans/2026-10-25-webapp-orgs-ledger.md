@@ -27,7 +27,7 @@ Task 6: complete (front 025fc8e..25eab2f, review clean)
 Task 7: implemented 1a26a72; review: 1 Important (org switch keeps page state: provider without key) → fix round running (23:14)
 Task 7: fix round 1/2 (1 addressed, 0 open — provider keyed by org id; commits 1a26a72..eb8d054); complete
 Task 8: complete (front eb8d054..9e9c4ee, back 7027fb0..95ff868, review clean) — smoke 5/5 twice; back 663 tests, front 389
-All task minors and concerns: task-results-summary.txt (from the workflow journal)
+All task minors and concerns: 2026-10-25-webapp-orgs-review-notes.md
 Ruling: /app/billing shows the changed price; the mock checkout page shows no amount (back test proves createCheckout receives the new price) — cost if wrong: demo point 4 shown on the billing page, not on the checkout page
 Final review: dispatched 23:46
 User: machine shuts down at 01:50; nothing may keep running from 01:40 (no servers, no agents, no timers); do not leave mock running
