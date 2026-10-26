@@ -193,7 +193,10 @@ Si falla una condición, la organización **no** se crea. Un scan puede reclamar
 
 **Cuenta sin organización.** Si un reclamo falla, la cuenta de Supabase ya existe pero no tiene organización. `/app` le muestra "Completa un análisis para crear tu organización", con enlace a `/quote`. `/app/login` nunca crea usuarios (`shouldCreateUser: false`); solo el registro desde los resultados los crea.
 
-**Cliente que ya tiene organización.** Si repite el embudo con sesión iniciada, el CTA de resultados ofrece **añadir el análisis a su organización** (`analysis.create`) en vez de crear otra.
+**Cliente que ya tiene organización.** Si repite el embudo con sesión iniciada, el CTA de resultados (que solo existe en `mock`, §5) pide primero el reclamo (`POST /claims`) y solo entonces decide adónde va el análisis:
+- se **añade a la organización activa** (`POST /orgs/:id/analyses { claimId }`) solo si se cumplen las tres condiciones: el email de la sesión es el del reclamo, sin distinguir mayúsculas; su rol tiene `analysis.create`; y la organización tiene acceso pagado (`paidAccess`);
+- si falta cualquiera de las tres, el flujo va al **registro con el reclamo** (`/app/signup?claim=<claimId>`), que inicia sesión con el email del reclamo;
+- si el back responde **402** (la organización dejó de estar pagada después de leer `/me`), el front lleva a `/app/billing`.
 
 ### 4.8 Configuración nueva
 
@@ -217,9 +220,9 @@ En `mock` no hace falta ninguna de las claves. Todas siguen las reglas de DN-09:
   - `/app/members`: lista, invitar, cambiar rol y quitar.
   - `/app/settings`: datos de la organización y "Solicitar eliminación".
   - `/app/invite/[token]`.
-  - `/app/billing/mock-checkout`: la página que hace de Stripe en `mock`, con el botón del pago simulado.
+  - `/app/billing/mock-checkout`: la página que hace de Stripe en `mock`, con el botón del pago simulado. Fuera de `mock` responde **404** (componente de servidor con `notFound()`) y **no está en el bundle de producción**: el componente del pago se carga con `next/dynamic` dentro de la guarda literal, así que el build de producción no emite su chunk.
   - `/app/admin`: prueba de concepto del panel de ARCA, solo para admins de plataforma: precios de los planes y cola de solicitudes de borrado.
-- **En `/assessment/results`:** un CTA "Save your results and activate your account" que lleva a `/app/signup` y conserva el token del scan.
+- **En `/assessment/results`:** un CTA "Save your results and activate your account". **Solo existe en `mock`** (guarda literal `process.env.NEXT_PUBLIC_ARCA_MODE === "mock"`, DN-09) hasta que lleguen los adaptadores reales de Auth y Stripe; fuera de `mock` no se pinta. Al pulsarlo cambia el token del scan por un reclamo (`POST /claims`, con el token en el cuerpo) y aplica las reglas de §4.7: el análisis se añade a la organización activa solo si el email de la sesión coincide con el del reclamo (sin distinguir mayúsculas), el rol tiene `analysis.create` y la organización tiene acceso pagado; si no, va a `/app/signup` con el reclamo, y un **402** lleva a `/app/billing`.
 - **Sin diseño:** componentes simples con los tokens de la marca. Los botones que el rol no permite se ocultan o se deshabilitan en producción, pero **el back es el que niega**. En los modos de debug (guarda literal de DN-09) se muestran activos, para que la demo enseñe el 403 del back. [mía]
 - **El código de la app** vive en carpetas propias: `app/app/...`, `components/app/...` y `lib/app/...`.
 
