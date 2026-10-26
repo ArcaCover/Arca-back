@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { SignJWT, UnsecuredJWT, decodeJwt, decodeProtectedHeader } from 'jose';
-import { issueSessionToken } from '../../src/auth/session-token.js';
+import { issueSessionToken, verifySessionToken } from '../../src/auth/session-token.js';
 import { MockAppAuth } from '../../src/webapp/auth.js';
 import { MockBillingProvider } from '../../src/webapp/billing.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
@@ -54,6 +54,14 @@ describe('mock app auth', () => {
     expect(await auth.verify(new UnsecuredJWT({ email: 'a@x.co' }).setSubject('u').setIssuer('arca-mock-auth')
       .setAudience('authenticated').setExpirationTime('1h').encode())).toBeNull();
     expect(await auth.verify('not-a-token')).toBeNull();
+  });
+
+  it('a mock app token is never a scan session token', async () => {
+    const auth = new MockAppAuth(secret);
+    expect(await verifySessionToken((await auth.issue('a@x.co')).token, secret)).toBeNull();
+    // Even signed with the scan secret itself, the issuer and audience keep it out.
+    expect(await verifySessionToken(await forge({ key: secret }), secret)).toBeNull();
+    expect(await verifySessionToken(await issueSessionToken('sc_1', 'a@x.co', secret), secret)).toEqual({ scanId: 'sc_1', email: 'a@x.co' });
   });
 
   it('an expired token is rejected', async () => {

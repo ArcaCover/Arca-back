@@ -388,6 +388,10 @@ describe('the webapp API in mock', () => {
         expect(await s.call(method, path, { token, body }), `${method} ${path}`).toEqual(failure(401, 'unauthorized'));
       }
     }
+    // Nor does an app token open a scan, even one of its own email.
+    const poll = await s.app.request(`/scan/${started.scanId}`, { headers: { Authorization: `Bearer ${owner.token}` } });
+    expect(poll.status).toBe(401);
+    expect((await s.app.request(`/scan/${started.scanId}`, { headers: { Authorization: `Bearer ${started.sessionToken}` } })).status).toBe(200);
     // The public routes stay public.
     expect((await s.call('GET', '/plans')).status).toBe(200);
     expect(MeResponse.parse((await s.call('GET', '/me', { token: owner.token })).body).organizations).toHaveLength(1);
