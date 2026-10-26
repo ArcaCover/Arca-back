@@ -282,3 +282,188 @@ Se recomienda cuando la app tenga usuarios reales. Separa riesgos, aísla las co
 4. UI del panel de ARCA, correos reales de invitación y la mudanza a `app.arcacover.com` cuando toque.
 
 En `live-debug` las rutas de la webapp responden 501 `not_configured` mientras falten los adaptadores reales, para que nunca parezca que funcionan contra servicios que no existen. **[mía]**
+
+## 11. Cómo correr la demo
+
+Todo en PowerShell, en Windows, y todo en `mock`: no se llama a Stripe ni a Supabase Auth, y los datos de la webapp viven en la memoria del back. Si el back se para, se pierden las organizaciones, los precios cambiados y los admins de plataforma.
+
+**Antes de la primera vez**, y cada vez que cambie `packages/*` del back, compila el back, porque el front importa `@arca/contracts` ya compilado:
+
+```powershell
+cd C:\Users\jesus\projects\Arca-back
+npm run build
+```
+
+**Arrancar los dos en mock** (DN-09 §11.1):
+
+```powershell
+cd C:\Users\jesus\projects\Arca-back
+npm run stack -- mock
+```
+
+Está listo cuando salen `[back] [api] MODE=mock sources=mock storage=memory (debug routes on 127.0.0.1 only)` y `[front] ✓ Ready`. `Ctrl+C` para los dos.
+
+**Ventanas.** La sesión de la app vive en el `localStorage` del navegador, así que cada persona necesita su propia ventana:
+- **owner:** una ventana normal;
+- **invitado:** una ventana de incógnito;
+- **admin de ARCA:** otro navegador, o la misma ventana de incógnito después de "Sign out" del invitado.
+
+### 11.1 Guion paso a paso
+
+**Preparación** (ventana del owner):
+1. Abre `http://localhost:3000/quote`. La franja dice `MOCK · no real APIs · in-memory data`.
+2. Pulsa `State` en la franja y, en el panel, "Reset limits". En mock también vacía la memoria del back, la de la webapp incluida.
+3. Pulsa "Fill mock firm": rellena un email `debug+…@arca.example` y la web `robust.arca.example`.
+4. Cierra el panel y pulsa "Scan my firm".
+
+**Punto 1. Del embudo a la organización.**
+1. En `/score`, pulsa "Refine your score".
+2. En `/assessment`, abre el panel y pulsa "Auto-answer"; la página se recarga con todo respondido.
+3. Abre el panel otra vez y pulsa "Attest & complete".
+4. En `/assessment/results`, cierra el panel y pulsa "Save your results and activate your account".
+5. En `/app/signup`, el email del scan sale prefijado y bloqueado. Escribe el nombre de la organización (por ejemplo, "Robust Law (demo)") y pulsa "Create organization".
+6. Llegas a `/app/billing` con "Status: Pending payment" y el nombre de la organización en la cabecera. El login simulado se hizo solo, con el email del scan.
+
+**Punto 2. Bloqueo hasta pagar.**
+1. Pulsa "Analyses". El back responde 402 a los análisis y la app te devuelve a `/app/billing`.
+2. Pulsa "Pay" en "Monthly (example price)". Vas a `/app/billing/mock-checkout`, la página que hace de Stripe.
+3. Pulsa "Simulated payment". Vuelves a `/app` con "Payment received. Your organization is active." y el análisis de `robust.arca.example`, con el mismo score que en los resultados.
+
+**Punto 3. Un invitado sin permisos.**
+1. En "Members", escribe un email (por ejemplo, `member@arca.example`), deja el rol `member` y pulsa "Send invitation".
+2. Pulsa "Copy invite link". La página solo enseña el principio del enlace, nunca el token entero.
+3. En la ventana de incógnito, pega el enlace, escribe ese mismo email y pulsa "Sign in and accept". Entra directo a `/app` y ve el análisis: no pasa por el embudo ni paga.
+4. En "Billing", pulsa "Pay". Sale "Your role does not allow this": es el 403 del back.
+5. En "Members", cambia el rol del owner. Sale el mismo aviso y el rol no cambia.
+
+En mock los botones salen activos a propósito, para que se vea que quien niega es el back (§5).
+
+**Punto 4. Cambiar un precio como admin de ARCA.**
+1. En la ventana del admin, abre `http://localhost:3000/app/login`.
+2. Escribe un email (por ejemplo, `ops@arca.example`), marca "Sign in as an ARCA platform admin (mock)" y pulsa "Sign in". Llegas a `/app/admin`.
+3. Cambia el precio de "Monthly (example price)" (por ejemplo, a `399.00`) y pulsa "Save". Sale "Monthly (example price) now costs $399.00 / month.".
+4. En la ventana del owner, "Billing" ya enseña `$399.00 / month`.
+
+El siguiente checkout cobra ese importe, porque el plan viaja entero al proveedor de cobro; lo fija `webapp-service.test.ts`. La página del checkout simulado no enseña el importe (§12.3).
+
+**Punto 5. Solicitar la eliminación.**
+1. En la ventana del owner, ve a "Settings", escribe un motivo y pulsa "Request deletion".
+2. Sale "Deletion requested. It is pending review by ARCA…". En "Analyses" el análisis sigue ahí, con el aviso de la solicitud pendiente.
+3. En la ventana del admin, recarga `/app/admin`. Aparece la solicitud, con su motivo y los botones "Approve" y "Reject".
+
+Para la demo, **no la apruebes**: aprobar marca la organización como borrada y desde ese momento todo responde 410. "Reject" cierra la solicitud y el aviso desaparece.
+
+Un usuario sin el rol de plataforma que abra `/app/admin` ve "Not available", y las rutas `/admin/*` le responden 403.
+
+### 11.2 Smoke de navegador
+
+Con `npm run stack -- mock` corriendo:
+
+```powershell
+cd C:\Users\jesus\projects\Arca-front
+npm run test:browser:webapp
+```
+
+- Recorre los cinco puntos de §10 con el guion de §11.1, en un solo navegador y con un contexto para el owner, otro para el invitado y otro para el admin. Cada punto parte del anterior: si uno falla, el smoke se para ahí.
+- Al final del punto 5, el admin rechaza la solicitud, para comprobar que el panel actúa y que el acceso sigue. Nunca la aprueba.
+- Bloquea cualquier host que no sea `localhost`, `127.0.0.1` o `[::1]`, y falla si se pide alguno.
+- Deja las capturas en `Arca-front\artifacts\webapp\`.
+- Empieza pulsando "Reset limits": borra lo que se hubiera hecho a mano en esa sesión del stack.
+
+## 12. Verificación
+
+Hecha el 2026-10-25 en la máquina de Jesús (Windows 11, Node 22.19.0, Playwright 1.62.1), sobre `feat/webapp-orgs`: back desde `7027fb0` y front desde `eb8d054`, más los commits de la Task 8. Las salidas están recortadas y no llevan ningún valor secreto.
+
+### 12.1 Resumen
+
+| Paso | Qué se comprobó | Resultado |
+|---|---|---|
+| (a) | `npm run build && npm test` en Arca-back | OK: 55 archivos, 663 tests |
+| (b) | `npm test`, `npm run typecheck` y `npm run lint` en Arca-front | OK: 27 archivos y 389 tests; typecheck limpio; lint con 0 errores y los 6 avisos previos |
+| (c) | build de producción del front, sin modo | OK: `0 debug leak(s)`; `/app/admin` está en el build y la casilla de admin simulado no |
+| smoke | `npm run test:browser:webapp` con `npm run stack -- mock` | OK: 5 de 5; ningún host fuera de la máquina; ningún error de página |
+
+Qué test fija cada regla de la demo:
+- **Back**, `apps/api/tests/integration/webapp.test.ts`:
+  - "the demo flow works end to end": el recorrido de §10 contra la API;
+  - aislamiento entre organizaciones (404), organización borrada (410), cada rol contra cada ruta (403), sin token o con el token del scan (401);
+  - "production wiring": todas las rutas de la webapp dan 501, no hay login simulado y CORS sigue exacto;
+  - "live-debug has no mock login": `/__debug/auth/login` y `/__debug/billing/pay` dan 404.
+- **Back**, `webapp-service.test.ts`: el checkout recibe el plan con el precio nuevo después de `updatePlan`.
+- **Front**, `components/app/app-flow.test.tsx`, bloque "the platform admin page (proof of concept)":
+  - "Not available" para quien no es admin de plataforma, sin llamar a la API de admin;
+  - la página abre para un admin sin organización;
+  - el cambio de precio llama a `adminUpdatePlan` en céntimos y enseña el precio nuevo;
+  - Approve y Reject cierran la solicitud;
+  - el motivo del back se enseña cuando niega.
+- **Front**, el mismo archivo: `/app/admin` sin sesión va a `/app/login`; la casilla de admin solo existe en mock y lleva a `/app/admin`.
+
+### 12.2 Salidas
+
+**(a) Back completo.** `npm run build && npm test` en Arca-back:
+
+```
+> tsc -b
+ Test Files  55 passed (55)
+      Tests  663 passed (663)
+```
+
+**(b) Front completo.** En Arca-front:
+
+```
+npm test            → Test Files  27 passed (27) · Tests  389 passed (389)
+npm run typecheck   → tsc --noEmit, sin errores
+npm run lint        → ✖ 6 problems (0 errors, 6 warnings)
+```
+
+Los 6 avisos son los `react-hooks/set-state-in-effect` que ya existían (DN-09 §12.2).
+
+**Las suites dependen de la carga de la máquina.** Corridas a la vez, back y front, fallan tests que ya existían, todos por tiempo:
+- en el back, `arca-demo-stack.test.ts` (20 s) y `crawler.test.ts`;
+- en el front, `lint-boundary.test.mjs` (5 s) y un caso de `assessment-flow.test.tsx`.
+
+Cada suite por separado pasa entera, que es lo que recoge esta tabla. Los tests nuevos de la Task 8 pasaron también con la máquina cargada.
+
+**(c) Build de producción del front, sin modo.** `Remove-Item Env:NEXT_PUBLIC_ARCA_MODE` antes de `npm run build`:
+
+```
+├ ○ /app
+├ ○ /app/admin
+├ ○ /app/billing
+├ ○ /app/billing/mock-checkout
+├ ƒ /app/invite/[token]
+├ ○ /app/login
+├ ○ /app/members
+├ ○ /app/settings
+├ ○ /app/signup
+[check-no-debug] 0 debug leak(s) in the production build
+```
+
+Búsqueda manual en el `.js` de `.next\static`:
+- `ARCA platform admin (mock)`, el texto de la casilla de admin simulado: 0 archivos;
+- `Platform admin (proof of concept)`, como control positivo: 1 archivo.
+
+**Smoke.** `npm run test:browser:webapp`, con el stack arrancado por `npm run stack -- mock` y parado al terminar:
+
+```
+  "Robust Law (demo)" created for the scan's email; the results scored 71
+PASS 1 sign-up from the results claims the analysis
+  402 before paying; after the simulated payment /app shows robust.arca.example at 71
+PASS 2 /app is blocked (402) until the simulated payment
+  the member joined by the link and sees the analysis; checkout 403, role change 403, both shown
+PASS 3 an invited member joins and the back refuses them (403)
+  Monthly (example price) set to $399.00 on /app/admin; the owner's /app/billing shows $399.00 / month
+PASS 4 the platform admin changes a price and billing shows it
+  pending request with access and notice; ARCA saw it and rejected it; the organization was never deleted
+PASS 5 a deletion request stays pending while access continues
+5/5 demo point(s) passed; screenshots in C:\Users\jesus\projects\Arca-front\artifacts\webapp
+```
+
+### 12.3 Decisiones tomadas al implementar (revisar)
+
+1. **El login simulado de admin está en `/app/login`.** En mock, la página ofrece la casilla "Sign in as an ARCA platform admin (mock)", que manda `platformAdmin: true` (§4.6) y lleva a `/app/admin`. Va detrás de la guarda literal `=== "mock"`, así que el build de producción no la lleva (§12.2 c).
+2. **`/app/admin` no exige organización.** Una persona de ARCA no tiene por qué pertenecer a ninguna, así que el layout de `/app` pinta esa página con sesión pero sin organización. Por la misma razón, la página pide `/me` ella misma. Las rutas `/admin/*` siguen negando con 403 a cualquiera que no sea admin de plataforma.
+3. **La página de admin enseña el nombre de la organización** en cada solicitud de borrado, con `GET /admin/organizations`. El id solo no dice nada en una demo.
+4. **El precio se escribe en dólares y viaja en céntimos** (`399.00` → `amountCents: 39900`). No hay campo para la nota de revisión: `ReviewRequest.note` sigue siendo opcional.
+5. **El formato del precio vive en `lib/app/price.ts`**, compartido por billing y admin.
+6. **Pendiente:** la página del checkout simulado no enseña el importe, porque su URL solo lleva la sesión. Que "el checkout simulado lo refleje" (§10, punto 4) se comprueba hoy en el back, no en pantalla. Para enseñarlo habría que añadir el plan a esa URL o una consulta de la sesión simulada.
