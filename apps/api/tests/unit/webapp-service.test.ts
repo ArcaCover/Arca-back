@@ -465,9 +465,28 @@ describe('billing', () => {
     const { owner, org, admin } = await s.team();
     await expectFailure(s.service.checkout(admin, org.id, 'monthly'), 'forbidden', 403);
     await expectFailure(s.service.portal(admin, org.id), 'forbidden', 403);
-    await expectFailure(s.service.checkout(owner, org.id, 'weekly'), 'invalid_request', 400);
+    const unpaid = await s.ownedOrg('sc_unpaid');
+    await expectFailure(s.service.checkout(unpaid.owner, unpaid.org.id, 'weekly'), 'invalid_request', 400);
     await s.service.updatePlan(await s.platformAdmin(), 'annual', { active: false });
-    await expectFailure(s.service.checkout(owner, org.id, 'annual'), 'invalid_request', 400);
+    await expectFailure(s.service.checkout(unpaid.owner, unpaid.org.id, 'annual'), 'invalid_request', 400);
+  });
+
+  it('an organization that already pays goes to the portal, not to another checkout', async () => {
+    const s = await scene();
+    const { owner, org } = await s.ownedOrg();
+    await s.pay(owner, org.id);
+    const checkout = vi.spyOn(s.billing, 'createCheckout');
+    await expectFailure(s.service.checkout(owner, org.id, 'annual'), 'conflict', 409);
+    await s.service.applyBillingEvent({ id: 'evt_failed', type: 'payment.failed', orgId: org.id, status: 'past_due', planCode: null,
+      customerId: null, subscriptionId: null, currentPeriodEnd: null });
+    await expectFailure(s.service.checkout(owner, org.id, 'monthly'), 'conflict', 409);
+    expect(checkout).not.toHaveBeenCalled();
+    expect((await s.service.portal(owner, org.id)).url).toBe(`${APP}/app/billing`);
+
+    // Once the subscription is canceled, paying again starts with a checkout.
+    await s.service.applyBillingEvent({ id: 'evt_canceled', type: 'subscription.canceled', orgId: org.id, status: 'canceled', planCode: null,
+      customerId: null, subscriptionId: null, currentPeriodEnd: null });
+    expect((await s.service.checkout(owner, org.id, 'monthly')).url).toMatch(/mock-checkout\?session=/);
   });
 });
 

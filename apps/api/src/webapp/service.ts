@@ -238,7 +238,9 @@ export class WebappService {
 
   /** Paying is how an organization gets in, so checkout and portal ask for billing.manage but not for a payment. */
   async checkout(actor: AppUser, orgId: string, planCode: string): Promise<{ url: string }> {
-    await this.authorize(actor, orgId, 'billing.manage', { payment: false });
+    const { org } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
+    // A second checkout would start a second subscription; changing plan or card is the portal's job.
+    if (hasPaidAccess(org.billing_status)) throw fail('conflict', 'This organization is already paid; use billing/portal');
     const plan = await this.repo.getPlan(planCode);
     if (!plan?.active) throw fail('invalid_request', 'Unknown or inactive plan');
     const { url } = await this.deps.billing.createCheckout({ orgId, plan, successUrl: `${this.appBaseUrl}/app?paid=1`,
