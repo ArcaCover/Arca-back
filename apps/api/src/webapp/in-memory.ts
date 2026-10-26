@@ -100,6 +100,7 @@ export class InMemoryWebappRepository implements WebappRepository {
     this.analyses.set(analysis.scan_id, structuredClone(analysis));
   }
   async listAnalyses(orgId: string) { return structuredClone([...this.analyses.values()].filter(a => a.org_id === orgId)); }
+  async getAnalysisByScan(scanId: string) { return structuredClone(this.analyses.get(scanId) ?? null); }
 
   async createClaimTicket(ticket: ClaimTicketRecord) {
     if (this.tickets.has(ticket.id_hash)) throw new Error('Duplicate claim ticket');

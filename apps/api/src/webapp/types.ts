@@ -81,6 +81,8 @@ export interface WebappRepository {
   /** `scan_claimed` when any organization already holds the scan. */
   claimAnalysis(analysis: OrgAnalysisRecord): Promise<void>;
   listAnalyses(orgId: string): Promise<OrgAnalysisRecord[]>;
+  /** The claim of a scan, in whichever organization holds it, so a claim can be refused before any ticket is issued. */
+  getAnalysisByScan(scanId: string): Promise<OrgAnalysisRecord | null>;
 
   createClaimTicket(ticket: ClaimTicketRecord): Promise<void>;
   getClaimTicket(idHash: string): Promise<ClaimTicketRecord | null>;

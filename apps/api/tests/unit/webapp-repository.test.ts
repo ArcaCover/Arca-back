@@ -191,6 +191,15 @@ describe('analyses', () => {
     expect((await repo.listAnalyses('org_1')).map(a => a.scan_id)).toEqual(['scan_1', 'scan_2']);
     expect(await repo.listAnalyses('org_2')).toEqual([]);
   });
+
+  it('finds the claim of a scan, whichever organization holds it', async () => {
+    const repo = newRepo();
+    await repo.createOrganization(org('org_1'), member('org_1', 'user_a', 'owner'), analysis('org_1', 'scan_1'));
+    expect(await repo.getAnalysisByScan('scan_1')).toEqual(analysis('org_1', 'scan_1'));
+    expect(await repo.getAnalysisByScan('scan_2')).toBeNull();
+    (await repo.getAnalysisByScan('scan_1'))!.org_id = 'mutated';
+    expect(await repo.getAnalysisByScan('scan_1')).toMatchObject({ org_id: 'org_1' });
+  });
 });
 
 describe('claim tickets', () => {
