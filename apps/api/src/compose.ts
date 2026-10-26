@@ -25,7 +25,7 @@ import { InMemoryWebappRepository } from './webapp/in-memory.js';
 import { DEFAULT_PLANS } from './webapp/plans.js';
 import { WebappService } from './webapp/service.js';
 
-/** In memory, with the mock login and payment. Its tokens share the scan session secret: issuer and audience keep the two apart. */
+/** In memory, with the mock login and payment. Its tokens are signed with a key derived from the scan session secret (DN-10 §4.1). */
 function mockWebapp(env: ReturnType<typeof loadEnv>, scans: RoutingScanRepository, assessments: RoutingAssessmentRepository) {
   const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
   const billing = new MockBillingProvider(env.APP_BASE_URL);

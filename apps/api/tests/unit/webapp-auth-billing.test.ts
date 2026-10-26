@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { SignJWT, UnsecuredJWT, decodeJwt, decodeProtectedHeader } from 'jose';
 import { issueSessionToken, verifySessionToken } from '../../src/auth/session-token.js';
@@ -11,13 +12,17 @@ const HOUR = 60 * 60 * 1000;
 const APP = 'http://localhost:3000';
 const [monthly, annual] = DEFAULT_PLANS as [typeof DEFAULT_PLANS[number], typeof DEFAULT_PLANS[number]];
 
+// The mock signs with a key of its own, derived from the scan session secret, never with the secret itself.
+const mockKey = createHmac('sha256', secret).update('arca-mock-auth').digest();
+
 // Signs a token by hand, so each test changes exactly one of the things the verifier must insist on.
-async function forge(claims: { iss?: string; aud?: string; alg?: string; key?: string; exp?: boolean } = {}) {
+async function forge(claims: { iss?: string; aud?: string; alg?: string; key?: string | Uint8Array; exp?: boolean } = {}) {
   const jwt = new SignJWT({ email: 'a@x.co' }).setProtectedHeader({ alg: claims.alg ?? 'HS256' })
     .setSubject('00000000-0000-8000-8000-000000000000').setIssuer(claims.iss ?? 'arca-mock-auth')
     .setAudience(claims.aud ?? 'authenticated').setIssuedAt();
   if (claims.exp !== false) jwt.setExpirationTime('1h');
-  return jwt.sign(new TextEncoder().encode(claims.key ?? secret));
+  const key = claims.key ?? mockKey;
+  return jwt.sign(typeof key === 'string' ? new TextEncoder().encode(key) : key);
 }
 
 describe('mock app auth', () => {
@@ -50,6 +55,8 @@ describe('mock app auth', () => {
     expect(await auth.verify(await forge({ aud: 'arca-scan' }))).toBeNull();
     expect(await auth.verify(await forge({ alg: 'HS512' }))).toBeNull();
     expect(await auth.verify(await forge({ key: 'another-secret-'.repeat(3) }))).toBeNull();
+    // Signed with the scan session secret itself, every claim right: still refused, the key is not the same.
+    expect(await auth.verify(await forge({ key: secret }))).toBeNull();
     expect(await auth.verify(await forge({ exp: false }))).toBeNull();
     expect(await auth.verify(new UnsecuredJWT({ email: 'a@x.co' }).setSubject('u').setIssuer('arca-mock-auth')
       .setAudience('authenticated').setExpirationTime('1h').encode())).toBeNull();

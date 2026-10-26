@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { SignJWT, jwtVerify } from 'jose';
 
 export type AppUser = { userId: string; email: string };
@@ -8,8 +8,8 @@ export interface AppAuth {
   verify(token: string): Promise<AppUser | null>;
 }
 
-// Same claim shape as a Supabase access token, under an issuer of its own: the scan session token shares the secret
-// in mock, and its issuer and audience are what keep the two apart.
+// Same claim shape as a Supabase access token, under an issuer and audience of its own, and signed with a key derived
+// from the scan session secret rather than the secret itself: a token of one kind never verifies as the other.
 const ISSUER = 'arca-mock-auth';
 const AUDIENCE = 'authenticated';
 const TTL_SECONDS = 12 * 60 * 60;
@@ -24,7 +24,8 @@ function userIdFor(email: string): string {
 export class MockAppAuth implements AppAuth {
   private readonly key: Uint8Array;
   constructor(secret: string, private readonly now: () => number = Date.now) {
-    this.key = new TextEncoder().encode(secret);
+    // Derived, not random: stable across restarts, so the front's stored token keeps verifying while the memory lives.
+    this.key = createHmac('sha256', secret).update('arca-mock-auth').digest();
   }
 
   async issue(email: string): Promise<{ token: string; user: AppUser; expiresAt: string }> {

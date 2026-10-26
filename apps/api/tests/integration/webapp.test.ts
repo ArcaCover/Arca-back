@@ -381,7 +381,7 @@ describe('the webapp API in mock', () => {
       ['POST', `/admin/deletion-requests/${crypto.randomUUID()}/approve`, {}], ['POST', `/admin/deletion-requests/${crypto.randomUUID()}/reject`, {}],
       ['PUT', '/admin/plans/monthly', { amountCents: 1 }],
     ];
-    // The scan session token shares the secret in mock: its issuer and audience keep it out. A mock token under another key too.
+    // The scan session token is signed under another key, issuer and audience. A mock token under another secret is refused too.
     const forged = await new MockAppAuth('x'.repeat(40)).issue(OWNER);
     for (const [method, path, body] of routes) {
       for (const token of [undefined, started.sessionToken, forged.token, 'garbage']) {
