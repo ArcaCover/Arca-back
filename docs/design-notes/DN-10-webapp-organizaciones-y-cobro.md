@@ -21,13 +21,13 @@ Hoy el embudo es anónimo. `/quote` → scan → `/score` → deep assessment �
 4. **Cobro por organización con Stripe**, como suscripción mensual o anual. El precio y los planes se configuran en la base de datos, nunca en el código. **[Jesús]**
 5. **Pagar para entrar.** Sin suscripción activa, la webapp queda bloqueada, salvo lo necesario para pagar. **[Jesús]**
 6. **Borrado con revisión humana.** El owner **solicita** borrar la organización; nada se borra hasta que una persona de ARCA lo apruebe. **[Jesús]**
-7. **Cimientos para un panel de administración de ARCA:** rol de plataforma, auditoría, cola de solicitudes y planes editables. Sin construir la UI del panel. **[Jesús]**
+7. **Cimientos para un panel de administración de ARCA:** rol de plataforma, auditoría, cola de solicitudes y planes editables. Del panel solo hay una prueba de concepto en `/app/admin`, con los precios de los planes y la cola de borrados (§4.6); el panel completo queda para después. **[Jesús]**
 8. **Front: un esqueleto funcional mock**, para recorrer el flujo en la demo. **[Jesús]**
 
 **No-objetivos (por ahora)**
 - Diseño, UI y UX finales: los pule otra persona. **[Jesús]**
 - Login con Google: queda **preparado** (§4.1), no activado.
-- Panel de administración de ARCA con UI.
+- Panel de administración de ARCA completo, más allá de la prueba de concepto de `/app/admin`.
 - Precio definitivo, planes por número de usuarios, pruebas gratuitas, facturas propias.
 - Subdominio `app.arcacover.com`: la app vive en Arca-front bajo `/app` mientras sea MVP, preparada para mudarse (§8). **[Jesús]**
 
@@ -44,11 +44,16 @@ Hoy el embudo es anónimo. `/quote` → scan → `/score` → deep assessment �
 /quote → scan → /score → /assessment → /assessment/results   (anónimo, como hoy)
                                              │
                                              ▼  CTA "Guarda tus resultados y activa tu cuenta"
-                                   /app/signup  (email → magic link)
-                                             │  al volver del magic link:
+                       POST /claims { scanToken }   (el token del scan va en el cuerpo)
+                       → claimId de un solo uso, válido 24 h
+                                             │
                                              ▼
-                POST /orgs  { name }  + Bearer de Supabase + X-Arca-Scan-Token del scan
-                → crea la organización, al usuario como owner y reclama scan + assessment
+                       /app/signup?claim=<claimId>  (email → magic link)
+                                             │  al volver del magic link, ya con sesión:
+                                             ▼
+           POST /orgs { name, claimId }  + Bearer de Supabase
+           (o POST /orgs/:id/analyses { claimId } si ya tiene organización)
+           → crea la organización, al usuario como owner y reclama scan + assessment
                                              │
                                              ▼
                           /app/billing → Stripe Checkout → webhook → org activa
@@ -56,6 +61,8 @@ Hoy el embudo es anónimo. `/quote` → scan → `/score` → deep assessment �
                                              ▼
                                      /app  (panel de la organización)
 ```
+
+El reclamo va en dos pasos (§4.7). El token del scan viaja en el cuerpo de `POST /claims`, nunca en una cabecera propia, así que `allowHeaders` de CORS sigue siendo exactamente `Content-Type,Authorization`.
 
 **Usuario con cuenta.** Hace login (magic link) y entra **directo al panel** de su organización. Toda cuenta pertenece al menos a una organización. **[Jesús]** Si pertenece a varias, elige una; la última usada queda recordada.
 
@@ -75,7 +82,8 @@ Hoy el embudo es anónimo. `/quote` → scan → `/score` → deep assessment �
 - **Google** queda listo para el futuro: es activar el proveedor en Supabase y añadir un botón. El back no cambia, porque solo ve un JWT de Supabase.
 - **Dos tokens, sin mezclarlos.** El token de sesión **del scan** (DN-01) sigue igual, para el embudo anónimo. El de Supabase es para la webapp.
 - **Modo `mock` (DN-09).** No hay Supabase Auth real:
-  - `POST /__debug/auth/login { email, platformAdmin? }`, que existe **solo en `mock`**, emite un JWT firmado con un secreto local, con el mismo formato y claims (en `live-debug` el login es el real de Supabase);
+  - `POST /__debug/auth/login { email, platformAdmin? }`, que existe **solo en `mock`**, emite un JWT con el mismo formato y claims (en `live-debug` el login es el real de Supabase);
+  - ese JWT se firma con una clave derivada de `SESSION_TOKEN_SECRET` (HMAC-SHA256 de `arca-mock-auth`), nunca con el secreto mismo, y lleva su propio emisor (`arca-mock-auth`) y audiencia (`authenticated`): un token de la app nunca vale como token del scan, ni al revés;
   - el verificador del back acepta ese emisor **solo** en mock;
   - en producción, ese emisor y esa ruta no existen.
 
@@ -88,11 +96,11 @@ Hoy el embudo es anónimo. `/quote` → scan → `/score` → deep assessment �
 | `profiles` | `user_id` (PK → `auth.users`), `email`, `full_name`, `last_org_id`, `created_at` | Datos propios del usuario |
 | `organizations` | `id`, `name`, `domain`, `billing_status`, `deleted_at`, `created_by`, `created_at` | `billing_status`: `pending_payment`, `active`, `past_due`, `canceled`; solo lo cambia el webhook. El ciclo de vida va aparte: una solicitud pendiente vive en `deletion_requests` y el borrado aprobado pone `deleted_at` [mía] |
 | `memberships` | `org_id`, `user_id`, `role`, `invited_by`, `created_at`; PK (`org_id`, `user_id`) | `role`: `owner`, `admin`, `member`, `viewer`. Siempre queda al menos un owner (trigger o check en la RPC) |
-| `invitations` | `id`, `org_id`, `email`, `role`, `token_hash`, `invited_by`, `expires_at`, `accepted_at`, `revoked_at` | Se guarda solo el hash del token; caduca a los 7 días [mía] |
+| `invitations` | `id`, `org_id`, `email`, `role`, `token_hash`, `invited_by`, `expires_at`, `accepted_at`, `revoked_at`, `created_at` | Se guarda solo el hash del token; caduca a los 7 días [mía]. Una sola pendiente por email y organización (`invitations_pending_email_idx`, §4.7) |
 | `org_analyses` | `org_id`, `scan_id` (UNIQUE), `assessment_id`, `claimed_by`, `claimed_at` | Un scan solo se reclama una vez |
 | `claim_tickets` | `id_hash`, `scan_id`, `email`, `expires_at`, `used_at` | Puente del embudo anónimo al registro (§4.7): sobrevive al magic link aunque se abra en otra pestaña o dispositivo [mía] |
-| `plans` | `id`, `code`, `name`, `amount_cents`, `currency`, `interval` (`month`/`year`), `active`, `created_at` | El precio vive **solo** aquí: el checkout le pasa a Stripe el importe con `price_data`, así que cambiar la tabla cambia el cobro sin tocar Stripe [mía]. Sembrado con planes de ejemplo |
-| `subscriptions` | `org_id` (PK), `plan_id`, `stripe_customer_id`, `stripe_subscription_id`, `status`, `current_period_end`, `updated_at` | Lo escribe solo el webhook de Stripe |
+| `plans` | `code` (PK), `name`, `amount_cents`, `currency`, `interval` (`month`/`year`), `active`, `created_at` | El precio vive **solo** aquí: el checkout le pasa a Stripe el importe con `price_data`, así que cambiar la tabla cambia el cobro sin tocar Stripe [mía]. Sembrado con planes de ejemplo |
+| `subscriptions` | `org_id` (PK), `plan_code` (→ `plans.code`), `customer_id`, `subscription_id`, `status`, `current_period_end`, `updated_at` | Lo escribe solo el webhook de Stripe. Los ids del proveedor van sin prefijo `stripe_` |
 | `stripe_events` | `id` (el id del evento de Stripe), `type`, `received_at`, `processed_at` | Idempotencia: un evento repetido no se procesa dos veces |
 | `deletion_requests` | `id`, `org_id`, `requested_by`, `reason`, `status` (`pending`, `approved`, `rejected`), `reviewed_by`, `reviewed_at`, `review_note` | La cola para la revisión humana |
 | `platform_admins` | `user_id` (PK), `granted_by`, `created_at` | Personas de ARCA. Rol de plataforma, separado de los roles de organización |
@@ -102,7 +110,7 @@ Hoy el embudo es anónimo. `/quote` → scan → `/score` → deep assessment �
 
 ### 4.3 Roles y permisos
 
-Hay una sola tabla de permisos en código (`permissions.ts`) y un helper `requirePermission(orgId, permission)` en cada ruta. **[Jesús + mía]**
+Hay una sola tabla de permisos en código, en `@arca/contracts` (`packages/contracts/src/webapp.ts`): `can(role, permission)` y `canManageMember(actor, target, nextRole?)`, compartidas con el front. En el back, `WebappService.authorize(user, orgId, permission, { payment })` las aplica en cada ruta, en este orden: quien no es miembro recibe 404, la organización borrada 410, el rol sin permiso 403 y la falta de pago 402. **[Jesús + mía]**
 
 | Permiso | owner | admin | member | viewer |
 |---|---|---|---|---|
@@ -119,7 +127,7 @@ Hay una sola tabla de permisos en código (`permissions.ts`) y un helper `requir
 
 ### 4.4 Cobro (Stripe)
 
-- **Checkout.** `POST /orgs/:id/billing/checkout { planCode }` (`billing.manage`) crea un Checkout Session de Stripe en modo `subscription`, con `price_data` (importe, moneda e intervalo leídos de `plans`), y devuelve la URL.
+- **Checkout.** `POST /orgs/:id/billing/checkout { planCode }` (`billing.manage`) crea un Checkout Session de Stripe en modo `subscription`, con `price_data` (importe, moneda e intervalo leídos de `plans`), y devuelve la URL. Si la organización ya paga (`active` o `past_due`), responde **409**: cambiar de plan o de tarjeta se hace en el portal.
 - **Portal.** `POST /orgs/:id/billing/portal` (`billing.manage`) devuelve la URL del Customer Portal, para cancelar o cambiar el método de pago.
 - **Webhook.** `POST /billing/webhook` es público, pero **verifica la firma** con `STRIPE_WEBHOOK_SECRET`. Procesa:
   - `checkout.session.completed`;
@@ -128,7 +136,7 @@ Hay una sola tabla de permisos en código (`permissions.ts`) y un helper `requir
 
   Con ellos actualiza `subscriptions` y `organizations.billing_status`, y nunca toca el borrado. Es idempotente por `stripe_events`.
 - **Planes.** `GET /plans` es público y devuelve los planes activos (nombre, precio, intervalo). El precio se cambia en la tabla `plans` (o con `PUT /admin/plans`) y el siguiente checkout ya lo usa.
-- **Modo `mock` (DN-09).** Sin Stripe real: el checkout devuelve una URL local `/app/billing/mock-success` y activa la suscripción en memoria. La demo puede usar **Stripe en modo test**, si hay claves de test, en `live-debug`.
+- **Modo `mock` (DN-09).** Sin Stripe real: el checkout devuelve una URL local, `/app/billing/mock-checkout?session=<id>`, y no activa nada por sí solo. La suscripción se activa en memoria solo con el pago simulado, `POST /__debug/billing/pay { sessionId }` (solo en `mock` y con `X-Arca-Debug: 1`); pagar dos veces la misma sesión da 409. **Stripe en modo test** llegará después, en `live-debug` (§10).
 
 ### 4.5 Bloqueo hasta pagar
 
@@ -137,7 +145,7 @@ Hay una sola tabla de permisos en código (`permissions.ts`) y un helper `requir
 - **`past_due`** sigue entrando, con un aviso; no se bloquea a un cliente por un pago fallido puntual. **[mía]**
 - **En el front**, `/app` redirige a `/app/billing` ante un 402. El bloqueo real es el del back.
 
-### 4.6 Cimientos del panel de ARCA (sin UI)
+### 4.6 Cimientos del panel de ARCA (con una prueba de concepto)
 
 Hay rutas `/admin/*` que solo responden a `platform_admins`:
 - `GET /admin/organizations`;
@@ -145,35 +153,43 @@ Hay rutas `/admin/*` que solo responden a `platform_admins`:
 - `POST /admin/deletion-requests/:id/approve` y `/reject`;
 - `GET` y `PUT /admin/plans`.
 
-Para la demo bastan los endpoints, probados con tests. La UI del panel es trabajo futuro. **Quién es admin de plataforma:** se otorga con un script del back (`npm run admin:grant -- <email>`); en `mock`, con `platformAdmin: true` en el login simulado. **Aprobar un borrado** pone `deleted_at` y cancela la suscripción en Stripe. **Rechazarlo** solo cierra la solicitud: el estado de cobro nunca cambió. El borrado físico de datos queda fuera de alcance, por implicaciones legales. **[mía]**
+Los endpoints están probados con tests. Hay además una prueba de concepto en `/app/admin`, que solo cubre los precios de los planes y la cola de solicitudes de borrado (§12.3); el panel completo es trabajo futuro. **Quién es admin de plataforma:** se otorga con un script del back (`npm run admin:grant -- <email>`); en `mock`, con `platformAdmin: true` en el login simulado. **Aprobar un borrado** pone `deleted_at` y cancela la suscripción en Stripe. **Rechazarlo** solo cierra la solicitud: el estado de cobro nunca cambió. El borrado físico de datos queda fuera de alcance, por implicaciones legales. **[mía]**
 
 ### 4.7 Endpoints (resumen)
 
 | Método y ruta | Auth | Qué hace |
 |---|---|---|
 | `GET /me` | Supabase | Usuario y organizaciones con su rol |
-| `POST /claims` | `X-Arca-Scan-Token` (token del scan) | Emite un ticket de reclamo de un solo uso (24 h) para ese scan y su email |
-| `POST /orgs` | Supabase + `claimId` | Crea la organización, el owner y reclama el análisis |
-| `POST /orgs/:id/analyses` | `analysis.create` + pago + `claimId` | Añade un análisis nuevo a una organización existente |
+| `POST /claims { scanToken }` | token del scan, en el cuerpo | Emite un ticket de reclamo de un solo uso (24 h) para ese scan y su email |
+| `POST /orgs { name, claimId }` | Supabase + `claimId` | Crea la organización, el owner y reclama el análisis |
+| `POST /orgs/:id/analyses { claimId }` | `analysis.create` + pago + `claimId` | Añade un análisis nuevo a una organización existente |
 | `GET /orgs/:id` | miembro | Organización, estado de la suscripción y tu rol (sin bloqueo por pago) |
 | `GET /orgs/:id/analyses` | `org.read` + pago | Análisis reclamados, con sus resultados |
 | `GET/POST/PATCH/DELETE /orgs/:id/members…` | según la matriz + pago | Miembros, roles e invitaciones |
 | `POST /invitations/:token/accept` | Supabase | Acepta una invitación |
-| `POST /orgs/:id/billing/checkout`, `/portal` | `billing.manage` | Stripe |
+| `POST /orgs/:id/billing/checkout`, `/portal` | `billing.manage` | Stripe (sin bloqueo por pago; el checkout de una organización que ya paga da 409) |
 | `POST /billing/webhook` | firma de Stripe | Estado de la suscripción |
 | `GET /plans` | pública | Planes activos |
 | `POST /orgs/:id/deletion-request` | `org.request_deletion` | Pasa a `deletion_requested` |
 | `/admin/*` | `platform_admin` | Cimientos del panel de ARCA |
 | `POST /__debug/auth/login` | solo mock | Login simulado (§4.1) |
+| `POST /__debug/billing/pay` | solo mock | Pago simulado de una sesión del checkout simulado (§4.4) |
 
 **Reclamar el análisis [mía].** Va en dos pasos, para que sobreviva al magic link (que puede abrirse en otra pestaña o dispositivo) sin guardar el token del scan fuera de `sessionStorage`:
-1. En los resultados, `POST /claims` con el token del scan devuelve un `claimId` aleatorio de un solo uso, válido 24 h. El back guarda su hash, el `scan_id` y el email del scan.
+1. En los resultados, `POST /claims { scanToken }`, con el token del scan en el cuerpo, devuelve un `claimId` aleatorio de un solo uso, válido 24 h. El back guarda su hash, el `scan_id` y el email del scan. Como el token no va en una cabecera, `allowHeaders` de CORS sigue siendo exactamente `Content-Type,Authorization`.
 2. El magic link vuelve con `?claim=<claimId>`. Ya con sesión, `POST /orgs { name, claimId }` (o `POST /orgs/:id/analyses { claimId }`) comprueba que:
    - el ticket existe, no caducó y no se usó;
    - el email del ticket coincide con el del usuario de Supabase, sin distinguir mayúsculas (el registro lleva ese email prefijado y bloqueado);
    - el scan está COMPLETED o PARTIAL, está en almacenamiento durable (un scan con fallo inyectado, que vive en memoria, da **409**) y no fue reclamado ya (`org_analyses.scan_id` UNIQUE).
 
 Si falla una condición, la organización **no** se crea. Un scan puede reclamarse aunque no tenga assessment.
+
+**Invitaciones [mía].** Un enlace de invitación vivo es una puerta de entrada, así que el back deja como mucho uno por email y organización:
+- un email que ya es miembro de la organización no se invita: **409** (`already_member`);
+- invitar otra vez a un email con una invitación pendiente, caducada o no, revoca la anterior y crea una nueva; el enlace viejo responde **410**. En SQL lo asegura `invitations_pending_email_idx`, y el repositorio traduce ese choque a `already_invited` (409), que solo puede darse en una carrera;
+- al aceptar, se revocan las demás invitaciones pendientes de ese email en la organización, también si la persona ya era miembro;
+- al quitar a un miembro, se revocan las invitaciones pendientes de su email en la organización: un enlace viejo no le sirve para volver;
+- cada revocación automática queda en `audit_log` como `invitation.revoked`, con el motivo.
 
 **Cuenta sin organización.** Si un reclamo falla, la cuenta de Supabase ya existe pero no tiene organización. `/app` le muestra "Completa un análisis para crear tu organización", con enlace a `/quote`. `/app/login` nunca crea usuarios (`shouldCreateUser: false`); solo el registro desde los resultados los crea.
 
@@ -201,6 +217,8 @@ En `mock` no hace falta ninguna de las claves. Todas siguen las reglas de DN-09:
   - `/app/members`: lista, invitar, cambiar rol y quitar.
   - `/app/settings`: datos de la organización y "Solicitar eliminación".
   - `/app/invite/[token]`.
+  - `/app/billing/mock-checkout`: la página que hace de Stripe en `mock`, con el botón del pago simulado.
+  - `/app/admin`: prueba de concepto del panel de ARCA, solo para admins de plataforma: precios de los planes y cola de solicitudes de borrado.
 - **En `/assessment/results`:** un CTA "Save your results and activate your account" que lleva a `/app/signup` y conserva el token del scan.
 - **Sin diseño:** componentes simples con los tokens de la marca. Los botones que el rol no permite se ocultan o se deshabilitan en producción, pero **el back es el que niega**. En los modos de debug (guarda literal de DN-09) se muestran activos, para que la demo enseñe el 403 del back. [mía]
 - **El código de la app** vive en carpetas propias: `app/app/...`, `components/app/...` y `lib/app/...`.
@@ -215,7 +233,7 @@ En `mock` no hace falta ninguna de las claves. Todas siguen las reglas de DN-09:
 | Webhook de Stripe falso | Verificación de la firma; idempotencia |
 | JWT falso o caducado | Verificación de la firma, `aud` y `exp`; el emisor mock solo existe en mock |
 | Borrado malicioso o accidental | Solo solicitud, con revisión humana y auditoría |
-| Invitación robada | Solo se guarda el hash del token, con expiración de 7 días; se acepta con el login del email invitado |
+| Invitación robada o vieja | Solo se guarda el hash del token, con expiración de 7 días; se acepta con el login del email invitado; reinvitar, aceptar o quitar al miembro revoca los demás enlaces de ese email (§4.7) |
 | Fuga de datos entre organizaciones | Cada consulta filtra por `org_id` de una membresía verificada; tests de "otra organización da 404" |
 
 ## 7. Tests
@@ -279,7 +297,7 @@ Se recomienda cuando la app tenga usuarios reales. Separa riesgos, aísla las co
 1. Repositorios de Supabase para las tablas nuevas, con las RPC atómicas (crear organización con owner y reclamo, aceptar invitación, aplicar webhook).
 2. Verificación de JWT de Supabase real, y Supabase Auth en el front (magic link; después Google).
 3. Stripe real: checkout con `price_data`, portal y webhook con firma. Primero en `live-debug` con claves de test, sobre un proyecto **Arca-dev**, no sobre la base de producción.
-4. UI del panel de ARCA, correos reales de invitación y la mudanza a `app.arcacover.com` cuando toque.
+4. El panel de ARCA completo (hoy solo la prueba de concepto de `/app/admin`), correos reales de invitación y la mudanza a `app.arcacover.com` cuando toque.
 
 En `live-debug` las rutas de la webapp responden 501 `not_configured` mientras falten los adaptadores reales, para que nunca parezca que funcionan contra servicios que no existen. **[mía]**
 
@@ -381,7 +399,7 @@ Hecha el 2026-10-25 en la máquina de Jesús (Windows 11, Node 22.19.0, Playwrig
 | (a) | `npm run build && npm test` en Arca-back | OK: 55 archivos, 663 tests |
 | (b) | `npm test`, `npm run typecheck` y `npm run lint` en Arca-front | OK: 27 archivos y 389 tests; typecheck limpio; lint con 0 errores y los 6 avisos previos |
 | (c) | build de producción del front, sin modo | OK: `0 debug leak(s)`; `/app/admin` está en el build y la casilla de admin simulado no |
-| smoke | `npm run test:browser:webapp` con `npm run stack -- mock` | OK: 5 de 5; ningún host fuera de la máquina; ningún error de página |
+| smoke | `npm run test:browser:webapp` con `npm run stack -- mock` | OK: 5 de 5; ningún host fuera de la máquina; ningún error de página no capturado |
 
 Qué test fija cada regla de la demo:
 - **Back**, `apps/api/tests/integration/webapp.test.ts`:
@@ -424,7 +442,7 @@ Los 6 avisos son los `react-hooks/set-state-in-effect` que ya existían (DN-09 �
 
 Cada suite por separado pasa entera, que es lo que recoge esta tabla. Los tests nuevos de la Task 8 pasaron también con la máquina cargada.
 
-**(c) Build de producción del front, sin modo.** `Remove-Item Env:NEXT_PUBLIC_ARCA_MODE` antes de `npm run build`:
+**(c) Build de producción del front, sin modo.** `Remove-Item Env:NEXT_PUBLIC_ARCA_MODE -ErrorAction SilentlyContinue` antes de `npm run build`:
 
 ```
 ├ ○ /app
