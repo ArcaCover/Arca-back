@@ -41,6 +41,16 @@ describe('independent source and storage configuration', () => {
     expect(loadEnv({ ...live, SIGNAL_LLM_MODEL: '' }).SIGNAL_LLM_MODEL).toBe('gpt-6-luna');
     expect(() => loadEnv({ ...live, WEBSITE_EVIDENCE_PROVIDER: 'nvidia' })).toThrow();
   });
+  it('takes the webapp base URL over http or https only, and an empty one falls back to the default', () => {
+    const local = { ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' };
+    expect(loadEnv(local).APP_BASE_URL).toBe('http://localhost:3000');
+    expect(loadEnv({ ...local, APP_BASE_URL: '' }).APP_BASE_URL).toBe('http://localhost:3000');
+    expect(loadEnv({ ...local, APP_BASE_URL: '  ' }).APP_BASE_URL).toBe('http://localhost:3000');
+    expect(loadEnv({ ...local, APP_BASE_URL: 'https://app.arca.example' }).APP_BASE_URL).toBe('https://app.arca.example');
+    for (const url of ['javascript:alert(1)', 'ftp://app.arca.example', 'file:///etc/passwd', 'not a url']) {
+      expect(() => loadEnv({ ...local, APP_BASE_URL: url }), url).toThrow('APP_BASE_URL');
+    }
+  });
   it('accepts only known reasoning efforts for the agentic extraction', () => {
     const openai = { ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test',
       OPENAI_API_KEY: 'sk-test', SIGNAL_LLM_MODEL: 'gpt-5-mini' };

@@ -27,7 +27,10 @@ const EnvSchema = z.object({
     z.enum(['none', 'minimal', 'low', 'medium', 'high']).optional()),
   CORS_ALLOWED_ORIGINS: z.string().min(1),
   // Where the front serves the webapp: the base of the invitation links and the billing return URLs (DN-10 §4.8).
-  APP_BASE_URL: z.string().url().default('http://localhost:3000'),
+  // An empty value falls back to the default; only http and https, since every link built on it is sent to a browser.
+  APP_BASE_URL: z.preprocess(value => typeof value === 'string' && value.trim() === '' ? undefined : value,
+    z.string().trim().url().refine(url => /^https?:\/\//i.test(url), 'APP_BASE_URL must be an http or https URL')
+      .default('http://localhost:3000')),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
   // Actor runs in flight at once, across every scan. The account allows 32 jobs and 64 GB, and each
   // directory run takes 1 GB: 16 lets Bar and Avvo each run 8 lookups at once, half the account.
