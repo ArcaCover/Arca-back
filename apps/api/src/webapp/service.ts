@@ -25,6 +25,7 @@ const CONFLICTS: Record<WebappConflictReason, string> = {
   scan_claimed: 'This analysis already belongs to an organization',
   last_owner: 'An organization always keeps at least one owner',
   already_member: 'This user already belongs to the organization',
+  already_invited: 'This email already has a pending invitation',
   deletion_pending: 'A deletion request is already pending',
 };
 /** The rules the repository enforces atomically come back as a 409. */
@@ -161,10 +162,16 @@ export class WebappService {
 
   async invite(actor: AppUser, orgId: string, req: InviteRequest): Promise<InvitationView> {
     await this.authorize(actor, orgId, 'members.invite', { payment: true });
+    const email = req.email.toLowerCase();
+    for (const member of await this.repo.listMembers(orgId)) {
+      if (sameEmail((await this.repo.getProfile(member.user_id))?.email ?? '', email)) throw fail('conflict', CONFLICTS.already_member);
+    }
+    // One pending invitation per email (invitations_pending_email_idx): the new link replaces the old one, expired or not.
+    await this.revokePending(actor.userId, orgId, email, 'reinvited');
     const token = secretToken();
-    const invitation: InvitationRecord = { id: randomUUID(), org_id: orgId, email: req.email.toLowerCase(), role: req.role, token_hash: sha256(token),
+    const invitation: InvitationRecord = { id: randomUUID(), org_id: orgId, email, role: req.role, token_hash: sha256(token),
       invited_by: actor.userId, expires_at: this.at(INVITATION_TTL_MS), accepted_at: null, revoked_at: null, created_at: this.timestamp() };
-    await this.repo.createInvitation(invitation);
+    await orConflict(this.repo.createInvitation(invitation));
     await this.audit(actor.userId, orgId, 'member.invited', invitation.email, { role: invitation.role, invitationId: invitation.id });
     // The only time the token exists in clear.
     return { ...invitationView(invitation), inviteUrl: `${this.appBaseUrl}/app/invite/${token}` };
@@ -192,14 +199,17 @@ export class WebappService {
     const at = this.timestamp();
     const existing = await this.repo.getMembership(org.id, user.userId);
     if (existing) {
-      // Someone who already belongs keeps their role; the invitation is only closed.
+      // Someone who already belongs keeps their role; the invitation is only closed, and so are the other links of that email.
       await this.repo.updateInvitation(invitation.id, { accepted_at: at });
+      await this.revokePending(user.userId, org.id, invitation.email, 'accepted');
       return this.view(org, existing.role);
     }
     await this.ensureProfile(user);
     await orConflict(this.repo.addMember({ org_id: org.id, user_id: user.userId, role: invitation.role, invited_by: invitation.invited_by,
       created_at: at }));
     await this.repo.updateInvitation(invitation.id, { accepted_at: at });
+    // No other link stays live, or a member removed later could use it to come back.
+    await this.revokePending(user.userId, org.id, invitation.email, 'accepted');
     await this.audit(user.userId, org.id, 'member.joined', user.userId, { role: invitation.role, invitationId: invitation.id });
     return this.view(org, invitation.role);
   }
@@ -221,6 +231,9 @@ export class WebappService {
     if (!canManageMember(actorRole, target.role)) throw fail('forbidden', 'Your role cannot remove this member');
     await orConflict(this.repo.removeMember(orgId, targetUserId));
     await this.audit(actor.userId, orgId, 'member.removed', targetUserId, { role: target.role });
+    // A link still pending for their email would let the removed member back in.
+    const profile = await this.repo.getProfile(targetUserId);
+    if (profile) await this.revokePending(actor.userId, orgId, profile.email, 'member_removed');
   }
 
   /** Paying is how an organization gets in, so checkout and portal ask for billing.manage but not for a payment. */
@@ -355,6 +368,15 @@ export class WebappService {
     const profile = await this.repo.getProfile(member.user_id);
     if (!profile) throw new Error('Member without a profile');
     return { userId: member.user_id, email: profile.email, role: member.role, joinedAt: member.created_at };
+  }
+
+  /** Revokes every pending invitation of this email in the organization, expired ones included: listInvitations returns them all. */
+  private async revokePending(actor: string, orgId: string, email: string, reason: 'reinvited' | 'accepted' | 'member_removed') {
+    const at = this.timestamp();
+    for (const invitation of (await this.repo.listInvitations(orgId)).filter(pending => sameEmail(pending.email, email))) {
+      await this.repo.updateInvitation(invitation.id, { revoked_at: at });
+      await this.audit(actor, orgId, 'invitation.revoked', invitation.email, { invitationId: invitation.id, reason });
+    }
   }
 
   /** Members are listed with the email of their profile, so every path that adds a member writes the profile first. */

@@ -37,7 +37,11 @@ export type AuditRecord = {
   data: Record<string, unknown>; created_at: string;
 };
 
-export type WebappConflictReason = 'scan_claimed' | 'last_owner' | 'already_member' | 'deletion_pending';
+/**
+ * `already_invited` is what a SQL repository maps the unique index `invitations_pending_email_idx` to: one pending
+ * invitation per email and organization. The service revokes the old one before inviting again, so it only shows up in a race.
+ */
+export type WebappConflictReason = 'scan_claimed' | 'last_owner' | 'already_member' | 'already_invited' | 'deletion_pending';
 /** A rule of the data model that the write would break. The routes turn it into a 409. */
 export class WebappConflict extends Error {
   constructor(readonly reason: WebappConflictReason) {

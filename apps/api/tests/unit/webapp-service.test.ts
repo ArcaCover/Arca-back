@@ -320,9 +320,9 @@ describe('members', () => {
     expect(listed.invitations).toEqual([]);
     expect(listed.members.map(m => [m.email, m.role])).toEqual([[OWNER, 'owner'], ['guest@firm.com', 'member']]);
 
-    // A second invitation for someone who already belongs changes nothing, and is closed.
-    const again = await s.service.invite(owner, org.id, { email: 'guest@firm.com', role: 'admin' });
-    expect(await s.service.acceptInvitation(guest, inviteToken(again))).toMatchObject({ id: org.id, role: 'member' });
+    // Someone who already belongs, the owner included, is not invited again.
+    await expectFailure(s.service.invite(owner, org.id, { email: 'Guest@Firm.com', role: 'admin' }), 'conflict', 409);
+    await expectFailure(s.service.invite(owner, org.id, { email: OWNER, role: 'admin' }), 'conflict', 409);
     expect(await s.service.listMembers(org.id)).toMatchObject({ invitations: [] });
     expect((await s.service.listMembers(org.id)).members).toHaveLength(2);
 
@@ -336,6 +336,63 @@ describe('members', () => {
     expect((await s.service.listMembers(org.id)).invitations).toEqual([]);
     await expectFailure(s.service.acceptInvitation(await s.user('slow@firm.com'), inviteToken(slow)), 'gone', 410);
     expect(await roleOf(s, org.id, (await s.user('slow@firm.com')).userId)).toBeNull();
+  });
+
+  it('a new invitation replaces the pending one of the same email, expired or not', async () => {
+    const s = await scene();
+    const { owner, org } = await s.ownedOrg();
+    await s.pay(owner, org.id);
+    const first = await s.service.invite(owner, org.id, { email: 'guest@firm.com', role: 'viewer' });
+    const second = await s.service.invite(owner, org.id, { email: 'Guest@Firm.com', role: 'member' });
+    expect((await s.service.listMembers(org.id)).invitations).toEqual([{ id: second.id, email: 'guest@firm.com', role: 'member',
+      expiresAt: iso(T0 + 7 * DAY) }]);
+    const guest = await s.user('guest@firm.com');
+    await expectFailure(s.service.acceptInvitation(guest, inviteToken(first)), 'gone', 410);
+
+    // An expired invitation still holds the SQL slot (invitations_pending_email_idx), so it is revoked too.
+    s.advance(8 * DAY);
+    const third = await s.service.invite(owner, org.id, { email: 'guest@firm.com', role: 'viewer' });
+    expect(await s.repository.listInvitations(org.id)).toEqual([expect.objectContaining({ id: third.id })]);
+    expect(await s.repository.findInvitationByHash(sha256(inviteToken(second)))).toMatchObject({ revoked_at: iso(T0 + 8 * DAY) });
+    await expectFailure(s.service.acceptInvitation(guest, inviteToken(second)), 'gone', 410);
+    expect(await s.service.acceptInvitation(guest, inviteToken(third))).toMatchObject({ id: org.id, role: 'viewer' });
+  });
+
+  it('accepting or removing closes every other link of that email', async () => {
+    const s = await scene();
+    const { owner, org } = await s.ownedOrg();
+    await s.pay(owner, org.id);
+    // A second live link for the same email, which the in-memory store allows (the SQL index would not).
+    const extraLink = async (name: string) => {
+      const token = `${name}-${'x'.repeat(40)}`;
+      await s.repository.createInvitation({ id: `inv_${name}`, org_id: org.id, email: 'guest@firm.com', role: 'admin', token_hash: sha256(token),
+        invited_by: owner.userId, expires_at: iso(s.now() + DAY), accepted_at: null, revoked_at: null, created_at: iso(s.now()) });
+      return token;
+    };
+    const guest = await s.user('guest@firm.com');
+
+    // Accept, then remove: the second link answers 410 and the removed member stays out.
+    const invitation = await s.service.invite(owner, org.id, { email: 'guest@firm.com', role: 'member' });
+    const second = await extraLink('second');
+    await s.service.acceptInvitation(guest, inviteToken(invitation));
+    expect((await s.service.listMembers(org.id)).invitations).toEqual([]);
+    await s.service.removeMember(owner, org.id, guest.userId);
+    await expectFailure(s.service.acceptInvitation(guest, second), 'gone', 410);
+    expect(await roleOf(s, org.id, guest.userId)).toBeNull();
+
+    // Removing a member closes the links still pending for their email.
+    await s.service.acceptInvitation(guest, inviteToken(await s.service.invite(owner, org.id, { email: 'guest@firm.com', role: 'member' })));
+    const leftover = await extraLink('leftover');
+    await s.service.removeMember(owner, org.id, guest.userId);
+    await expectFailure(s.service.acceptInvitation(guest, leftover), 'gone', 410);
+    expect(await roleOf(s, org.id, guest.userId)).toBeNull();
+
+    // Someone who already belongs keeps their role, and the other links are closed too.
+    await s.service.acceptInvitation(guest, inviteToken(await s.service.invite(owner, org.id, { email: 'guest@firm.com', role: 'member' })));
+    const [stale, other] = [await extraLink('stale'), await extraLink('other')];
+    expect(await s.service.acceptInvitation(guest, stale)).toMatchObject({ id: org.id, role: 'member' });
+    await expectFailure(s.service.acceptInvitation(guest, other), 'gone', 410);
+    expect(await s.service.listMembers(org.id)).toMatchObject({ invitations: [] });
   });
 
   it('an invitation of another organization cannot be revoked through this one', async () => {
