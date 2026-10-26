@@ -46,12 +46,15 @@ const sameEmail = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 type FinishedScan = ScanRecord & { status: 'COMPLETED' | 'PARTIAL'; result: Layer1Result };
 const isFinished = (scan: ScanRecord): scan is FinishedScan => (scan.status === 'COMPLETED' || scan.status === 'PARTIAL') && scan.result !== null;
 
+// The store may print a timestamp its own way (Postgres: '2026-10-25 12:00:00+00'); the contract wants ISO with Z.
+const iso = (value: string) => new Date(value).toISOString();
 const planView = (plan: PlanRecord): PlanView => ({ code: plan.code, name: plan.name, amountCents: plan.amount_cents, currency: plan.currency,
   interval: plan.interval });
 const invitationView = (invitation: InvitationRecord): InvitationView => ({ id: invitation.id, email: invitation.email, role: invitation.role,
-  expiresAt: invitation.expires_at });
+  expiresAt: iso(invitation.expires_at) });
 const deletionView = (request: DeletionRequestRecord): DeletionRequestView => ({ id: request.id, orgId: request.org_id, reason: request.reason,
-  status: request.status, requestedAt: request.created_at, reviewedAt: request.reviewed_at, reviewNote: request.review_note });
+  status: request.status, requestedAt: iso(request.created_at), reviewedAt: request.reviewed_at && iso(request.reviewed_at),
+  reviewNote: request.review_note });
 
 export type WebappServiceDeps = {
   repository: WebappRepository; scans: ScanRepository; assessments: AssessmentRepository; billing: BillingProvider;
@@ -351,7 +354,7 @@ export class WebappService {
 
   private async analysisView(analysis: OrgAnalysisRecord, scan: FinishedScan): Promise<AnalysisView> {
     const assessment = await this.deps.assessments.getByScan(scan.scan_id);
-    return { scanId: scan.scan_id, domain: scan.canonical_domain, scanStatus: scan.status, claimedAt: analysis.claimed_at, layer1: scan.result,
+    return { scanId: scan.scan_id, domain: scan.canonical_domain, scanStatus: scan.status, claimedAt: iso(analysis.claimed_at), layer1: scan.result,
       assessment: assessment?.status === 'COMPLETED' ? assessment.result : null };
   }
 
@@ -369,7 +372,7 @@ export class WebappService {
   private async memberView(member: MembershipRecord): Promise<MemberView> {
     const profile = await this.repo.getProfile(member.user_id);
     if (!profile) throw new Error('Member without a profile');
-    return { userId: member.user_id, email: profile.email, role: member.role, joinedAt: member.created_at };
+    return { userId: member.user_id, email: profile.email, role: member.role, joinedAt: iso(member.created_at) };
   }
 
   /** Revokes every pending invitation of this email in the organization, expired ones included: listInvitations returns them all. */

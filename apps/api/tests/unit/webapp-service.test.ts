@@ -546,6 +546,35 @@ describe('deletion and the platform admin', () => {
   });
 });
 
+describe('views', () => {
+  it('timestamps leave as ISO with Z, whatever format the store returns', async () => {
+    const s = await scene();
+    const { owner, org } = await s.ownedOrg();
+    await s.pay(owner, org.id);
+    // How Postgres prints a timestamptz.
+    const pg = '2026-10-25 13:30:00.5+00';
+    const expected = '2026-10-25T13:30:00.500Z';
+    await s.addScan('sc_pg');
+    await s.repository.claimAnalysis({ org_id: org.id, scan_id: 'sc_pg', assessment_id: null, claimed_by: owner.userId, claimed_at: pg });
+    const guest = await s.user('guest@firm.com');
+    await s.repository.upsertProfile({ user_id: guest.userId, email: 'guest@firm.com', full_name: null, last_org_id: null, created_at: pg });
+    await s.repository.addMember({ org_id: org.id, user_id: guest.userId, role: 'viewer', invited_by: owner.userId, created_at: pg });
+    await s.repository.createInvitation({ id: 'inv_pg', org_id: org.id, email: 'late@firm.com', role: 'viewer', token_hash: sha256('pg'),
+      invited_by: owner.userId, expires_at: '2026-11-01 13:30:00.5+00', accepted_at: null, revoked_at: null, created_at: pg });
+    await s.repository.createDeletionRequest({ id: 'dr_pg', org_id: org.id, requested_by: owner.userId, reason: 'Closing the firm',
+      status: 'pending', reviewed_by: null, reviewed_at: null, review_note: null, created_at: pg });
+    await s.repository.reviewDeletionRequest('dr_pg', 'rejected', owner.userId, null, pg);
+
+    const analysis = (await s.service.listAnalyses(org.id)).find(view => view.scanId === 'sc_pg')!;
+    expect(AnalysisView.parse(analysis).claimedAt).toBe(expected);
+    const { members, invitations } = await s.service.listMembers(org.id);
+    expect(members.map(m => MemberView.parse(m)).find(m => m.userId === guest.userId)!.joinedAt).toBe(expected);
+    expect(invitations.map(i => InvitationView.parse(i))).toEqual([expect.objectContaining({ expiresAt: '2026-11-01T13:30:00.500Z' })]);
+    expect((await s.service.listDeletionRequests()).map(r => DeletionRequestView.parse(r)))
+      .toEqual([expect.objectContaining({ requestedAt: expected, reviewedAt: expected })]);
+  });
+});
+
 describe('audit', () => {
   it('every change writes the audit log', async () => {
     const s = await scene();
