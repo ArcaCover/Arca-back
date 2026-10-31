@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { loadEnv } from '../../src/config/env.js';
+import { listenHostname } from '../../src/config/mode.js';
 
 const base = { SESSION_TOKEN_SECRET: 's'.repeat(40), CORS_ALLOWED_ORIGINS: 'http://localhost:3000' };
 const database = { SUPABASE_URL: 'https://fixture.supabase.co', SUPABASE_SECRET_KEY: 'sb_secret_fixture' };
@@ -75,5 +76,53 @@ describe('independent source and storage configuration', () => {
     expect(loadEnv({ ...mock, SCAN_PARTIAL_REPAIR_COOLDOWN_MS: '0' }).SCAN_PARTIAL_REPAIR_COOLDOWN_MS).toBe(0);
     expect(() => loadEnv({ ...mock, SCAN_CACHE_TTL_MS: '3600000', SCAN_PARTIAL_REPAIR_COOLDOWN_MS: '7200000' }))
       .toThrow('SCAN_PARTIAL_REPAIR_COOLDOWN_MS');
+  });
+});
+describe('ARCA_MODE', () => {
+  const liveKeys = { APIFY_API_TOKEN: 'test', OPENAI_API_KEY: 'sk-test' };
+  it('defaults to production when ARCA_MODE is absent', () => {
+    expect(loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' })).toMatchObject({ mode: 'production', overridden: [] });
+  });
+  it('rejects an unknown mode, listing the valid ones', () => {
+    const env = { ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' };
+    for (const mode of ['Mock', 'debug', 'live', '']) {
+      const start = () => loadEnv({ ...env, ARCA_MODE: mode });
+      expect(start).toThrow(/production/);
+      expect(start).toThrow(/live-debug/);
+      expect(start).toThrow(/mock/);
+    }
+  });
+  it('mock forces mock sources, memory storage and rules planning over live settings', () => {
+    const result = loadEnv({ ...base, ...database, ARCA_MODE: 'mock', SOURCE_MODE: 'live', STORAGE_BACKEND: 'supabase', ASSESSMENT_PLANNER: 'agent' });
+    expect(result).toMatchObject({ mode: 'mock', sourceMode: 'mock', storageBackend: 'memory', ASSESSMENT_PLANNER: 'rules' });
+    expect(result.overridden).toEqual(['SOURCE_MODE=live→mock', 'STORAGE_BACKEND=supabase→memory', 'ASSESSMENT_PLANNER=agent→rules']);
+  });
+  it('mock overrides the legacy MOCK_MODE defaults too, and reports only what it actually changed', () => {
+    expect(loadEnv({ ...base, ARCA_MODE: 'mock' }).overridden).toEqual(['SOURCE_MODE=live→mock', 'STORAGE_BACKEND=supabase→memory']);
+    expect(loadEnv({ ...base, ARCA_MODE: 'mock', SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' }).overridden).toEqual([]);
+    expect(loadEnv({ ...base, ARCA_MODE: 'mock', MOCK_MODE: 'true' })).toMatchObject({ mode: 'mock', overridden: [] });
+  });
+  it('live-debug never forces: it requires live sources and Supabase', () => {
+    expect(() => loadEnv({ ...base, ARCA_MODE: 'live-debug', SOURCE_MODE: 'mock' })).toThrow(/live-debug requires SOURCE_MODE=live/);
+    expect(() => loadEnv({ ...base, ARCA_MODE: 'live-debug', MOCK_MODE: 'true' })).toThrow(/live-debug requires SOURCE_MODE=live/);
+    expect(() => loadEnv({ ...base, ARCA_MODE: 'live-debug', STORAGE_BACKEND: 'memory' })).toThrow(/live-debug requires STORAGE_BACKEND=supabase/);
+    expect(loadEnv({ ...base, ...database, ...liveKeys, ARCA_MODE: 'live-debug', SOURCE_MODE: 'live', STORAGE_BACKEND: 'supabase' }))
+      .toMatchObject({ mode: 'live-debug', sourceMode: 'live', storageBackend: 'supabase', overridden: [] });
+  });
+  it('live-debug keeps the credential checks of production', () => {
+    const debug = { ...base, ...database, ARCA_MODE: 'live-debug', SOURCE_MODE: 'live', STORAGE_BACKEND: 'supabase' };
+    expect(() => loadEnv(debug)).toThrow('APIFY_API_TOKEN');
+    expect(() => loadEnv({ ...debug, APIFY_API_TOKEN: 'test' })).toThrow('OPENAI_API_KEY');
+  });
+  it('refuses any debug mode inside a deployment', () => {
+    expect(() => loadEnv({ ...base, ARCA_MODE: 'mock', ARCA_DEPLOYMENT: 'aws' })).toThrow(/ARCA_DEPLOYMENT/);
+    expect(() => loadEnv({ ...base, ...database, ...liveKeys, ARCA_MODE: 'live-debug', ARCA_DEPLOYMENT: 'aws' })).toThrow(/ARCA_DEPLOYMENT/);
+    expect(loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory', ARCA_DEPLOYMENT: 'aws' })).toMatchObject({ mode: 'production' });
+    expect(loadEnv({ ...base, ...database, ...liveKeys, ARCA_MODE: 'production', ARCA_DEPLOYMENT: 'aws' })).toMatchObject({ mode: 'production' });
+  });
+  it('listens on loopback only in debug modes', () => {
+    expect(listenHostname('mock')).toBe('127.0.0.1');
+    expect(listenHostname('live-debug')).toBe('127.0.0.1');
+    expect(listenHostname('production')).toBeUndefined();
   });
 });

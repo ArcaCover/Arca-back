@@ -12,6 +12,9 @@
   ],
   "scripts": {
     "dev": "npm run dev --workspace @arca/api",
+    "dev:mock": "node scripts/with-mode.mjs mock npm run dev",
+    "dev:live-debug": "node scripts/with-mode.mjs live-debug npm run dev",
+    "stack": "node scripts/stack.mjs",
     "build": "tsc -b",
     "typecheck": "tsc -b",
     "test": "vitest run",

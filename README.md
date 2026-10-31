@@ -12,18 +12,42 @@ de website ocurre antes de ese límite mediante un `EvidenceProvider`. El provee
 
 ## Ejecutar localmente
 
-Requiere Node.js 22 y npm. Desde la raíz:
+Requiere Node.js 22 y npm. El front ([ArcaCover/Arca-front](https://github.com/ArcaCover/Arca-front)) importa
+los contratos desde este repo con `file:../Arca-back/packages/contracts`, así que los dos repos tienen que
+estar clonados uno al lado del otro, en la misma carpeta y con esos nombres.
 
 ```powershell
+git clone https://github.com/ArcaCover/Arca-back.git
+git clone https://github.com/ArcaCover/Arca-front.git
+
+cd Arca-back
+npm ci
+npx playwright install chromium   # el PDF del Quick Scan y los tests lo usan, también en mock
+npm run build                     # compila packages/contracts/dist, que el front necesita
+Copy-Item .env.example .env.local
+# En .env.local, asignar SESSION_TOKEN_SECRET: un secreto aleatorio de al menos 32 caracteres, por ejemplo
+#   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+
+cd ..\Arca-front
 npm ci
 Copy-Item .env.example .env.local
-# Asignar SESSION_TOKEN_SECRET en .env.local: un secreto aleatorio de al menos 32 caracteres.
-npm run dev
+
+cd ..\Arca-back
+npm run stack -- mock             # back en 127.0.0.1:8080 y front en http://localhost:3000, los dos en mock
 ```
 
-`.env.example` activa `SOURCE_MODE=mock` y `STORAGE_BACKEND=memory`: usa fixtures y persistencia local,
-sin credenciales externas ni llamadas pagadas. Datos y caché desaparecen al reiniciar.
-Swagger está en http://localhost:8080/docs.
+Después, abrir http://localhost:3000/quote. La franja amarilla a rayas `MOCK` confirma que el back también
+corre en mock, y su botón **State** abre el panel con el estado de cada pantalla, los escenarios de fallo y
+los atajos del assessment.
+
+Los modos (`ARCA_MODE` aquí y `NEXT_PUBLIC_ARCA_MODE` en el front) son `mock`, `live-debug` y `production`.
+Si faltan, el modo es `production`. Los dos `.env.example` arrancan en `mock`, que no necesita ninguna
+credencial ni hace llamadas pagadas. Datos y caché viven en memoria y desaparecen al reiniciar. `live-debug`
+usa las APIs reales y Supabase, y necesita sus claves. Comandos, comprobaciones y reglas de seguridad:
+[DN-09](docs/design-notes/DN-09-modos-mock-y-live-debug.md), §11 y §12.
+
+Cada repo también tiene `npm run dev:mock` y `npm run dev:live-debug` para arrancarlo por separado. Sin
+modo de debug, `npm run dev` arranca el back solo. Swagger está en http://localhost:8080/docs.
 
 Desde Swagger se puede ejecutar el flujo completo:
 

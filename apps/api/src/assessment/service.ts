@@ -15,6 +15,8 @@ export type AssessmentAgent = Parameters<typeof planAssessment>[0]['agent'];
 export type AssessmentServiceOptions = {
   repository: AssessmentRepository; now?: () => number; bank?: QuestionBank;
   agent?: AssessmentAgent; planningTimeoutMs?: number; maxWritesPerMinute?: number;
+  /** Debug modes only: the agent for one scan's assessment, when it is not `agent`. */
+  agentFor?: (scanId: string) => AssessmentAgent | undefined;
 };
 const SESSION_TTL_MS = 86_400_000;
 const STALE_PLANNING_MS = 30_000;
@@ -87,7 +89,7 @@ export class AssessmentService {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       planned = recovery ? fallback() : await Promise.race([
-        planAssessment({ bank, layer1, evidence, agent: this.options.agent, timeoutMs: this.options.planningTimeoutMs ?? 15_000 }),
+        planAssessment({ bank, layer1, evidence, agent: this.options.agentFor?.(record.scan_id) ?? this.options.agent, timeoutMs: this.options.planningTimeoutMs ?? 15_000 }),
         new Promise<never>((_resolve, reject) => { timeout = setTimeout(() => reject(new Error('Assessment planning timed out')),
           this.options.planningTimeoutMs ?? 15_000); timeout.unref(); }),
       ]);

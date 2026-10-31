@@ -3,67 +3,27 @@ import { loadEnvFile } from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { serve, type HttpBindings } from '@hono/node-server';
 import { loadEnv } from './config/env.js';
-import { createApp } from './http/app.js';
-import { InMemoryRepository } from './repositories/in-memory.js';
-import { SupabaseRepository, createStorageClient } from './repositories/supabase.js';
-import { InMemoryAssessmentRepository, SupabaseAssessmentRepository } from './assessment/repository.js';
-import { InProcessPipeline } from './pipeline/in-process-pipeline.js';
-import { WebsiteExtractionSource } from './pipeline/website-source.js';
-import { OpenAIEvidenceProvider, RuleBasedEvidenceProvider } from './pipeline/website-evidence-provider.js';
-import { AgenticEvidenceProvider } from './pipeline/agentic-evidence-provider.js';
-import { openAiEndpoint } from './pipeline/llm-endpoint.js';
-import { ApifyClient } from './pipeline/apify-client.js';
-import { ApifyDirectorySource } from './pipeline/directories.js';
-import { PublicDomainResolver } from './pipeline/domain-resolution.js';
-import { mockSources, MOCK_DOMAINS } from './pipeline/mock-sources.js';
-import { createOpenAIPlanner } from '@arca/questions';
-import { renderPdf } from './report/pdf.js';
+import { listenHostname } from './config/mode.js';
+import { compose, interruptedBefore } from './compose.js';
 
 const envPath = fileURLToPath(new URL('../../../.env.local', import.meta.url));
 if (existsSync(envPath)) loadEnvFile(envPath);
 const env = loadEnv();
-const storageClient = env.storageBackend === 'supabase' ? createStorageClient(env.SUPABASE_URL!, env.supabaseKey!) : null;
-const repository = storageClient ? new SupabaseRepository(storageClient) : new InMemoryRepository();
-const assessmentRepository = storageClient ? new SupabaseAssessmentRepository(storageClient) : new InMemoryAssessmentRepository();
-const interruptedBefore = () => new Date(Date.now() - env.PIPELINE_TIMEOUT_MS - 120_000).toISOString();
-await repository.recoverInterrupted(interruptedBefore());
-const websiteEvidenceProvider = env.sourceMode === 'mock' ? null : env.WEBSITE_EVIDENCE_PROVIDER === 'openai'
-  ? new OpenAIEvidenceProvider(env.OPENAI_API_KEY!) : env.WEBSITE_EVIDENCE_PROVIDER === 'rules'
-    ? new RuleBasedEvidenceProvider() : new AgenticEvidenceProvider(env.OPENAI_API_KEY!, env.SIGNAL_LLM_MODEL, undefined,
-      undefined, openAiEndpoint(env.SIGNAL_LLM_REASONING_EFFORT));
-const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY, {
-  store: repository, build: env.APIFY_ACTOR_BUILD, expectedCostUsdPerRun: env.APIFY_EXPECTED_COST_USD_PER_RUN,
-  cacheTtlMs: env.APIFY_QUERY_CACHE_TTL_MS, activeTtlMs: env.APIFY_ACTIVE_RUN_TTL_MS,
-  runTimeoutSecs: env.APIFY_RUN_TIMEOUT_SECS,
-  maxCachedItems: env.APIFY_MAX_CACHED_ITEMS,
-}) : null;
-const sources = env.sourceMode === 'mock' ? mockSources() : {
-  website: new WebsiteExtractionSource(repository, websiteEvidenceProvider!),
-  bar: new ApifyDirectorySource('bar', apify!, { targetedMaxLawyers: env.APIFY_BAR_TARGETED_MAX_RESULTS }),
-  avvo: new ApifyDirectorySource('avvo', apify!, { targetedMaxLawyers: env.APIFY_AVVO_TARGETED_MAX_RESULTS }),
-};
-const domainResolver = env.sourceMode === 'mock' ? new PublicDomainResolver(async url => {
-  if (!(MOCK_DOMAINS as readonly string[]).includes(new URL(url).hostname)) throw new Error('Unknown mock domain');
-}) : new PublicDomainResolver();
-const clientIps = new WeakMap<Request, string>();
-const { app, drain, recoverAssessments } = createApp({ repository, assessmentRepository, domainResolver,
-  assessmentAgent: env.sourceMode === 'live' && env.ASSESSMENT_PLANNER === 'agent'
-    ? createOpenAIPlanner({ apiKey: env.OPENAI_API_KEY!, model: env.SIGNAL_LLM_MODEL }) : undefined,
-  pipeline: new InProcessPipeline({ ...sources, repository, timeoutMs: env.PIPELINE_TIMEOUT_MS }),
-  sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
-  renderReport: renderPdf,
-  scanCacheTtlMs: env.SCAN_CACHE_TTL_MS, partialRepairCooldownMs: env.SCAN_PARTIAL_REPAIR_COOLDOWN_MS,
-  clientIp: request => clientIps.get(request) ?? 'unknown' });
+const { app, drain, recoverAssessments, repository, apify, banner, clientIps } = await compose(env);
 await recoverAssessments();
-const server = serve({ port: env.PORT, fetch: (request, bindings) => {
+// The debug modes listen on loopback only; production keeps every interface (DN-09 5.1).
+const server = serve({ port: env.PORT, hostname: listenHostname(env.mode), fetch: (request, bindings) => {
   const connection = bindings as HttpBindings;
   const remote = connection.incoming.socket.remoteAddress ?? 'unknown';
   const forwarded = request.headers.get('x-forwarded-for')?.split(',').map(value => value.trim()).filter(Boolean) ?? [];
   clientIps.set(request, env.TRUST_PROXY_HOPS > 0 ? [...forwarded, remote].at(-(env.TRUST_PROXY_HOPS + 1)) ?? remote : remote);
   return app.fetch(request);
-} }, info => console.log(`[api] sources=${env.sourceMode} storage=${env.storageBackend} on port ${info.port}`));
+} }, info => {
+  console.log(banner);
+  console.log(`[api] listening on ${info.address} port ${info.port}`);
+});
 const recoverTimer = setInterval(() => {
-  void repository.recoverInterrupted(interruptedBefore()).catch(() => console.error('[api] recovery failed'));
+  void repository.recoverInterrupted(interruptedBefore(env.PIPELINE_TIMEOUT_MS)).catch(() => console.error('[api] recovery failed'));
   void recoverAssessments().catch(() => console.error('[api] assessment recovery failed'));
 }, 60_000);
 recoverTimer.unref();

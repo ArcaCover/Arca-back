@@ -17,6 +17,8 @@ export const AVVO_TARGETED_MAX_LAWYERS = 10;
 // Lookups one source keeps in flight. Bar and Avvo run side by side, so two sources fill the
 // default MAX_APIFY_CONCURRENCY of 16; the Apify client queues anything beyond its limit.
 export const DIRECTORY_LOOKUPS_IN_FLIGHT = 8;
+// The reason of a directory stopped by the usage limit. The debug sources fabricate the same status, so it is shared.
+export const APIFY_QUOTA_REASON = 'Apify usage limit reached for the current billing cycle; lookups after it were not started';
 const record = z.record(z.unknown());
 const text = (value: unknown): string | null => typeof value === 'string' && value.trim() ? value.trim() : null;
 const availableText = (value: unknown): string | null => {
@@ -128,6 +130,16 @@ export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQue
     return { target, actor: source === 'bar' ? BAR_ACTOR : AVVO_ACTOR, input, fallback, resultLimit };
   });
 }
+// What a directory returns when its query yields no lookup target: Apify is never called. The debug sources reuse it
+// so an injected quota error cannot claim a lookup that the real source would not have made.
+export function nothingToLookUp(query: DirectoryQuery): SourceResult<AttorneyMatch[]> {
+  const fallback = stableSample(query.names).length === 0;
+  return { data: null, rawContent: null, status: { status: 'skipped', dataStatus: 'UNKNOWN',
+    durationMs: 0, code: 'INSUFFICIENT_IDENTITY', reason: fallback && query.firmName
+      ? 'A firm-wide search needs a verified city; a nationwide search is not run'
+      : 'No verified firm or attorney identity available',
+    attorneysSearched: 0, attorneysFound: 0, candidatesReceived: 0, recordsValid: 0, providerRuns: [], costUsd: 0 } };
+}
 type DirectoryClient = { run(actor: string, input: Record<string, unknown>, signal: AbortSignal,
   context?: { scanId?: string }): Promise<unknown[] | ApifyRunResult>;
   recordAccepted?(metadata: ApifyRunMetadata, acceptedCount: number): Promise<void> };
@@ -143,11 +155,7 @@ export class ApifyDirectorySource implements DirectorySource {
     const names = stableSample(query.names);
     const fallback = names.length === 0;
     const targets = planned.map(item => item.target);
-    if (!targets.length) return { data: null, rawContent: null, status: { status: 'skipped', dataStatus: 'UNKNOWN',
-      durationMs: 0, code: 'INSUFFICIENT_IDENTITY', reason: fallback && query.firmName
-        ? 'A firm-wide search needs a verified city; a nationwide search is not run'
-        : 'No verified firm or attorney identity available',
-      attorneysSearched: 0, attorneysFound: 0, candidatesReceived: 0, recordsValid: 0, providerRuns: [], costUsd: 0 } };
+    if (!targets.length) return nothingToLookUp(query);
     const rawResults: { target: string; items: unknown[] | null; error: string | null }[] = [];
     const matches: AttorneyMatch[] = [];
     const providerRuns: NonNullable<SourceStatus['providerRuns']> = [];
@@ -241,7 +249,7 @@ export class ApifyDirectorySource implements DirectorySource {
         candidatesReceived, recordsValid, providerRuns, costUsd, accountingComplete,
         cachedRuns: providerRuns.filter(run => run.cached).length, resumedRuns: providerRuns.filter(run => run.resumed).length,
         costPerAcceptedAttorneyUsd, ...(code ? { code } : {}),
-        reason: quotaReached ? 'Apify usage limit reached for the current billing cycle; lookups after it were not started' :
+        reason: quotaReached ? APIFY_QUOTA_REASON :
           failed ? 'One or more targeted lookups were incomplete; raw responses retained' :
           found ? null : 'Provider completed successfully with no accepted identity match' } };
   }
