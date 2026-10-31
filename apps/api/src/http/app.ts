@@ -14,6 +14,9 @@ import { InMemoryRepository } from '../repositories/in-memory.js';
 import { InMemoryAssessmentRepository, type AssessmentRepository } from '../assessment/repository.js';
 import { AssessmentService, type AssessmentAgent } from '../assessment/service.js';
 import { assessmentRoutes } from '../assessment/routes.js';
+import type { AppAuth } from '../webapp/auth.js';
+import { notConfiguredWebapp, webappRoutes } from '../webapp/routes.js';
+import type { WebappService } from '../webapp/service.js';
 
 export type AppDeps = {
   pipeline: Layer1Pipeline; repository: ScanRepository; sessionSecret: string; corsOrigins: string[];
@@ -26,6 +29,8 @@ export type AppDeps = {
   renderReport?: (html: string) => Promise<Uint8Array<ArrayBuffer>>;
   /** Debug modes only. Without it there is no /__debug route, the scenario header is never read and CORS refuses it. */
   debug?: DebugTools;
+  /** The private webapp (DN-10). Only mock builds it for now; without it every webapp route answers 501. */
+  webapp?: { service: WebappService; auth: AppAuth };
 };
 export function createApp(deps: AppDeps) {
   const app = new Hono();
@@ -37,7 +42,7 @@ export function createApp(deps: AppDeps) {
   const jobs = new Set<Promise<void>>();
   const inFlightByDomain = new Map<string, Promise<PipelineResult>>();
   app.use('*', cors({ origin: origin => deps.corsOrigins.includes(origin) ? origin : null,
-    allowMethods: ['GET', 'POST', 'PUT', 'OPTIONS'],
+    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowHeaders: debug ? ['Content-Type', 'Authorization', DEBUG_SCENARIO_HEADER, DEBUG_REQUEST_HEADER] : ['Content-Type', 'Authorization'],
     exposeHeaders: ['Retry-After', 'Content-Disposition'], maxAge: 86400 }));
   app.onError((error, c) => {
@@ -184,6 +189,7 @@ export function createApp(deps: AppDeps) {
     agentFor: debug ? scanId => debug.assessmentAgentFor(scanId) : undefined,
     planningTimeoutMs: deps.assessmentPlanningTimeoutMs, maxWritesPerMinute: deps.assessmentMaxWritesPerMinute });
   app.route('/', assessmentRoutes({ scans: deps.repository, repository: assessmentRepository, service: assessments, sessionSecret: deps.sessionSecret }));
+  app.route('/', deps.webapp ? webappRoutes(deps.webapp) : notConfiguredWebapp());
   if (debug) app.route('/__debug', debug.routes({ limiter, sessionSecret: deps.sessionSecret }));
   return { app, drain: async () => { await Promise.all([...jobs]); await assessments.drain(); },
     recoverAssessments: () => assessments.recoverInterrupted() };

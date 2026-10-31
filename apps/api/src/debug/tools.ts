@@ -1,10 +1,15 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
+import { z } from 'zod';
 import type { DirectorySource, Layer1Pipeline, Layer1Result, WebsiteSource } from '@arca/contracts';
 import { DEBUG_REQUEST_HEADER, DebugModeResponse, DebugScanState, DebugScenario, isInjected } from '@arca/contracts/debug';
 import { verifySessionToken } from '../auth/session-token.js';
 import type { AssessmentAgent } from '../assessment/service.js';
 import type { ScanLimiter } from '../http/rate-limit.js';
 import { InProcessPipeline } from '../pipeline/in-process-pipeline.js';
+import type { MockAppAuth } from '../webapp/auth.js';
+import type { MockBillingProvider } from '../webapp/billing.js';
+import type { InMemoryWebappRepository } from '../webapp/in-memory.js';
+import type { WebappService } from '../webapp/service.js';
 import type { RoutingAssessmentRepository, RoutingScanRepository } from './isolation.js';
 import { injectDirectory, injectWebsite } from './sources.js';
 
@@ -34,13 +39,23 @@ const stalledPlanner: NonNullable<AssessmentAgent> = { model: 'debug-stalled-pla
     signal.addEventListener('abort', () => reject(signal.reason), { once: true });
   }) };
 
+// The custom header forces a CORS preflight, which only the allowed origins pass: without it any page open in the
+// browser could fire a debug write as a simple request.
+const withoutDebugHeader = (c: Context, what: string) => c.req.header(DEBUG_REQUEST_HEADER) === '1' ? null
+  : c.json({ error: 'invalid_request', message: `${what} needs the ${DEBUG_REQUEST_HEADER}: 1 header` }, 400);
+const MockLogin = z.object({ email: z.string().trim().email().max(320), platformAdmin: z.boolean().optional() }).strict();
+const MockPayment = z.object({ sessionId: z.string().min(1) }).strict();
+
 export function createDebugTools(options: {
   mode: 'mock' | 'live-debug'; describe: DebugModeResponse;
   sources: { website: WebsiteSource; bar: DirectorySource; avvo: DirectorySource };
   scans: RoutingScanRepository; assessments: RoutingAssessmentRepository; pipelineTimeoutMs: number;
   clearDurableMemory?: () => void;
+  /** The mock login and payment of the webapp (DN-10 §4.1, §4.4). Mock only: live-debug signs in with the real Supabase Auth. */
+  webapp?: { auth: MockAppAuth; billing: MockBillingProvider; service: WebappService; repository: InMemoryWebappRepository };
 }): DebugTools {
-  const { scans, assessments, sources } = options;
+  const { scans, assessments, sources, webapp } = options;
+  if (webapp && options.mode !== 'mock') throw new Error('The mock login and payment exist only in mock');
   // Checked once, here: the mode route can only ever serve enums and booleans, never a key or a URL (DN-09 7).
   const description = DebugModeResponse.parse(options.describe);
   const scenarios = new Map<string, DebugScenario>();
@@ -103,19 +118,41 @@ export function createDebugTools(options: {
           // Null while the scan runs, and for a failure no source reported on: a thrown pipeline, or one this process did not run.
           sources: scan.result?.sources ?? failedSources.get(scanId) ?? null }));
       });
-      // The custom header forces a CORS preflight, which only the allowed origins pass: without it any page open in the
-      // browser could fire this as a simple request.
       // The limiter always; this process's memory only in mock (DN-09 5.2). Supabase is never touched. The isolated ids
       // are never forgotten, so a wiped injected scan answers 404 and never falls through to durable storage.
       app.post('/reset', c => {
-        if (c.req.header(DEBUG_REQUEST_HEADER) !== '1') {
-          return c.json({ error: 'invalid_request', message: `A debug reset needs the ${DEBUG_REQUEST_HEADER}: 1 header` }, 400);
-        }
+        const refused = withoutDebugHeader(c, 'A debug reset');
+        if (refused) return refused;
         limiter.clear();
         if (options.mode === 'mock') {
           scans.overlay.clear();
           assessments.overlay.clear();
           options.clearDurableMemory?.();
+          webapp?.repository.clear();
+        }
+        return c.json({ ok: true });
+      });
+      if (!webapp) return app;
+      // A token in the shape of a Supabase one, for any email; platformAdmin also makes that user an ARCA platform admin.
+      app.post('/auth/login', async c => {
+        const refused = withoutDebugHeader(c, 'A mock login');
+        if (refused) return refused;
+        const body = MockLogin.safeParse(await c.req.json().catch(() => null));
+        if (!body.success) return c.json({ error: 'invalid_request', message: 'A valid email is required' }, 400);
+        const session = await webapp.auth.issue(body.data.email);
+        if (body.data.platformAdmin) await webapp.repository.grantPlatformAdmin(session.user.userId, session.user.userId);
+        return c.json(session);
+      });
+      // Stands in for Stripe's checkout.session.completed webhook: the event goes through the same service method.
+      app.post('/billing/pay', async c => {
+        const refused = withoutDebugHeader(c, 'A mock payment');
+        if (refused) return refused;
+        const body = MockPayment.safeParse(await c.req.json().catch(() => null));
+        if (!body.success) return c.json({ error: 'invalid_request', message: 'A checkout session id is required' }, 400);
+        const event = webapp.billing.pay(body.data.sessionId);
+        // After a reset the session may name an organization that no longer exists.
+        if (!event || await webapp.service.applyBillingEvent(event) !== 'applied') {
+          return c.json({ error: 'conflict', message: 'Unknown or already paid checkout session' }, 409);
         }
         return c.json({ ok: true });
       });

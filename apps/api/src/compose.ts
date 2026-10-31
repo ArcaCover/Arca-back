@@ -19,6 +19,22 @@ import { RoutingAssessmentRepository, RoutingScanRepository } from './debug/isol
 import { createDebugTools } from './debug/tools.js';
 import { createOpenAIPlanner } from '@arca/questions';
 import { renderPdf } from './report/pdf.js';
+import { MockAppAuth } from './webapp/auth.js';
+import { MockBillingProvider } from './webapp/billing.js';
+import { InMemoryWebappRepository } from './webapp/in-memory.js';
+import { DEFAULT_PLANS } from './webapp/plans.js';
+import { WebappService } from './webapp/service.js';
+
+/** In memory, with the mock login and payment. Its tokens are signed with a key derived from the scan session secret (DN-10 §4.1). */
+function mockWebapp(env: ReturnType<typeof loadEnv>, scans: RoutingScanRepository, assessments: RoutingAssessmentRepository) {
+  const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
+  const billing = new MockBillingProvider(env.APP_BASE_URL);
+  const service = new WebappService({ repository, scans, assessments, billing, sessionSecret: env.SESSION_TOKEN_SECRET,
+    appBaseUrl: env.APP_BASE_URL,
+    // A scan with an injected fault lives in memory only, so it can never belong to an organization.
+    isDurableScan: scanId => !scans.isIsolated(scanId) });
+  return { repository, billing, service, auth: new MockAppAuth(env.SESSION_TOKEN_SECRET) };
+}
 
 /** A scan still RUNNING past this point outlived its pipeline budget: a restart cut it short. */
 export const interruptedBefore = (pipelineTimeoutMs: number) => new Date(Date.now() - pipelineTimeoutMs - 120_000).toISOString();
@@ -67,7 +83,9 @@ export async function compose(env: ReturnType<typeof loadEnv>): Promise<{ app: H
   // The model a built component calls: the extraction's first, then the planner's. Rules and fixtures call none.
   const signalLlmModel = evidence === 'agentic' ? env.SIGNAL_LLM_MODEL : evidence === 'openai' ? OPENAI_EVIDENCE_MODEL
     : assessmentAgent?.model ?? null;
-  const debug = mode !== 'production' && scans && assessments ? createDebugTools({ mode, sources, scans, assessments,
+  // The private webapp (DN-10) runs only in mock until its Supabase and Stripe adapters exist; every other mode answers 501.
+  const webapp = mode === 'mock' && scans && assessments ? mockWebapp(env, scans, assessments) : undefined;
+  const debug = mode !== 'production' && scans && assessments ? createDebugTools({ mode, sources, scans, assessments, webapp,
     pipelineTimeoutMs: env.PIPELINE_TIMEOUT_MS,
     // What this process built, so the label cannot lie (DN-09 4): a key sitting in .env.local is not a service in use.
     // Enums, booleans and a model name only, never a key or a URL (DN-09 7).
@@ -80,6 +98,7 @@ export async function compose(env: ReturnType<typeof loadEnv>): Promise<{ app: H
       ? () => { durable.clear(); durableAssessments.clear(); } : undefined }) : undefined;
   const clientIps = new WeakMap<Request, string>();
   const { app, drain, recoverAssessments } = createApp({ repository, assessmentRepository, domainResolver, debug, assessmentAgent,
+    webapp: webapp && { service: webapp.service, auth: webapp.auth },
     pipeline: new InProcessPipeline({ ...sources, repository, timeoutMs: env.PIPELINE_TIMEOUT_MS }),
     sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
     renderReport: renderPdf,
