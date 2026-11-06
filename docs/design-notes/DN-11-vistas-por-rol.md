@@ -42,7 +42,7 @@ Esta nota hace que cada rol vea su propia webapp. También vuelve real lo que di
 | D12 | Cualquiera con `actions.update` cambia el estado de cualquier acción, asignada a quien sea. Cada cambio queda auditado | **[mía]** |
 | D13 | Las acciones propias se pueden borrar (`actions.assign`). Las del assessment no, solo cambian de estado | **[mía]** |
 | D14 | Un análisis nuevo trae un plan nuevo: el progreso no se arrastra por `action_key`. Los estados del plan anterior se guardan y ya no se muestran ni se editan | **[mía]** |
-| D15 | Quitar a un miembro libera sus asignaciones: el servicio pone en null su responsable. Si vuelve, no las recupera | **[mía]** |
+| D15 | Quitar a un miembro libera sus asignaciones: el servicio pone en null su responsable. Si vuelve, no las recupera. Tras la revisión final (hecho): pasarlo a `viewer`, que no puede marcar acciones (D11), también las libera, y recuperar el rol no se las devuelve | **[mía]** |
 | D16 | Marcar una acción no cambia el score: el plan es seguimiento. El texto lo dice ("A new analysis updates the score") | **[mía]** |
 | D17 | "Create action" desde una alerta de muestra abre el formulario de acción propia con el texto sugerido. La persona la confirma y se guarda real | **[mía]** |
 
@@ -128,6 +128,12 @@ La fila de una acción del assessment se crea la primera vez que algo cambia. Ha
 con `todo`, sin responsable y sin fecha. Como máximo hay 100 acciones propias por organización; la
 101 da 409.
 
+**Tras la revisión final (hecho):** el tope lo hace cumplir el repositorio al insertar.
+`createCustomAction` cuenta e inserta en un solo paso y da `WebappConflict('action_limit')`, que el
+servicio traduce al mismo 409, así dos altas a la vez con 99 no pasan las dos. Un repositorio SQL
+bloquea la fila de la organización (`select ... for update`) y cuenta e inserta en esa misma
+transacción. El conteo previo del servicio queda solo como respuesta temprana, que no gasta escritura.
+
 **`PATCH /orgs/:id/actions/:key`.** Recibe `{ status?, assigneeUserId?, dueDate? }`. Las dos últimas
 aceptan null, que significa borrar. El orden es fijo:
 
@@ -144,6 +150,12 @@ aceptan null, que significa borrar. El orden es fijo:
 
 Responde la `ActionItemView` actualizada.
 
+**Tras la revisión final (hecho):** se escriben solo los campos enviados que difieren de lo leído.
+En una fila que ya existe, de antes o creada por otra petición a la vez, el upsert cambia solo esas
+columnas, así dos cambios simultáneos a campos distintos se conservan los dos. La auditoría guarda
+solo esos campos: el antes según lo leído y el después según la fila que devuelve la escritura, que
+es también la respuesta.
+
 **Otras rutas.**
 
 - `POST /orgs/:id/actions` (`actions.assign` + pago) crea una acción propia y responde 201 con su
@@ -152,7 +164,8 @@ Responde la `ActionItemView` actualizada.
   `a.` da 400. Audita `action.deleted`.
 - **Tope de escritura:** como máximo 60 escrituras de acciones por usuario y minuto. Por encima
   responde 429 `rate_limited`, un código nuevo en el servicio.
-- **Quitar un miembro** pone en null sus asignaciones en esa organización (D15).
+- **Quitar un miembro** pone en null sus asignaciones en esa organización (D15). Tras la revisión
+  final (hecho), pasarlo a `viewer` también.
 
 ### 4.3 Actividad
 
@@ -180,6 +193,15 @@ Cada evento expone:
 - **change:** `{ from, to }` o null. Sale de una lista permitida de campos del `data`: rol, estado de
   acción, nombre y fecha. El `data` crudo nunca sale.
 
+**Tras la revisión final (hecho):**
+
+- Las acciones que solo hacen el personal de ARCA (`org.deletion_approved`, `org.deletion_rejected`
+  y `plan.updated`) o el sistema (`billing.event_applied`) se muestran con ese tipo de actor, sea
+  cual sea el que guarda la fila. Así una fila mal escrita nunca expone el email del personal. La
+  auditoría de ARCA (§4.5) usa la misma regla.
+- La fila de `before` se busca solo dentro del mismo filtro: un `seq` de otra organización da una
+  página vacía, no una posición en su registro.
+
 ### 4.4 Renombrar la organización
 
 `PATCH /orgs/:id { name }` usa la misma regla de nombre que `CreateOrgRequest`, exige `org.update` y
@@ -196,6 +218,10 @@ de ARCA queda en su perfil y aparece en la auditoría de ARCA.
 - `GET /admin/audit?orgId=&before=&limit=`: el orden de la §4.3. `limit` va de 1 a 500, por defecto
   100. Cada evento lleva `orgName` (null en eventos sin organización), `actorKind`, `actorEmail`,
   `action` y `targetLabel`. Un `orgId` desconocido devuelve una lista vacía.
+- **Tras la revisión final (hecho):** un `orgId` que no es UUID da la lista vacía, y un `:id` que no
+  es UUID da 404 en el detalle, los dos sin consultar el repositorio: una columna uuid rechazaría el
+  valor con un error en vez de no encontrarlo. Un UUID vale en mayúsculas o en minúsculas, como lo
+  lee Postgres.
 - `GET /admin/metrics`, solo conteos:
   - organizaciones por estado de cobro, con las borradas aparte;
   - miembros;
@@ -211,6 +237,10 @@ de ARCA queda en su perfil y aparece en la auditoría de ARCA.
 - **Dónde existe:** solo en mock, con `X-Arca-Debug: 1`, dentro de la sección webapp de las
   herramientas de debug, como `/auth/login`. Fuera de mock es 404 (no existe); **nunca** entra en
   `WEBAPP_PATHS`. Las piezas que necesita le llegan solo por las dependencias mock de la webapp.
+  **Tras la revisión final (hecho):** `createApp` construye el ejecutor del scan de la semilla, que
+  salta el limitador, y se lo pasa con su `AssessmentService` a las rutas de debug solo cuando las
+  herramientas traen las piezas mock de la webapp (`DebugTools.seeds`, verdadero solo en mock). En
+  live-debug no se construye, y `routes()` rechaza una pieza sin la otra.
 - **Usa el flujo real**, sin resultados escritos a mano y sin pasar por el limitador de scans:
   1. Escanea `robust.arca.example` con el pipeline mock, como `owner@demo.arca.example`, y espera a
      que termine.
@@ -219,6 +249,10 @@ de ARCA queda en su perfil y aparece en la auditoría de ARCA.
   4. La paga con el evento de cobro simulado.
   5. Agrega `admin@`, `member@` y `viewer@demo.arca.example` con su rol.
   6. Hace a `ops@demo.arca.example` admin de plataforma.
+
+  **Tras la revisión final (hecho):** antes del paso 1 comprueba que hay un plan activo y obtiene
+  las identidades de los usuarios. Lo que puede fallar sin escribir falla antes de crear la
+  organización, así un fallo no deja una organización sin pagar, ni una más en cada reintento.
 - **Respuestas del assessment:** una política determinista, portada del Auto-answer del front, que
   deja **al menos 3** acciones en el plan. Si no se cumple, la semilla falla.
 - **Tiempo:** espera como máximo 60 s; si se pasa, responde 504.
@@ -245,6 +279,22 @@ de ARCA queda en su perfil y aparece en la auditoría de ARCA.
 En RLS se copia DN-10 exactamente: RLS activado, sin políticas, `revoke` a `public`, `anon` y
 `authenticated`, y permisos solo para `service_role`. `org_actions` se suma a la lista de tablas de
 `webapp-database.test.ts`.
+
+**Tras la revisión final (hecho):**
+
+- **Índices.** Siguen el orden de lectura (§4.3). (`org_id`, `created_at desc`, `seq desc`) sirve a
+  la actividad de una organización y reemplaza al (`org_id`, `seq`) de arriba y al (`org_id`,
+  `created_at`) de DN-10, que cubre. (`created_at desc`, `seq desc`) sirve a `/admin/audit`. `seq`
+  sigue siendo único, y por él se busca el cursor.
+- **Filas ya escritas.** Las de DN-10 se corrigen: `platform` para `org.deletion_approved`,
+  `org.deletion_rejected` y `plan.updated`, y `system` para `billing.event_applied`. El trigger
+  append-only se desactiva solo para esa sentencia y se vuelve a activar enseguida.
+- **Sin default.** Después se quita el default `member` de `actor_kind`: una escritura sin tipo de
+  actor falla en vez de pasar por la de un miembro. En el repositorio, `actor_kind` es obligatorio.
+- **Secuencia.** La de la identidad, `audit_log_seq_seq`, se revoca a `public`, `anon`,
+  `authenticated` y `service_role`: insertar no necesita ningún permiso sobre ella. La prueba en
+  PGlite corre con los privilegios por defecto que Supabase da a las secuencias nuevas, y comprueba
+  que no hay políticas.
 
 ### 4.8 Repositorio
 
@@ -301,6 +351,17 @@ En `packages/contracts/src/webapp.ts`, con zod estricto. `DomainKey` sale de `la
 - **Vistas de admin:** `AdminOrgDetailView`, `AdminAuditEventView` (más su página) y
   `AdminMetricsView`, según la §4.5.
 - **`DebugSeedResponse`:** en `debug.ts`.
+
+**Tras la revisión final (hecho):**
+
+- `UpdateActionRequest.assigneeUserId` es un UUID de cualquier versión, en minúsculas, o null. Uno
+  mal formado da 400 con el cuerpo, antes del permiso, y nunca llega a una columna uuid.
+- `CreateActionRequest.detail` acepta null, y un detalle vacío una vez recortado se lee como null.
+  El servicio guarda null y el plan nunca muestra un detalle vacío.
+- `AdminAuditEventView` rechaza un email en un actor `system`, como la actividad. Las filas de un
+  miembro y del personal de ARCA pueden llevarlo (§4.5).
+- `DOMAIN_LABELS` se exporta junto a `DomainKey`, en `layer2.ts`: una sola fuente para el nombre de
+  cada dominio, en el banco de demo y en la webapp. También se exporta el esquema `ActivityActor`.
 
 **Orden de publicación.**
 
@@ -426,6 +487,10 @@ prueba para `member` y `viewer`.
 - **Entrar como** hace `signOut()`, guarda la nueva sesión y navega a `/app` (o a `/app/admin`) con
   `window.location.assign`. Una navegación completa evita arrastrar el `/me` y el estado del usuario
   anterior.
+- **Tras la revisión final (hecho):** cada "Sign in as" pide primero la semilla, que es idempotente
+  (§4.6): devuelve la misma organización o la vuelve a crear tras un reset. Después entra con la
+  cuenta nueva, y solo con esa sesión en mano cierra la del usuario anterior y guarda la nueva. Si el
+  login falla, el usuario actual sigue dentro.
 
 **Puente del interruptor.**
 
@@ -434,6 +499,10 @@ prueba para `member` y `viewer`.
 - La clave `arca.debug.showForbidden` aparece **solo dentro de esas funciones**.
 - El panel escribe la clave y emite un evento; las páginas se suscriben con `useSyncExternalStore`.
 - `useCan` nunca toca `sessionStorage` por su cuenta.
+- **Tras la revisión final (hecho):** el puente tiene una tercera función, `setShowForbidden()`, que
+  también empieza con la comparación literal del modo. Escribe o borra la clave y emite el evento, y
+  el panel escribe la clave solo a través de ella. Así la clave aparece solo en esas tres funciones
+  del puente, y el panel nunca la escribe directamente.
 
 **Guardas.**
 
