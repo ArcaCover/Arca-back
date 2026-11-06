@@ -81,6 +81,11 @@ function parseActionKey(key: string): ParsedKey | null {
   if (kind === 'c' && head !== undefined && rest.length === 0 && UUID.test(head)) return { source: 'custom', id: head.toLowerCase() };
   return null;
 }
+/**
+ * An organization id from ARCA's panel, read the way Postgres reads a uuid (any case), or null when it is not one. The store is never
+ * asked about anything else: its uuid column would refuse the value with an error instead of finding nothing.
+ */
+const organizationId = (id: string) => UUID.test(id) ? id.toLowerCase() : null;
 const assessmentKey = (scanId: string, actionKey: string) => `a.${scanId}.${actionKey}`;
 const customKey = (id: string) => `c.${id}`;
 
@@ -331,6 +336,8 @@ export class WebappService {
     if (!canManageMember(actorRole, target.role, role)) throw fail('forbidden', 'Your role cannot give this role to this member');
     if (target.role !== role) {
       await orConflict(this.repo.setRole(orgId, targetUserId, role));
+      // Only someone who can mark an action may hold it (D11): a role that cannot lets go of them, as a removal does (D15).
+      if (!can(role, 'actions.update')) await this.repo.clearAssignee(orgId, targetUserId);
       await this.audit(actor.userId, orgId, 'member.role_changed', targetUserId, { from: target.role, to: role });
     }
     return this.memberView({ ...target, role });
@@ -509,9 +516,10 @@ export class WebappService {
   }
 
   /** A deleted organization is found too: ARCA keeps seeing what it deleted. */
-  async adminOrganization(orgId: string): Promise<AdminOrgDetailView> {
-    const org = await this.repo.getOrganization(orgId);
-    if (!org) throw fail('not_found', 'Organization not found');
+  async adminOrganization(id: string): Promise<AdminOrgDetailView> {
+    const orgId = organizationId(id);
+    const org = orgId && await this.repo.getOrganization(orgId);
+    if (!orgId || !org) throw fail('not_found', 'Organization not found');
     const pending = await this.repo.getPendingDeletionRequest(orgId);
     const members = await Promise.all((await this.repo.listMembers(orgId)).map(member => this.memberView(member)));
     return { id: org.id, name: org.name, domain: org.domain, billingStatus: org.billing_status, deleted: org.deleted_at !== null,
@@ -522,7 +530,10 @@ export class WebappService {
 
   /** ARCA's own audit, across organizations or of one. Unlike an organization's activity, it names ARCA staff too. */
   async adminAudit(page: { orgId?: string; before?: number; limit: number }): Promise<AdminAuditPage> {
-    const rows = await this.repo.listAllAudit({ ...page, limit: page.limit + 1 });
+    // An orgId that names no organization gives an empty page (DN-11 §4.5), one that is not even a UUID included.
+    const orgId = page.orgId === undefined ? undefined : organizationId(page.orgId);
+    if (orgId === null) return { events: [], nextBefore: null };
+    const rows = await this.repo.listAllAudit({ orgId, before: page.before, limit: page.limit + 1 });
     const shown = rows.slice(0, page.limit);
     const names = this.names();
     const events = await Promise.all(shown.map(async row => {

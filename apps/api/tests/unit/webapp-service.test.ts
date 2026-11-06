@@ -239,7 +239,7 @@ describe('access', () => {
     const { owner, org } = await s.ownedOrg();
     const stranger = await s.user('stranger@other.com');
     await expectFailure(s.service.authorize(stranger, org.id, 'org.read', { payment: false }), 'not_found', 404);
-    await expectFailure(s.service.authorize(owner, 'org_missing', 'org.read', { payment: false }), 'not_found', 404);
+    await expectFailure(s.service.authorize(owner, randomUUID(), 'org.read', { payment: false }), 'not_found', 404);
     // Before paying the owner reaches the organization itself but no paid route.
     await expectFailure(s.service.authorize(owner, org.id, 'org.read', { payment: true }), 'payment_required', 402);
     expect(await s.service.authorize(owner, org.id, 'billing.manage', { payment: false })).toMatchObject({ role: 'owner', org: { id: org.id } });
@@ -286,7 +286,7 @@ describe('members', () => {
     await expectFailure(s.service.setRole(admin, org.id, member.userId, 'owner'), 'forbidden', 403);
     await expectFailure(s.service.setRole(member, org.id, viewer.userId, 'member'), 'forbidden', 403);
     await expectFailure(s.service.removeMember(viewer, org.id, member.userId), 'forbidden', 403);
-    await expectFailure(s.service.setRole(admin, org.id, 'user_missing', 'member'), 'not_found', 404);
+    await expectFailure(s.service.setRole(admin, org.id, randomUUID(), 'member'), 'not_found', 404);
     expect(MemberView.parse(await s.service.setRole(admin, org.id, viewer.userId, 'member')))
       .toEqual({ userId: viewer.userId, email: 'viewer@firm.com', role: 'member', joinedAt: iso(T0) });
     await s.service.removeMember(admin, org.id, viewer.userId);
@@ -435,10 +435,10 @@ describe('billing', () => {
     expect(await s.repository.getSubscription(org.id)).toMatchObject({ status: 'past_due', plan_code: 'monthly',
       customer_id: event.customerId, subscription_id: event.subscriptionId, current_period_end: event.currentPeriodEnd });
 
-    const stray = { ...event, id: 'evt_stray', orgId: 'org_missing' };
+    const stray = { ...event, id: 'evt_stray', orgId: randomUUID() };
     expect(await s.service.applyBillingEvent(stray)).toBe('unknown_org');
-    expect(await s.repository.getSubscription('org_missing')).toBeNull();
-    expect(await s.repository.getOrganization('org_missing')).toBeNull();
+    expect(await s.repository.getSubscription(stray.orgId)).toBeNull();
+    expect(await s.repository.getOrganization(stray.orgId)).toBeNull();
   });
 
   it('a payment activates the organization and a cancellation keeps the deletion state untouched', async () => {
@@ -522,7 +522,7 @@ describe('deletion and the platform admin', () => {
     expect(s.billing.canceled).toEqual([]);
     expect(await s.service.orgView(owner, org.id)).toMatchObject({ deletionPending: false });
     await expectFailure(s.service.reviewDeletion(ops, first.id, 'approve'), 'conflict', 409);
-    await expectFailure(s.service.reviewDeletion(ops, 'dr_missing', 'approve'), 'not_found', 404);
+    await expectFailure(s.service.reviewDeletion(ops, randomUUID(), 'approve'), 'not_found', 404);
 
     const second = await s.service.requestDeletion(owner, org.id, 'Closing the firm, signed letter attached');
     expect(await s.service.listDeletionRequests()).toEqual([rejected, second].map(r => DeletionRequestView.parse(r)));
@@ -952,6 +952,27 @@ describe('the action plan', () => {
     expect(await holders()).toEqual([[A1, null, 'in_progress'], [A2, owner.userId, 'todo'], [own.key, null, 'todo']]);
   });
 
+  it('a member made viewer lets go of their actions, and is not given them back with the role (D11, D15)', async () => {
+    const s = await scene();
+    const { owner, org, admin, member } = await s.team();
+    const own = await s.service.createAction(owner, org.id, { title: 'Name an AI lead' });
+    await s.service.updateAction(owner, org.id, A1, { assigneeUserId: member.userId, status: 'in_progress' });
+    await s.service.updateAction(owner, org.id, own.key, { assigneeUserId: member.userId, dueDate: '2026-12-01' });
+    await s.service.updateAction(owner, org.id, A2, { assigneeUserId: admin.userId });
+    const holders = async () => (await s.service.listActions(owner, org.id)).items
+      .map(item => [item.key, item.assignee?.userId ?? null, item.status, item.dueDate]);
+
+    // A role that can still mark actions keeps them.
+    await s.service.setRole(owner, org.id, admin.userId, 'member');
+    expect(await holders()).toEqual([[A1, member.userId, 'in_progress', null], [A2, admin.userId, 'todo', null],
+      [own.key, member.userId, 'todo', '2026-12-01']]);
+    // A viewer cannot, so nothing stays with them; the rest of each action is untouched.
+    await s.service.setRole(owner, org.id, member.userId, 'viewer');
+    expect(await holders()).toEqual([[A1, null, 'in_progress', null], [A2, admin.userId, 'todo', null], [own.key, null, 'todo', '2026-12-01']]);
+    await s.service.setRole(owner, org.id, member.userId, 'member');
+    expect(await holders()).toEqual([[A1, null, 'in_progress', null], [A2, admin.userId, 'todo', null], [own.key, null, 'todo', '2026-12-01']]);
+  });
+
   it('checks access, then the key, then the assignee', async () => {
     const s = await scene();
     const { owner, org, viewer } = await s.team();
@@ -1147,7 +1168,23 @@ describe('the platform admin panel', () => {
     const unpaid = await s.ownedOrg('sc_unpaid', { email: 'solo@else.com' });
     expect(await s.service.adminOrganization(unpaid.org.id)).toMatchObject({ billingStatus: 'pending_payment', planCode: null, analysisCount: 1,
       members: [{ email: 'solo@else.com', role: 'owner' }] });
-    await expectFailure(s.service.adminOrganization('org_missing'), 'not_found', 404);
+    await expectFailure(s.service.adminOrganization(randomUUID()), 'not_found', 404);
+    // An id is read the way Postgres reads a uuid, whatever its case.
+    expect(await s.service.adminOrganization(unpaid.org.id.toUpperCase())).toMatchObject({ id: unpaid.org.id });
+  });
+
+  it('answers an organization id that is not a UUID without asking the store, whose column would refuse it', async () => {
+    const s = await scene();
+    const { org } = await s.ownedOrg();
+    const getOrganization = vi.spyOn(s.repository, 'getOrganization');
+    const listAllAudit = vi.spyOn(s.repository, 'listAllAudit');
+    for (const id of ['org_missing', `${org.id}x`, '', 'null']) {
+      await expectFailure(s.service.adminOrganization(id), 'not_found', 404);
+      expect(await s.service.adminAudit({ orgId: id, limit: 100 })).toEqual({ events: [], nextBefore: null });
+    }
+    expect(getOrganization).not.toHaveBeenCalled();
+    expect(listAllAudit).not.toHaveBeenCalled();
+    expect((await s.service.adminAudit({ orgId: org.id.toUpperCase(), limit: 100 })).events.map(event => event.action)).toEqual(['org.created']);
   });
 
   it('pages the audit across organizations or of one', async () => {
@@ -1168,7 +1205,7 @@ describe('the platform admin panel', () => {
     ]);
     expect(all.nextBefore).toBeNull();
     expect((await s.service.adminAudit({ orgId: b.org.id, limit: 100 })).events.map(event => event.action)).toEqual(['org.created']);
-    expect(await s.service.adminAudit({ orgId: 'org_missing', limit: 100 })).toEqual({ events: [], nextBefore: null });
+    expect(await s.service.adminAudit({ orgId: randomUUID(), limit: 100 })).toEqual({ events: [], nextBefore: null });
     const first = await s.service.adminAudit({ limit: 2 });
     expect(first.events).toEqual(all.events.slice(0, 2));
     expect(await s.service.adminAudit({ limit: 2, before: first.nextBefore! })).toEqual({ events: all.events.slice(2), nextBefore: null });

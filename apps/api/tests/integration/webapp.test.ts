@@ -711,6 +711,8 @@ describe('the webapp API in mock', () => {
       createdAt: expect.any(String), planCode: 'monthly', analysisCount: 1, pendingDeletion: null,
       members: [{ email: OWNER, role: 'owner', joinedAt: expect.any(String) }] });
     expect(await s.call('GET', `/admin/organizations/${crypto.randomUUID()}`, { token: ops.token })).toEqual(failure(404, 'not_found'));
+    // An id that is not a UUID is not looked up at all: a uuid column would refuse it with an error, not a 404.
+    expect(await s.call('GET', '/admin/organizations/org_missing', { token: ops.token })).toEqual(failure(404, 'not_found'));
 
     const metrics = await s.call('GET', '/admin/metrics', { token: ops.token });
     expect(AdminMetricsView.parse(metrics.body)).toEqual({ organizations: { pending_payment: 0, active: 1, past_due: 0, canceled: 0, deleted: 0 },
@@ -718,8 +720,10 @@ describe('the webapp API in mock', () => {
 
     const audit = AdminAuditPage.parse((await s.call('GET', '/admin/audit', { token: ops.token })).body);
     expect(audit.events.map(event => event.action)).toEqual(['billing.event_applied', 'org.created']);
-    expect(await s.call('GET', `/admin/audit?orgId=${crypto.randomUUID()}`, { token: ops.token })).toEqual({ status: 200,
-      body: { events: [], nextBefore: null } });
+    for (const orgId of [crypto.randomUUID(), 'org_missing']) {
+      expect(await s.call('GET', `/admin/audit?orgId=${orgId}`, { token: ops.token }), orgId).toEqual({ status: 200,
+        body: { events: [], nextBefore: null } });
+    }
     expect((await s.call('GET', '/admin/audit?limit=500', { token: ops.token })).status).toBe(200);
     for (const query of ['limit=0', 'limit=501', 'before=abc', 'orgId=']) {
       expect(await s.call('GET', `/admin/audit?${query}`, { token: ops.token }), query).toEqual(failure(400, 'invalid_request'));
