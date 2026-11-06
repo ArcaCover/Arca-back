@@ -1,7 +1,8 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { AnalysisView, AssessmentView, ClaimResponse, DeletionRequestView, InvitationView, MeResponse, MemberView, OrgView, PlanView,
-  PollResponse, ScanResponse, StartedAssessmentResponse, UrlResponse, type AnswerValue, type RenderedQuestion, type Role } from '@arca/contracts';
+import { ActionItemView, ActionPlanResponse, ActivityPage, AdminAuditPage, AdminMetricsView, AdminOrgDetailView, AnalysisView, AssessmentView,
+  ClaimResponse, DeletionRequestView, InvitationView, MeResponse, MemberView, OrgView, PlanView, PollResponse, ROLES, ScanResponse,
+  StartedAssessmentResponse, UrlResponse, type AnswerValue, type RenderedQuestion, type Role } from '@arca/contracts';
 import { DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, type DebugModeResponse, type DebugScenarioInput } from '@arca/contracts/debug';
 import { InMemoryAssessmentRepository } from '../../src/assessment/repository.js';
 import { compose } from '../../src/compose.js';
@@ -96,8 +97,10 @@ async function mockApp() {
     expect(reply.status).toBe(200);
     return LoginResponse.parse(reply.body);
   }
-  async function claim(email = OWNER) {
+  /** With `assessed`, the assessment is completed before the claim, which gives the organization its action plan. */
+  async function claim(email = OWNER, options: { assessed?: boolean } = {}) {
     const started = await scan(app, email);
+    if (options.assessed) await completeAssessment(app, started);
     const reply = await call('POST', '/claims', { body: { scanToken: started.sessionToken } });
     expect(reply.status).toBe(201);
     return ClaimResponse.parse(reply.body).claimId;
@@ -130,19 +133,33 @@ async function mockApp() {
     return session;
   }
   /** An organization created from a funnel claim, paid unless told otherwise. */
-  async function ownedOrg(email = OWNER, options: { paid?: boolean } = {}) {
+  async function ownedOrg(email = OWNER, options: { paid?: boolean; assessed?: boolean } = {}) {
     const owner = await login(email);
-    const org = await createOrg(owner.token, await claim(email));
+    const org = await createOrg(owner.token, await claim(email, { assessed: options.assessed }));
     if (options.paid ?? true) await pay(owner.token, org.id);
     return { owner, org };
   }
-  return { ...composed, call, login, claim, createOrg, pay, invite, join, ownedOrg };
+  async function actionPlan(token: string, orgId: string) {
+    const reply = await call('GET', `/orgs/${orgId}/actions`, { token });
+    expect(reply.status).toBe(200);
+    return ActionPlanResponse.parse(reply.body);
+  }
+  async function createAction(token: string, orgId: string, title = 'Name an AI lead') {
+    const reply = await call('POST', `/orgs/${orgId}/actions`, { token, body: { title } });
+    expect(reply.status).toBe(201);
+    return ActionItemView.parse(reply.body);
+  }
+  return { ...composed, call, login, claim, createOrg, pay, invite, join, ownedOrg, actionPlan, createAction };
 }
 
-type OrgIds = { orgId: string; memberId: string; invitationId: string };
+// The front sends an action key through encodeURIComponent: an assessment key holds a colon (improve:D1.1).
+const actionPath = (orgId: string, key: string) => `/orgs/${orgId}/actions/${encodeURIComponent(key)}`;
+
+type OrgIds = { orgId: string; memberId: string; invitationId: string; actionKey: string };
 /** Every route under /orgs/:id, each with a valid body, so only who asks decides the answer. */
-const orgRoutes = ({ orgId, memberId, invitationId }: OrgIds): Array<[method: string, path: string, body?: unknown]> => [
+const orgRoutes = ({ orgId, memberId, invitationId, actionKey }: OrgIds): Array<[method: string, path: string, body?: unknown]> => [
   ['GET', `/orgs/${orgId}`],
+  ['PATCH', `/orgs/${orgId}`, { name: 'Smith & Co' }],
   ['GET', `/orgs/${orgId}/analyses`],
   ['POST', `/orgs/${orgId}/analyses`, { claimId: 'not-a-real-claim' }],
   ['GET', `/orgs/${orgId}/members`],
@@ -153,6 +170,23 @@ const orgRoutes = ({ orgId, memberId, invitationId }: OrgIds): Array<[method: st
   ['POST', `/orgs/${orgId}/billing/checkout`, { planCode: 'monthly' }],
   ['POST', `/orgs/${orgId}/billing/portal`],
   ['POST', `/orgs/${orgId}/deletion-request`, { reason: 'Closing the firm' }],
+  ['GET', `/orgs/${orgId}/actions`],
+  ['POST', `/orgs/${orgId}/actions`, { title: 'Name an AI lead' }],
+  ['PATCH', actionPath(orgId, actionKey), { status: 'done' }],
+  ['DELETE', actionPath(orgId, actionKey)],
+  ['GET', `/orgs/${orgId}/activity`],
+];
+/** Every route of ARCA's panel; `:id` is a deletion request, `:org` an organization. */
+const adminRoutes = (ids: { deletionId: string; orgId: string }): Array<[method: string, path: string, body?: unknown]> => [
+  ['GET', '/admin/organizations'],
+  ['GET', `/admin/organizations/${ids.orgId}`],
+  ['GET', '/admin/audit'],
+  ['GET', '/admin/metrics'],
+  ['GET', '/admin/deletion-requests'],
+  ['POST', `/admin/deletion-requests/${ids.deletionId}/approve`, {}],
+  ['POST', `/admin/deletion-requests/${ids.deletionId}/reject`, {}],
+  ['GET', '/admin/plans'],
+  ['PUT', '/admin/plans/monthly', { amountCents: 1 }],
 ];
 
 describe('the webapp API in mock', () => {
@@ -230,12 +264,19 @@ describe('the webapp API in mock', () => {
     const b = await s.ownedOrg('partner@robust.arca.example');
     const bMember = await s.join(b.owner.token, b.org.id, 'associate@robust.arca.example', 'member');
     const { invitation } = await s.invite(b.owner.token, b.org.id, 'pending@robust.arca.example', 'viewer');
+    const bAction = await s.createAction(b.owner.token, b.org.id);
     const before = await s.call('GET', `/orgs/${b.org.id}/members`, { token: b.owner.token });
+    const beforeActivity = await s.call('GET', `/orgs/${b.org.id}/activity`, { token: b.owner.token });
 
     // Not 403: an outsider must not learn that the organization exists.
-    for (const [method, path, body] of orgRoutes({ orgId: b.org.id, memberId: bMember.user.userId, invitationId: invitation.id })) {
+    for (const [method, path, body] of orgRoutes({ orgId: b.org.id, memberId: bMember.user.userId, invitationId: invitation.id,
+      actionKey: bAction.key })) {
       expect(await s.call(method, path, { token: a.owner.token, body }), `${method} ${path}`).toEqual(failure(404, 'not_found'));
     }
+    // Nor does A reach B's action through its own organization.
+    expect(await s.call('PATCH', actionPath(a.org.id, bAction.key), { token: a.owner.token, body: { status: 'done' } }))
+      .toEqual(failure(404, 'not_found'));
+    expect(await s.call('DELETE', actionPath(a.org.id, bAction.key), { token: a.owner.token })).toEqual(failure(404, 'not_found'));
     // The same answer as for an organization that does not exist at all.
     expect(await s.call('GET', `/orgs/${crypto.randomUUID()}`, { token: a.owner.token })).toEqual(failure(404, 'not_found'));
     // Nor can A reach B's invitation from its own organization.
@@ -245,6 +286,8 @@ describe('the webapp API in mock', () => {
 
     // B is untouched, and A only ever sees its own organization.
     expect(await s.call('GET', `/orgs/${b.org.id}/members`, { token: b.owner.token })).toEqual(before);
+    expect(await s.call('GET', `/orgs/${b.org.id}/activity`, { token: b.owner.token })).toEqual(beforeActivity);
+    expect((await s.actionPlan(b.owner.token, b.org.id)).items).toEqual([bAction]);
     expect(OrgView.parse((await s.call('GET', `/orgs/${b.org.id}`, { token: b.owner.token })).body)).toMatchObject({ deletionPending: false });
     expect(MeResponse.parse((await s.call('GET', '/me', { token: a.owner.token })).body).organizations.map(org => org.id)).toEqual([a.org.id]);
   });
@@ -261,8 +304,9 @@ describe('the webapp API in mock', () => {
     expect(approved.status).toBe(200);
     expect(DeletionRequestView.parse(approved.body)).toMatchObject({ id: requested.id, status: 'approved', reviewNote: 'Confirmed' });
 
-    // Billing and the deletion request included.
-    for (const [method, path, body] of orgRoutes({ orgId: org.id, memberId: member.user.userId, invitationId: pending.invitation.id })) {
+    // Billing, the deletion request, renaming and the activity included.
+    for (const [method, path, body] of orgRoutes({ orgId: org.id, memberId: member.user.userId, invitationId: pending.invitation.id,
+      actionKey: `c.${crypto.randomUUID()}` })) {
       expect(await s.call(method, path, { token: owner.token, body }), `${method} ${path}`).toEqual(failure(410, 'gone'));
     }
     expect(await s.call('GET', `/orgs/${org.id}/analyses`, { token: member.token })).toEqual(failure(410, 'gone'));
@@ -281,10 +325,12 @@ describe('the webapp API in mock', () => {
   it('an unpaid organization answers 402 on every paid route, and only there', async () => {
     const s = await mockApp();
     const { owner, org } = await s.ownedOrg(OWNER, { paid: false });
-    // Paying is how an organization gets in, and asking for its deletion needs no payment either (DN-10 §4.4).
-    const exempt = new Set([`GET /orgs/${org.id}`, `POST /orgs/${org.id}/billing/checkout`, `POST /orgs/${org.id}/billing/portal`,
-      `POST /orgs/${org.id}/deletion-request`]);
-    const routes = orgRoutes({ orgId: org.id, memberId: owner.user.userId, invitationId: crypto.randomUUID() });
+    // Paying is how an organization gets in, and asking for its deletion needs no payment either (DN-10 §4.4). Renaming it and
+    // reading its activity need none (DN-11 D5, D6): the owner keeps their trail unpaid.
+    const exempt = new Set([`GET /orgs/${org.id}`, `PATCH /orgs/${org.id}`, `POST /orgs/${org.id}/billing/checkout`,
+      `POST /orgs/${org.id}/billing/portal`, `POST /orgs/${org.id}/deletion-request`, `GET /orgs/${org.id}/activity`]);
+    const routes = orgRoutes({ orgId: org.id, memberId: owner.user.userId, invitationId: crypto.randomUUID(),
+      actionKey: `c.${crypto.randomUUID()}` });
     expect(routes.filter(([method, path]) => exempt.has(`${method} ${path}`))).toHaveLength(exempt.size);
     for (const [method, path, body] of routes.filter(([method, path]) => !exempt.has(`${method} ${path}`))) {
       expect(await s.call(method, path, { token: owner.token, body }), `${method} ${path}`).toEqual(failure(402, 'payment_required'));
@@ -298,73 +344,119 @@ describe('the webapp API in mock', () => {
       .toMatchObject({ billingStatus: 'pending_payment', paidAccess: false, deletionPending: true });
   });
 
-  describe('routes refuse every role the matrix refuses', () => {
-    type Team = { orgId: string; ids: Record<Role, string>; tokens: Record<Role, string>; invitationId: string; deletionId: string };
+  describe('every role against every route', () => {
+    type Team = { orgId: string; ids: Record<Role, string>; tokens: Record<Role, string>; invitationId: string; deletionId: string;
+      assessmentKey: string; customKey: string };
+    type Snapshot = { members: Reply; actions: Reply; activity: Reply; plans: Reply; requests: Reply };
     let team: Team;
     let s: Awaited<ReturnType<typeof mockApp>>;
-    let before: { members: Reply; plans: Reply; requests: Reply };
+    let before: Snapshot;
+    const snapshot = async (): Promise<Snapshot> => {
+      const ops = await s.login('ops@arca.example', true);
+      const read = (path: string) => s.call('GET', path, { token: team.tokens.owner });
+      return { members: await read(`/orgs/${team.orgId}/members`), actions: await read(`/orgs/${team.orgId}/actions`),
+        activity: await read(`/orgs/${team.orgId}/activity?limit=200`), plans: await s.call('GET', '/admin/plans', { token: ops.token }),
+        requests: await s.call('GET', '/admin/deletion-requests', { token: ops.token }) };
+    };
 
     beforeAll(async () => {
       s = await mockApp();
-      const { owner, org } = await s.ownedOrg();
+      const owner = await s.login(OWNER);
+      // The assessment is completed before the claim, so the organization has a plan whose keys are real.
+      const org = await s.createOrg(owner.token, await s.claim(OWNER, { assessed: true }));
+      await s.pay(owner.token, org.id);
       const admin = await s.join(owner.token, org.id, 'admin@robust.arca.example', 'admin');
       const member = await s.join(owner.token, org.id, 'member@robust.arca.example', 'member');
       const viewer = await s.join(owner.token, org.id, 'viewer@robust.arca.example', 'viewer');
       const { invitation } = await s.invite(owner.token, org.id, 'pending@robust.arca.example', 'viewer');
       const deletion = DeletionRequestView.parse((await s.call('POST', `/orgs/${org.id}/deletion-request`, { token: owner.token,
         body: { reason: 'Closing the firm' } })).body);
-      team = { orgId: org.id, invitationId: invitation.id, deletionId: deletion.id,
+      const assessmentKey = (await s.actionPlan(owner.token, org.id)).items.find(item => item.source === 'assessment')?.key;
+      expect(assessmentKey).toMatch(/^a\.sc_[a-zA-Z0-9]+\..+$/);
+      const custom = await s.createAction(owner.token, org.id);
+      team = { orgId: org.id, invitationId: invitation.id, deletionId: deletion.id, assessmentKey: assessmentKey!, customKey: custom.key,
         ids: { owner: owner.user.userId, admin: admin.user.userId, member: member.user.userId, viewer: viewer.user.userId },
         tokens: { owner: owner.token, admin: admin.token, member: member.token, viewer: viewer.token } };
-      const ops = await s.login('ops@arca.example', true);
-      before = { members: await s.call('GET', `/orgs/${org.id}/members`, { token: owner.token }),
-        plans: await s.call('GET', '/admin/plans', { token: ops.token }), requests: await s.call('GET', '/admin/deletion-requests', { token: ops.token }) };
+      before = await snapshot();
     });
 
-    const org = (path: string) => (t: Team) => `/orgs/${t.orgId}${path}`;
-    const routes = {
-      attach: ['POST', org('/analyses'), () => ({ claimId: 'not-a-real-claim' })],
-      invite: ['POST', org('/invitations'), () => ({ email: 'newcomer@elsewhere.example', role: 'viewer' })],
-      revoke: ['DELETE', (t: Team) => `/orgs/${t.orgId}/invitations/${t.invitationId}`, undefined],
-      checkout: ['POST', org('/billing/checkout'), () => ({ planCode: 'monthly' })],
-      portal: ['POST', org('/billing/portal'), undefined],
-      deletion: ['POST', org('/deletion-request'), () => ({ reason: 'Not mine to ask' })],
-    } as const;
-    const setRole = (target: Role, role: Role) => ['PATCH', (t: Team) => `/orgs/${t.orgId}/members/${t.ids[target]}`, () => ({ role })] as const;
-    const remove = (target: Role) => ['DELETE', (t: Team) => `/orgs/${t.orgId}/members/${t.ids[target]}`, undefined] as const;
-    const admin = (method: string, path: string, body?: unknown) => [method, (t: Team) => path.replace(':id', t.deletionId),
-      body === undefined ? undefined : () => body] as const;
-    type Route = readonly [string, (t: Team) => string, (() => unknown) | undefined];
-    const cases: Array<{ actor: Role; name: string; route: Route }> = [
-      ...(['checkout', 'portal', 'deletion'] as const).map(name => ({ actor: 'admin' as const, name, route: routes[name] })),
-      { actor: 'admin', name: 'demote an owner', route: setRole('owner', 'admin') },
-      { actor: 'admin', name: 'remove an owner', route: remove('owner') },
-      { actor: 'admin', name: 'give owner', route: setRole('member', 'owner') },
-      ...(['invite', 'revoke', 'checkout', 'portal', 'deletion'] as const).map(name => ({ actor: 'member' as const, name, route: routes[name] })),
-      { actor: 'member', name: 'change a role', route: setRole('viewer', 'member') },
-      { actor: 'member', name: 'remove a member', route: remove('viewer') },
-      ...(['attach', 'invite', 'revoke', 'checkout', 'portal', 'deletion'] as const).map(name => ({ actor: 'viewer' as const, name,
-        route: routes[name] })),
-      { actor: 'viewer', name: 'change a role', route: setRole('member', 'viewer') },
-      { actor: 'viewer', name: 'remove a member', route: remove('member') },
+    // What each role gets on each route. Every allowed call is chosen so it leaves the organization as it was, or only adds to
+    // it, and so the next role meets the same state: renaming to the same name, marking an untouched action todo, a deletion
+    // request already pending.
+    const everyone = (status: number) => ({ owner: status, admin: status, member: status, viewer: status });
+    const only = (roles: Role[], status: number) =>
+      Object.fromEntries(ROLES.map(role => [role, roles.includes(role) ? status : 403])) as Record<Role, number>;
+    const managers: Role[] = ['owner', 'admin'];
+    const markers: Role[] = ['owner', 'admin', 'member'];
+    const nobody = everyone(403);
+    type Row = { name: string; method: string; path: (t: Team) => string; body?: unknown; expected: Record<Role, number> };
+    const orgPath = (path: string) => (t: Team) => `/orgs/${t.orgId}${path}`;
+    const rows: Row[] = [
+      { name: 'read the organization', method: 'GET', path: orgPath(''), expected: everyone(200) },
+      { name: 'rename it to its own name', method: 'PATCH', path: orgPath(''), body: { name: 'Smith & Co' }, expected: only(managers, 200) },
+      { name: 'read the analyses', method: 'GET', path: orgPath('/analyses'), expected: everyone(200) },
+      // A member saves no analysis (DN-11 D2); the others get as far as the made-up claim.
+      { name: 'add an analysis', method: 'POST', path: orgPath('/analyses'), body: { claimId: 'not-a-real-claim' }, expected: only(managers, 410) },
+      { name: 'read the members', method: 'GET', path: orgPath('/members'), expected: everyone(200) },
+      { name: 'invite', method: 'POST', path: orgPath('/invitations'), body: { email: 'newcomer@elsewhere.example', role: 'viewer' },
+        expected: only(managers, 201) },
+      { name: 'revoke an unknown invitation', method: 'DELETE', path: t => `/orgs/${t.orgId}/invitations/${crypto.randomUUID()}`,
+        expected: only(managers, 404) },
+      { name: 'keep a viewer a viewer', method: 'PATCH', path: t => `/orgs/${t.orgId}/members/${t.ids.viewer}`, body: { role: 'viewer' },
+        expected: only(managers, 200) },
+      // An admin may not touch an owner nor hand out ownership; the owner meets the last-owner rule.
+      { name: 'demote the owner', method: 'PATCH', path: t => `/orgs/${t.orgId}/members/${t.ids.owner}`, body: { role: 'admin' },
+        expected: { ...nobody, owner: 409 } },
+      { name: 'keep the owner an owner', method: 'PATCH', path: t => `/orgs/${t.orgId}/members/${t.ids.owner}`, body: { role: 'owner' },
+        expected: { ...nobody, owner: 200 } },
+      { name: 'remove the owner', method: 'DELETE', path: t => `/orgs/${t.orgId}/members/${t.ids.owner}`, expected: { ...nobody, owner: 409 } },
+      { name: 'remove an unknown member', method: 'DELETE', path: t => `/orgs/${t.orgId}/members/${crypto.randomUUID()}`,
+        expected: only(managers, 404) },
+      // Already paid, so the owner is sent to the portal.
+      { name: 'check out', method: 'POST', path: orgPath('/billing/checkout'), body: { planCode: 'monthly' }, expected: { ...nobody, owner: 409 } },
+      { name: 'open the portal', method: 'POST', path: orgPath('/billing/portal'), expected: { ...nobody, owner: 200 } },
+      { name: 'request deletion again', method: 'POST', path: orgPath('/deletion-request'), body: { reason: 'Not mine to ask' },
+        expected: { ...nobody, owner: 409 } },
+      { name: 'read the action plan', method: 'GET', path: orgPath('/actions'), expected: everyone(200) },
+      { name: 'create an action', method: 'POST', path: orgPath('/actions'), body: { title: 'Another action' }, expected: only(managers, 201) },
+      { name: 'mark an assessment action', method: 'PATCH', path: t => actionPath(t.orgId, t.assessmentKey), body: { status: 'todo' },
+        expected: only(markers, 200) },
+      { name: 'mark an own action', method: 'PATCH', path: t => actionPath(t.orgId, t.customKey), body: { status: 'todo' },
+        expected: only(markers, 200) },
+      { name: 'clear a due date', method: 'PATCH', path: t => actionPath(t.orgId, t.assessmentKey), body: { dueDate: null },
+        expected: only(managers, 200) },
+      { name: 'clear an assignee', method: 'PATCH', path: t => actionPath(t.orgId, t.customKey), body: { assigneeUserId: null },
+        expected: only(managers, 200) },
+      { name: 'delete an assessment action', method: 'DELETE', path: t => actionPath(t.orgId, t.assessmentKey), expected: only(managers, 400) },
+      { name: 'delete an unknown action', method: 'DELETE', path: t => actionPath(t.orgId, `c.${crypto.randomUUID()}`),
+        expected: only(managers, 404) },
+      { name: 'read the activity', method: 'GET', path: orgPath('/activity'), expected: only(managers, 200) },
       // An organization owner is not an ARCA platform admin.
-      { actor: 'owner', name: 'list organizations', route: admin('GET', '/admin/organizations') },
-      { actor: 'owner', name: 'list deletion requests', route: admin('GET', '/admin/deletion-requests') },
-      { actor: 'owner', name: 'approve a deletion', route: admin('POST', '/admin/deletion-requests/:id/approve', {}) },
-      { actor: 'owner', name: 'reject a deletion', route: admin('POST', '/admin/deletion-requests/:id/reject', {}) },
-      { actor: 'owner', name: 'list every plan', route: admin('GET', '/admin/plans') },
-      { actor: 'owner', name: 'change a price', route: admin('PUT', '/admin/plans/monthly', { amountCents: 1 }) },
+      ...adminRoutes({ deletionId: ':deletion', orgId: ':org' }).map(([method, path, body]): Row => ({ name: `${method} ${path}`, method,
+        path: t => path.replace(':deletion', t.deletionId).replace(':org', t.orgId), body, expected: nobody })),
     ];
+    const cells = rows.flatMap(row => ROLES.map(role => ({ ...row, role, status: row.expected[role] })));
 
-    it.each(cases)('$actor: $name', async ({ actor, route: [method, path, body] }) => {
-      expect(await s.call(method, path(team), { token: team.tokens[actor], body: body?.() })).toEqual(failure(403, 'forbidden'));
+    it('walks every webapp route', () => {
+      // Path shapes, ids replaced, so a route added later without a row fails here.
+      const shape = (path: string) => path.replace(/\/orgs\/[^/]+/, '/orgs/:id')
+        .replace(/\/(members|invitations|actions|organizations|deletion-requests)\/[^/?]+/, '/$1/:param');
+      const ids = { orgId: 'o', memberId: 'm', invitationId: 'i', actionKey: 'c.k' };
+      const routes = [...orgRoutes(ids), ...adminRoutes({ deletionId: 'd', orgId: 'o' })].map(([method, path]) => `${method} ${shape(path)}`);
+      const covered = new Set(rows.map(row => `${row.method} ${shape(row.path({ ...team, orgId: 'o' }))}`));
+      expect(routes.filter(route => !covered.has(route))).toEqual([]);
+    });
+
+    it.each(cells.filter(cell => cell.status === 403))('$role is refused: $name', async ({ role, method, path, body }) => {
+      expect(await s.call(method, path(team), { token: team.tokens[role], body })).toEqual(failure(403, 'forbidden'));
     });
 
     it('and none of the refusals changed anything', async () => {
-      const ops = await s.login('ops@arca.example', true);
-      expect(await s.call('GET', `/orgs/${team.orgId}/members`, { token: team.tokens.owner })).toEqual(before.members);
-      expect(await s.call('GET', '/admin/plans', { token: ops.token })).toEqual(before.plans);
-      expect(await s.call('GET', '/admin/deletion-requests', { token: ops.token })).toEqual(before.requests);
+      expect(await snapshot()).toEqual(before);
+    });
+
+    it.each(cells.filter(cell => cell.status !== 403))('$role may: $name ($status)', async ({ role, method, path, body, status }) => {
+      expect((await s.call(method, path(team), { token: team.tokens[role], body })).status).toBe(status);
     });
   });
 
@@ -375,11 +467,9 @@ describe('the webapp API in mock', () => {
     const routes: Array<[method: string, path: string, body?: unknown]> = [
       ['GET', '/me'],
       ['POST', '/orgs', { name: 'Smith & Co', claimId: 'not-a-real-claim' }],
-      ...orgRoutes({ orgId: org.id, memberId: owner.user.userId, invitationId: crypto.randomUUID() }),
+      ...orgRoutes({ orgId: org.id, memberId: owner.user.userId, invitationId: crypto.randomUUID(), actionKey: `c.${crypto.randomUUID()}` }),
       ['POST', '/invitations/not-a-real-token/accept'],
-      ['GET', '/admin/organizations'], ['GET', '/admin/deletion-requests'], ['GET', '/admin/plans'],
-      ['POST', `/admin/deletion-requests/${crypto.randomUUID()}/approve`, {}], ['POST', `/admin/deletion-requests/${crypto.randomUUID()}/reject`, {}],
-      ['PUT', '/admin/plans/monthly', { amountCents: 1 }],
+      ...adminRoutes({ deletionId: crypto.randomUUID(), orgId: org.id }),
     ];
     // The scan session token is signed under another key, issuer and audience. A mock token under another secret is refused too.
     const forged = await new MockAppAuth('x'.repeat(40)).issue(OWNER);
@@ -434,6 +524,22 @@ describe('the webapp API in mock', () => {
       ['POST', `/orgs/${org.id}/deletion-request`, { reason: '' }, owner.token],
       ['PUT', '/admin/plans/monthly', {}, ops.token],
       ['PUT', '/admin/plans/monthly', { amountCents: -1 }, ops.token],
+      ['PATCH', `/orgs/${org.id}`, { name: '   ' }, owner.token],
+      ['PATCH', `/orgs/${org.id}`, { name: 'x'.repeat(121) }, owner.token],
+      ['PATCH', `/orgs/${org.id}`, { name: 'Smith & Co', domain: 'other.example' }, owner.token],
+      ['POST', `/orgs/${org.id}/actions`, {}, owner.token],
+      ['POST', `/orgs/${org.id}/actions`, { title: '  ' }, owner.token],
+      ['POST', `/orgs/${org.id}/actions`, { title: 'x'.repeat(201) }, owner.token],
+      ['POST', `/orgs/${org.id}/actions`, { title: 'Name an AI lead', detail: 'x'.repeat(2001) }, owner.token],
+      ['POST', `/orgs/${org.id}/actions`, { title: 'Name an AI lead', domain: 'finance' }, owner.token],
+      ['POST', `/orgs/${org.id}/actions`, { title: 'Name an AI lead', status: 'done' }, owner.token],
+      // Nothing to change is a 400 before anything else, whatever the key.
+      ['PATCH', actionPath(org.id, 'c.whatever'), {}, owner.token],
+      ['PATCH', actionPath(org.id, 'c.whatever'), { status: 'finished' }, owner.token],
+      ['PATCH', actionPath(org.id, 'c.whatever'), { dueDate: '2026-13-01' }, owner.token],
+      ['PATCH', actionPath(org.id, 'c.whatever'), { dueDate: '01/12/2026' }, owner.token],
+      ['PATCH', actionPath(org.id, 'c.whatever'), { assigneeUserId: '' }, owner.token],
+      ['PATCH', actionPath(org.id, 'c.whatever'), { status: 'done', title: 'Renamed' }, owner.token],
     ];
     for (const [method, path, body, token] of invalid) {
       expect(await s.call(method, path, { token, body }), `${method} ${path}`).toEqual(failure(400, 'invalid_request'));
@@ -446,6 +552,160 @@ describe('the webapp API in mock', () => {
   it('the Stripe webhook is not configured, even in mock', async () => {
     const s = await mockApp();
     expect(await s.call('POST', '/billing/webhook', { body: { type: 'checkout.session.completed' } })).toEqual(failure(501, 'not_configured'));
+  });
+
+  it('a member marks the plan, the owner assigns and sees it, and only the organization\'s own actions are deleted', async () => {
+    const s = await mockApp();
+    const { owner, org } = await s.ownedOrg(OWNER, { assessed: true });
+    const member = await s.join(owner.token, org.id, 'member@robust.arca.example', 'member');
+    const plan = await s.actionPlan(member.token, org.id);
+    expect(plan.source).toMatchObject({ domain: DOMAIN });
+    const [first] = plan.items;
+    expect(first).toMatchObject({ source: 'assessment', status: 'todo', assignee: null, dueDate: null, updatedAt: null });
+    // An assessment key holds a colon, which the front encodes.
+    expect(first!.key).toMatch(/^a\.sc_[a-zA-Z0-9]+\.improve:/);
+
+    const marked = await s.call('PATCH', actionPath(org.id, first!.key), { token: member.token, body: { status: 'done' } });
+    expect(marked).toEqual({ status: 200, body: { ...first, status: 'done', updatedAt: expect.any(String) } });
+    expect(await s.call('PATCH', actionPath(org.id, first!.key), { token: member.token, body: { status: 'todo', dueDate: '2026-12-01' } }))
+      .toEqual(failure(403, 'forbidden'));
+    const assigned = await s.call('PATCH', actionPath(org.id, first!.key), { token: owner.token,
+      body: { assigneeUserId: member.user.userId, dueDate: '2026-12-01' } });
+    expect(assigned.status).toBe(200);
+    expect(ActionItemView.parse(assigned.body)).toMatchObject({ status: 'done', dueDate: '2026-12-01',
+      assignee: { userId: member.user.userId, email: 'member@robust.arca.example' } });
+    // Only someone who can mark actions may hold one.
+    const viewer = await s.join(owner.token, org.id, 'viewer@robust.arca.example', 'viewer');
+    expect(await s.call('PATCH', actionPath(org.id, first!.key), { token: owner.token, body: { assigneeUserId: viewer.user.userId } }))
+      .toEqual(failure(400, 'invalid_request'));
+    expect((await s.actionPlan(owner.token, org.id)).items[0]).toEqual(ActionItemView.parse(assigned.body));
+
+    const own = await s.createAction(owner.token, org.id);
+    expect(own).toMatchObject({ source: 'custom', title: 'Name an AI lead', pointsGain: null, status: 'todo' });
+    expect(await s.call('DELETE', actionPath(org.id, first!.key), { token: owner.token })).toEqual(failure(400, 'invalid_request'));
+    expect(await s.call('DELETE', actionPath(org.id, own.key), { token: member.token })).toEqual(failure(403, 'forbidden'));
+    expect(await s.call('DELETE', actionPath(org.id, own.key), { token: owner.token })).toEqual({ status: 204, body: null });
+    expect(await s.call('DELETE', actionPath(org.id, own.key), { token: owner.token })).toEqual(failure(404, 'not_found'));
+
+    const activity = ActivityPage.parse((await s.call('GET', `/orgs/${org.id}/activity`, { token: owner.token })).body);
+    expect(activity.events.filter(event => event.action.startsWith('action.')).map(event => [event.action, event.actor.email, event.change]))
+      .toEqual([['action.deleted', OWNER, null], ['action.created', OWNER, null], ['action.updated', OWNER, { from: null, to: '2026-12-01' }],
+        ['action.updated', 'member@robust.arca.example', { from: 'todo', to: 'done' }]]);
+  });
+
+  it('a key of another organization or of an older plan is not found', async () => {
+    const s = await mockApp();
+    const a = await s.ownedOrg('owner@robust.arca.example', { assessed: true });
+    const b = await s.ownedOrg('partner@robust.arca.example', { assessed: true });
+    const theirs = [(await s.actionPlan(b.owner.token, b.org.id)).items[0]!.key, (await s.createAction(b.owner.token, b.org.id)).key];
+    const bBefore = await s.actionPlan(b.owner.token, b.org.id);
+    for (const key of theirs) {
+      expect(await s.call('PATCH', actionPath(a.org.id, key), { token: a.owner.token, body: { status: 'done' } })).toEqual(failure(404, 'not_found'));
+      expect(await s.call('PATCH', actionPath(a.org.id, key), { token: a.owner.token, body: { dueDate: null } })).toEqual(failure(404, 'not_found'));
+    }
+    expect(await s.call('DELETE', actionPath(a.org.id, theirs[1]!), { token: a.owner.token })).toEqual(failure(404, 'not_found'));
+    expect(await s.actionPlan(b.owner.token, b.org.id)).toEqual(bBefore);
+
+    // A newer analysis with a completed assessment replaces the plan: the old keys name nothing and nothing carries over.
+    const [old] = (await s.actionPlan(a.owner.token, a.org.id)).items;
+    expect((await s.call('PATCH', actionPath(a.org.id, old!.key), { token: a.owner.token, body: { status: 'done' } })).status).toBe(200);
+    const attached = await s.call('POST', `/orgs/${a.org.id}/analyses`, { token: a.owner.token,
+      body: { claimId: await s.claim('owner@robust.arca.example', { assessed: true }) } });
+    expect(attached.status).toBe(201);
+    const current = await s.actionPlan(a.owner.token, a.org.id);
+    expect(current.source?.scanId).toBe(AnalysisView.parse(attached.body).scanId);
+    expect(current.items.map(item => item.key)).not.toContain(old!.key);
+    expect(current.items.every(item => item.status === 'todo' && item.updatedAt === null)).toBe(true);
+    expect(await s.call('PATCH', actionPath(a.org.id, old!.key), { token: a.owner.token, body: { status: 'in_progress' } }))
+      .toEqual(failure(404, 'not_found'));
+  });
+
+  it('answers 429 after 60 writes to the action plan in a minute', async () => {
+    const s = await mockApp();
+    const { owner, org } = await s.ownedOrg();
+    const own = await s.createAction(owner.token, org.id);
+    for (let index = 0; index < 59; index++) {
+      const reply = await s.call('PATCH', actionPath(org.id, own.key), { token: owner.token, body: { status: index % 2 ? 'todo' : 'done' } });
+      expect(reply.status).toBe(200);
+    }
+    expect(await s.call('PATCH', actionPath(org.id, own.key), { token: owner.token, body: { status: 'in_progress' } }))
+      .toEqual(failure(429, 'rate_limited'));
+    expect(await s.call('POST', `/orgs/${org.id}/actions`, { token: owner.token, body: { title: 'Another' } })).toEqual(failure(429, 'rate_limited'));
+    expect((await s.actionPlan(owner.token, org.id)).items).toEqual([expect.objectContaining({ key: own.key, status: 'done' })]);
+  });
+
+  it('owners and admins read the activity, paged, and never the email of ARCA staff', async () => {
+    const s = await mockApp();
+    const { owner, org } = await s.ownedOrg();
+    const admin = await s.join(owner.token, org.id, 'admin@robust.arca.example', 'admin');
+    const member = await s.join(owner.token, org.id, 'member@robust.arca.example', 'member');
+    const requested = DeletionRequestView.parse((await s.call('POST', `/orgs/${org.id}/deletion-request`, { token: owner.token,
+      body: { reason: 'Closing the firm' } })).body);
+    const ops = await s.login('ops@arca.example', true);
+    expect((await s.call('POST', `/admin/deletion-requests/${requested.id}/reject`, { token: ops.token })).status).toBe(200);
+
+    const reply = await s.call('GET', `/orgs/${org.id}/activity`, { token: admin.token });
+    expect(reply.status).toBe(200);
+    const all = ActivityPage.parse(reply.body);
+    expect(all.events[0]).toMatchObject({ action: 'org.deletion_rejected', actor: { kind: 'arca', email: null } });
+    expect(all.events.at(-1)).toMatchObject({ action: 'org.created', actor: { kind: 'member', email: OWNER } });
+    expect(all.nextBefore).toBeNull();
+    expect(JSON.stringify(reply.body)).not.toContain('ops@arca.example');
+    expect(await s.call('GET', `/orgs/${org.id}/activity`, { token: member.token })).toEqual(failure(403, 'forbidden'));
+    // ARCA's own audit names its staff.
+    const audit = await s.call('GET', `/admin/audit?orgId=${org.id}&limit=1`, { token: ops.token });
+    expect(AdminAuditPage.parse(audit.body).events).toEqual([expect.objectContaining({ action: 'org.deletion_rejected', actorKind: 'platform',
+      actorEmail: 'ops@arca.example', orgName: 'Smith & Co' })]);
+
+    const first = ActivityPage.parse((await s.call('GET', `/orgs/${org.id}/activity?limit=2`, { token: owner.token })).body);
+    expect(first.events).toEqual(all.events.slice(0, 2));
+    const next = await s.call('GET', `/orgs/${org.id}/activity?limit=2&before=${first.nextBefore}`, { token: owner.token });
+    expect(ActivityPage.parse(next.body).events).toEqual(all.events.slice(2, 4));
+    expect((await s.call('GET', `/orgs/${org.id}/activity?limit=200`, { token: owner.token })).status).toBe(200);
+    for (const query of ['limit=0', 'limit=201', 'limit=abc', 'limit=1.5', 'limit=', 'before=0', 'before=-3', 'before=x', 'before=1e3']) {
+      expect(await s.call('GET', `/orgs/${org.id}/activity?${query}`, { token: owner.token }), query).toEqual(failure(400, 'invalid_request'));
+    }
+  });
+
+  it('owners and admins rename the organization', async () => {
+    const s = await mockApp();
+    const { owner, org } = await s.ownedOrg();
+    const admin = await s.join(owner.token, org.id, 'admin@robust.arca.example', 'admin');
+    const member = await s.join(owner.token, org.id, 'member@robust.arca.example', 'member');
+    expect(await s.call('PATCH', `/orgs/${org.id}`, { token: member.token, body: { name: 'Mine now' } })).toEqual(failure(403, 'forbidden'));
+    const renamed = await s.call('PATCH', `/orgs/${org.id}`, { token: admin.token, body: { name: '  Robust Law (demo)  ' } });
+    expect(renamed).toEqual({ status: 200, body: { ...org, name: 'Robust Law (demo)', role: 'admin', billingStatus: 'active', paidAccess: true } });
+    expect(MeResponse.parse((await s.call('GET', '/me', { token: owner.token })).body).organizations[0]).toMatchObject({ name: 'Robust Law (demo)' });
+    const [latest] = ActivityPage.parse((await s.call('GET', `/orgs/${org.id}/activity`, { token: owner.token })).body).events;
+    expect(latest).toMatchObject({ action: 'org.renamed', actor: { kind: 'member', email: 'admin@robust.arca.example' },
+      targetLabel: 'Robust Law (demo)', change: { from: 'Smith & Co', to: 'Robust Law (demo)' } });
+  });
+
+  it('gives ARCA an organization in detail, its audit and the metrics', async () => {
+    const s = await mockApp();
+    const { owner, org } = await s.ownedOrg(OWNER, { assessed: true });
+    const plan = await s.actionPlan(owner.token, org.id);
+    const ops = await s.login('ops@arca.example', true);
+
+    const detail = await s.call('GET', `/admin/organizations/${org.id}`, { token: ops.token });
+    expect(detail.status).toBe(200);
+    expect(AdminOrgDetailView.parse(detail.body)).toEqual({ id: org.id, name: 'Smith & Co', domain: DOMAIN, billingStatus: 'active', deleted: false,
+      createdAt: expect.any(String), planCode: 'monthly', analysisCount: 1, pendingDeletion: null,
+      members: [{ email: OWNER, role: 'owner', joinedAt: expect.any(String) }] });
+    expect(await s.call('GET', `/admin/organizations/${crypto.randomUUID()}`, { token: ops.token })).toEqual(failure(404, 'not_found'));
+
+    const metrics = await s.call('GET', '/admin/metrics', { token: ops.token });
+    expect(AdminMetricsView.parse(metrics.body)).toEqual({ organizations: { pending_payment: 0, active: 1, past_due: 0, canceled: 0, deleted: 0 },
+      members: 1, analyses: 1, pendingDeletionRequests: 0, actions: { todo: plan.items.length, in_progress: 0, done: 0 } });
+
+    const audit = AdminAuditPage.parse((await s.call('GET', '/admin/audit', { token: ops.token })).body);
+    expect(audit.events.map(event => event.action)).toEqual(['billing.event_applied', 'org.created']);
+    expect(await s.call('GET', `/admin/audit?orgId=${crypto.randomUUID()}`, { token: ops.token })).toEqual({ status: 200,
+      body: { events: [], nextBefore: null } });
+    expect((await s.call('GET', '/admin/audit?limit=500', { token: ops.token })).status).toBe(200);
+    for (const query of ['limit=0', 'limit=501', 'before=abc', 'orgId=']) {
+      expect(await s.call('GET', `/admin/audit?${query}`, { token: ops.token }), query).toEqual(failure(400, 'invalid_request'));
+    }
   });
 });
 
@@ -496,8 +756,11 @@ describe('production wiring', () => {
     const { app } = await compose(loadEnv({ SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory', SESSION_TOKEN_SECRET: secret,
       CORS_ALLOWED_ORIGINS: origin }));
     const routes: Array<[string, string]> = [['GET', '/me'], ['POST', '/claims'], ['GET', '/plans'], ['POST', '/orgs'], ['GET', '/orgs/x'],
-      ['GET', '/orgs/x/analyses'], ['PATCH', '/orgs/x/members/y'], ['DELETE', '/orgs/x/members/y'], ['POST', '/orgs/x/billing/checkout'],
-      ['POST', '/invitations/t/accept'], ['GET', '/admin/organizations'], ['PUT', '/admin/plans/monthly'], ['POST', '/billing/webhook']];
+      ['PATCH', '/orgs/x'], ['GET', '/orgs/x/analyses'], ['PATCH', '/orgs/x/members/y'], ['DELETE', '/orgs/x/members/y'],
+      ['POST', '/orgs/x/billing/checkout'], ['GET', '/orgs/x/actions'], ['POST', '/orgs/x/actions'], ['PATCH', '/orgs/x/actions/a.sc_1.y'],
+      ['DELETE', '/orgs/x/actions/c.y'], ['GET', '/orgs/x/activity'], ['POST', '/invitations/t/accept'], ['GET', '/admin/organizations'],
+      ['GET', '/admin/organizations/x'], ['GET', '/admin/audit'], ['GET', '/admin/metrics'], ['PUT', '/admin/plans/monthly'],
+      ['POST', '/billing/webhook']];
     for (const [method, path] of routes) {
       const response = await app.request(path, { method, headers: { Authorization: 'Bearer x', 'Content-Type': 'application/json' },
         body: method === 'GET' ? undefined : '{}' });
