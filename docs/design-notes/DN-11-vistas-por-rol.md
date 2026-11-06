@@ -42,7 +42,7 @@ Esta nota hace que cada rol vea su propia webapp. También vuelve real lo que di
 | D12 | Cualquiera con `actions.update` cambia el estado de cualquier acción, asignada a quien sea. Cada cambio queda auditado | **[mía]** |
 | D13 | Las acciones propias se pueden borrar (`actions.assign`). Las del assessment no, solo cambian de estado | **[mía]** |
 | D14 | Un análisis nuevo trae un plan nuevo: el progreso no se arrastra por `action_key`. Los estados del plan anterior se guardan y ya no se muestran ni se editan | **[mía]** |
-| D15 | Quitar a un miembro libera sus asignaciones: el servicio pone en null su responsable. Si vuelve, no las recupera. Tras la revisión final (hecho): pasarlo a `viewer`, que no puede marcar acciones (D11), también las libera, y recuperar el rol no se las devuelve | **[mía]** |
+| D15 | Quitar a un miembro libera sus asignaciones: el servicio pone en null su responsable (desde la segunda revisión, el repositorio, en la misma llamada que lo quita). Si vuelve, no las recupera. Tras la revisión final (hecho): pasarlo a `viewer`, que no puede marcar acciones (D11), también las libera, y recuperar el rol no se las devuelve | **[mía]** |
 | D16 | Marcar una acción no cambia el score: el plan es seguimiento. El texto lo dice ("A new analysis updates the score") | **[mía]** |
 | D17 | "Create action" desde una alerta de muestra abre el formulario de acción propia con el texto sugerido. La persona la confirma y se guarda real | **[mía]** |
 
@@ -185,7 +185,8 @@ es también la respuesta.
   responde 429 `rate_limited`, un código nuevo en el servicio.
 - **Quitar un miembro** pone en null sus asignaciones en esa organización (D15). Tras la revisión
   final (hecho), pasarlo a `viewer` también. Tras la segunda revisión (hecho), en la misma llamada
-  al repositorio que el cambio (arriba).
+  al repositorio que el cambio (arriba). Tras la tercera revisión (hecho), si otra petición ya lo
+  quitó, el cambio de rol o la segunda baja responde 404 y no audita, como una acción que desaparece.
 
 ### 4.3 Actividad
 
@@ -338,7 +339,9 @@ Métodos nuevos (en la interfaz y en memoria):
 
 **Tras la segunda revisión (hecho):** `clearAssignee` desaparece, porque la liberación va dentro de
 `setRole` y `removeMember` (§4.2). `updateAction` devuelve la fila o null, y `deleteCustomAction`
-un booleano. La interfaz dice qué transacción y qué cerraduras necesita un repositorio SQL.
+un booleano. La interfaz dice qué transacción y qué cerraduras necesita un repositorio SQL. Tras la
+tercera revisión (hecho), `setRole` y `removeMember` también devuelven un booleano: false si la
+membresía ya no existe.
 
 ### 4.9 Rutas nuevas
 
@@ -402,6 +405,8 @@ de la organización, y el 403 de quien no es admin de plataforma en las solicitu
 aceptan en cualquier caso, y lo que sigue usa el id guardado. El `orgId` de un evento de cobro sigue
 la misma regla (`unknown_org`). El `scanId` de una clave `a.` no es un UUID (es texto `sc_...` en la
 base) y ya se valida con su patrón; el `:code` de un plan y los tokens tampoco van a columnas uuid.
+
+**Orden de publicación.**
 
 1. Se fusiona el PR del back.
 2. Se crea el tag `contracts-v0.4.0`.
