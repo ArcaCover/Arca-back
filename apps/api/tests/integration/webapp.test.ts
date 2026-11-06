@@ -21,6 +21,7 @@ import { MockAppAuth } from '../../src/webapp/auth.js';
 import { MockBillingProvider } from '../../src/webapp/billing.js';
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
+import { webappRoutes } from '../../src/webapp/routes.js';
 import { WebappService } from '../../src/webapp/service.js';
 
 const secret = 's'.repeat(40);
@@ -441,13 +442,24 @@ describe('the webapp API in mock', () => {
     const cells = rows.flatMap(row => ROLES.map(role => ({ ...row, role, status: row.expected[role] })));
 
     it('walks every webapp route', () => {
-      // Path shapes, ids replaced, so a route added later without a row fails here.
-      const shape = (path: string) => path.replace(/\/orgs\/[^/]+/, '/orgs/:id')
-        .replace(/\/(members|invitations|actions|organizations|deletion-requests)\/[^/?]+/, '/$1/:param');
-      const ids = { orgId: 'o', memberId: 'm', invitationId: 'i', actionKey: 'c.k' };
-      const routes = [...orgRoutes(ids), ...adminRoutes({ deletionId: 'd', orgId: 'o' })].map(([method, path]) => `${method} ${shape(path)}`);
-      const covered = new Set(rows.map(row => `${row.method} ${shape(row.path({ ...team, orgId: 'o' }))}`));
-      expect(routes.filter(route => !covered.has(route))).toEqual([]);
+      // The routes the router really registers under /orgs/:id and /admin/, so a route added later without a row fails here.
+      const router = webappRoutes({ auth: new MockAppAuth(secret), service: new WebappService({ repository: new InMemoryWebappRepository(DEFAULT_PLANS),
+        scans: new InMemoryRepository(), assessments: new InMemoryAssessmentRepository(), billing: new MockBillingProvider(origin),
+        sessionSecret: secret, appBaseUrl: origin }) });
+      const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const routes = router.routes.filter(route => route.method !== 'ALL' && /^\/(orgs\/:id(\/|$)|admin\/)/.test(route.path))
+        .map(route => ({ name: `${route.method} ${route.path}`, method: route.method,
+          pattern: new RegExp(`^${route.path.split('/').map(part => part.startsWith(':') ? '[^/]+' : escape(part)).join('/')}$`) }));
+      expect(routes.length).toBeGreaterThan(20);
+      const walks = (calls: Array<{ method: string; path: string }>) => ({
+        missed: routes.filter(route => !calls.some(call => call.method === route.method && route.pattern.test(call.path))).map(route => route.name),
+        unknown: calls.filter(call => !routes.some(route => call.method === route.method && route.pattern.test(call.path))),
+      });
+      // The table, and the lists the other tests walk (isolation, 402, 410, 401).
+      expect(walks(rows.map(row => ({ method: row.method, path: row.path(team).split('?')[0]! })))).toEqual({ missed: [], unknown: [] });
+      const ids = { orgId: crypto.randomUUID(), memberId: crypto.randomUUID(), invitationId: crypto.randomUUID(), actionKey: `c.${crypto.randomUUID()}` };
+      expect(walks([...orgRoutes(ids), ...adminRoutes({ deletionId: crypto.randomUUID(), orgId: ids.orgId })]
+        .map(([method, path]) => ({ method, path })))).toEqual({ missed: [], unknown: [] });
     });
 
     it.each(cells.filter(cell => cell.status === 403))('$role is refused: $name', async ({ role, method, path, body }) => {
