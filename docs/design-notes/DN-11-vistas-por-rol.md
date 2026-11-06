@@ -156,6 +156,25 @@ columnas, así dos cambios simultáneos a campos distintos se conservan los dos.
 solo esos campos: el antes según lo leído y el después según la fila que devuelve la escritura, que
 es también la respuesta.
 
+**Tras la segunda revisión (hecho):**
+
+- **El responsable se comprueba en la escritura.** El paso 5 queda como respuesta temprana. La
+  escritura (`updateAction`, `upsertAssessmentAction` y también `createCustomAction`) vuelve a mirar
+  el rol actual del responsable y rechaza a quien no es owner, admin ni member con
+  `IneligibleAssignee`, que el servicio traduce al mismo 400. En SQL va en la misma transacción, con
+  `select role from memberships ... for share` antes de escribir.
+- **La liberación va en la misma llamada que el cambio de rol.** `setRole` a un rol que no marca
+  acciones (`viewer`) y `removeMember` ponen en null las asignaciones de esa persona en esa misma
+  llamada al repositorio, no en una aparte. En SQL es una transacción con `for update` sobre la fila
+  de la membresía. Las dos cerraduras chocan, así que una asignación y un cambio de rol a la vez
+  nunca dejan una acción en manos de un `viewer` ni de un ex miembro (D11, D15). La fila de auditoría
+  se escribe después, como en los demás cambios.
+- **Una acción que desaparece da 404.** Si otra petición borró una acción propia entre la lectura y
+  la escritura, `updateAction` devuelve null y `deleteCustomAction` false. El `PATCH`, o el segundo
+  de dos `DELETE`, responde 404 y no audita nada.
+- **Sin cambios, una lectura nueva.** El paso 6 responde con la acción leída otra vez, tal como está
+  ahora, y no con lo leído antes, que puede haber cambiado. Sigue sin escribir ni auditar.
+
 **Otras rutas.**
 
 - `POST /orgs/:id/actions` (`actions.assign` + pago) crea una acción propia y responde 201 con su
@@ -165,7 +184,8 @@ es también la respuesta.
 - **Tope de escritura:** como máximo 60 escrituras de acciones por usuario y minuto. Por encima
   responde 429 `rate_limited`, un código nuevo en el servicio.
 - **Quitar un miembro** pone en null sus asignaciones en esa organización (D15). Tras la revisión
-  final (hecho), pasarlo a `viewer` también.
+  final (hecho), pasarlo a `viewer` también. Tras la segunda revisión (hecho), en la misma llamada
+  al repositorio que el cambio (arriba).
 
 ### 4.3 Actividad
 
@@ -296,6 +316,12 @@ En RLS se copia DN-10 exactamente: RLS activado, sin políticas, `revoke` a `pub
   PGlite corre con los privilegios por defecto que Supabase da a las secuencias nuevas, y comprueba
   que no hay políticas.
 
+**Tras la segunda revisión (hecho):** el `audit()` del servicio tampoco tiene default. Cada llamada
+nombra el tipo de actor, así una acción nueva del personal de ARCA que lo olvide no pasa el
+typecheck. `ACTOR_KIND_OF_ACTION` y la tabla de destinos de la §4.3 se consultan solo por claves
+propias (`Object.hasOwn`): una acción que se llame como una propiedad de todo objeto
+(`constructor`) no encuentra entrada y queda como la de un miembro.
+
 ### 4.8 Repositorio
 
 Métodos nuevos (en la interfaz y en memoria):
@@ -309,6 +335,10 @@ Métodos nuevos (en la interfaz y en memoria):
 - `listAllAudit({ orgId?, before, limit })`.
 
 `clear()` borra también las acciones.
+
+**Tras la segunda revisión (hecho):** `clearAssignee` desaparece, porque la liberación va dentro de
+`setRole` y `removeMember` (§4.2). `updateAction` devuelve la fila o null, y `deleteCustomAction`
+un booleano. La interfaz dice qué transacción y qué cerraduras necesita un repositorio SQL.
 
 ### 4.9 Rutas nuevas
 
@@ -354,8 +384,9 @@ En `packages/contracts/src/webapp.ts`, con zod estricto. `DomainKey` sale de `la
 
 **Tras la revisión final (hecho):**
 
-- `UpdateActionRequest.assigneeUserId` es un UUID de cualquier versión, en minúsculas, o null. Uno
-  mal formado da 400 con el cuerpo, antes del permiso, y nunca llega a una columna uuid.
+- `UpdateActionRequest.assigneeUserId` es un UUID de cualquier versión, o null. Se acepta en
+  cualquier caso y se pasa a minúsculas, como lo escribe Postgres. Uno mal formado da 400 con el
+  cuerpo, antes del permiso, y nunca llega a una columna uuid.
 - `CreateActionRequest.detail` acepta null, y un detalle vacío una vez recortado se lee como null.
   El servicio guarda null y el plan nunca muestra un detalle vacío.
 - `AdminAuditEventView` rechaza un email en un actor `system`, como la actividad. Las filas de un
@@ -363,7 +394,14 @@ En `packages/contracts/src/webapp.ts`, con zod estricto. `DomainKey` sale de `la
 - `DOMAIN_LABELS` se exporta junto a `DomainKey`, en `layer2.ts`: una sola fuente para el nombre de
   cada dominio, en el banco de demo y en la webapp. También se exporta el esquema `ActivityActor`.
 
-**Orden de publicación.**
+**Tras la segunda revisión (hecho):** los ids de la ruta siguen la regla de los UUID de la §4.5. El
+`:id` de `/orgs/:id/*`, el `:userId` de un miembro, el `:invitationId` y el `:id` de una solicitud
+de borrado van a columnas uuid. Uno que no es UUID da el mismo 404 que uno desconocido, sin
+consultar el repositorio, y después de los controles que ya iban antes: el orden 404/410/403/402
+de la organización, y el 403 de quien no es admin de plataforma en las solicitudes de borrado. Se
+aceptan en cualquier caso, y lo que sigue usa el id guardado. El `orgId` de un evento de cobro sigue
+la misma regla (`unknown_org`). El `scanId` de una clave `a.` no es un UUID (es texto `sc_...` en la
+base) y ya se valida con su patrón; el `:code` de un plan y los tokens tampoco van a columnas uuid.
 
 1. Se fusiona el PR del back.
 2. Se crea el tag `contracts-v0.4.0`.
