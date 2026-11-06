@@ -37,11 +37,12 @@ export type AuditRecord = {
   id: string; seq: number; actor_kind: AuditActorKind; actor_user_id: string | null; org_id: string | null; action: string;
   target: string | null; data: Record<string, unknown>; created_at: string;
 };
-/** What appendAudit takes. A row that names no actor kind is a member's, like the column default. */
-export type NewAuditRecord = Omit<AuditRecord, 'seq' | 'actor_kind'> & { actor_kind?: AuditActorKind };
+/** What appendAudit takes. The actor kind is required, as the column has no default: a row never passes as a member's by omission. */
+export type NewAuditRecord = Omit<AuditRecord, 'seq'>;
 /**
  * A page of the audit log, newest first (`created_at desc, seq desc`). `before` is the seq of the last row of the previous
- * page and the page goes on after that row in this order; a seq that names no row gives an empty page.
+ * page and the page goes on after that row in this order. The row is looked up within the same filter, so a seq that names no
+ * row, or a row of another organization, gives an empty page.
  */
 export type AuditPageQuery = { before?: number; limit: number };
 

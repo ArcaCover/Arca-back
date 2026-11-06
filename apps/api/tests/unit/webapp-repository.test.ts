@@ -27,8 +27,8 @@ const deletion = (id: string, orgId = 'org_1'): DeletionRequestRecord => ({ id, 
   status: 'pending', reviewed_by: null, reviewed_at: null, review_note: null, created_at: NOW });
 const subscription = (orgId: string, patch: Partial<SubscriptionRecord> = {}): SubscriptionRecord => ({ org_id: orgId, plan_code: 'monthly',
   customer_id: 'cus_1', subscription_id: 'sub_1', status: 'active', current_period_end: LATER, updated_at: NOW, ...patch });
-const audit = (id: string, orgId: string | null, patch: Partial<NewAuditRecord> = {}): NewAuditRecord => ({ id, actor_user_id: 'user_a',
-  org_id: orgId, action: 'member.invited', target: 'guest@firm.com', data: {}, created_at: NOW, ...patch });
+const audit = (id: string, orgId: string | null, patch: Partial<NewAuditRecord> = {}): NewAuditRecord => ({ id, actor_kind: 'member',
+  actor_user_id: 'user_a', org_id: orgId, action: 'member.invited', target: 'guest@firm.com', data: {}, created_at: NOW, ...patch });
 const custom = (id: string, orgId = 'org_1', patch: Partial<CustomActionRecord> = {}): CustomActionRecord => ({ id, org_id: orgId,
   source: 'custom', scan_id: null, action_key: null, title: `Action ${id}`, detail: null, domain: null, status: 'todo', assignee_user_id: null,
   due_date: null, created_by: 'user_a', created_at: NOW, updated_by: 'user_a', updated_at: NOW, ...patch });
@@ -447,7 +447,7 @@ describe('platform admins and the audit log', () => {
     expect(await repo.isPlatformAdmin('user_a')).toBe(false);
   });
 
-  it('numbers every audit row and records the kind of actor, a member when none is given', async () => {
+  it('numbers every audit row and records the kind of actor it names', async () => {
     const repo = newRepo();
     await repo.appendAudit(audit('aud_1', 'org_1'));
     await repo.appendAudit(audit('aud_2', 'org_1', { actor_kind: 'system', actor_user_id: null }));
@@ -455,6 +455,15 @@ describe('platform admins and the audit log', () => {
     expect((await repo.listAllAudit({ limit: 10 })).map(a => [a.id, a.seq, a.actor_kind])).toEqual([
       ['aud_3', 3, 'platform'], ['aud_2', 2, 'system'], ['aud_1', 1, 'member']]);
     expect(await repo.listAudit('org_1', { limit: 1 })).toEqual([{ ...audit('aud_2', 'org_1', { actor_kind: 'system', actor_user_id: null }), seq: 2 }]);
+  });
+
+  it('refuses an audit row that names no kind of actor, rather than take it for a member\'s', async () => {
+    const repo = newRepo();
+    const { actor_kind: _, ...unnamed } = audit('aud_1', 'org_1');
+    for (const record of [unnamed, { ...unnamed, actor_kind: undefined }, { ...unnamed, actor_kind: 'arca' }]) {
+      await expect(repo.appendAudit(record as unknown as NewAuditRecord)).rejects.toThrow('actor kind');
+    }
+    expect(await repo.listAllAudit({ limit: 10 })).toEqual([]);
   });
 
   /** org_1 gets aud_1 (now), aud_3 (earlier, appended late), aud_4 (later) and aud_6 (now); the rest belong elsewhere. */
@@ -493,6 +502,19 @@ describe('platform admins and the audit log', () => {
     expect(ids(await repo.listAllAudit({ orgId: 'org_2', limit: 10 }))).toEqual(['aud_2']);
     expect(ids(await repo.listAllAudit({ orgId: 'org_1', before: first[1]!.seq, limit: 10 }))).toEqual(['aud_1', 'aud_3']);
     expect(await repo.listAllAudit({ orgId: 'org_9', limit: 10 })).toEqual([]);
+  });
+
+  it('looks a cursor up only within the same filter, so another organization\'s seq gives an empty page', async () => {
+    const repo = await repoWithAudit();
+    const [theirs] = await repo.listAudit('org_2', { limit: 1 });
+    const [unowned] = await repo.listAllAudit({ limit: 10 }).then(rows => rows.filter(row => row.org_id === null));
+    // Without the filter, org_2's row would place org_1's page and tell when it was written.
+    expect(await repo.listAudit('org_1', { before: theirs!.seq, limit: 10 })).toEqual([]);
+    expect(await repo.listAudit('org_1', { before: unowned!.seq, limit: 10 })).toEqual([]);
+    expect(await repo.listAllAudit({ orgId: 'org_1', before: theirs!.seq, limit: 10 })).toEqual([]);
+    expect(await repo.listAllAudit({ orgId: 'org_2', before: unowned!.seq, limit: 10 })).toEqual([]);
+    // Across organizations any row is a cursor.
+    expect(ids(await repo.listAllAudit({ before: theirs!.seq, limit: 10 }))).toEqual(['aud_1', 'aud_3']);
   });
 });
 

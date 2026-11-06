@@ -94,8 +94,16 @@ const entryKey = (entry: PlanEntry) => entry.source === 'assessment' ? assessmen
 // What action.updated keeps of each side, in the contract's names.
 const trackedData = (tracked: Tracked) => ({ status: tracked.status, assigneeUserId: tracked.assignee_user_id, dueDate: tracked.due_date });
 
-// The activity (DN-11 §4.3). What the target of each audited action is, so the back can name it; an action not listed here
-// (a billing event, a deletion request) has no label.
+// The activity (DN-11 §4.3). The actions that only ARCA staff (from /admin/*) or the system ever perform. The views name their actor
+// by this kind, whatever the row stores, so a row written as a member's never shows a staff email; the role views migration
+// corrects the rows DN-10 wrote with the same list.
+export const ACTOR_KIND_OF_ACTION: Readonly<Record<string, Exclude<AuditActorKind, 'member'>>> = Object.freeze({
+  'org.deletion_approved': 'platform', 'org.deletion_rejected': 'platform', 'plan.updated': 'platform',
+  'billing.event_applied': 'system',
+});
+const actorKindOf = (row: AuditRecord): AuditActorKind => ACTOR_KIND_OF_ACTION[row.action] ?? row.actor_kind;
+// What the target of each audited action is, so the back can name it; an action not listed here (a billing event, a deletion
+// request) has no label.
 const TARGETS: Record<string, 'user' | 'email' | 'scan' | 'org' | 'action' | 'plan'> = {
   'member.joined': 'user', 'member.role_changed': 'user', 'member.removed': 'user',
   'member.invited': 'email', 'invitation.revoked': 'email',
@@ -461,10 +469,13 @@ export class WebappService {
     const rows = await this.repo.listAudit(orgId, { before: page.before, limit: page.limit + 1 });
     const shown = rows.slice(0, page.limit);
     const names = this.names();
+    const actor = async (row: AuditRecord): Promise<ActivityEventView['actor']> => {
+      const kind = actorKindOf(row);
+      if (kind !== 'member') return { kind: kind === 'platform' ? 'arca' : 'system', email: null };
+      return { kind: 'member', email: row.actor_user_id === null ? null : await names.email(row.actor_user_id) };
+    };
     const events = await Promise.all(shown.map(async (row): Promise<ActivityEventView> => ({ id: row.id, at: iso(row.created_at),
-      actor: row.actor_kind === 'platform' ? { kind: 'arca', email: null } : row.actor_kind === 'system' ? { kind: 'system', email: null }
-        : { kind: 'member', email: row.actor_user_id === null ? null : await names.email(row.actor_user_id) },
-      action: row.action, targetLabel: await names.target(row), change: changeOf(row) })));
+      actor: await actor(row), action: row.action, targetLabel: await names.target(row), change: changeOf(row) })));
     return { events, nextBefore: rows.length > page.limit ? shown.at(-1)!.seq : null };
   }
 
@@ -499,10 +510,12 @@ export class WebappService {
     const rows = await this.repo.listAllAudit({ ...page, limit: page.limit + 1 });
     const shown = rows.slice(0, page.limit);
     const names = this.names();
-    const events = await Promise.all(shown.map(async row => ({ id: row.id, at: iso(row.created_at), orgId: row.org_id,
-      orgName: row.org_id === null ? null : await names.org(row.org_id), actorKind: row.actor_kind,
-      actorEmail: row.actor_kind === 'system' || row.actor_user_id === null ? null : await names.email(row.actor_user_id),
-      action: row.action, targetLabel: await names.target(row) })));
+    const events = await Promise.all(shown.map(async row => {
+      const actorKind = actorKindOf(row);
+      return { id: row.id, at: iso(row.created_at), orgId: row.org_id, orgName: row.org_id === null ? null : await names.org(row.org_id),
+        actorKind, actorEmail: actorKind === 'system' || row.actor_user_id === null ? null : await names.email(row.actor_user_id),
+        action: row.action, targetLabel: await names.target(row) };
+    }));
     return { events, nextBefore: rows.length > page.limit ? shown.at(-1)!.seq : null };
   }
 

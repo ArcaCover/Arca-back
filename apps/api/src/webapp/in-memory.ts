@@ -1,4 +1,4 @@
-import type { BillingStatus, Role } from '@arca/contracts';
+import { AUDIT_ACTOR_KINDS, type BillingStatus, type Role } from '@arca/contracts';
 import { WebappConflict } from './types.js';
 import type { ActionPatch, AssessmentActionRecord, AuditPageQuery, AuditRecord, ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord,
   InvitationRecord, MembershipRecord, NewAuditRecord, OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, PlanRecord, ProfileRecord,
@@ -204,16 +204,21 @@ export class InMemoryWebappRepository implements WebappRepository {
   }
 
   async appendAudit(record: NewAuditRecord) {
-    this.auditLog.push({ ...structuredClone(record), seq: ++this.auditSeq, actor_kind: record.actor_kind ?? 'member' });
+    // Like the column, which is not null, has no default and checks its values.
+    if (!(AUDIT_ACTOR_KINDS as readonly unknown[]).includes(record.actor_kind)) throw new Error('An audit row names its actor kind');
+    this.auditLog.push({ ...structuredClone(record), seq: ++this.auditSeq });
   }
   async listAudit(orgId: string, page: AuditPageQuery) { return this.auditPage(r => r.org_id === orgId, page); }
   async listAllAudit({ orgId, ...page }: AuditPageQuery & { orgId?: string }) {
     return this.auditPage(r => orgId === undefined || r.org_id === orgId, page);
   }
 
-  /** Keyset pagination on (created_at, seq), so rows whose clock disagrees with the insertion order are neither skipped nor repeated. */
+  /**
+   * Keyset pagination on (created_at, seq), so rows whose clock disagrees with the insertion order are neither skipped nor repeated.
+   * The cursor row is looked up within the same filter: a seq of another organization gives an empty page, not a place in its log.
+   */
   private auditPage(include: (row: AuditRecord) => boolean, { before, limit }: AuditPageQuery) {
-    const cursor = before === undefined ? null : this.auditLog.find(r => r.seq === before);
+    const cursor = before === undefined ? null : this.auditLog.find(r => r.seq === before && include(r));
     if (cursor === undefined) return [];
     const rows = this.auditLog.filter(r => include(r) && (cursor === null || newestFirst(cursor, r) < 0));
     return structuredClone(rows.sort(newestFirst).slice(0, limit));

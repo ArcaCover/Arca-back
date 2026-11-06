@@ -964,6 +964,33 @@ describe('activity', () => {
       .toMatchObject({ actorKind: 'platform', actorEmail: 'ops@arca.example' });
   });
 
+  it('never shows what only ARCA staff or the system do as a member\'s, whatever kind the row stores', async () => {
+    const s = await scene();
+    const { owner, org } = await s.ownedOrg();
+    const ops = await s.platformAdmin();
+    await s.service.requirePlatformAdmin(ops);
+    // Rows a store could hold with the wrong kind: written before actor_kind existed, or by a path that named the wrong one.
+    const stored = [['org.deletion_rejected', ops.userId], ['org.deletion_approved', ops.userId], ['plan.updated', ops.userId],
+      ['billing.event_applied', owner.userId]] as const;
+    for (const [action, actor] of stored) {
+      s.advance(1);
+      await s.repository.appendAudit({ id: randomUUID(), actor_kind: 'member', actor_user_id: actor, org_id: org.id, action,
+        target: null, data: {}, created_at: iso(s.now()) });
+    }
+    const page = ActivityPage.parse(await s.service.activity(owner, org.id, { limit: 50 }));
+    expect(page.events.map(event => [event.action, event.actor])).toEqual([
+      ['billing.event_applied', { kind: 'system', email: null }], ['plan.updated', { kind: 'arca', email: null }],
+      ['org.deletion_approved', { kind: 'arca', email: null }], ['org.deletion_rejected', { kind: 'arca', email: null }],
+      ['org.created', { kind: 'member', email: OWNER }]]);
+    expect(JSON.stringify(page)).not.toContain('ops@arca.example');
+    // ARCA's audit tells them apart the same way: staff by email, the system by kind alone.
+    const audit = AdminAuditPage.parse(await s.service.adminAudit({ orgId: org.id, limit: 100 }));
+    expect(audit.events.map(event => [event.action, event.actorKind, event.actorEmail])).toEqual([
+      ['billing.event_applied', 'system', null], ['plan.updated', 'platform', 'ops@arca.example'],
+      ['org.deletion_approved', 'platform', 'ops@arca.example'], ['org.deletion_rejected', 'platform', 'ops@arca.example'],
+      ['org.created', 'member', OWNER]]);
+  });
+
   it('labels each target and shows only the allowed changes', async () => {
     const s = await scene();
     const { owner, org, admin, member, viewer } = await s.team();
