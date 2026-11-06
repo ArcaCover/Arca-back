@@ -202,16 +202,19 @@ export function createApp(deps: AppDeps) {
     planningTimeoutMs: deps.assessmentPlanningTimeoutMs, maxWritesPerMinute: deps.assessmentMaxWritesPerMinute });
   app.route('/', assessmentRoutes({ scans: deps.repository, repository: assessmentRepository, service: assessments, sessionSecret: deps.sessionSecret }));
   app.route('/', deps.webapp ? webappRoutes(deps.webapp) : notConfiguredWebapp());
-  // The mock demo seed (DN-11 §4.6) runs this very scan, past the limiter, to its end, then the assessment through this service.
-  const runScan = async (email: string, domain: string) => {
-    const started = await startScan(email, domain, null);
-    if (!started.ok) throw new Error(started.message);
-    await started.settled;
-    const scan = await deps.repository.get(started.response.scanId);
-    if (!scan) throw new Error('The scan was not stored');
-    return { scan, sessionToken: started.response.sessionToken };
-  };
-  if (debug) app.route('/__debug', debug.routes({ limiter, sessionSecret: deps.sessionSecret, runScan, assessments }));
+  if (debug) {
+    // The mock demo seed (DN-11 §4.6) runs this very scan, past the limiter, to its end, then the assessment through this service.
+    // Built only where the seed exists, so no other mode ever holds a scan runner that skips the limiter.
+    const seed = debug.seeds ? { assessments, runScan: async (email: string, domain: string) => {
+      const started = await startScan(email, domain, null);
+      if (!started.ok) throw new Error(started.message);
+      await started.settled;
+      const scan = await deps.repository.get(started.response.scanId);
+      if (!scan) throw new Error('The scan was not stored');
+      return { scan, sessionToken: started.response.sessionToken };
+    } } : undefined;
+    app.route('/__debug', debug.routes({ limiter, sessionSecret: deps.sessionSecret, seed }));
+  }
   return { app, drain: async () => { await Promise.all([...jobs]); await assessments.drain(); },
     recoverAssessments: () => assessments.recoverInterrupted() };
 }

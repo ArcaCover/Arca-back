@@ -27,8 +27,13 @@ export type DebugTools = {
   takePollFault(scanId: string): 'unauthorized' | 'server_error' | 'hang' | null;
   reportFault(scanId: string): boolean;
   assessmentAgentFor(scanId: string): AssessmentAgent | undefined;
-  /** `runScan` and `assessments` are the app's own, for the mock demo seed; every other mode leaves them unused. */
-  routes(context: { limiter: ScanLimiter; sessionSecret: string } & Pick<SeedDeps, 'runScan' | 'assessments'>): Hono;
+  /**
+   * True only in mock, with the webapp's mock pieces: only then does the demo seed exist (DN-11 §4.6), and only then does createApp
+   * build the scan runner it needs, which skips the scan limiter.
+   */
+  readonly seeds: boolean;
+  /** `seed` carries the app's own scan runner and assessments, exactly when `seeds` is true. */
+  routes(context: { limiter: ScanLimiter; sessionSecret: string; seed?: Pick<SeedDeps, 'runScan' | 'assessments'> }): Hono;
 };
 
 // A server error or a hang spoils this many polls, then the scan answers again, so the front can be seen recovering.
@@ -131,7 +136,10 @@ export function createDebugTools(options: {
     },
     reportFault: scanId => scenarios.get(scanId)?.http.report === 'unavailable',
     assessmentAgentFor: scanId => scenarios.get(scanId)?.planner === 'timeout' ? stalledPlanner : undefined,
-    routes({ limiter, sessionSecret, runScan, assessments: assessmentService }) {
+    seeds: webapp !== undefined,
+    routes({ limiter, sessionSecret, seed: seedPieces }) {
+      // Both ways round: no seed without its scan runner, and no scan runner where there is no seed to hand it to.
+      if (!webapp !== !seedPieces) throw new Error('The demo seed and its scan runner exist only in mock, and only together');
       const app = new Hono();
       app.use('*', async (c, next) => { c.header('Cache-Control', 'no-store'); await next(); });
       app.get('/mode', c => c.json(description));
@@ -170,7 +178,7 @@ export function createDebugTools(options: {
         }
         return c.json({ ok: true });
       });
-      if (!webapp) return app;
+      if (!webapp || !seedPieces) return app;
       // A token in the shape of a Supabase one, for any email; platformAdmin also makes that user an ARCA platform admin.
       app.post('/auth/login', async c => {
         const refused = withoutDebugHeader(c, 'A mock login');
@@ -186,7 +194,7 @@ export function createDebugTools(options: {
       app.post('/seed', async c => {
         const refused = withoutDebugHeader(c, 'A demo seed');
         if (refused) return refused;
-        const run = seed({ ...webapp, runScan, assessments: assessmentService });
+        const run = seed({ ...webapp, ...seedPieces });
         let timer: ReturnType<typeof setTimeout> | undefined;
         const late = new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), options.seedTimeoutMs ?? SEED_TIMEOUT_MS); });
         try {

@@ -74,29 +74,33 @@ async function completeAssessment(assessments: AssessmentService, scan: ScanReco
  * of it as the system's (DN-11 §4.3).
  */
 export async function seedDemo(deps: SeedDeps): Promise<SeededDemo> {
-  const { scan, sessionToken } = await deps.runScan(OWNER, DOMAIN);
-  const { actionPlan } = await completeAssessment(deps.assessments, scan);
-  if (actionPlan.length < MIN_ACTIONS) throw new Error(`The assessment left ${actionPlan.length} actions; the demo needs ${MIN_ACTIONS}`);
   const service = deps.service.asSystem();
+  // What can be checked or settled without writing comes first. Once the organization exists a failure would leave it behind,
+  // unpaid, in the demo owner's list, and every retry would add another.
+  const [plan] = await service.listPlans();
+  if (!plan) throw new Error('No active plan to pay the demo organization with');
   // The identities the mock login gives these emails, so each user signs in to what the seed built.
   const user = async (email: string) => (await deps.auth.issue(email)).user;
   const owner = await user(OWNER);
+  const invited: Array<{ email: string; role: (typeof INVITED)[number][1]; member: AppUser }> = [];
+  for (const [email, role] of INVITED) invited.push({ email, role, member: await user(email) });
+  const platformAdmin = await user(PLATFORM_ADMIN);
+  const { scan, sessionToken } = await deps.runScan(OWNER, DOMAIN);
+  const { actionPlan } = await completeAssessment(deps.assessments, scan);
+  if (actionPlan.length < MIN_ACTIONS) throw new Error(`The assessment left ${actionPlan.length} actions; the demo needs ${MIN_ACTIONS}`);
   const { claimId } = await service.issueClaim(sessionToken);
+
   const org = await service.createOrganization(owner, { name: NAME, claimId });
-  const [plan] = await service.listPlans();
-  if (!plan) throw new Error('No active plan to pay the demo organization with');
   const { url } = await service.checkout(owner, org.id, plan.code);
   const event = deps.billing.pay(new URL(url).searchParams.get('session') ?? '');
   if (!event || await service.applyBillingEvent(event) !== 'applied') throw new Error('The simulated payment was not applied');
   const members = [owner];
-  for (const [email, role] of INVITED) {
+  for (const { email, role, member } of invited) {
     const token = (await service.invite(owner, org.id, { email, role })).inviteUrl?.split('/app/invite/')[1];
     if (!token) throw new Error('The invitation came without its link');
-    const member = await user(email);
     await service.acceptInvitation(member, token);
     members.push(member);
   }
-  const platformAdmin = await user(PLATFORM_ADMIN);
   await deps.repository.grantPlatformAdmin(platformAdmin.userId, platformAdmin.userId);
   return { orgId: org.id, members, platformAdmin };
 }

@@ -6,11 +6,13 @@ import { ActionItemView, ActionPlanResponse, ActivityPage, AdminAuditPage, Admin
 import { DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, DebugSeedResponse, type DebugModeResponse,
   type DebugScenarioInput } from '@arca/contracts/debug';
 import { InMemoryAssessmentRepository } from '../../src/assessment/repository.js';
+import { AssessmentService } from '../../src/assessment/service.js';
 import { compose } from '../../src/compose.js';
 import { loadEnv } from '../../src/config/env.js';
 import { RoutingAssessmentRepository, RoutingScanRepository } from '../../src/debug/isolation.js';
 import { createDebugTools } from '../../src/debug/tools.js';
 import { createApp } from '../../src/http/app.js';
+import { ScanLimiter } from '../../src/http/rate-limit.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
 import { InProcessPipeline } from '../../src/pipeline/in-process-pipeline.js';
 import { mockSources } from '../../src/pipeline/mock-sources.js';
@@ -786,6 +788,25 @@ describe('the demo seed', () => {
     const ops = await s.login(`ops@${DEMO}`);
     return z.array(AdminOrgView).parse((await s.call('GET', '/admin/organizations', { token: ops.token })).body);
   }
+  /** The mock app built by hand, the way compose builds it, so a test can hold or watch the scan pipeline. */
+  function handBuilt(options: { hold?: Promise<void>; seedTimeoutMs?: number } = {}) {
+    const scans = new RoutingScanRepository(new InMemoryRepository(), new InMemoryRepository());
+    const assessments = new RoutingAssessmentRepository(new InMemoryAssessmentRepository(), new InMemoryAssessmentRepository(), scans);
+    const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
+    const billing = new MockBillingProvider(origin);
+    const auth = new MockAppAuth(secret);
+    const service = new WebappService({ repository, scans, assessments, billing, sessionSecret: secret, appBaseUrl: origin });
+    const real = new InProcessPipeline({ ...mockSources(), repository: scans, timeoutMs: 600_000 });
+    const run = vi.fn(async (input: Parameters<InProcessPipeline['run']>[0]) => { await options.hold; return real.run(input); });
+    const debug = createDebugTools({ mode: 'mock', sources: mockSources(), scans, assessments, pipelineTimeoutMs: 600_000,
+      describe: { mode: 'mock', sourceMode: 'mock', storageBackend: 'memory', websiteEvidenceProvider: 'mock', assessmentPlanner: 'rules',
+        signalLlmModel: null, inUse: { openai: false, apify: false, supabase: false } },
+      webapp: { auth, billing, service, repository }, seedTimeoutMs: options.seedTimeoutMs });
+    const { app } = createApp({ repository: scans, assessmentRepository: assessments, debug, webapp: { service, auth }, pipeline: { run },
+      domainResolver: new PublicDomainResolver(async () => {}), sessionSecret: secret, corsOrigins: [origin], clientIp: () => '127.0.0.1' });
+    const seed = () => app.request('/__debug/seed', { method: 'POST', headers: { [DEBUG_REQUEST_HEADER]: '1' } });
+    return { app, debug, repository, run, seed };
+  }
 
   it('builds a paid organization with a user of each role through the real flow, its plan holding at least three actions', async () => {
     const s = await mockApp();
@@ -861,30 +882,46 @@ describe('the demo seed', () => {
     expect(await organizations(s)).toHaveLength(1);
   });
 
+  it('checks for an active plan before anything else, so a refusal leaves no organization and runs no scan', async () => {
+    const { seed, repository, run } = handBuilt();
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const code of ['monthly', 'annual']) await repository.updatePlan(code, { active: false });
+      // A retry finds the same refusal, and still nothing behind it.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const refused = await seed();
+        expect(refused.status).toBe(500);
+        expect(await refused.json()).toEqual({ error: 'internal_error', message: expect.stringContaining('No active plan') });
+      }
+      expect(await repository.listOrganizations()).toEqual([]);
+      expect(run).not.toHaveBeenCalled();
+      expect(logged).toHaveBeenCalledWith('[debug] demo seed failed', expect.stringContaining('No active plan'));
+    } finally {
+      logged.mockRestore();
+    }
+    // With a plan to pay with again, the seed builds its one organization.
+    await repository.updatePlan('monthly', { active: true });
+    expect((await seed()).status).toBe(200);
+    expect(await repository.listOrganizations()).toHaveLength(1);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it('is the only mode whose debug routes get the seed\'s scan runner, and they refuse to go without it', () => {
+    const { debug } = handBuilt();
+    expect(debug.seeds).toBe(true);
+    expect(() => debug.routes({ limiter: new ScanLimiter(), sessionSecret: secret })).toThrow('only in mock, and only together');
+  });
+
   it('answers 504 when the run outlives the deadline, and the run goes on', async () => {
-    const scans = new RoutingScanRepository(new InMemoryRepository(), new InMemoryRepository());
-    const assessments = new RoutingAssessmentRepository(new InMemoryAssessmentRepository(), new InMemoryAssessmentRepository(), scans);
-    const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
-    const billing = new MockBillingProvider(origin);
-    const auth = new MockAppAuth(secret);
-    const service = new WebappService({ repository, scans, assessments, billing, sessionSecret: secret, appBaseUrl: origin });
     // The scan's pipeline holds until the test lets it go.
     let release!: () => void;
-    const held = new Promise<void>(resolve => { release = resolve; });
-    const real = new InProcessPipeline({ ...mockSources(), repository: scans, timeoutMs: 600_000 });
-    const debug = createDebugTools({ mode: 'mock', sources: mockSources(), scans, assessments, pipelineTimeoutMs: 600_000,
-      describe: { mode: 'mock', sourceMode: 'mock', storageBackend: 'memory', websiteEvidenceProvider: 'mock', assessmentPlanner: 'rules',
-        signalLlmModel: null, inUse: { openai: false, apify: false, supabase: false } },
-      webapp: { auth, billing, service, repository }, seedTimeoutMs: 50 });
-    const { app } = createApp({ repository: scans, assessmentRepository: assessments, debug, webapp: { service, auth },
-      pipeline: { run: async input => { await held; return real.run(input); } },
-      domainResolver: new PublicDomainResolver(async () => {}), sessionSecret: secret, corsOrigins: [origin], clientIp: () => '127.0.0.1' });
-    const post = () => app.request('/__debug/seed', { method: 'POST', headers: { [DEBUG_REQUEST_HEADER]: '1' } });
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const { seed: post, repository } = handBuilt({ hold, seedTimeoutMs: 50 });
     const late = await post();
     expect(late.status).toBe(504);
     expect(await late.json()).toEqual({ error: 'timeout', message: expect.any(String) });
     release();
-    const seeded = await until(post, response => response.status === 200);
+    const seeded = await until(async () => post(), response => response.status === 200);
     expect(DebugSeedResponse.parse(await seeded.json()).users).toEqual(SEEDED_USERS);
     expect(await repository.listOrganizations()).toHaveLength(1);
   });
@@ -943,6 +980,21 @@ describe('live-debug has no mock login', () => {
       expect(response.status).toBe(404);
     }
     expect((await app.request('/me')).status).toBe(501);
+  });
+
+  it('hands its debug routes no scan runner, so none that skips the limiter is built there', () => {
+    const { scans, assessments, options } = liveDebug();
+    const debug = createDebugTools(options);
+    expect(debug.seeds).toBe(false);
+    const routes = vi.spyOn(debug, 'routes');
+    createApp({ repository: scans, assessmentRepository: assessments, debug,
+      pipeline: new InProcessPipeline({ ...mockSources(), repository: scans, timeoutMs: 600_000 }),
+      domainResolver: new PublicDomainResolver(async () => {}), sessionSecret: secret, corsOrigins: [origin], clientIp: () => '127.0.0.1' });
+    expect(routes).toHaveBeenCalledTimes(1);
+    expect(routes.mock.calls[0]![0]).toEqual({ limiter: expect.any(ScanLimiter), sessionSecret: secret, seed: undefined });
+    // Nor would the routes take one.
+    expect(() => debug.routes({ limiter: new ScanLimiter(), sessionSecret: secret,
+      seed: { runScan: vi.fn(), assessments: new AssessmentService({ repository: assessments }) } })).toThrow('only in mock');
   });
 
   it('nor does compose build one: the webapp answers 501 there', async () => {
