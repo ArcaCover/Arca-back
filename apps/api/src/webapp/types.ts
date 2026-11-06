@@ -59,15 +59,21 @@ export type CustomActionRecord = ActionRecordBase & {
   source: 'custom'; scan_id: null; action_key: null; title: string; detail: string | null; domain: DomainKey | null;
 };
 export type OrgActionRecord = AssessmentActionRecord | CustomActionRecord;
-/** What a change to the plan can move. Who changed it and when are always written. */
+/**
+ * What a change to the plan moves: only the fields it names, so a change made meanwhile to another field stays. Who changed it and
+ * when are always written.
+ */
 export type ActionPatch = Partial<Pick<ActionRecordBase, 'status' | 'assignee_user_id' | 'due_date'>>
   & Pick<ActionRecordBase, 'updated_by' | 'updated_at'>;
+/** How many actions of its own an organization keeps (DN-11 §4.2); the repository refuses the next with `action_limit`. */
+export const MAX_CUSTOM_ACTIONS = 100;
 
 /**
  * `already_invited` is what a SQL repository maps the unique index `invitations_pending_email_idx` to: one pending
  * invitation per email and organization. The service revokes the old one before inviting again, so it only shows up in a race.
  */
-export type WebappConflictReason = 'scan_claimed' | 'last_owner' | 'already_member' | 'already_invited' | 'deletion_pending';
+export type WebappConflictReason = 'scan_claimed' | 'last_owner' | 'already_member' | 'already_invited' | 'deletion_pending'
+  | 'action_limit';
 /** A rule of the data model that the write would break. The routes turn it into a 409. */
 export class WebappConflict extends Error {
   constructor(readonly reason: WebappConflictReason) {
@@ -151,14 +157,19 @@ export interface WebappRepository {
   getCustomAction(orgId: string, id: string): Promise<CustomActionRecord | null>;
   getAssessmentAction(orgId: string, scanId: string, actionKey: string): Promise<AssessmentActionRecord | null>;
   /**
-   * Unique by (org_id, scan_id, action_key). The first write creates the row as given; a later one moves only the status,
-   * the assignee, the due date and who changed it when. The scan must be one this organization claimed.
+   * Unique by (org_id, scan_id, action_key). The first write creates the row as given; on a row that exists, whoever created it,
+   * only the fields of `patch` change (in SQL, the conflict branch sets only those columns). Returns the row as written. The scan
+   * must be one this organization claimed.
    */
-  upsertAssessmentAction(action: AssessmentActionRecord): Promise<AssessmentActionRecord>;
-  /** No cap here: the caller checks countCustomActions first (DN-11 §4.2). */
+  upsertAssessmentAction(action: AssessmentActionRecord, patch: ActionPatch): Promise<AssessmentActionRecord>;
+  /**
+   * `action_limit` when the organization already keeps MAX_CUSTOM_ACTIONS of its own. The count and the insert are one step, so two
+   * creations at 99 cannot both pass: a SQL repository locks the organization row (`select ... from organizations where id = $1 for
+   * update`), then counts and inserts in that same transaction.
+   */
   createCustomAction(action: CustomActionRecord): Promise<void>;
   countCustomActions(orgId: string): Promise<number>;
-  /** An action of either source, by its id within the organization. */
+  /** An action of either source, by its id within the organization. Only the fields of `patch` change; returns the row as written. */
   updateAction(orgId: string, id: string, patch: ActionPatch): Promise<OrgActionRecord>;
   /** Only an action the organization wrote itself; the assessment's are never deleted (DN-11 D13). */
   deleteCustomAction(orgId: string, id: string): Promise<void>;

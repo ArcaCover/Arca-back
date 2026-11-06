@@ -9,9 +9,9 @@ import { verifySessionToken } from '../auth/session-token.js';
 import type { ScanRecord, ScanRepository } from '../repositories/types.js';
 import type { AppUser } from './auth.js';
 import type { BillingEvent, BillingProvider } from './billing.js';
-import { WebappConflict, type AuditRecord, type CustomActionRecord, type DeletionRequestRecord, type InvitationRecord,
-  type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord, type PlanRecord, type WebappConflictReason,
-  type WebappRepository } from './types.js';
+import { MAX_CUSTOM_ACTIONS, WebappConflict, type ActionPatch, type AuditRecord, type CustomActionRecord, type DeletionRequestRecord,
+  type InvitationRecord, type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord, type PlanRecord,
+  type WebappConflictReason, type WebappRepository } from './types.js';
 
 const STATUS = { invalid_request: 400, unauthorized: 401, payment_required: 402, forbidden: 403, not_found: 404, conflict: 409, gone: 410,
   rate_limited: 429 } as const;
@@ -31,6 +31,7 @@ const CONFLICTS: Record<WebappConflictReason, string> = {
   already_member: 'This user already belongs to the organization',
   already_invited: 'This email already has a pending invitation',
   deletion_pending: 'A deletion request is already pending',
+  action_limit: `An organization keeps at most ${MAX_CUSTOM_ACTIONS} actions of its own`,
 };
 /** The rules the repository enforces atomically come back as a 409. */
 async function orConflict<T>(write: Promise<T>): Promise<T> {
@@ -61,10 +62,10 @@ const deletionView = (request: DeletionRequestRecord): DeletionRequestView => ({
   reviewNote: request.review_note });
 
 // The action plan (DN-11 §4.2).
-const MAX_CUSTOM_ACTIONS = 100;
 const ACTION_WRITES_PER_MINUTE = 60;
 type ActionItem = AssessmentResult['actionPlan'][number];
 type Tracked = { status: ActionStatus; assignee_user_id: string | null; due_date: string | null };
+const TRACKED_FIELDS = ['status', 'assignee_user_id', 'due_date'] as const satisfies ReadonlyArray<keyof Tracked>;
 const UNTOUCHED: Tracked = { status: 'todo', assignee_user_id: null, due_date: null };
 
 // Public keys, split on their first two dots: `a.<scanId>.<actionKey>`, where the action key may hold more dots (improve:D1.1),
@@ -91,8 +92,10 @@ const laterClaim = (a: OrgAnalysisRecord, b: OrgAnalysisRecord) =>
 type PlanEntry = { source: 'assessment'; scanId: string; item: ActionItem; row: (Tracked & { updated_at: string }) | null }
   | { source: 'custom'; row: CustomActionRecord };
 const entryKey = (entry: PlanEntry) => entry.source === 'assessment' ? assessmentKey(entry.scanId, entry.item.id) : customKey(entry.row.id);
-// What action.updated keeps of each side, in the contract's names.
-const trackedData = (tracked: Tracked) => ({ status: tracked.status, assigneeUserId: tracked.assignee_user_id, dueDate: tracked.due_date });
+// What action.updated keeps of each side: the fields the change moved, in the contract's names.
+const CONTRACT_NAMES = { status: 'status', assignee_user_id: 'assigneeUserId', due_date: 'dueDate' } as const;
+const trackedData = (tracked: Tracked, fields: ReadonlyArray<keyof Tracked>) =>
+  Object.fromEntries(fields.map(field => [CONTRACT_NAMES[field], tracked[field]]));
 
 // The activity (DN-11 §4.3). The actions that only ARCA staff (from /admin/*) or the system ever perform. The views name their actor
 // by this kind, whatever the row stores, so a row written as a member's never shows a staff email; the role views migration
@@ -410,38 +413,50 @@ export class WebappService {
     const target = await this.resolveAction(orgId, key);
     if (typeof req.assigneeUserId === 'string') await this.requireAssignee(orgId, req.assigneeUserId);
     const before: Tracked = target.row ?? UNTOUCHED;
-    const after: Tracked = { status: req.status ?? before.status,
-      assignee_user_id: req.assigneeUserId === undefined ? before.assignee_user_id : req.assigneeUserId,
-      due_date: req.dueDate === undefined ? before.due_date : req.dueDate };
-    if (before.status === after.status && before.assignee_user_id === after.assignee_user_id && before.due_date === after.due_date) {
-      return this.actionView(target);
-    }
+    // Only the fields sent that differ from what was read are written and audited. Another request may have changed the row since
+    // the read: writing nothing else leaves its change in place, and the audit names no change this request did not make.
+    const changes: Partial<Tracked> = {};
+    if (req.status !== undefined && req.status !== before.status) changes.status = req.status;
+    if (req.assigneeUserId !== undefined && req.assigneeUserId !== before.assignee_user_id) changes.assignee_user_id = req.assigneeUserId;
+    if (req.dueDate !== undefined && req.dueDate !== before.due_date) changes.due_date = req.dueDate;
+    const changed = TRACKED_FIELDS.filter(field => field in changes);
+    if (changed.length === 0) return this.actionView(target);
     this.checkActionWrites(user.userId);
     const at = this.timestamp();
-    const tracked = { ...after, updated_by: user.userId, updated_at: at };
+    const patch: ActionPatch = { ...changes, updated_by: user.userId, updated_at: at };
+    let row: Tracked;
+    let written: PlanEntry;
     if (target.source === 'assessment') {
-      // The first change creates the row; the upsert also covers a row that another request created meanwhile.
-      await this.repo.upsertAssessmentAction({ id: randomUUID(), org_id: orgId, source: 'assessment', scan_id: target.scanId,
-        action_key: target.item.id, title: null, detail: null, domain: null, ...tracked, created_by: user.userId, created_at: at });
+      // The first change creates the row. A row that exists by now, from an earlier change or from a request that raced this one,
+      // only gets the patch.
+      const upserted = await this.repo.upsertAssessmentAction({ id: randomUUID(), org_id: orgId, source: 'assessment',
+        scan_id: target.scanId, action_key: target.item.id, title: null, detail: null, domain: null, ...UNTOUCHED, ...patch,
+        created_by: user.userId, created_at: at }, patch);
+      row = upserted;
+      written = { ...target, row: upserted };
     } else {
-      await this.repo.updateAction(orgId, target.row.id, tracked);
+      const updated = await this.repo.updateAction(orgId, target.row.id, patch);
+      if (updated.source !== 'custom') throw new Error('An action of the organization\'s own changed its source');
+      row = updated;
+      written = { source: 'custom', row: updated };
     }
+    // Before is what this request read, after what its write left: the row as written, which may also hold another request's change.
     const title = target.source === 'assessment' ? target.item.title : target.row.title;
-    await this.audit(user.userId, orgId, 'action.updated', entryKey(target), { title, before: trackedData(before), after: trackedData(after) });
-    return this.actionView(target.source === 'assessment' ? { ...target, row: tracked } : { ...target, row: { ...target.row, ...tracked } });
+    await this.audit(user.userId, orgId, 'action.updated', entryKey(target), { title, before: trackedData(before, changed),
+      after: trackedData(row, changed) });
+    return this.actionView(written);
   }
 
   async createAction(user: AppUser, orgId: string, req: CreateActionRequest): Promise<ActionItemView> {
     await this.authorize(user, orgId, 'actions.assign', { payment: true });
-    if (await this.repo.countCustomActions(orgId) >= MAX_CUSTOM_ACTIONS) {
-      throw fail('conflict', `An organization keeps at most ${MAX_CUSTOM_ACTIONS} actions of its own`);
-    }
+    // An early answer that spends no write slot; the repository enforces the cap with the insert, which settles a race.
+    if (await this.repo.countCustomActions(orgId) >= MAX_CUSTOM_ACTIONS) throw fail('conflict', CONFLICTS.action_limit);
     this.checkActionWrites(user.userId);
     const at = this.timestamp();
     const action: CustomActionRecord = { id: randomUUID(), org_id: orgId, source: 'custom', scan_id: null, action_key: null, title: req.title,
       detail: req.detail || null, domain: req.domain ?? null, ...UNTOUCHED, created_by: user.userId, created_at: at, updated_by: user.userId,
       updated_at: at };
-    await this.repo.createCustomAction(action);
+    await orConflict(this.repo.createCustomAction(action));
     await this.audit(user.userId, orgId, 'action.created', customKey(action.id), { title: action.title });
     return this.actionView({ source: 'custom', row: action });
   }

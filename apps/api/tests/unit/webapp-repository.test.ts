@@ -3,7 +3,7 @@ import { PlanView } from '@arca/contracts';
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
 import {
-  WebappConflict, type ActionPatch, type AssessmentActionRecord, type ClaimTicketRecord, type CustomActionRecord, type DeletionRequestRecord,
+  MAX_CUSTOM_ACTIONS, WebappConflict, type ActionPatch, type AssessmentActionRecord, type ClaimTicketRecord, type CustomActionRecord, type DeletionRequestRecord,
   type InvitationRecord, type MembershipRecord, type NewAuditRecord, type OrgAnalysisRecord, type OrganizationRecord, type ProfileRecord,
   type SubscriptionRecord,
 } from '../../src/webapp/types.js';
@@ -37,6 +37,9 @@ const tracked = (id: string, scanId: string, actionKey: string, patch: Partial<A
   assignee_user_id: null, due_date: null, created_by: 'user_a', created_at: NOW, updated_by: 'user_a', updated_at: NOW, ...patch });
 
 const newRepo = () => new InMemoryWebappRepository([...DEFAULT_PLANS]);
+/** An upsert whose patch names every tracked field of the row, as a first write does. */
+const upsert = (repo: InMemoryWebappRepository, row: AssessmentActionRecord) => repo.upsertAssessmentAction(row, { status: row.status,
+  assignee_user_id: row.assignee_user_id, due_date: row.due_date, updated_by: row.updated_by, updated_at: row.updated_at });
 async function repoWithOrg(orgId = 'org_1', ownerId = 'user_a') {
   const repo = newRepo();
   await repo.createOrganization(org(orgId), member(orgId, ownerId, 'owner'), null);
@@ -335,21 +338,44 @@ describe('action plan', () => {
     expect(await repo.countCustomActions('org_1')).toBe(1);
   });
 
+  it('keeps at most 100 actions of an organization\'s own, counted with the insert', async () => {
+    const repo = await repoWithPlans();
+    for (let index = 0; index < MAX_CUSTOM_ACTIONS; index++) await repo.createCustomAction(custom(`act_${index}`));
+    await upsert(repo, tracked('act_assessment', 'scan_1', 'improve:D1.1'));
+    const refused = await repo.createCustomAction(custom('act_extra')).then(() => null, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(WebappConflict);
+    expect(refused).toMatchObject({ reason: 'action_limit' });
+    expect(await repo.countCustomActions('org_1')).toBe(MAX_CUSTOM_ACTIONS);
+    expect(await repo.getCustomAction('org_1', 'act_extra')).toBeNull();
+    // Creations that race each find the count where the one before left it.
+    await repo.deleteCustomAction('org_1', 'act_0');
+    const racing = await Promise.allSettled(['act_a', 'act_b', 'act_c'].map(id => repo.createCustomAction(custom(id))));
+    expect(racing.map(result => result.status)).toEqual(['fulfilled', 'rejected', 'rejected']);
+    expect(await repo.countCustomActions('org_1')).toBe(MAX_CUSTOM_ACTIONS);
+    // Another organization has its own count.
+    await repo.createCustomAction(custom('act_other', 'org_2'));
+    expect(await repo.countCustomActions('org_2')).toBe(1);
+  });
+
   it('gives an action of the assessment one row per plan, created by the first change and moved by later ones', async () => {
     const repo = await repoWithPlans();
     expect(await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.1')).toBeNull();
     const first = tracked('act_1', 'scan_1', 'improve:D1.1', { status: 'in_progress' });
-    expect(await repo.upsertAssessmentAction(first)).toEqual(first);
+    expect(await repo.upsertAssessmentAction(first, { status: 'in_progress', updated_by: 'user_a', updated_at: NOW })).toEqual(first);
 
-    // A later write keeps the identity and the creation of the row, and moves the rest.
+    // A later write keeps the identity and the creation of the row, and moves only what its patch names.
     const moved = { status: 'done', assignee_user_id: 'user_b', due_date: '2026-12-01', updated_by: 'user_b', updated_at: LATER } as const;
     const expected = { ...first, ...moved };
-    expect(await repo.upsertAssessmentAction(tracked('act_other', 'scan_1', 'improve:D1.1', { ...moved, created_by: 'user_b', created_at: LATER })))
-      .toEqual(expected);
+    expect(await repo.upsertAssessmentAction(tracked('act_other', 'scan_1', 'improve:D1.1', { ...moved, created_by: 'user_b', created_at: LATER }),
+      moved)).toEqual(expected);
     expect(await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.1')).toEqual(expected);
+    // A row the write did not know about, created meanwhile, keeps the fields the patch leaves out: nothing is undone.
+    const unaware = tracked('act_late', 'scan_1', 'improve:D1.1', { status: 'todo', due_date: null, updated_at: NOW });
+    expect(await repo.upsertAssessmentAction(unaware, { assignee_user_id: null, updated_by: 'user_a', updated_at: NOW }))
+      .toEqual({ ...expected, assignee_user_id: null, updated_by: 'user_a', updated_at: NOW });
 
     // The same action key in a newer plan is another action (DN-11 D14), and assessment rows are not custom actions.
-    await repo.upsertAssessmentAction(tracked('act_2', 'scan_2', 'improve:D1.1'));
+    await repo.upsertAssessmentAction(tracked('act_2', 'scan_2', 'improve:D1.1'), { updated_by: 'user_a', updated_at: NOW });
     expect((await repo.listActions('org_1')).map(a => [a.id, a.scan_id, a.status])).toEqual([['act_1', 'scan_1', 'done'], ['act_2', 'scan_2', 'todo']]);
     expect(await repo.countCustomActions('org_1')).toBe(0);
     expect(await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.2')).toBeNull();
@@ -358,24 +384,24 @@ describe('action plan', () => {
 
   it('only a scan the organization claimed has actions', async () => {
     const repo = await repoWithPlans();
-    await expect(repo.upsertAssessmentAction(tracked('act_1', 'scan_3', 'improve:D1.1'))).rejects.toThrow('Analysis not found');
-    await expect(repo.upsertAssessmentAction(tracked('act_1', 'scan_missing', 'improve:D1.1'))).rejects.toThrow('Analysis not found');
-    await expect(repo.upsertAssessmentAction({ ...tracked('act_1', 'scan_1', 'improve:D1.1'), org_id: 'org_2' })).rejects.toThrow('Analysis not found');
+    await expect(upsert(repo, tracked('act_1', 'scan_3', 'improve:D1.1'))).rejects.toThrow('Analysis not found');
+    await expect(upsert(repo, tracked('act_1', 'scan_missing', 'improve:D1.1'))).rejects.toThrow('Analysis not found');
+    await expect(upsert(repo, { ...tracked('act_1', 'scan_1', 'improve:D1.1'), org_id: 'org_2' })).rejects.toThrow('Analysis not found');
     expect(await repo.getAssessmentAction('org_2', 'scan_1', 'improve:D1.1')).toBeNull();
     expect(await repo.listActions('org_1')).toEqual([]);
     expect(await repo.listActions('org_2')).toEqual([]);
 
     await repo.createCustomAction(custom('act_1'));
-    await expect(repo.upsertAssessmentAction(tracked('act_1', 'scan_1', 'improve:D1.1'))).rejects.toThrow('Duplicate action');
+    await expect(upsert(repo, tracked('act_1', 'scan_1', 'improve:D1.1'))).rejects.toThrow('Duplicate action');
     expect(await repo.listActions('org_1')).toEqual([custom('act_1')]);
   });
 
   it('lists every action of one organization, from both sources and every plan, oldest first', async () => {
     const repo = await repoWithPlans();
     await repo.createCustomAction(custom('act_1'));
-    await repo.upsertAssessmentAction(tracked('act_2', 'scan_1', 'improve:D1.1'));
+    await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'));
     await repo.createCustomAction(custom('act_3', 'org_2'));
-    await repo.upsertAssessmentAction(tracked('act_4', 'scan_2', 'improve:D2.1'));
+    await upsert(repo, tracked('act_4', 'scan_2', 'improve:D2.1'));
     expect((await repo.listActions('org_1')).map(a => [a.id, a.source])).toEqual([['act_1', 'custom'], ['act_2', 'assessment'], ['act_4', 'assessment']]);
     expect((await repo.listActions('org_2')).map(a => a.id)).toEqual(['act_3']);
     expect(await repo.listActions('org_9')).toEqual([]);
@@ -384,7 +410,7 @@ describe('action plan', () => {
   it('updates only the tracked fields given, always recording who changed them and when', async () => {
     const repo = await repoWithPlans();
     await repo.createCustomAction(custom('act_1'));
-    await repo.upsertAssessmentAction(tracked('act_2', 'scan_1', 'improve:D1.1'));
+    await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'));
     const by = (updatedBy: string, updatedAt: string) => ({ updated_by: updatedBy, updated_at: updatedAt });
 
     expect(await repo.updateAction('org_1', 'act_1', { status: 'in_progress', ...by('user_b', LATER) }))
@@ -409,7 +435,7 @@ describe('action plan', () => {
     const repo = await repoWithPlans();
     await repo.createCustomAction(custom('act_1'));
     await repo.createCustomAction(custom('act_2'));
-    await repo.upsertAssessmentAction(tracked('act_3', 'scan_1', 'improve:D1.1'));
+    await upsert(repo, tracked('act_3', 'scan_1', 'improve:D1.1'));
     await expect(repo.deleteCustomAction('org_2', 'act_1')).rejects.toThrow('Action not found');
     await expect(repo.deleteCustomAction('org_1', 'act_3')).rejects.toThrow('Action not found');
     await expect(repo.deleteCustomAction('org_1', 'act_missing')).rejects.toThrow('Action not found');
@@ -426,7 +452,7 @@ describe('action plan', () => {
     const repo = await repoWithPlans();
     await repo.createCustomAction(custom('act_1', 'org_1', { assignee_user_id: 'user_b' }));
     await repo.createCustomAction(custom('act_2', 'org_1', { assignee_user_id: 'user_c' }));
-    await repo.upsertAssessmentAction(tracked('act_3', 'scan_1', 'improve:D1.1', { assignee_user_id: 'user_b', due_date: '2026-12-01' }));
+    await upsert(repo, tracked('act_3', 'scan_1', 'improve:D1.1', { assignee_user_id: 'user_b', due_date: '2026-12-01' }));
     await repo.createCustomAction(custom('act_4', 'org_2', { assignee_user_id: 'user_b' }));
 
     await repo.clearAssignee('org_1', 'user_b');
@@ -551,13 +577,13 @@ describe('copies and reset', () => {
     const written = custom('act_1');
     await repo.createCustomAction(written);
     const upserted = tracked('act_2', 'scan_1', 'improve:D1.1');
-    await repo.upsertAssessmentAction(upserted);
+    await upsert(repo, upserted);
 
     created.name = 'mutated input';
     record.data.nested = 'mutated input';
     written.title = 'mutated input';
     upserted.status = 'done';
-    (await repo.upsertAssessmentAction(tracked('act_2', 'scan_1', 'improve:D1.1'))).status = 'done';
+    (await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'))).status = 'done';
     (await repo.updateAction('org_1', 'act_1', { updated_by: 'user_a', updated_at: NOW })).title = 'mutated';
     (await repo.getCustomAction('org_1', 'act_1'))!.title = 'mutated';
     (await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.1'))!.status = 'done';
@@ -610,7 +636,7 @@ describe('copies and reset', () => {
     await repo.grantPlatformAdmin('staff_1', 'script');
     await repo.appendAudit(audit('aud_1', 'org_1'));
     await repo.createCustomAction(custom('act_1'));
-    await repo.upsertAssessmentAction(tracked('act_2', 'scan_1', 'improve:D1.1'));
+    await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'));
     const [cursor] = await repo.listAudit('org_1', { limit: 1 });
 
     repo.clear();

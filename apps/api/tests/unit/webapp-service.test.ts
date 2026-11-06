@@ -820,13 +820,45 @@ describe('the action plan', () => {
       .toMatchObject({ created_by: owner.userId, created_at: iso(T0 + HOUR), updated_by: member.userId, updated_at: iso(T0 + 2 * HOUR) });
     expect((await s.service.listActions(owner, org.id)).items[1]).toEqual(marked);
 
+    // Each event keeps only the fields its request changed.
     const [second, first] = await s.repository.listAudit(org.id, { limit: 2 });
     expect(first).toMatchObject({ action: 'action.updated', actor_user_id: owner.userId, actor_kind: 'member', target: A2,
-      data: { title: PLAN[1]!.title, before: { status: 'todo', assigneeUserId: null, dueDate: null },
-        after: { status: 'todo', assigneeUserId: member.userId, dueDate: '2026-12-01' } } });
+      data: { title: PLAN[1]!.title, before: { assigneeUserId: null, dueDate: null }, after: { assigneeUserId: member.userId, dueDate: '2026-12-01' } } });
     expect(second).toMatchObject({ action: 'action.updated', actor_user_id: member.userId, target: A2,
-      data: { before: { status: 'todo', assigneeUserId: member.userId, dueDate: '2026-12-01' },
-        after: { status: 'in_progress', assigneeUserId: member.userId, dueDate: '2026-12-01' } } });
+      data: { before: { status: 'todo' }, after: { status: 'in_progress' } } });
+    expect([first!.data.before, second!.data.after]).toEqual([{ assigneeUserId: null, dueDate: null }, { status: 'in_progress' }]);
+
+    // A field sent with the value it already has is neither written nor audited.
+    s.advance(HOUR);
+    const update = vi.spyOn(s.repository, 'upsertAssessmentAction');
+    await s.service.updateAction(owner, org.id, A2, { status: 'done', dueDate: '2026-12-01', assigneeUserId: member.userId });
+    expect(update.mock.calls[0]![1]).toEqual({ status: 'done', updated_by: owner.userId, updated_at: iso(T0 + 3 * HOUR) });
+    expect((await s.repository.listAudit(org.id, { limit: 1 }))[0]!.data).toEqual({ title: PLAN[1]!.title, before: { status: 'in_progress' },
+      after: { status: 'done' } });
+  });
+
+  it('two changes to the same action at once both stay, and each is audited as made', async () => {
+    const s = await scene();
+    const { owner, org, admin, member } = await s.team();
+    const own = await s.service.createAction(owner, org.id, { title: 'Name an AI lead' });
+    // An untouched assessment action (its row is created by the race), one that has a row, and one of the organization's own.
+    await s.service.updateAction(owner, org.id, A2, { dueDate: '2026-12-01' });
+    for (const key of [A1, A2, own.key]) {
+      const appendAudit = vi.spyOn(s.repository, 'appendAudit');
+      const [marked, assigned] = await Promise.all([s.service.updateAction(member, org.id, key, { status: 'done' }),
+        s.service.updateAction(admin, org.id, key, { assigneeUserId: member.userId })]);
+      const stored = (await s.service.listActions(owner, org.id)).items.find(item => item.key === key)!;
+      expect(stored, key).toMatchObject({ status: 'done', assignee: { userId: member.userId } });
+      // Each answer holds its own change, and the write that landed last answers with both.
+      expect([marked.status, assigned.assignee?.userId], key).toEqual(['done', member.userId]);
+      expect([marked, assigned].some(view => view.status === 'done' && view.assignee?.userId === member.userId), key).toBe(true);
+      const audited = new Map(appendAudit.mock.calls.map(([record]) => [record.actor_user_id, [record.target, record.data.before, record.data.after]]));
+      expect(audited, key).toEqual(new Map([[member.userId, [key, { status: 'todo' }, { status: 'done' }]],
+        [admin.userId, [key, { assigneeUserId: null }, { assigneeUserId: member.userId }]]]));
+      appendAudit.mockRestore();
+    }
+    expect(await s.repository.getAssessmentAction(org.id, 'sc_1', 'improve:D3.2')).toMatchObject({ due_date: '2026-12-01' });
+    expect((await s.repository.listActions(org.id)).filter(row => row.source === 'assessment')).toHaveLength(2);
   });
 
   it('an organization keeps at most 100 actions of its own', async () => {
@@ -844,6 +876,26 @@ describe('the action plan', () => {
     // The assessment's actions do not count, and deleting one makes room.
     await s.service.deleteAction(owner, org.id, hundredth.key);
     expect(await s.service.createAction(owner, org.id, { title: 'Room again' })).toMatchObject({ title: 'Room again' });
+  });
+
+  it('creations that race at the cap stop at 100 actions', async () => {
+    const s = await scene();
+    const { owner, org, admin } = await s.team();
+    for (let index = 0; index < 98; index++) {
+      await s.repository.createCustomAction({ id: randomUUID(), org_id: org.id, source: 'custom', scan_id: null, action_key: null,
+        title: `Action ${index}`, detail: null, domain: null, status: 'todo', assignee_user_id: null, due_date: null, created_by: owner.userId,
+        created_at: iso(T0), updated_by: owner.userId, updated_at: iso(T0) });
+    }
+    const appendAudit = vi.spyOn(s.repository, 'appendAudit');
+    // Every one of them counts 98 before any is written.
+    const results = await Promise.allSettled([owner, admin, owner, admin, owner].map((who, index) =>
+      s.service.createAction(who, org.id, { title: `Racing ${index}` })));
+    expect(results.map(result => result.status)).toEqual(['fulfilled', 'fulfilled', 'rejected', 'rejected', 'rejected']);
+    for (const result of results) {
+      if (result.status === 'rejected') expect(result.reason).toMatchObject({ code: 'conflict', status: 409 });
+    }
+    expect(await s.repository.countCustomActions(org.id)).toBe(100);
+    expect(appendAudit.mock.calls.map(([record]) => record.action)).toEqual(['action.created', 'action.created']);
   });
 
   it('only the organization\'s own actions are deleted, by whoever can assign (D13)', async () => {

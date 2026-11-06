@@ -1,13 +1,15 @@
 import { AUDIT_ACTOR_KINDS, type BillingStatus, type Role } from '@arca/contracts';
-import { WebappConflict } from './types.js';
+import { MAX_CUSTOM_ACTIONS, WebappConflict } from './types.js';
 import type { ActionPatch, AssessmentActionRecord, AuditPageQuery, AuditRecord, ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord,
   InvitationRecord, MembershipRecord, NewAuditRecord, OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, PlanRecord, ProfileRecord,
   SubscriptionRecord, WebappRepository } from './types.js';
 
 // updatePlan can change these and nothing else; the code is the identity of the plan.
 const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active'] as const;
-// What upsertAssessmentAction and updateAction may move on an existing row.
+// What upsertAssessmentAction and updateAction may move on an existing row: the fields a patch names, nothing else.
 const TRACKED_FIELDS = ['status', 'assignee_user_id', 'due_date', 'updated_by', 'updated_at'] as const;
+const applyPatch = <T extends OrgActionRecord>(action: T, patch: ActionPatch): T =>
+  Object.assign(action, Object.fromEntries(TRACKED_FIELDS.filter(field => patch[field] !== undefined).map(field => [field, patch[field]])));
 
 // The audit order, created_at desc then seq desc: negative when `a` comes first.
 const newestFirst = (a: AuditRecord, b: AuditRecord) => (Date.parse(b.created_at) - Date.parse(a.created_at)) || b.seq - a.seq;
@@ -170,14 +172,11 @@ export class InMemoryWebappRepository implements WebappRepository {
   async getAssessmentAction(orgId: string, scanId: string, actionKey: string) {
     return structuredClone(this.assessmentAction(orgId, scanId, actionKey) ?? null);
   }
-  async upsertAssessmentAction(action: AssessmentActionRecord) {
+  async upsertAssessmentAction(action: AssessmentActionRecord, patch: ActionPatch) {
     // The composite foreign key to org_analyses: only a scan this organization claimed has actions.
     if (this.analyses.get(action.scan_id)?.org_id !== action.org_id) throw new Error('Analysis not found');
     const existing = this.assessmentAction(action.org_id, action.scan_id, action.action_key);
-    if (existing) {
-      Object.assign(existing, Object.fromEntries(TRACKED_FIELDS.map(field => [field, action[field]])));
-      return structuredClone(existing);
-    }
+    if (existing) return structuredClone(applyPatch(existing, patch));
     if (this.actions.some(a => a.id === action.id)) throw new Error('Duplicate action');
     this.actions.push(structuredClone(action));
     return structuredClone(action);
@@ -185,14 +184,15 @@ export class InMemoryWebappRepository implements WebappRepository {
   async createCustomAction(action: CustomActionRecord) {
     this.requireOrganization(action.org_id);
     if (this.actions.some(a => a.id === action.id)) throw new Error('Duplicate action');
+    // Counted here, with no await before the insert, so creations that race cannot pass the cap together.
+    if (this.customCount(action.org_id) >= MAX_CUSTOM_ACTIONS) throw new WebappConflict('action_limit');
     this.actions.push(structuredClone(action));
   }
-  async countCustomActions(orgId: string) { return this.actions.filter(a => a.org_id === orgId && a.source === 'custom').length; }
+  async countCustomActions(orgId: string) { return this.customCount(orgId); }
   async updateAction(orgId: string, id: string, patch: ActionPatch) {
     const action = this.actions.find(a => a.org_id === orgId && a.id === id);
     if (!action) throw new Error('Action not found');
-    Object.assign(action, Object.fromEntries(TRACKED_FIELDS.filter(field => patch[field] !== undefined).map(field => [field, patch[field]])));
-    return structuredClone(action);
+    return structuredClone(applyPatch(action, patch));
   }
   async deleteCustomAction(orgId: string, id: string) {
     const action = this.customAction(orgId, id);
@@ -223,6 +223,7 @@ export class InMemoryWebappRepository implements WebappRepository {
     const rows = this.auditLog.filter(r => include(r) && (cursor === null || newestFirst(cursor, r) < 0));
     return structuredClone(rows.sort(newestFirst).slice(0, limit));
   }
+  private customCount(orgId: string) { return this.actions.filter(a => a.org_id === orgId && a.source === 'custom').length; }
   private customAction(orgId: string, id: string) {
     return this.actions.find((a): a is CustomActionRecord => a.org_id === orgId && a.id === id && a.source === 'custom');
   }
