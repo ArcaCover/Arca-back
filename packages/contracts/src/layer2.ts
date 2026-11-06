@@ -3,6 +3,15 @@ import { Decision, Tier } from './layer1.js';
 
 export const DomainKey = z.enum(['governance', 'tools', 'oversight', 'data_protection', 'training', 'incident_preparedness']);
 export type DomainKey = z.infer<typeof DomainKey>;
+/** How the assessment names each domain: one source for the demo bank and the webapp, so both name a domain alike. */
+export const DOMAIN_LABELS: Readonly<Record<DomainKey, string>> = Object.freeze({
+  governance: 'AI Governance & Policy',
+  tools: 'AI Tool Environment',
+  oversight: 'Human Oversight & Review',
+  data_protection: 'Data Protection & Confidentiality',
+  training: 'Training & Competency',
+  incident_preparedness: 'Incident Preparedness',
+});
 export const QuestionType = z.enum(['single_select', 'multi_select', 'yes_no', 'scale', 'number']);
 export const AnswerValue = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('option'), optionId: z.string().min(1).max(80) }).strict(),

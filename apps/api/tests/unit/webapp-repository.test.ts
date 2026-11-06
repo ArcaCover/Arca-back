@@ -3,12 +3,14 @@ import { PlanView } from '@arca/contracts';
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
 import {
-  WebappConflict, type AuditRecord, type ClaimTicketRecord, type DeletionRequestRecord, type InvitationRecord,
-  type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord, type ProfileRecord, type SubscriptionRecord,
+  IneligibleAssignee, MAX_CUSTOM_ACTIONS, WebappConflict, type ActionPatch, type AssessmentActionRecord, type ClaimTicketRecord, type CustomActionRecord, type DeletionRequestRecord,
+  type InvitationRecord, type MembershipRecord, type NewAuditRecord, type OrgAnalysisRecord, type OrganizationRecord, type ProfileRecord,
+  type SubscriptionRecord,
 } from '../../src/webapp/types.js';
 
 const NOW = '2026-10-25T12:00:00.000Z';
 const LATER = '2026-10-25T13:00:00.000Z';
+const EARLIER = '2026-10-25T11:00:00.000Z';
 
 const profile = (userId: string): ProfileRecord => ({ user_id: userId, email: `${userId}@firm.com`, full_name: null, last_org_id: null, created_at: NOW });
 const org = (id: string, patch: Partial<OrganizationRecord> = {}): OrganizationRecord => ({ id, name: `Org ${id}`, domain: 'firm.com',
@@ -25,13 +27,30 @@ const deletion = (id: string, orgId = 'org_1'): DeletionRequestRecord => ({ id, 
   status: 'pending', reviewed_by: null, reviewed_at: null, review_note: null, created_at: NOW });
 const subscription = (orgId: string, patch: Partial<SubscriptionRecord> = {}): SubscriptionRecord => ({ org_id: orgId, plan_code: 'monthly',
   customer_id: 'cus_1', subscription_id: 'sub_1', status: 'active', current_period_end: LATER, updated_at: NOW, ...patch });
-const audit = (id: string, orgId: string | null, data: Record<string, unknown> = {}): AuditRecord => ({ id, actor_user_id: 'user_a', org_id: orgId,
-  action: 'member.invited', target: 'guest@firm.com', data, created_at: NOW });
+const audit = (id: string, orgId: string | null, patch: Partial<NewAuditRecord> = {}): NewAuditRecord => ({ id, actor_kind: 'member',
+  actor_user_id: 'user_a', org_id: orgId, action: 'member.invited', target: 'guest@firm.com', data: {}, created_at: NOW, ...patch });
+const custom = (id: string, orgId = 'org_1', patch: Partial<CustomActionRecord> = {}): CustomActionRecord => ({ id, org_id: orgId,
+  source: 'custom', scan_id: null, action_key: null, title: `Action ${id}`, detail: null, domain: null, status: 'todo', assignee_user_id: null,
+  due_date: null, created_by: 'user_a', created_at: NOW, updated_by: 'user_a', updated_at: NOW, ...patch });
+const tracked = (id: string, scanId: string, actionKey: string, patch: Partial<AssessmentActionRecord> = {}): AssessmentActionRecord => ({ id,
+  org_id: 'org_1', source: 'assessment', scan_id: scanId, action_key: actionKey, title: null, detail: null, domain: null, status: 'todo',
+  assignee_user_id: null, due_date: null, created_by: 'user_a', created_at: NOW, updated_by: 'user_a', updated_at: NOW, ...patch });
 
 const newRepo = () => new InMemoryWebappRepository([...DEFAULT_PLANS]);
+/** An upsert whose patch names every tracked field of the row, as a first write does. */
+const upsert = (repo: InMemoryWebappRepository, row: AssessmentActionRecord) => repo.upsertAssessmentAction(row, { status: row.status,
+  assignee_user_id: row.assignee_user_id, due_date: row.due_date, updated_by: row.updated_by, updated_at: row.updated_at });
 async function repoWithOrg(orgId = 'org_1', ownerId = 'user_a') {
   const repo = newRepo();
   await repo.createOrganization(org(orgId), member(orgId, ownerId, 'owner'), null);
+  return repo;
+}
+/** org_1 holds scan_1 and scan_2, org_2 holds scan_3. */
+async function repoWithPlans() {
+  const repo = newRepo();
+  await repo.createOrganization(org('org_1'), member('org_1', 'user_a', 'owner'), analysis('org_1', 'scan_1'));
+  await repo.claimAnalysis(analysis('org_1', 'scan_2'));
+  await repo.createOrganization(org('org_2'), member('org_2', 'user_b', 'owner'), analysis('org_2', 'scan_3'));
   return repo;
 }
 
@@ -94,6 +113,15 @@ describe('organizations', () => {
     expect(await repo.listOrganizationsForUser('nobody')).toEqual([]);
   });
 
+  it('renames an organization and nothing else', async () => {
+    const repo = await repoWithOrg();
+    await repo.createOrganization(org('org_2'), member('org_2', 'user_b', 'owner'), null);
+    await repo.updateOrganizationName('org_1', 'Renamed LLP');
+    expect(await repo.getOrganization('org_1')).toEqual(org('org_1', { name: 'Renamed LLP' }));
+    expect(await repo.getOrganization('org_2')).toEqual(org('org_2'));
+    await expect(repo.updateOrganizationName('org_missing', 'Renamed LLP')).rejects.toThrow('Organization not found');
+  });
+
   it('upserts a profile by user', async () => {
     const repo = newRepo();
     expect(await repo.getProfile('user_a')).toBeNull();
@@ -146,11 +174,18 @@ describe('members', () => {
     expect(await repo.listMembers('org_1')).toHaveLength(1);
   });
 
-  it('refuses to change a member that does not exist', async () => {
+  it('says whether there was a member to change, as when another request removed them first', async () => {
     const repo = await repoWithOrg();
-    await expect(repo.setRole('org_1', 'ghost', 'admin')).rejects.toThrow('Member not found');
-    await expect(repo.removeMember('org_1', 'ghost')).rejects.toThrow('Member not found');
-    await expect(repo.setRole('org_9', 'user_a', 'admin')).rejects.toThrow('Member not found');
+    await repo.addMember(member('org_1', 'user_b', 'member'));
+    expect(await repo.setRole('org_1', 'ghost', 'admin')).toBe(false);
+    expect(await repo.removeMember('org_1', 'ghost')).toBe(false);
+    expect(await repo.setRole('org_9', 'user_a', 'admin')).toBe(false);
+    expect(await repo.setRole('org_1', 'user_b', 'admin')).toBe(true);
+    expect(await repo.removeMember('org_1', 'user_b')).toBe(true);
+    // The second of two removals finds nobody.
+    expect(await repo.removeMember('org_1', 'user_b')).toBe(false);
+    expect(await repo.setRole('org_1', 'user_b', 'viewer')).toBe(false);
+    expect((await repo.listMembers('org_1')).map(m => [m.user_id, m.role])).toEqual([['user_a', 'owner']]);
   });
 });
 
@@ -293,6 +328,207 @@ describe('deletion requests', () => {
   });
 });
 
+describe('action plan', () => {
+  it('finds an action the organization wrote only within that organization', async () => {
+    const repo = await repoWithPlans();
+    await repo.createCustomAction(custom('act_1', 'org_1', { detail: 'Name an owner for it', domain: 'governance' }));
+    await repo.createCustomAction(custom('act_2', 'org_2'));
+    expect(await repo.getCustomAction('org_1', 'act_1')).toEqual(custom('act_1', 'org_1', { detail: 'Name an owner for it', domain: 'governance' }));
+    expect(await repo.getCustomAction('org_2', 'act_1')).toBeNull();
+    expect(await repo.getCustomAction('org_1', 'act_2')).toBeNull();
+    expect(await repo.getCustomAction('org_1', 'act_missing')).toBeNull();
+    expect([await repo.countCustomActions('org_1'), await repo.countCustomActions('org_2'), await repo.countCustomActions('org_9')])
+      .toEqual([1, 1, 0]);
+
+    await expect(repo.createCustomAction(custom('act_1', 'org_1', { title: 'Another' }))).rejects.toThrow('Duplicate action');
+    await expect(repo.createCustomAction(custom('act_3', 'org_missing'))).rejects.toThrow('Organization not found');
+    expect(await repo.countCustomActions('org_1')).toBe(1);
+  });
+
+  it('keeps at most 100 actions of an organization\'s own, counted with the insert', async () => {
+    const repo = await repoWithPlans();
+    for (let index = 0; index < MAX_CUSTOM_ACTIONS; index++) await repo.createCustomAction(custom(`act_${index}`));
+    await upsert(repo, tracked('act_assessment', 'scan_1', 'improve:D1.1'));
+    const refused = await repo.createCustomAction(custom('act_extra')).then(() => null, (error: unknown) => error);
+    expect(refused).toBeInstanceOf(WebappConflict);
+    expect(refused).toMatchObject({ reason: 'action_limit' });
+    expect(await repo.countCustomActions('org_1')).toBe(MAX_CUSTOM_ACTIONS);
+    expect(await repo.getCustomAction('org_1', 'act_extra')).toBeNull();
+    // Creations that race each find the count where the one before left it.
+    await repo.deleteCustomAction('org_1', 'act_0');
+    const racing = await Promise.allSettled(['act_a', 'act_b', 'act_c'].map(id => repo.createCustomAction(custom(id))));
+    expect(racing.map(result => result.status)).toEqual(['fulfilled', 'rejected', 'rejected']);
+    expect(await repo.countCustomActions('org_1')).toBe(MAX_CUSTOM_ACTIONS);
+    // Another organization has its own count.
+    await repo.createCustomAction(custom('act_other', 'org_2'));
+    expect(await repo.countCustomActions('org_2')).toBe(1);
+  });
+
+  it('gives an action of the assessment one row per plan, created by the first change and moved by later ones', async () => {
+    const repo = await repoWithPlans();
+    await repo.addMember(member('org_1', 'user_b'));
+    expect(await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.1')).toBeNull();
+    const first = tracked('act_1', 'scan_1', 'improve:D1.1', { status: 'in_progress' });
+    expect(await repo.upsertAssessmentAction(first, { status: 'in_progress', updated_by: 'user_a', updated_at: NOW })).toEqual(first);
+
+    // A later write keeps the identity and the creation of the row, and moves only what its patch names.
+    const moved = { status: 'done', assignee_user_id: 'user_b', due_date: '2026-12-01', updated_by: 'user_b', updated_at: LATER } as const;
+    const expected = { ...first, ...moved };
+    expect(await repo.upsertAssessmentAction(tracked('act_other', 'scan_1', 'improve:D1.1', { ...moved, created_by: 'user_b', created_at: LATER }),
+      moved)).toEqual(expected);
+    expect(await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.1')).toEqual(expected);
+    // A row the write did not know about, created meanwhile, keeps the fields the patch leaves out: nothing is undone.
+    const unaware = tracked('act_late', 'scan_1', 'improve:D1.1', { status: 'todo', due_date: null, updated_at: NOW });
+    expect(await repo.upsertAssessmentAction(unaware, { assignee_user_id: null, updated_by: 'user_a', updated_at: NOW }))
+      .toEqual({ ...expected, assignee_user_id: null, updated_by: 'user_a', updated_at: NOW });
+
+    // The same action key in a newer plan is another action (DN-11 D14), and assessment rows are not custom actions.
+    await repo.upsertAssessmentAction(tracked('act_2', 'scan_2', 'improve:D1.1'), { updated_by: 'user_a', updated_at: NOW });
+    expect((await repo.listActions('org_1')).map(a => [a.id, a.scan_id, a.status])).toEqual([['act_1', 'scan_1', 'done'], ['act_2', 'scan_2', 'todo']]);
+    expect(await repo.countCustomActions('org_1')).toBe(0);
+    expect(await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.2')).toBeNull();
+    expect(await repo.getCustomAction('org_1', 'act_1')).toBeNull();
+  });
+
+  it('only a scan the organization claimed has actions', async () => {
+    const repo = await repoWithPlans();
+    await expect(upsert(repo, tracked('act_1', 'scan_3', 'improve:D1.1'))).rejects.toThrow('Analysis not found');
+    await expect(upsert(repo, tracked('act_1', 'scan_missing', 'improve:D1.1'))).rejects.toThrow('Analysis not found');
+    await expect(upsert(repo, { ...tracked('act_1', 'scan_1', 'improve:D1.1'), org_id: 'org_2' })).rejects.toThrow('Analysis not found');
+    expect(await repo.getAssessmentAction('org_2', 'scan_1', 'improve:D1.1')).toBeNull();
+    expect(await repo.listActions('org_1')).toEqual([]);
+    expect(await repo.listActions('org_2')).toEqual([]);
+
+    await repo.createCustomAction(custom('act_1'));
+    await expect(upsert(repo, tracked('act_1', 'scan_1', 'improve:D1.1'))).rejects.toThrow('Duplicate action');
+    expect(await repo.listActions('org_1')).toEqual([custom('act_1')]);
+  });
+
+  it('lists every action of one organization, from both sources and every plan, oldest first', async () => {
+    const repo = await repoWithPlans();
+    await repo.createCustomAction(custom('act_1'));
+    await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'));
+    await repo.createCustomAction(custom('act_3', 'org_2'));
+    await upsert(repo, tracked('act_4', 'scan_2', 'improve:D2.1'));
+    expect((await repo.listActions('org_1')).map(a => [a.id, a.source])).toEqual([['act_1', 'custom'], ['act_2', 'assessment'], ['act_4', 'assessment']]);
+    expect((await repo.listActions('org_2')).map(a => a.id)).toEqual(['act_3']);
+    expect(await repo.listActions('org_9')).toEqual([]);
+  });
+
+  it('updates only the tracked fields given, always recording who changed them and when', async () => {
+    const repo = await repoWithPlans();
+    await repo.addMember(member('org_1', 'user_b'));
+    await repo.createCustomAction(custom('act_1'));
+    await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'));
+    const by = (updatedBy: string, updatedAt: string) => ({ updated_by: updatedBy, updated_at: updatedAt });
+
+    expect(await repo.updateAction('org_1', 'act_1', { status: 'in_progress', ...by('user_b', LATER) }))
+      .toEqual(custom('act_1', 'org_1', { status: 'in_progress', ...by('user_b', LATER) }));
+    await repo.updateAction('org_1', 'act_1', { assignee_user_id: 'user_b', due_date: '2026-12-01', ...by('user_a', LATER) });
+    expect(await repo.getCustomAction('org_1', 'act_1'))
+      .toEqual(custom('act_1', 'org_1', { status: 'in_progress', assignee_user_id: 'user_b', due_date: '2026-12-01', ...by('user_a', LATER) }));
+    // Null clears; what the row says about itself never moves.
+    await repo.updateAction('org_1', 'act_1', { assignee_user_id: null, due_date: null, title: 'Changed', org_id: 'org_2', created_by: 'user_b',
+      ...by('user_b', LATER) } as ActionPatch);
+    expect(await repo.getCustomAction('org_1', 'act_1')).toEqual(custom('act_1', 'org_1', { status: 'in_progress', ...by('user_b', LATER) }));
+
+    expect(await repo.updateAction('org_1', 'act_2', { status: 'done', ...by('user_b', LATER) }))
+      .toEqual(tracked('act_2', 'scan_1', 'improve:D1.1', { status: 'done', ...by('user_b', LATER) }));
+
+    // A row that is not there, deleted meanwhile or of another organization, is not an error: null, and nothing is written.
+    expect(await repo.updateAction('org_2', 'act_1', { status: 'done', ...by('user_b', LATER) })).toBeNull();
+    expect(await repo.updateAction('org_1', 'act_missing', { status: 'done', ...by('user_b', LATER) })).toBeNull();
+    expect((await repo.getCustomAction('org_1', 'act_1'))?.status).toBe('in_progress');
+  });
+
+  it('deletes only an action the organization wrote, within that organization', async () => {
+    const repo = await repoWithPlans();
+    await repo.createCustomAction(custom('act_1'));
+    await repo.createCustomAction(custom('act_2'));
+    await upsert(repo, tracked('act_3', 'scan_1', 'improve:D1.1'));
+    // False when nothing was deleted, so the second of two deletions that race can tell.
+    expect(await repo.deleteCustomAction('org_2', 'act_1')).toBe(false);
+    expect(await repo.deleteCustomAction('org_1', 'act_3')).toBe(false);
+    expect(await repo.deleteCustomAction('org_1', 'act_missing')).toBe(false);
+    expect(await repo.listActions('org_1')).toHaveLength(3);
+
+    expect(await repo.deleteCustomAction('org_1', 'act_1')).toBe(true);
+    expect(await repo.getCustomAction('org_1', 'act_1')).toBeNull();
+    expect(await repo.countCustomActions('org_1')).toBe(1);
+    expect((await repo.listActions('org_1')).map(a => a.id)).toEqual(['act_2', 'act_3']);
+    expect(await repo.deleteCustomAction('org_1', 'act_1')).toBe(false);
+  });
+
+  it('refuses, in the write itself, an assignee who is not a member that can mark actions (DN-11 D11)', async () => {
+    const repo = await repoWithPlans();
+    await repo.addMember(member('org_1', 'user_b'));
+    await repo.addMember(member('org_1', 'user_c', 'viewer'));
+    await repo.addMember(member('org_2', 'user_d'));
+    await repo.createCustomAction(custom('act_1'));
+    await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'));
+    const by = { updated_by: 'user_a', updated_at: LATER };
+    // A viewer, a member of another organization only, and nobody at all.
+    for (const userId of ['user_c', 'user_d', 'ghost']) {
+      const patch = { assignee_user_id: userId, status: 'done', ...by } as const;
+      await expect(repo.updateAction('org_1', 'act_1', patch), userId).rejects.toBeInstanceOf(IneligibleAssignee);
+      await expect(repo.upsertAssessmentAction(tracked('act_new', 'scan_1', 'improve:D1.1', patch), patch), userId)
+        .rejects.toBeInstanceOf(IneligibleAssignee);
+      // The write that would create the row is checked too, and creates nothing.
+      await expect(repo.upsertAssessmentAction(tracked('act_new', 'scan_1', 'improve:D2.1', patch), patch), userId)
+        .rejects.toBeInstanceOf(IneligibleAssignee);
+      await expect(repo.createCustomAction(custom('act_new', 'org_1', { assignee_user_id: userId })), userId)
+        .rejects.toBeInstanceOf(IneligibleAssignee);
+    }
+    // None of the refused writes landed, their other fields included.
+    expect(await repo.listActions('org_1')).toEqual([custom('act_1'), tracked('act_2', 'scan_1', 'improve:D1.1')]);
+
+    // An owner, an admin or a member may hold one, and null always clears.
+    await repo.setRole('org_1', 'user_c', 'admin');
+    for (const userId of ['user_a', 'user_b', 'user_c']) {
+      expect(await repo.updateAction('org_1', 'act_1', { assignee_user_id: userId, ...by })).toMatchObject({ assignee_user_id: userId });
+      expect(await repo.upsertAssessmentAction(tracked('act_2', 'scan_1', 'improve:D1.1'), { assignee_user_id: userId, ...by }))
+        .toMatchObject({ assignee_user_id: userId });
+    }
+    expect(await repo.updateAction('org_1', 'act_1', { assignee_user_id: null, ...by })).toMatchObject({ assignee_user_id: null });
+    // A patch that leaves the assignee out checks nobody, and keeps whoever holds the row.
+    expect(await repo.upsertAssessmentAction(tracked('act_2', 'scan_1', 'improve:D1.1'), { status: 'done', ...by }))
+      .toMatchObject({ status: 'done', assignee_user_id: 'user_c' });
+  });
+
+  it('releases a user\'s actions in the same call that makes them viewer or removes them, and only there (DN-11 D11, D15)', async () => {
+    const repo = await repoWithPlans();
+    await repo.addMember(member('org_1', 'user_b'));
+    await repo.addMember(member('org_1', 'user_c'));
+    await repo.addMember(member('org_2', 'user_c'));
+    await repo.createCustomAction(custom('act_1', 'org_1', { assignee_user_id: 'user_b' }));
+    await repo.createCustomAction(custom('act_2', 'org_1', { assignee_user_id: 'user_c' }));
+    await upsert(repo, tracked('act_3', 'scan_1', 'improve:D1.1', { assignee_user_id: 'user_b', due_date: '2026-12-01' }));
+    await repo.createCustomAction(custom('act_4', 'org_2', { assignee_user_id: 'user_c' }));
+    await repo.createCustomAction(custom('act_5', 'org_1', { assignee_user_id: 'user_a' }));
+    const holders = async (orgId: string) => (await repo.listActions(orgId)).map(a => [a.id, a.assignee_user_id]);
+
+    // A role that can still mark actions keeps them.
+    await repo.setRole('org_1', 'user_b', 'admin');
+    await repo.setRole('org_1', 'user_b', 'member');
+    expect(await holders('org_1')).toEqual([['act_1', 'user_b'], ['act_2', 'user_c'], ['act_3', 'user_b'], ['act_5', 'user_a']]);
+    // Made viewer: released by that same call, and the rest of each row stays as it was.
+    await repo.setRole('org_1', 'user_b', 'viewer');
+    expect(await repo.listActions('org_1')).toEqual([custom('act_1'), custom('act_2', 'org_1', { assignee_user_id: 'user_c' }),
+      tracked('act_3', 'scan_1', 'improve:D1.1', { due_date: '2026-12-01' }), custom('act_5', 'org_1', { assignee_user_id: 'user_a' })]);
+    // Getting the role back gives nothing back.
+    await repo.setRole('org_1', 'user_b', 'member');
+    expect(await holders('org_1')).toEqual([['act_1', null], ['act_2', 'user_c'], ['act_3', null], ['act_5', 'user_a']]);
+    // Removed: released in that organization only.
+    await repo.removeMember('org_1', 'user_c');
+    expect(await holders('org_1')).toEqual([['act_1', null], ['act_2', null], ['act_3', null], ['act_5', 'user_a']]);
+    expect(await holders('org_2')).toEqual([['act_4', 'user_c']]);
+    // A change the store refuses releases nothing either: the role and the assignments move together or not at all.
+    await expect(repo.setRole('org_1', 'user_a', 'viewer')).rejects.toMatchObject({ reason: 'last_owner' });
+    await expect(repo.removeMember('org_1', 'user_a')).rejects.toMatchObject({ reason: 'last_owner' });
+    expect(await holders('org_1')).toEqual([['act_1', null], ['act_2', null], ['act_3', null], ['act_5', 'user_a']]);
+  });
+});
+
 describe('platform admins and the audit log', () => {
   it('grants the platform role by user, apart from any organization role', async () => {
     const repo = await repoWithOrg();
@@ -303,14 +539,74 @@ describe('platform admins and the audit log', () => {
     expect(await repo.isPlatformAdmin('user_a')).toBe(false);
   });
 
-  it('lists the audit rows of one organization in the order they were appended', async () => {
+  it('numbers every audit row and records the kind of actor it names', async () => {
+    const repo = newRepo();
+    await repo.appendAudit(audit('aud_1', 'org_1'));
+    await repo.appendAudit(audit('aud_2', 'org_1', { actor_kind: 'system', actor_user_id: null }));
+    await repo.appendAudit(audit('aud_3', null, { actor_kind: 'platform' }));
+    expect((await repo.listAllAudit({ limit: 10 })).map(a => [a.id, a.seq, a.actor_kind])).toEqual([
+      ['aud_3', 3, 'platform'], ['aud_2', 2, 'system'], ['aud_1', 1, 'member']]);
+    expect(await repo.listAudit('org_1', { limit: 1 })).toEqual([{ ...audit('aud_2', 'org_1', { actor_kind: 'system', actor_user_id: null }), seq: 2 }]);
+  });
+
+  it('refuses an audit row that names no kind of actor, rather than take it for a member\'s', async () => {
+    const repo = newRepo();
+    const { actor_kind: _, ...unnamed } = audit('aud_1', 'org_1');
+    for (const record of [unnamed, { ...unnamed, actor_kind: undefined }, { ...unnamed, actor_kind: 'arca' }]) {
+      await expect(repo.appendAudit(record as unknown as NewAuditRecord)).rejects.toThrow('actor kind');
+    }
+    expect(await repo.listAllAudit({ limit: 10 })).toEqual([]);
+  });
+
+  /** org_1 gets aud_1 (now), aud_3 (earlier, appended late), aud_4 (later) and aud_6 (now); the rest belong elsewhere. */
+  async function repoWithAudit() {
     const repo = newRepo();
     await repo.appendAudit(audit('aud_1', 'org_1'));
     await repo.appendAudit(audit('aud_2', 'org_2'));
-    await repo.appendAudit(audit('aud_3', 'org_1'));
-    await repo.appendAudit(audit('aud_4', null));
-    expect((await repo.listAudit('org_1')).map(a => a.id)).toEqual(['aud_1', 'aud_3']);
-    expect(await repo.listAudit('org_9')).toEqual([]);
+    await repo.appendAudit(audit('aud_3', 'org_1', { created_at: EARLIER }));
+    await repo.appendAudit(audit('aud_4', 'org_1', { created_at: LATER }));
+    await repo.appendAudit(audit('aud_5', null, { actor_kind: 'platform' }));
+    await repo.appendAudit(audit('aud_6', 'org_1'));
+    return repo;
+  }
+  const ids = (rows: Array<{ id: string }>) => rows.map(row => row.id);
+
+  it('lists the audit rows of one organization newest first, then by seq, a page at a time', async () => {
+    const repo = await repoWithAudit();
+    expect(ids(await repo.listAudit('org_1', { limit: 10 }))).toEqual(['aud_4', 'aud_6', 'aud_1', 'aud_3']);
+    const first = await repo.listAudit('org_1', { limit: 3 });
+    expect(ids(first)).toEqual(['aud_4', 'aud_6', 'aud_1']);
+    // aud_3 has a higher seq than the cursor but an older time: the page goes on by the order, not by the seq alone.
+    const second = await repo.listAudit('org_1', { before: first[2]!.seq, limit: 3 });
+    expect(ids(second)).toEqual(['aud_3']);
+    expect(await repo.listAudit('org_1', { before: second[0]!.seq, limit: 3 })).toEqual([]);
+    expect(ids(await repo.listAudit('org_1', { before: first[0]!.seq, limit: 1 }))).toEqual(['aud_6']);
+    expect(await repo.listAudit('org_9', { limit: 10 })).toEqual([]);
+    // A cursor that names no row gives nothing rather than a guess.
+    expect(await repo.listAudit('org_1', { before: 999, limit: 10 })).toEqual([]);
+  });
+
+  it('lists the audit rows of every organization for ARCA, or of one', async () => {
+    const repo = await repoWithAudit();
+    expect(ids(await repo.listAllAudit({ limit: 10 }))).toEqual(['aud_4', 'aud_6', 'aud_5', 'aud_2', 'aud_1', 'aud_3']);
+    const first = await repo.listAllAudit({ limit: 2 });
+    expect(ids(await repo.listAllAudit({ before: first[1]!.seq, limit: 2 }))).toEqual(['aud_5', 'aud_2']);
+    expect(ids(await repo.listAllAudit({ orgId: 'org_2', limit: 10 }))).toEqual(['aud_2']);
+    expect(ids(await repo.listAllAudit({ orgId: 'org_1', before: first[1]!.seq, limit: 10 }))).toEqual(['aud_1', 'aud_3']);
+    expect(await repo.listAllAudit({ orgId: 'org_9', limit: 10 })).toEqual([]);
+  });
+
+  it('looks a cursor up only within the same filter, so another organization\'s seq gives an empty page', async () => {
+    const repo = await repoWithAudit();
+    const [theirs] = await repo.listAudit('org_2', { limit: 1 });
+    const [unowned] = await repo.listAllAudit({ limit: 10 }).then(rows => rows.filter(row => row.org_id === null));
+    // Without the filter, org_2's row would place org_1's page and tell when it was written.
+    expect(await repo.listAudit('org_1', { before: theirs!.seq, limit: 10 })).toEqual([]);
+    expect(await repo.listAudit('org_1', { before: unowned!.seq, limit: 10 })).toEqual([]);
+    expect(await repo.listAllAudit({ orgId: 'org_1', before: theirs!.seq, limit: 10 })).toEqual([]);
+    expect(await repo.listAllAudit({ orgId: 'org_2', before: unowned!.seq, limit: 10 })).toEqual([]);
+    // Across organizations any row is a cursor.
+    expect(ids(await repo.listAllAudit({ before: theirs!.seq, limit: 10 }))).toEqual(['aud_1', 'aud_3']);
   });
 });
 
@@ -341,10 +637,24 @@ describe('copies and reset', () => {
     const created = org('org_1');
     await repo.createOrganization(created, member('org_1', 'user_a', 'owner'), analysis('org_1', 'scan_1'));
     await repo.createInvitation(invitation('inv_1'));
-    await repo.appendAudit(audit('aud_1', 'org_1', { nested: { count: 1 } }));
+    const record = audit('aud_1', 'org_1', { data: { nested: { count: 1 } } });
+    await repo.appendAudit(record);
     await repo.upsertProfile(profile('user_a'));
+    const written = custom('act_1');
+    await repo.createCustomAction(written);
+    const upserted = tracked('act_2', 'scan_1', 'improve:D1.1');
+    await upsert(repo, upserted);
 
     created.name = 'mutated input';
+    record.data.nested = 'mutated input';
+    written.title = 'mutated input';
+    upserted.status = 'done';
+    (await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'))).status = 'done';
+    (await repo.updateAction('org_1', 'act_1', { updated_by: 'user_a', updated_at: NOW }))!.title = 'mutated';
+    (await repo.getCustomAction('org_1', 'act_1'))!.title = 'mutated';
+    (await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.1'))!.status = 'done';
+    (await repo.listActions('org_1'))[0]!.status = 'done';
+    (await repo.listAllAudit({ limit: 1 }))[0]!.data.nested = 'mutated';
     (await repo.getOrganization('org_1'))!.name = 'mutated';
     (await repo.listOrganizations())[0]!.name = 'mutated';
     (await repo.listOrganizationsForUser('user_a'))[0]!.org.name = 'mutated';
@@ -356,7 +666,7 @@ describe('copies and reset', () => {
     (await repo.listInvitations('org_1'))[0]!.role = 'viewer';
     (await repo.getPlan('monthly'))!.amount_cents = 1;
     (await repo.listPlans())[0]!.name = 'mutated';
-    (await repo.listAudit('org_1'))[0]!.data.nested = 'mutated';
+    (await repo.listAudit('org_1', { limit: 1 }))[0]!.data.nested = 'mutated';
     (await repo.getProfile('user_a'))!.email = 'mutated@firm.com';
 
     expect(await repo.getOrganization('org_1')).toEqual(org('org_1'));
@@ -366,8 +676,9 @@ describe('copies and reset', () => {
     expect(await repo.listAnalyses('org_1')).toEqual([analysis('org_1', 'scan_1')]);
     expect(await repo.findInvitationByHash('hash_inv_1')).toEqual(invitation('inv_1'));
     expect(await repo.getPlan('monthly')).toEqual(DEFAULT_PLANS[0]);
-    expect((await repo.listAudit('org_1'))[0]!.data).toEqual({ nested: { count: 1 } });
+    expect((await repo.listAudit('org_1', { limit: 1 }))[0]!.data).toEqual({ nested: { count: 1 } });
     expect(await repo.getProfile('user_a')).toEqual(profile('user_a'));
+    expect(await repo.listActions('org_1')).toEqual([custom('act_1'), tracked('act_2', 'scan_1', 'improve:D1.1')]);
   });
 
   it('does not share the plans it was seeded with', async () => {
@@ -390,6 +701,9 @@ describe('copies and reset', () => {
     await repo.createDeletionRequest(deletion('del_1'));
     await repo.grantPlatformAdmin('staff_1', 'script');
     await repo.appendAudit(audit('aud_1', 'org_1'));
+    await repo.createCustomAction(custom('act_1'));
+    await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'));
+    const [cursor] = await repo.listAudit('org_1', { limit: 1 });
 
     repo.clear();
 
@@ -406,12 +720,23 @@ describe('copies and reset', () => {
     expect(await repo.getPendingDeletionRequest('org_1')).toBeNull();
     expect(await repo.listDeletionRequests()).toEqual([]);
     expect(await repo.isPlatformAdmin('staff_1')).toBe(false);
-    expect(await repo.listAudit('org_1')).toEqual([]);
+    expect(await repo.listAudit('org_1', { limit: 10 })).toEqual([]);
+    expect(await repo.listAllAudit({ limit: 10 })).toEqual([]);
+    expect(await repo.listActions('org_1')).toEqual([]);
+    expect(await repo.countCustomActions('org_1')).toBe(0);
+    expect(await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.1')).toBeNull();
     expect(await repo.listPlans()).toEqual(DEFAULT_PLANS);
 
     // What was remembered to refuse repeats is forgotten too.
     expect(await repo.recordBillingEvent('evt_1', 'x')).toBe(true);
     await repo.createOrganization(org('org_1'), member('org_1', 'user_a', 'owner'), analysis('org_1', 'scan_1'));
     expect(await repo.listAnalyses('org_1')).toHaveLength(1);
+    await repo.createCustomAction(custom('act_1'));
+    expect(await repo.countCustomActions('org_1')).toBe(1);
+    // Like an identity column, seq is never reused: a cursor from before the reset names no row.
+    await repo.appendAudit(audit('aud_1', 'org_1'));
+    const [after] = await repo.listAudit('org_1', { limit: 1 });
+    expect(after!.seq).toBeGreaterThan(cursor!.seq);
+    expect(await repo.listAudit('org_1', { before: cursor!.seq, limit: 10 })).toEqual([]);
   });
 });

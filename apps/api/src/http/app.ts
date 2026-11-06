@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { swaggerUI } from '@hono/swagger-ui';
-import { Layer1Result, DomainResolution, ScanRequest, type Layer1Pipeline, type DomainResolver, type PipelineResult } from '@arca/contracts';
-import { DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER } from '@arca/contracts/debug';
+import { Layer1Result, DomainResolution, ScanRequest, type Layer1Pipeline, type DomainResolver, type PipelineResult,
+  type ScanResponse } from '@arca/contracts';
+import { DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, type DebugScenario } from '@arca/contracts/debug';
 import { issueSessionToken, verifySessionToken } from '../auth/session-token.js';
 import type { DebugTools } from '../debug/tools.js';
 import type { ScanRepository, ScanRecord } from '../repositories/types.js';
@@ -71,12 +72,22 @@ export function createApp(deps: AppDeps) {
       c.header('Retry-After', String(limit.retryAfter));
       return c.json({ error: 'rate_limited', message: 'Scan request limit exceeded' }, 429);
     }
+    const started = await startScan(email, domain, scenario);
+    if (!started.ok) return c.json({ error: started.error, message: started.message }, 400);
+    return c.json(started.response, started.response.status === 'COMPLETED' ? 200 : 202);
+  });
+  /**
+   * Everything POST /scan does once its faults and its limiter let the request through. `settled` resolves when the scan is
+   * stored as finished, whichever way it ended.
+   */
+  async function startScan(email: string, domain: string, scenario: DebugScenario | null): Promise<{ ok: true; response: ScanResponse;
+    settled: Promise<void> } | { ok: false; error: 'personal_email_domain' | 'invalid_domain'; message: string }> {
     const domainResolution = DomainResolution.parse(await deps.domainResolver.resolve({ domain, email }));
     if (domainResolution.reason === 'PERSONAL_EMAIL') {
-      return c.json({ error: 'personal_email_domain', message: 'The domain belongs to an email provider, not a firm' }, 400);
+      return { ok: false, error: 'personal_email_domain', message: 'The domain belongs to an email provider, not a firm' };
     }
     if (domainResolution.canonicalDomain === null) {
-      return c.json({ error: 'invalid_domain', message: 'The domain could not be resolved' }, 400);
+      return { ok: false, error: 'invalid_domain', message: 'The domain could not be resolved' };
     }
     const canonicalDomain = domainResolution.canonicalDomain;
     const timestamp = now();
@@ -109,9 +120,10 @@ export function createApp(deps: AppDeps) {
     // The fast 200 carries COMPLETED only. A partial, even one served from cache, reaches the
     // caller through polling, where the PARTIAL status and its warning already live.
     if (cachedResult && cachedStatus === 'COMPLETED') {
-      return c.json({ scanId, sessionToken, status: cachedStatus, cached: true, result: cachedResult }, 200);
+      return { ok: true, response: { scanId, sessionToken, status: cachedStatus, cached: true, result: cachedResult },
+        settled: Promise.resolve() };
     }
-    if (cachedResult) return c.json({ scanId, sessionToken, status: 'RUNNING' as const }, 202);
+    if (cachedResult) return { ok: true, response: { scanId, sessionToken, status: 'RUNNING' }, settled: Promise.resolve() };
     // Persist RUNNING before dispatch. Requests never wait for the scan's external I/O.
     const job = Promise.resolve().then(async () => {
       try {
@@ -145,8 +157,8 @@ export function createApp(deps: AppDeps) {
     }).catch(error => console.error('[scan] persistence failed', scanId, error instanceof Error ? error.message : 'Unknown error'));
     jobs.add(job);
     void job.finally(() => jobs.delete(job));
-    return c.json({ scanId, sessionToken, status: 'RUNNING' as const }, 202);
-  });
+    return { ok: true, response: { scanId, sessionToken, status: 'RUNNING' }, settled: job };
+  }
   // A scan is readable only with the capability token issued for it, and by the email it was issued to.
   async function authorizedScan(authorization: string | undefined, scanId: string) {
     const token = /^Bearer\s+(.+)$/i.exec(authorization ?? '')?.[1];
@@ -190,7 +202,19 @@ export function createApp(deps: AppDeps) {
     planningTimeoutMs: deps.assessmentPlanningTimeoutMs, maxWritesPerMinute: deps.assessmentMaxWritesPerMinute });
   app.route('/', assessmentRoutes({ scans: deps.repository, repository: assessmentRepository, service: assessments, sessionSecret: deps.sessionSecret }));
   app.route('/', deps.webapp ? webappRoutes(deps.webapp) : notConfiguredWebapp());
-  if (debug) app.route('/__debug', debug.routes({ limiter, sessionSecret: deps.sessionSecret }));
+  if (debug) {
+    // The mock demo seed (DN-11 §4.6) runs this very scan, past the limiter, to its end, then the assessment through this service.
+    // Built only where the seed exists, so no other mode ever holds a scan runner that skips the limiter.
+    const seed = debug.seeds ? { assessments, runScan: async (email: string, domain: string) => {
+      const started = await startScan(email, domain, null);
+      if (!started.ok) throw new Error(started.message);
+      await started.settled;
+      const scan = await deps.repository.get(started.response.scanId);
+      if (!scan) throw new Error('The scan was not stored');
+      return { scan, sessionToken: started.response.sessionToken };
+    } } : undefined;
+    app.route('/__debug', debug.routes({ limiter, sessionSecret: deps.sessionSecret, seed }));
+  }
   return { app, drain: async () => { await Promise.all([...jobs]); await assessments.drain(); },
     recoverAssessments: () => assessments.recoverInterrupted() };
 }

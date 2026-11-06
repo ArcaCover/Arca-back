@@ -1,4 +1,5 @@
 import { describe,it,expect,vi } from 'vitest';
+import { DOMAIN_LABELS } from '@arca/contracts';
 import { fixtureResult } from '../../contracts/tests/fixture.js';
 import { DEMO_BANK, QuestionBank, collectEvidence, createOpenAIPlanner, evaluateCondition, planAssessment,
   reconcileAnswers, renderQuestions, rulesPlan, validateAnswer, validatePlan, visibleQuestions } from '../src/index.js';
@@ -14,6 +15,9 @@ describe('fixed versioned demo bank',()=>{
     expect(QuestionBank.parse(DEMO_BANK).bankStatus).toBe('DEMO');
     expect(DEMO_BANK.questions.filter(q=>q.scored)).toHaveLength(8);
     expect(DEMO_BANK.domains.reduce((n,d)=>n+d.weight,0)).toBe(100);
+  });
+  it('labels its domains as the contracts do, so the webapp and the assessment name them alike',()=>{
+    expect(Object.fromEntries(DEMO_BANK.domains.map(d=>[d.key,d.label]))).toEqual(DOMAIN_LABELS);
   });
   it.each([
     (bank:typeof DEMO_BANK)=>bank.questions.push(bank.questions[0]!),

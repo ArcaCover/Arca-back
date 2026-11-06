@@ -1,3 +1,4 @@
+import { DOMAIN_LABELS } from '@arca/contracts';
 import { QuestionBank, type Question } from './schema.js';
 
 // Engineering fixtures only. Juan José owns the eventual underwriting questions and weights.
@@ -39,10 +40,10 @@ const questions: Question[] = [
   {...info,id:'D6.2',domain:'incident_preparedness',type:'yes_no',text:'Does your team know where to report an AI-related concern?',options:[{id:'yes',label:'Yes',points:0},{id:'no',label:'Not yet',points:0}]},
 ];
 export const DEMO_BANK: QuestionBank = QuestionBank.parse({bankVersion:'0.1.0-demo.1',bankStatus:'DEMO',
-  domains:[{key:'governance',label:'AI Governance & Policy',weight:25,minQuestions:2},
-    {key:'tools',label:'AI Tool Environment',weight:20,minQuestions:1},
-    {key:'oversight',label:'Human Oversight & Review',weight:20,minQuestions:2},
-    {key:'data_protection',label:'Data Protection & Confidentiality',weight:15,minQuestions:1},
-    {key:'training',label:'Training & Competency',weight:10,minQuestions:1},
-    {key:'incident_preparedness',label:'Incident Preparedness',weight:10,minQuestions:1}],
+  domains:[{key:'governance',label:DOMAIN_LABELS.governance,weight:25,minQuestions:2},
+    {key:'tools',label:DOMAIN_LABELS.tools,weight:20,minQuestions:1},
+    {key:'oversight',label:DOMAIN_LABELS.oversight,weight:20,minQuestions:2},
+    {key:'data_protection',label:DOMAIN_LABELS.data_protection,weight:15,minQuestions:1},
+    {key:'training',label:DOMAIN_LABELS.training,weight:10,minQuestions:1},
+    {key:'incident_preparedness',label:DOMAIN_LABELS.incident_preparedness,weight:10,minQuestions:1}],
   questions,limits:{minQuestions:8,maxQuestions:12}});

@@ -1,4 +1,4 @@
-import type { BillingStatus, Role } from '@arca/contracts';
+import type { ActionStatus, AuditActorKind, BillingStatus, DomainKey, Role } from '@arca/contracts';
 
 // Records of the private webapp (DN-10 §4.2), in snake_case like the rows they map to.
 export type ProfileRecord = {
@@ -32,16 +32,48 @@ export type DeletionRequestRecord = {
   id: string; org_id: string; requested_by: string; reason: string; status: 'pending' | 'approved' | 'rejected';
   reviewed_by: string | null; reviewed_at: string | null; review_note: string | null; created_at: string;
 };
+/** `seq` is numbered by the store on append (an identity column in SQL) and gives a strict order (DN-11 §4.3). */
 export type AuditRecord = {
-  id: string; actor_user_id: string | null; org_id: string | null; action: string; target: string | null;
-  data: Record<string, unknown>; created_at: string;
+  id: string; seq: number; actor_kind: AuditActorKind; actor_user_id: string | null; org_id: string | null; action: string;
+  target: string | null; data: Record<string, unknown>; created_at: string;
 };
+/** What appendAudit takes. The actor kind is required, as the column has no default: a row never passes as a member's by omission. */
+export type NewAuditRecord = Omit<AuditRecord, 'seq'>;
+/**
+ * A page of the audit log, newest first (`created_at desc, seq desc`). `before` is the seq of the last row of the previous
+ * page and the page goes on after that row in this order. The row is looked up within the same filter, so a seq that names no
+ * row, or a row of another organization, gives an empty page.
+ */
+export type AuditPageQuery = { before?: number; limit: number };
+
+// The action plan (DN-11 §4.2). An action of the assessment gets its row the first time something changes, and takes its
+// title, detail and domain from the assessment; an action the organization wrote itself carries them in the row.
+type ActionRecordBase = {
+  id: string; org_id: string; status: ActionStatus; assignee_user_id: string | null; due_date: string | null;
+  created_by: string; created_at: string; updated_by: string; updated_at: string;
+};
+export type AssessmentActionRecord = ActionRecordBase & {
+  source: 'assessment'; scan_id: string; action_key: string; title: null; detail: null; domain: null;
+};
+export type CustomActionRecord = ActionRecordBase & {
+  source: 'custom'; scan_id: null; action_key: null; title: string; detail: string | null; domain: DomainKey | null;
+};
+export type OrgActionRecord = AssessmentActionRecord | CustomActionRecord;
+/**
+ * What a change to the plan moves: only the fields it names, so a change made meanwhile to another field stays. Who changed it and
+ * when are always written.
+ */
+export type ActionPatch = Partial<Pick<ActionRecordBase, 'status' | 'assignee_user_id' | 'due_date'>>
+  & Pick<ActionRecordBase, 'updated_by' | 'updated_at'>;
+/** How many actions of its own an organization keeps (DN-11 §4.2); the repository refuses the next with `action_limit`. */
+export const MAX_CUSTOM_ACTIONS = 100;
 
 /**
  * `already_invited` is what a SQL repository maps the unique index `invitations_pending_email_idx` to: one pending
  * invitation per email and organization. The service revokes the old one before inviting again, so it only shows up in a race.
  */
-export type WebappConflictReason = 'scan_claimed' | 'last_owner' | 'already_member' | 'already_invited' | 'deletion_pending';
+export type WebappConflictReason = 'scan_claimed' | 'last_owner' | 'already_member' | 'already_invited' | 'deletion_pending'
+  | 'action_limit';
 /** A rule of the data model that the write would break. The routes turn it into a 409. */
 export class WebappConflict extends Error {
   constructor(readonly reason: WebappConflictReason) {
@@ -51,9 +83,39 @@ export class WebappConflict extends Error {
 }
 
 /**
+ * The assignee a write names may not hold an action (DN-11 D11): when the write runs, they are not a member of the organization,
+ * or their role cannot update actions. The service answers it with the same 400 as its own earlier check.
+ */
+export class IneligibleAssignee extends Error {
+  constructor() {
+    super('The assignee cannot hold an action of this organization');
+    this.name = 'IneligibleAssignee';
+  }
+}
+
+/**
  * Storage of the webapp. Reads return null (or an empty list) for what does not exist; a write that names a record
- * that does not exist throws a plain Error, so the caller looks it up first. The rules of the data model throw
- * WebappConflict and leave nothing half written.
+ * that does not exist throws a plain Error, so the caller looks it up first, except for a membership or an action, which another
+ * request may delete between that lookup and the write: setRole, removeMember, updateAction and deleteCustomAction say so in
+ * what they return. The rules of the data model throw WebappConflict or IneligibleAssignee and leave nothing half written.
+ *
+ * Who holds an action (DN-11 D11, D15) is a rule of the writes, not of an earlier read: every write that names an assignee checks
+ * them, and the change that takes a user's right to hold actions away releases theirs in the same call. A SQL repository runs
+ * each of these as one transaction:
+ * - a write that names an assignee first takes `select role from memberships where org_id = $1 and user_id = $2 for share`
+ *   and refuses unless the role can update actions, then writes;
+ * - setRole and removeMember first take `select role from memberships where org_id = $1 and user_id = $2 for update` (no row:
+ *   return false and write nothing), then change or delete the row. Only when the user is removed, or their new role cannot
+ *   update actions (a viewer), do they also run `update org_actions set assignee_user_id = null where org_id = $1 and
+ *   assignee_user_id = $2`; a change to a role that can (member, admin or owner) keeps the user's actions.
+ * The two locks conflict, so a change to viewer or a removal waits for an assignment in flight and then releases it, or the
+ * assignment waits for the change and then reads the new role.
+ *
+ * Not closed yet: the service checks the actor's right over the target (canManageMember) against the target's role as it read it
+ * before the write, and setRole and removeMember change or delete the row whatever its role is by then, so an admin whose request
+ * overlaps an owner's promotion of the target can demote or remove an owner, and the audit row records the stale role. The SQL
+ * version must re-check that right against the role it reads under the `for update` lock, and change or delete nothing when it no
+ * longer holds; that means passing the store what the service checked. The in-memory store has the same window today.
  */
 export interface WebappRepository {
   upsertProfile(profile: ProfileRecord): Promise<void>;
@@ -61,6 +123,7 @@ export interface WebappRepository {
   /** Atomic: the organization, its first owner and the claimed analysis go in together or not at all (`scan_claimed`). */
   createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null): Promise<void>;
   getOrganization(id: string): Promise<OrganizationRecord | null>;
+  updateOrganizationName(orgId: string, name: string): Promise<void>;
   /** Includes deleted organizations (`deleted_at` set): the caller decides what to show. */
   listOrganizationsForUser(userId: string): Promise<Array<{ org: OrganizationRecord; role: Role }>>;
   /** Every organization, deleted ones included. */
@@ -70,10 +133,18 @@ export interface WebappRepository {
   listMembers(orgId: string): Promise<MembershipRecord[]>;
   /** `already_member` when the user already belongs to the organization. */
   addMember(member: MembershipRecord): Promise<void>;
-  /** `last_owner` when it would leave the organization without an owner. */
-  setRole(orgId: string, userId: string, role: Role): Promise<void>;
-  /** `last_owner` when it would leave the organization without an owner. */
-  removeMember(orgId: string, userId: string): Promise<void>;
+  /**
+   * `last_owner` when it would leave the organization without an owner. A role that cannot update actions (a viewer) holds none:
+   * the same call unassigns every action of the organization the user held, and nothing else on those rows changes. True when it
+   * changed the role, false when the user is not a member, as when another request removed them after the caller read it.
+   */
+  setRole(orgId: string, userId: string, role: Role): Promise<boolean>;
+  /**
+   * `last_owner` when it would leave the organization without an owner. The same call unassigns every action of the organization
+   * the user held (DN-11 D15), and they stay unassigned if the user comes back. True when it removed the member, false when there
+   * was none to remove, as for the second of two removals that race.
+   */
+  removeMember(orgId: string, userId: string): Promise<boolean>;
 
   createInvitation(invitation: InvitationRecord): Promise<void>;
   /** Finds it whatever its state, so the caller can tell an accepted or revoked invitation from an unknown one. */
@@ -117,7 +188,40 @@ export interface WebappRepository {
 
   isPlatformAdmin(userId: string): Promise<boolean>;
   grantPlatformAdmin(userId: string, grantedBy: string): Promise<void>;
+
+  /** Every row of the organization, from both sources and every plan, oldest first: the caller picks the current plan. */
+  listActions(orgId: string): Promise<OrgActionRecord[]>;
+  /** Null for an id of another organization too: the organization is part of the lookup. */
+  getCustomAction(orgId: string, id: string): Promise<CustomActionRecord | null>;
+  getAssessmentAction(orgId: string, scanId: string, actionKey: string): Promise<AssessmentActionRecord | null>;
+  /**
+   * Unique by (org_id, scan_id, action_key). The first write creates the row as given; on a row that exists, whoever created it,
+   * only the fields of `patch` change (in SQL, the conflict branch sets only those columns). Returns the row as written. The scan
+   * must be one this organization claimed. IneligibleAssignee when the row would name an assignee who cannot hold it.
+   */
+  upsertAssessmentAction(action: AssessmentActionRecord, patch: ActionPatch): Promise<AssessmentActionRecord>;
+  /**
+   * `action_limit` when the organization already keeps MAX_CUSTOM_ACTIONS of its own. The count and the insert are one step, so two
+   * creations at 99 cannot both pass: a SQL repository locks the organization row (`select ... from organizations where id = $1 for
+   * update`), then counts and inserts in that same transaction. IneligibleAssignee when it names an assignee who cannot hold it.
+   */
+  createCustomAction(action: CustomActionRecord): Promise<void>;
+  countCustomActions(orgId: string): Promise<number>;
+  /**
+   * An action of either source, by its id within the organization. Only the fields of `patch` change; returns the row as written,
+   * or null when the organization has no action with this id, as when another request deleted it after the caller read it (in
+   * SQL, an `update ... returning` that returns no row). IneligibleAssignee when the patch names an assignee who cannot hold it.
+   */
+  updateAction(orgId: string, id: string, patch: ActionPatch): Promise<OrgActionRecord | null>;
+  /**
+   * Only an action the organization wrote itself; the assessment's are never deleted (DN-11 D13). True when it deleted the row,
+   * false when there was none to delete, as for the second of two deletions that race (in SQL, a delete whose rowCount is 0).
+   */
+  deleteCustomAction(orgId: string, id: string): Promise<boolean>;
+
   /** Append-only. */
-  appendAudit(record: AuditRecord): Promise<void>;
-  listAudit(orgId: string): Promise<AuditRecord[]>;
+  appendAudit(record: NewAuditRecord): Promise<void>;
+  listAudit(orgId: string, page: AuditPageQuery): Promise<AuditRecord[]>;
+  /** Across organizations, or only one with `orgId`; rows with no organization appear only without it. */
+  listAllAudit(page: AuditPageQuery & { orgId?: string }): Promise<AuditRecord[]>;
 }

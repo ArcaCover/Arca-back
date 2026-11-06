@@ -1,12 +1,18 @@
 import { Hono, type Context } from 'hono';
-import type { z } from 'zod';
-import { AttachAnalysisRequest, CheckoutRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, InviteRequest, ReviewRequest,
-  SetRoleRequest, UpdatePlanRequest } from '@arca/contracts';
+import { z } from 'zod';
+import { AttachAnalysisRequest, CheckoutRequest, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, InviteRequest,
+  ReviewRequest, SetRoleRequest, UpdateActionRequest, UpdateOrgRequest, UpdatePlanRequest } from '@arca/contracts';
 import type { AppAuth, AppUser } from './auth.js';
 import { WebappFailure, type WebappService } from './service.js';
 
-// Every path the private webapp answers on (DN-10 §4.7). Outside mock they all answer 501 until the real adapters exist.
+// Every path the private webapp answers on (DN-10 §4.7, DN-11 §4.9). Outside mock they all answer 501 until the real adapters exist.
 const WEBAPP_PATHS = ['/me', '/claims', '/plans', '/orgs', '/orgs/*', '/invitations/*', '/admin/*', '/billing/*'] as const;
+
+// A page of the audit log (DN-11 §4.3, §4.5): `before` is the seq the previous page ended on; a limit out of range is a 400.
+const auditPage = (max: number, fallback: number) => z.object({
+  before: z.string().regex(/^[1-9]\d{0,14}$/).transform(Number).optional(),
+  limit: z.string().regex(/^\d{1,4}$/).transform(Number).pipe(z.number().int().min(1).max(max)).default(String(fallback)),
+});
 
 /** Accounts, organizations and billing of the private webapp. The service owns every rule; these routes only authenticate and parse. */
 export function webappRoutes(deps: { service: WebappService; auth: AppAuth }): Hono {
@@ -37,15 +43,18 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth }): H
   app.get('/me', signedIn(async (c, me) => c.json(await service.me(me))));
   app.post('/orgs', signedIn(async (c, me) => c.json(await service.createOrganization(me, await body(c, CreateOrgRequest)), 201)));
   app.get('/orgs/:id', signedIn(async (c, me) => c.json(await service.orgView(me, param(c, 'id')))));
+  app.patch('/orgs/:id', signedIn(async (c, me) =>
+    c.json(await service.renameOrganization(me, param(c, 'id'), (await body(c, UpdateOrgRequest)).name))));
+  // These two read with the organization id as stored, which authorize returns whatever case the path used.
   app.get('/orgs/:id/analyses', signedIn(async (c, me) => {
-    await service.authorize(me, param(c, 'id'), 'org.read', { payment: true });
-    return c.json(await service.listAnalyses(param(c, 'id')));
+    const { org } = await service.authorize(me, param(c, 'id'), 'org.read', { payment: true });
+    return c.json(await service.listAnalyses(org.id));
   }));
   app.post('/orgs/:id/analyses', signedIn(async (c, me) =>
     c.json(await service.attachAnalysis(me, param(c, 'id'), (await body(c, AttachAnalysisRequest)).claimId), 201)));
   app.get('/orgs/:id/members', signedIn(async (c, me) => {
-    await service.authorize(me, param(c, 'id'), 'org.read', { payment: true });
-    return c.json(await service.listMembers(param(c, 'id')));
+    const { org } = await service.authorize(me, param(c, 'id'), 'org.read', { payment: true });
+    return c.json(await service.listMembers(org.id));
   }));
   app.post('/orgs/:id/invitations', signedIn(async (c, me) =>
     c.json(await service.invite(me, param(c, 'id'), await body(c, InviteRequest)), 201)));
@@ -65,9 +74,26 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth }): H
   app.post('/orgs/:id/billing/portal', signedIn(async (c, me) => c.json(await service.portal(me, param(c, 'id')))));
   app.post('/orgs/:id/deletion-request', signedIn(async (c, me) =>
     c.json(await service.requestDeletion(me, param(c, 'id'), (await body(c, DeletionRequestBody)).reason), 201)));
+  // The action plan (DN-11 §4.2). Hono decodes the key, which the front sends through encodeURIComponent.
+  app.get('/orgs/:id/actions', signedIn(async (c, me) => c.json(await service.listActions(me, param(c, 'id')))));
+  app.post('/orgs/:id/actions', signedIn(async (c, me) =>
+    c.json(await service.createAction(me, param(c, 'id'), await body(c, CreateActionRequest)), 201)));
+  app.patch('/orgs/:id/actions/:key', signedIn(async (c, me) =>
+    c.json(await service.updateAction(me, param(c, 'id'), param(c, 'key'), await body(c, UpdateActionRequest)))));
+  app.delete('/orgs/:id/actions/:key', signedIn(async (c, me) => {
+    await service.deleteAction(me, param(c, 'id'), param(c, 'key'));
+    return c.body(null, 204);
+  }));
+  app.get('/orgs/:id/activity', signedIn(async (c, me) =>
+    c.json(await service.activity(me, param(c, 'id'), query(c, auditPage(200, 50))))));
 
   // The platform admin is checked before the body, so anyone else gets the same 403 whatever they send.
   app.get('/admin/organizations', platformAdmin(async c => c.json(await service.listOrganizations())));
+  app.get('/admin/organizations/:id', platformAdmin(async c => c.json(await service.adminOrganization(param(c, 'id')))));
+  // An orgId that names no organization gives an empty page.
+  app.get('/admin/audit', platformAdmin(async c => c.json(await service.adminAudit(query(c, auditPage(500, 100).extend({
+    orgId: z.string().min(1).optional() }))))));
+  app.get('/admin/metrics', platformAdmin(async c => c.json(await service.adminMetrics())));
   app.get('/admin/deletion-requests', platformAdmin(async c => c.json(await service.listDeletionRequests())));
   app.get('/admin/plans', platformAdmin(async c => c.json(await service.listAllPlans())));
   for (const decision of ['approve', 'reject'] as const) {
@@ -103,6 +129,12 @@ async function body<T extends z.ZodTypeAny>(c: Context, schema: T, options: { op
   try { value = options.optional && raw.trim() === '' ? {} : JSON.parse(raw); } catch { /* not JSON: refused below */ }
   const parsed = schema.safeParse(value);
   if (!parsed.success) throw new WebappFailure('invalid_request', 'The request body is not valid', 400);
+  return parsed.data;
+}
+
+function query<T extends z.ZodTypeAny>(c: Context, schema: T): z.output<T> {
+  const parsed = schema.safeParse(c.req.query());
+  if (!parsed.success) throw new WebappFailure('invalid_request', 'The query is not valid', 400);
   return parsed.data;
 }
 
