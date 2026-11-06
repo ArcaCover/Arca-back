@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import * as root from '@arca/contracts';
 import {
-  DEBUG_PRESETS, DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, DebugModeResponse, DebugScanState, DebugScenario, isInjected,
+  DEBUG_PRESETS, DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, DebugModeResponse, DebugScanState, DebugScenario, DebugSeedResponse,
+  isInjected,
 } from '@arca/contracts/debug';
 
 const okSource = { status: 'ok', dataStatus: 'PRESENT', durationMs: 12 } as const;
@@ -141,10 +142,37 @@ describe('DebugScanState', () => {
   });
 });
 
+describe('DebugSeedResponse', () => {
+  const seed = {
+    organization: { id: 'org-1', name: 'Robust Law (demo)' },
+    users: [
+      { email: 'owner@demo.arca.example', role: 'owner' }, { email: 'admin@demo.arca.example', role: 'admin' },
+      { email: 'member@demo.arca.example', role: 'member' }, { email: 'viewer@demo.arca.example', role: 'viewer' },
+      { email: 'ops@demo.arca.example', role: 'platform_admin' },
+    ],
+  };
+
+  it('names the seeded organization and who can sign in to it, with each role', () => {
+    expect(DebugSeedResponse.parse(seed)).toEqual(seed);
+  });
+
+  it('never carries a token, for the organization or for any user', () => {
+    expect(DebugSeedResponse.safeParse({ ...seed, token: 'x' }).success).toBe(false);
+    expect(DebugSeedResponse.safeParse({ ...seed, users: [{ ...seed.users[0], token: 'x' }] }).success).toBe(false);
+    expect(DebugSeedResponse.safeParse({ ...seed, organization: { ...seed.organization, inviteUrl: 'x' } }).success).toBe(false);
+  });
+
+  it('knows the four organization roles and the platform admin, and needs someone to sign in as', () => {
+    expect(DebugSeedResponse.safeParse({ ...seed, users: [{ email: 'broker@demo.arca.example', role: 'broker' }] }).success).toBe(false);
+    expect(DebugSeedResponse.safeParse({ ...seed, users: [{ email: 'not-an-email', role: 'owner' }] }).success).toBe(false);
+    expect(DebugSeedResponse.safeParse({ ...seed, users: [] }).success).toBe(false);
+  });
+});
+
 describe('the package root', () => {
   it('does not expose the debug contract: it lives only on the @arca/contracts/debug subpath', () => {
     for (const name of ['DebugScenario', 'DEBUG_SCENARIO_HEADER', 'DEBUG_REQUEST_HEADER', 'DEBUG_PRESETS', 'DebugModeResponse',
-      'DebugScanState', 'isInjected']) {
+      'DebugScanState', 'DebugSeedResponse', 'isInjected']) {
       expect(root, name).not.toHaveProperty(name);
     }
   });

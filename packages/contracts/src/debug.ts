@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { DomainResolution, Layer1Result, ScanStatus } from './layer1.js';
+import { ROLES } from './webapp.js';
 
 // The debug contract is reachable only through the `@arca/contracts/debug` subpath. It is not re-exported from
 // index.ts, so production code that imports the package root never bundles it.
@@ -78,6 +79,16 @@ export const DebugScanState = z.object({
   sources: Layer1Result.shape.sources.nullable(),
 }).strict();
 export type DebugScanState = z.infer<typeof DebugScanState>;
+
+/**
+ * What POST /__debug/seed answers in mock (DN-11 §4.6): the seeded organization and who can sign in to it, each with the
+ * role to show on its button. Never a token: signing in as one of them goes through the mock /auth/login.
+ */
+export const DebugSeedResponse = z.object({
+  organization: z.object({ id: z.string().min(1), name: z.string().min(1) }).strict(),
+  users: z.array(z.object({ email: z.string().email(), role: z.enum([...ROLES, 'platform_admin']) }).strict()).min(1),
+}).strict();
+export type DebugSeedResponse = z.infer<typeof DebugSeedResponse>;
 
 export const DEBUG_PRESETS: Record<'apify_quota' | 'partial' | 'no_identity' | 'all_down' | 'session_expired',
   { label: string; scenario: DebugScenarioInput }> = {

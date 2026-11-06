@@ -1,17 +1,23 @@
 import { describe, expect, it } from 'vitest';
 import {
-  AdminOrgView, AnalysisView, AttachAnalysisRequest, BILLING_STATUSES, CheckoutRequest, ClaimResponse, CreateClaimRequest,
-  CreateOrgRequest, DeletionRequestBody, DeletionRequestView, InvitationView, InviteRequest, MeResponse, MemberView,
-  OrgView, PERMISSIONS, PlanView, ROLES, ROLE_PERMISSIONS, ReviewRequest, SetRoleRequest, UpdatePlanRequest, UrlResponse,
+  ACTION_STATUSES, AUDIT_ACTOR_KINDS, ActionItemView, ActionPlanResponse, ActivityEventView, ActivityPage, AdminAuditEventView,
+  AdminAuditPage, AdminMetricsView, AdminOrgDetailView, AdminOrgView, AnalysisView, AttachAnalysisRequest, BILLING_STATUSES,
+  CheckoutRequest, ClaimResponse, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, DeletionRequestView,
+  InvitationView, InviteRequest, MeResponse, MemberView, OrgView, PERMISSIONS, PlanView, ROLES, ROLE_PERMISSIONS, ReviewRequest,
+  SetRoleRequest, UpdateActionRequest, UpdateOrgRequest, UpdatePlanRequest, UrlResponse,
   can, canManageMember, hasPaidAccess,
   type BillingStatus, type Permission, type Role,
 } from '@arca/contracts';
 import { fixtureResult } from './fixture.js';
 
-// DN-10 §4.3, written out literally so a change to the matrix has to change this table too.
+// DN-11 §4.1, written out literally so a change to the matrix has to change this table too.
 const EXPECTED: Record<Permission, Record<Role, boolean>> = {
   'org.read':               { owner: true,  admin: true,  member: true,  viewer: true },
-  'analysis.create':        { owner: true,  admin: true,  member: true,  viewer: false },
+  'org.update':             { owner: true,  admin: true,  member: false, viewer: false },
+  'analysis.create':        { owner: true,  admin: true,  member: false, viewer: false },
+  'actions.update':         { owner: true,  admin: true,  member: true,  viewer: false },
+  'actions.assign':         { owner: true,  admin: true,  member: false, viewer: false },
+  'activity.read':          { owner: true,  admin: true,  member: false, viewer: false },
   'members.invite':         { owner: true,  admin: true,  member: false, viewer: false },
   'members.remove':         { owner: true,  admin: true,  member: false, viewer: false },
   'members.set_role':       { owner: true,  admin: true,  member: false, viewer: false },
@@ -22,19 +28,21 @@ const EXPECTED: Record<Permission, Record<Role, boolean>> = {
 const CELLS = ROLES.flatMap(role => PERMISSIONS.map(permission => [role, permission, EXPECTED[permission][role]] as const));
 
 describe('the permission matrix', () => {
-  it('has the four roles and the eight permissions, in order', () => {
+  it('has the four roles and the twelve permissions, in order', () => {
     expect(ROLES).toEqual(['owner', 'admin', 'member', 'viewer']);
     expect(PERMISSIONS).toEqual([
-      'org.read', 'analysis.create', 'members.invite', 'members.remove', 'members.set_role',
+      'org.read', 'org.update', 'analysis.create', 'actions.update', 'actions.assign', 'activity.read',
+      'members.invite', 'members.remove', 'members.set_role',
       'billing.manage', 'org.transfer_ownership', 'org.request_deletion',
     ]);
   });
 
   it('covers every role x permission combination', () => {
-    expect(CELLS).toHaveLength(32);
+    expect(Object.keys(EXPECTED)).toHaveLength(PERMISSIONS.length);
+    expect(CELLS).toHaveLength(48);
   });
 
-  it.each(CELLS)('the matrix is exactly DN-10 §4.3: %s / %s -> %s', (role, permission, allowed) => {
+  it.each(CELLS)('the matrix is exactly DN-11 §4.1: %s / %s -> %s', (role, permission, allowed) => {
     expect(can(role, permission)).toBe(allowed);
     expect(ROLE_PERMISSIONS[role].includes(permission)).toBe(allowed);
   });
@@ -236,5 +244,270 @@ describe('request bodies', () => {
     expect(UpdatePlanRequest.safeParse({ interval: 'week' }).success).toBe(false);
     expect(UpdatePlanRequest.safeParse({ code: 'other' }).success).toBe(false);
     expect(UpdatePlanRequest.safeParse({ name: undefined }).success).toBe(false);
+  });
+
+  it('UpdateOrgRequest follows the name rule of CreateOrgRequest', () => {
+    for (const name of ['A', 'x'.repeat(120), '', 'x'.repeat(121), '   ', `  ${'x'.repeat(120)}  `, 'Smith & Co']) {
+      expect(UpdateOrgRequest.safeParse({ name }).success, JSON.stringify(name))
+        .toBe(CreateOrgRequest.safeParse({ name, claimId: 'c1' }).success);
+    }
+    expect(UpdateOrgRequest.parse({ name: '  Smith & Co ' })).toEqual({ name: 'Smith & Co' });
+    expect(UpdateOrgRequest.safeParse({}).success).toBe(false);
+    expect(UpdateOrgRequest.safeParse({ name: 'Firm', claimId: 'c1' }).success).toBe(false);
+  });
+
+  it('UpdateActionRequest needs at least one field that is not undefined', () => {
+    expect(UpdateActionRequest.safeParse({}).success).toBe(false);
+    expect(UpdateActionRequest.safeParse({ status: undefined, dueDate: undefined }).success).toBe(false);
+    for (const status of ACTION_STATUSES) expect(UpdateActionRequest.safeParse({ status }).success).toBe(true);
+    expect(UpdateActionRequest.safeParse({ assigneeUserId: 'u1' }).success).toBe(true);
+    expect(UpdateActionRequest.safeParse({ status: 'done', assigneeUserId: 'u1', dueDate: '2026-12-01' }).success).toBe(true);
+  });
+
+  it('UpdateActionRequest takes null as "clear" for the assignee and the due date, and keeps it apart from a missing field', () => {
+    expect(UpdateActionRequest.parse({ assigneeUserId: null })).toEqual({ assigneeUserId: null });
+    expect(UpdateActionRequest.parse({ dueDate: null })).toEqual({ dueDate: null });
+    // The service picks the permission by the fields present, so a field that was not sent must stay absent.
+    const statusOnly = UpdateActionRequest.parse({ status: 'in_progress' });
+    expect(Object.keys(statusOnly)).toEqual(['status']);
+    expect(UpdateActionRequest.safeParse({ status: null }).success).toBe(false);
+  });
+
+  it('UpdateActionRequest checks each field', () => {
+    expect(UpdateActionRequest.safeParse({ status: 'blocked' }).success).toBe(false);
+    expect(UpdateActionRequest.safeParse({ assigneeUserId: '' }).success).toBe(false);
+    expect(UpdateActionRequest.safeParse({ assigneeUserId: 7 }).success).toBe(false);
+    expect(UpdateActionRequest.safeParse({ title: 'Renamed' }).success).toBe(false);
+    expect(UpdateActionRequest.safeParse({ status: 'done', key: 'a.sc_1.improve:D1.1' }).success).toBe(false);
+  });
+
+  it('a due date is a calendar date written YYYY-MM-DD', () => {
+    for (const dueDate of ['2026-12-01', '2028-02-29']) expect(UpdateActionRequest.safeParse({ dueDate }).success, dueDate).toBe(true);
+    for (const dueDate of ['2026-12-1', '2026-02-29', '2026-13-01', '2026-12-01T00:00:00.000Z', '12/01/2026', '', ' 2026-12-01']) {
+      expect(UpdateActionRequest.safeParse({ dueDate }).success, dueDate).toBe(false);
+    }
+  });
+
+  it('CreateActionRequest trims the title and bounds it to 1..200 characters', () => {
+    expect(CreateActionRequest.parse({ title: '  Write an AI use policy ' })).toEqual({ title: 'Write an AI use policy' });
+    expect(CreateActionRequest.safeParse({ title: 'x'.repeat(200) }).success).toBe(true);
+    expect(CreateActionRequest.safeParse({ title: `  ${'x'.repeat(200)}  ` }).success).toBe(true);
+    expect(CreateActionRequest.safeParse({ title: 'x'.repeat(201) }).success).toBe(false);
+    expect(CreateActionRequest.safeParse({ title: '' }).success).toBe(false);
+    expect(CreateActionRequest.safeParse({ title: ' \t ' }).success).toBe(false);
+    expect(CreateActionRequest.safeParse({}).success).toBe(false);
+  });
+
+  it('CreateActionRequest takes an optional detail of at most 2000 characters and an optional domain', () => {
+    const title = 'Review vendor terms';
+    expect(CreateActionRequest.safeParse({ title, detail: 'x'.repeat(2000) }).success).toBe(true);
+    expect(CreateActionRequest.safeParse({ title, detail: 'x'.repeat(2001) }).success).toBe(false);
+    expect(CreateActionRequest.parse({ title, detail: ' Ask the vendor ' }).detail).toBe('Ask the vendor');
+    expect(CreateActionRequest.safeParse({ title, domain: 'tools' }).success).toBe(true);
+    expect(CreateActionRequest.safeParse({ title, domain: null }).success).toBe(true);
+    expect(CreateActionRequest.safeParse({ title, domain: 'marketing' }).success).toBe(false);
+    expect(CreateActionRequest.safeParse({ title, status: 'done' }).success).toBe(false);
+    expect(CreateActionRequest.safeParse({ title, pointsGain: 2 }).success).toBe(false);
+  });
+});
+
+const fromAssessment = {
+  key: 'a.sc_robust1.improve:D1.1', source: 'assessment', title: 'Does the firm have a written AI use policy?',
+  detail: 'Illustrative next step: Yes.', domain: 'governance', pointsGain: 1.75,
+  status: 'todo', assignee: null, dueDate: null, updatedAt: null,
+};
+const custom = {
+  key: 'c.3f1c2a9e-8b7d-4c6e-9a5f-0d1e2f3a4b5c', source: 'custom', title: 'Review vendor terms', detail: null, domain: null,
+  pointsGain: null, status: 'in_progress', assignee: { userId: 'u2', email: 'member@firm.com' }, dueDate: '2026-12-01',
+  updatedAt: '2026-11-05T10:00:00.000Z',
+};
+
+describe('the action plan', () => {
+  it('has three statuses', () => {
+    expect(ACTION_STATUSES).toEqual(['todo', 'in_progress', 'done']);
+  });
+
+  it('ActionItemView accepts an untouched action of the assessment and one the organization wrote', () => {
+    expect(ActionItemView.parse(fromAssessment)).toEqual(fromAssessment);
+    expect(ActionItemView.parse(custom)).toEqual(custom);
+    expect(ActionItemView.safeParse({ ...custom, detail: 'Ask for the data terms', domain: 'tools' }).success).toBe(true);
+  });
+
+  it('ActionItemView keeps the points and the domain to the actions of the assessment', () => {
+    expect(ActionItemView.safeParse({ ...custom, pointsGain: 2 }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...fromAssessment, pointsGain: null }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...fromAssessment, pointsGain: -1 }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...fromAssessment, domain: null }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...fromAssessment, detail: null }).success).toBe(false);
+  });
+
+  it('ActionItemView ties the key to its source', () => {
+    expect(ActionItemView.safeParse({ ...fromAssessment, source: 'custom', pointsGain: null }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...custom, source: 'assessment', domain: 'tools', detail: '', pointsGain: 1 }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...custom, source: 'imported' }).success).toBe(false);
+  });
+
+  it('ActionItemView only accepts well-formed keys', () => {
+    for (const key of ['a.sc_1.D1', 'a.sc_AbC123.improve:D1.1', 'a.sc_1.x.y.z']) {
+      expect(ActionItemView.safeParse({ ...fromAssessment, key }).success, key).toBe(true);
+    }
+    for (const key of ['a.sc_1.', 'a.sc_1', 'a.scan1.D1', 'a.sc_bad-id.D1', 'c.3f1c2a9e-8b7d-4c6e-9a5f-0d1e2f3a4b5c', 'improve:D1.1']) {
+      expect(ActionItemView.safeParse({ ...fromAssessment, key }).success, key).toBe(false);
+    }
+    for (const key of ['c.not-a-uuid', 'c.', 'c.3f1c2a9e8b7d4c6e9a5f0d1e2f3a4b5c', 'a.sc_1.D1']) {
+      expect(ActionItemView.safeParse({ ...custom, key }).success, key).toBe(false);
+    }
+  });
+
+  it('ActionItemView checks the tracking fields and is strict', () => {
+    expect(ActionItemView.safeParse({ ...custom, status: 'blocked' }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...custom, dueDate: '2026-12-01T00:00:00.000Z' }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...custom, updatedAt: 'today' }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...custom, assignee: { userId: 'u2' } }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...custom, assignee: { ...custom.assignee, role: 'member' } }).success).toBe(false);
+    expect(ActionItemView.safeParse({ ...custom, extra: 1 }).success).toBe(false);
+    const { updatedAt: _omitted, ...withoutUpdatedAt } = custom;
+    expect(ActionItemView.safeParse(withoutUpdatedAt).success).toBe(false);
+  });
+
+  const source = { scanId: 'sc_robust1', domain: 'robust.arca.example', claimedAt: '2026-11-05T09:00:00.000Z' };
+
+  it('ActionPlanResponse carries where the plan comes from and its actions, not the analysis', () => {
+    expect(ActionPlanResponse.parse({ source, items: [fromAssessment, custom] })).toEqual({ source, items: [fromAssessment, custom] });
+    expect(ActionPlanResponse.safeParse({ source, items: [] }).success).toBe(true);
+    expect(ActionPlanResponse.safeParse({ source, items: [], analysis: {} }).success).toBe(false);
+    expect(ActionPlanResponse.safeParse({ source: { ...source, decision: 'REFERRAL' }, items: [] }).success).toBe(false);
+    expect(ActionPlanResponse.safeParse({ source: { ...source, scanId: 'scan-1' }, items: [] }).success).toBe(false);
+  });
+
+  it('ActionPlanResponse without an assessment lists the organization\'s own actions only', () => {
+    expect(ActionPlanResponse.safeParse({ source: null, items: [custom] }).success).toBe(true);
+    expect(ActionPlanResponse.safeParse({ source: null, items: [fromAssessment] }).success).toBe(false);
+  });
+
+  it('ActionPlanResponse never lists an action of an older plan, nor one key twice', () => {
+    const older = { ...fromAssessment, key: 'a.sc_older.improve:D1.1' };
+    expect(ActionPlanResponse.safeParse({ source, items: [older] }).success).toBe(false);
+    // A scan id that only starts like the current one is another scan.
+    expect(ActionPlanResponse.safeParse({ source, items: [{ ...fromAssessment, key: 'a.sc_robust12.improve:D1.1' }] }).success).toBe(false);
+    expect(ActionPlanResponse.safeParse({ source, items: [fromAssessment, fromAssessment] }).success).toBe(false);
+    expect(ActionPlanResponse.safeParse({ source, items: [custom, { ...custom, title: 'Another' }] }).success).toBe(false);
+  });
+});
+
+const activityEvent = {
+  id: '6a1f0c1e-2b3c-4d5e-8f90-a1b2c3d4e5f6', at: '2026-11-05T10:00:00.000Z',
+  actor: { kind: 'member', email: 'admin@firm.com' }, action: 'member.role_changed', targetLabel: 'viewer@firm.com',
+  change: { from: 'viewer', to: 'member' },
+};
+
+describe('the activity of an organization', () => {
+  it('ActivityEventView accepts an event of a member, with or without an email', () => {
+    expect(ActivityEventView.parse(activityEvent)).toEqual(activityEvent);
+    expect(ActivityEventView.safeParse({ ...activityEvent, actor: { kind: 'member', email: null } }).success).toBe(true);
+  });
+
+  it('ActivityEventView never carries the email of ARCA staff or of the system', () => {
+    expect(ActivityEventView.safeParse({ ...activityEvent, actor: { kind: 'arca', email: null } }).success).toBe(true);
+    expect(ActivityEventView.safeParse({ ...activityEvent, actor: { kind: 'system', email: null } }).success).toBe(true);
+    expect(ActivityEventView.safeParse({ ...activityEvent, actor: { kind: 'arca', email: 'ops@arca.example' } }).success).toBe(false);
+    expect(ActivityEventView.safeParse({ ...activityEvent, actor: { kind: 'system', email: 'ops@arca.example' } }).success).toBe(false);
+    expect(ActivityEventView.safeParse({ ...activityEvent, actor: { kind: 'platform', email: null } }).success).toBe(false);
+    expect(ActivityEventView.safeParse({ ...activityEvent, actor: { kind: 'arca' } }).success).toBe(false);
+    expect(ActivityEventView.safeParse({ ...activityEvent, actor: { kind: 'member', email: 'a@b.co', userId: 'u1' } }).success).toBe(false);
+  });
+
+  it('ActivityEventView shows a translated target and an allowed change, never the raw data', () => {
+    expect(ActivityEventView.safeParse({ ...activityEvent, targetLabel: null, change: null }).success).toBe(true);
+    expect(ActivityEventView.safeParse({ ...activityEvent, action: 'action.updated', change: { from: null, to: '2026-12-01' } }).success)
+      .toBe(true);
+    expect(ActivityEventView.safeParse({ ...activityEvent, data: { from: 'viewer', to: 'member' } }).success).toBe(false);
+    expect(ActivityEventView.safeParse({ ...activityEvent, target: 'u1' }).success).toBe(false);
+    expect(ActivityEventView.safeParse({ ...activityEvent, change: { from: 'viewer', to: 'member', reason: 'x' } }).success).toBe(false);
+    expect(ActivityEventView.safeParse({ ...activityEvent, change: { from: 'viewer' } }).success).toBe(false);
+    expect(ActivityEventView.safeParse({ ...activityEvent, at: 'yesterday' }).success).toBe(false);
+    expect(ActivityEventView.safeParse({ ...activityEvent, action: '' }).success).toBe(false);
+  });
+
+  it('ActivityPage pages backwards by audit sequence', () => {
+    expect(ActivityPage.parse({ events: [activityEvent], nextBefore: 41 })).toEqual({ events: [activityEvent], nextBefore: 41 });
+    expect(ActivityPage.safeParse({ events: [], nextBefore: null }).success).toBe(true);
+    for (const nextBefore of [0, -1, 1.5, '41']) expect(ActivityPage.safeParse({ events: [], nextBefore }).success).toBe(false);
+    expect(ActivityPage.safeParse({ events: [] }).success).toBe(false);
+    expect(ActivityPage.safeParse({ events: [], nextBefore: null, total: 0 }).success).toBe(false);
+  });
+});
+
+describe('the platform admin views', () => {
+  const detail = {
+    id: 'org-1', name: 'Robust Law (demo)', domain: 'robust.arca.example', billingStatus: 'active', deleted: false,
+    createdAt: '2026-11-05T09:00:00.000Z', planCode: 'monthly', analysisCount: 1, pendingDeletion: null,
+    members: [{ email: 'owner@firm.com', role: 'owner', joinedAt: '2026-11-05T09:00:00.000Z' }],
+  };
+  const pending = {
+    id: 'd1', orgId: 'org-1', reason: 'Closing the firm', status: 'pending', requestedAt: '2026-11-05T11:00:00.000Z',
+    reviewedAt: null, reviewNote: null,
+  };
+
+  it('AdminOrgDetailView describes one organization and its members', () => {
+    expect(AdminOrgDetailView.parse(detail)).toEqual(detail);
+    const unpaid = { ...detail, domain: null, billingStatus: 'pending_payment', planCode: null, analysisCount: 0, pendingDeletion: pending };
+    expect(AdminOrgDetailView.parse(unpaid)).toEqual(unpaid);
+    expect(AdminOrgDetailView.safeParse({ ...detail, deleted: true }).success).toBe(true);
+  });
+
+  it('AdminOrgDetailView is strict, also for each member', () => {
+    expect(AdminOrgDetailView.safeParse({ ...detail, extra: 1 }).success).toBe(false);
+    expect(AdminOrgDetailView.safeParse({ ...detail, members: [{ ...detail.members[0], userId: 'u1' }] }).success).toBe(false);
+    expect(AdminOrgDetailView.safeParse({ ...detail, members: [{ ...detail.members[0], role: 'root' }] }).success).toBe(false);
+    expect(AdminOrgDetailView.safeParse({ ...detail, analysisCount: -1 }).success).toBe(false);
+    expect(AdminOrgDetailView.safeParse({ ...detail, billingStatus: 'trialing' }).success).toBe(false);
+    expect(AdminOrgDetailView.safeParse({ ...detail, pendingDeletion: { ...pending, extra: 1 } }).success).toBe(false);
+    const { createdAt: _omitted, ...withoutCreatedAt } = detail;
+    expect(AdminOrgDetailView.safeParse(withoutCreatedAt).success).toBe(false);
+  });
+
+  const auditEvent = {
+    id: 'e1', at: '2026-11-05T10:00:00.000Z', orgId: 'org-1', orgName: 'Robust Law (demo)', actorKind: 'platform',
+    actorEmail: 'ops@arca.example', action: 'org.deletion_approved', targetLabel: 'Robust Law (demo)',
+  };
+
+  it('AdminAuditEventView names the organization and the actor, ARCA staff included', () => {
+    expect(AUDIT_ACTOR_KINDS).toEqual(['member', 'platform', 'system']);
+    expect(AdminAuditEventView.parse(auditEvent)).toEqual(auditEvent);
+    const planChange = { ...auditEvent, orgId: null, orgName: null, action: 'plan.updated', targetLabel: 'monthly' };
+    expect(AdminAuditEventView.parse(planChange)).toEqual(planChange);
+    const billing = { ...auditEvent, actorKind: 'system', actorEmail: null, action: 'billing.event_applied', targetLabel: null };
+    expect(AdminAuditEventView.parse(billing)).toEqual(billing);
+    expect(AdminAuditEventView.safeParse({ ...auditEvent, actorKind: 'arca' }).success).toBe(false);
+    expect(AdminAuditEventView.safeParse({ ...auditEvent, actorEmail: 'not-an-email' }).success).toBe(false);
+    expect(AdminAuditEventView.safeParse({ ...auditEvent, data: {} }).success).toBe(false);
+  });
+
+  it('AdminAuditPage pages backwards like the activity', () => {
+    expect(AdminAuditPage.safeParse({ events: [auditEvent], nextBefore: 7 }).success).toBe(true);
+    expect(AdminAuditPage.safeParse({ events: [], nextBefore: null }).success).toBe(true);
+    expect(AdminAuditPage.safeParse({ events: [], nextBefore: 0 }).success).toBe(false);
+    expect(AdminAuditPage.safeParse({ events: [activityEvent], nextBefore: null }).success).toBe(false);
+  });
+
+  const metrics = {
+    organizations: { pending_payment: 1, active: 2, past_due: 0, canceled: 0, deleted: 1 },
+    members: 7, analyses: 3, pendingDeletionRequests: 1, actions: { todo: 4, in_progress: 1, done: 2 },
+  };
+
+  it('AdminMetricsView holds counts only', () => {
+    expect(AdminMetricsView.parse(metrics)).toEqual(metrics);
+    expect(AdminMetricsView.safeParse({ ...metrics, members: -1 }).success).toBe(false);
+    expect(AdminMetricsView.safeParse({ ...metrics, analyses: 1.5 }).success).toBe(false);
+    expect(AdminMetricsView.safeParse({ ...metrics, revenueCents: 0 }).success).toBe(false);
+    expect(AdminMetricsView.safeParse({ ...metrics, actions: { ...metrics.actions, blocked: 0 } }).success).toBe(false);
+    const { canceled: _omitted, ...withoutCanceled } = metrics.organizations;
+    expect(AdminMetricsView.safeParse({ ...metrics, organizations: withoutCanceled }).success).toBe(false);
+  });
+
+  it('AdminMetricsView counts every billing status, with the deleted organizations apart', () => {
+    expect(Object.keys(AdminMetricsView.shape.organizations.shape)).toEqual([...BILLING_STATUSES, 'deleted']);
+    expect(AdminMetricsView.safeParse({ ...metrics, organizations: { ...metrics.organizations, trialing: 0 } }).success).toBe(false);
   });
 });
