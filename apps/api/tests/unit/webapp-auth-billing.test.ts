@@ -1,6 +1,7 @@
 import { createHmac } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { SignJWT, UnsecuredJWT, decodeJwt, decodeProtectedHeader } from 'jose';
+import { UpdateActionRequest } from '@arca/contracts';
 import { issueSessionToken, verifySessionToken } from '../../src/auth/session-token.js';
 import { MockAppAuth } from '../../src/webapp/auth.js';
 import { MockBillingProvider } from '../../src/webapp/billing.js';
@@ -44,6 +45,17 @@ describe('mock app auth', () => {
 
     // A fresh verifier with the same secret accepts it: nothing lives in the issuing object.
     expect(await new MockAppAuth(secret, () => T0).verify(upper.token)).toEqual(upper.user);
+  });
+
+  it('a mock user id is a UUID the contracts take as an assignee, as they take a Supabase one', async () => {
+    const auth = new MockAppAuth(secret, () => T0);
+    const { userId } = (await auth.issue('member@firm.com')).user;
+    // The contracts test pins this same id, so the two cannot drift apart unnoticed.
+    expect(userId).toBe('2c294f0a-7fef-8432-994d-eb217db83c68');
+    for (const email of ['member@firm.com', 'a@x.co', 'owner@robust.arca.example', 'viewer+demo@robust.arca.example']) {
+      const assigneeUserId = (await auth.issue(email)).user.userId;
+      expect(UpdateActionRequest.parse({ assigneeUserId }), email).toEqual({ assigneeUserId });
+    }
   });
 
   it('a token with another issuer, audience or algorithm is rejected', async () => {

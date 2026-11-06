@@ -515,6 +515,7 @@ describe('the webapp API in mock', () => {
     const s = await mockApp();
     const { owner, org } = await s.ownedOrg();
     const ops = await s.login('ops@arca.example', true);
+    const stranger = await s.login('stranger@robust.arca.example');
     const invalid: Array<[method: string, path: string, body: unknown, token: string]> = [
       ['POST', '/orgs', { name: '   ', claimId: 'x' }, owner.token],
       ['POST', `/orgs/${org.id}/analyses`, {}, owner.token],
@@ -540,6 +541,9 @@ describe('the webapp API in mock', () => {
       ['PATCH', actionPath(org.id, 'c.whatever'), { dueDate: '2026-13-01' }, owner.token],
       ['PATCH', actionPath(org.id, 'c.whatever'), { dueDate: '01/12/2026' }, owner.token],
       ['PATCH', actionPath(org.id, 'c.whatever'), { assigneeUserId: '' }, owner.token],
+      // A user id is a UUID; anything else is refused with the body, before who asks or which key is looked at.
+      ['PATCH', actionPath(org.id, 'c.whatever'), { assigneeUserId: 'user_missing' }, owner.token],
+      ['PATCH', actionPath(org.id, 'c.whatever'), { assigneeUserId: 'user_missing' }, stranger.token],
       ['PATCH', actionPath(org.id, 'c.whatever'), { status: 'done', title: 'Renamed' }, owner.token],
     ];
     for (const [method, path, body, token] of invalid) {
@@ -592,6 +596,19 @@ describe('the webapp API in mock', () => {
     expect(activity.events.filter(event => event.action.startsWith('action.')).map(event => [event.action, event.actor.email, event.change]))
       .toEqual([['action.deleted', OWNER, null], ['action.created', OWNER, null], ['action.updated', OWNER, { from: null, to: '2026-12-01' }],
         ['action.updated', 'member@robust.arca.example', { from: 'todo', to: 'done' }]]);
+  });
+
+  it('an action of the organization\'s own sent with a blank or null detail is stored with none', async () => {
+    const s = await mockApp();
+    const { owner, org } = await s.ownedOrg();
+    const created: ActionItemView[] = [];
+    for (const detail of [undefined, null, '', '   ', ' Ask the vendor ']) {
+      const reply = await s.call('POST', `/orgs/${org.id}/actions`, { token: owner.token, body: { title: 'Review vendor terms', detail } });
+      expect(reply.status, JSON.stringify(detail)).toBe(201);
+      created.push(ActionItemView.parse(reply.body));
+    }
+    expect(created.map(item => item.detail)).toEqual([null, null, null, null, 'Ask the vendor']);
+    expect((await s.actionPlan(owner.token, org.id)).items.map(item => item.detail)).toEqual([null, null, null, null, 'Ask the vendor']);
   });
 
   it('a key of another organization or of an older plan is not found', async () => {

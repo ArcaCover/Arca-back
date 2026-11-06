@@ -765,7 +765,7 @@ describe('the action plan', () => {
     const outsider = await s.user('outsider@other.com');
     await s.service.me(outsider);
     const messages = new Set<string>();
-    for (const userId of [viewer.userId, outsider.userId, 'user_missing']) {
+    for (const userId of [viewer.userId, outsider.userId, randomUUID()]) {
       const error = await s.service.updateAction(owner, org.id, A1, { assigneeUserId: userId }).then(() => null, (caught: unknown) => caught);
       expect(error).toMatchObject({ code: 'invalid_request', status: 400 });
       messages.add((error as Error).message);
@@ -1093,6 +1093,16 @@ describe('the platform admin panel', () => {
     const first = await s.service.adminAudit({ limit: 2 });
     expect(first.events).toEqual(all.events.slice(0, 2));
     expect(await s.service.adminAudit({ limit: 2, before: first.nextBefore! })).toEqual({ events: all.events.slice(2), nextBefore: null });
+  });
+
+  it('never gives a system row an email in ARCA\'s audit, even one that names a user', async () => {
+    const s = await scene();
+    const { owner, org } = await s.ownedOrg();
+    await s.repository.appendAudit({ id: randomUUID(), actor_kind: 'system', actor_user_id: owner.userId, org_id: org.id,
+      action: 'billing.event_applied', target: null, data: {}, created_at: iso(T0) });
+    const page = AdminAuditPage.parse(await s.service.adminAudit({ orgId: org.id, limit: 100 }));
+    expect(page.events.map(event => [event.action, event.actorKind, event.actorEmail])).toEqual([
+      ['billing.event_applied', 'system', null], ['org.created', 'member', OWNER]]);
   });
 
   it('counts, never money, over the organizations that are not deleted and each one\'s current plan', async () => {

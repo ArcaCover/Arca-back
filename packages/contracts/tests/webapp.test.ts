@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  ACTION_STATUSES, AUDIT_ACTOR_KINDS, ActionItemView, ActionPlanResponse, ActivityEventView, ActivityPage, AdminAuditEventView,
-  AdminAuditPage, AdminMetricsView, AdminOrgDetailView, AdminOrgView, AnalysisView, AttachAnalysisRequest, BILLING_STATUSES,
+  ACTION_STATUSES, AUDIT_ACTOR_KINDS, ActionItemView, ActionPlanResponse, ActivityActor, ActivityEventView, ActivityPage,
+  AdminAuditEventView, AdminAuditPage, AdminMetricsView, AdminOrgDetailView, AdminOrgView, AnalysisView, AttachAnalysisRequest, BILLING_STATUSES,
   CheckoutRequest, ClaimResponse, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, DeletionRequestView,
   InvitationView, InviteRequest, MeResponse, MemberView, OrgView, PERMISSIONS, PlanView, ROLES, ROLE_PERMISSIONS, ReviewRequest,
   SetRoleRequest, UpdateActionRequest, UpdateOrgRequest, UpdatePlanRequest, UrlResponse,
@@ -181,6 +181,10 @@ describe('schemas', () => {
   });
 });
 
+// What the mock login issues for member@firm.com (RFC 9562 version 8), and a version 4 id like the ones Supabase Auth issues.
+const MOCK_USER_ID = '2c294f0a-7fef-8432-994d-eb217db83c68';
+const SUPABASE_USER_ID = '7d3f5b9e-1c2a-4e8f-9b6d-0a1b2c3d4e5f';
+
 describe('request bodies', () => {
   it('invitations cannot grant ownership', () => {
     expect(InviteRequest.safeParse({ email: 'a@b.co', role: 'owner' }).success).toBe(false);
@@ -260,8 +264,20 @@ describe('request bodies', () => {
     expect(UpdateActionRequest.safeParse({}).success).toBe(false);
     expect(UpdateActionRequest.safeParse({ status: undefined, dueDate: undefined }).success).toBe(false);
     for (const status of ACTION_STATUSES) expect(UpdateActionRequest.safeParse({ status }).success).toBe(true);
-    expect(UpdateActionRequest.safeParse({ assigneeUserId: 'u1' }).success).toBe(true);
-    expect(UpdateActionRequest.safeParse({ status: 'done', assigneeUserId: 'u1', dueDate: '2026-12-01' }).success).toBe(true);
+    expect(UpdateActionRequest.safeParse({ assigneeUserId: MOCK_USER_ID }).success).toBe(true);
+    expect(UpdateActionRequest.safeParse({ status: 'done', assigneeUserId: MOCK_USER_ID, dueDate: '2026-12-01' }).success).toBe(true);
+  });
+
+  it('UpdateActionRequest takes an assignee by UUID: version 4 from Supabase, version 8 from the mock login', () => {
+    for (const assigneeUserId of [MOCK_USER_ID, SUPABASE_USER_ID]) {
+      expect(UpdateActionRequest.parse({ assigneeUserId }), assigneeUserId).toEqual({ assigneeUserId });
+    }
+    // Written the way Postgres prints a uuid, so the same user always compares equal.
+    expect(UpdateActionRequest.parse({ assigneeUserId: SUPABASE_USER_ID.toUpperCase() })).toEqual({ assigneeUserId: SUPABASE_USER_ID });
+    for (const assigneeUserId of ['u1', 'user_missing', 'member@firm.com', `c.${SUPABASE_USER_ID}`, `{${SUPABASE_USER_ID}}`,
+      ` ${SUPABASE_USER_ID}`, SUPABASE_USER_ID.slice(0, -1), SUPABASE_USER_ID.replaceAll('-', '')]) {
+      expect(UpdateActionRequest.safeParse({ assigneeUserId }).success, assigneeUserId).toBe(false);
+    }
   });
 
   it('UpdateActionRequest takes null as "clear" for the assignee and the due date, and keeps it apart from a missing field', () => {
@@ -303,11 +319,21 @@ describe('request bodies', () => {
     expect(CreateActionRequest.safeParse({ title, detail: 'x'.repeat(2000) }).success).toBe(true);
     expect(CreateActionRequest.safeParse({ title, detail: 'x'.repeat(2001) }).success).toBe(false);
     expect(CreateActionRequest.parse({ title, detail: ' Ask the vendor ' }).detail).toBe('Ask the vendor');
+    expect(CreateActionRequest.safeParse({ title, detail: 7 }).success).toBe(false);
     expect(CreateActionRequest.safeParse({ title, domain: 'tools' }).success).toBe(true);
     expect(CreateActionRequest.safeParse({ title, domain: null }).success).toBe(true);
     expect(CreateActionRequest.safeParse({ title, domain: 'marketing' }).success).toBe(false);
     expect(CreateActionRequest.safeParse({ title, status: 'done' }).success).toBe(false);
     expect(CreateActionRequest.safeParse({ title, pointsGain: 2 }).success).toBe(false);
+  });
+
+  it('CreateActionRequest reads a null or blank detail as no detail, so the plan never shows an empty one', () => {
+    const title = 'Review vendor terms';
+    for (const detail of [null, '', '   ', ' \t\n ']) {
+      expect(CreateActionRequest.parse({ title, detail }), JSON.stringify(detail)).toEqual({ title, detail: null });
+    }
+    // Left out, it stays out.
+    expect(Object.keys(CreateActionRequest.parse({ title }))).toEqual(['title']);
   });
 });
 
@@ -417,6 +443,14 @@ describe('the activity of an organization', () => {
     expect(ActivityEventView.safeParse({ ...activityEvent, actor: { kind: 'member', email: 'a@b.co', userId: 'u1' } }).success).toBe(false);
   });
 
+  it('ActivityActor is exported for the front, schema and type', () => {
+    const actors: ActivityActor[] = [{ kind: 'member', email: 'admin@firm.com' }, { kind: 'member', email: null },
+      { kind: 'arca', email: null }, { kind: 'system', email: null }];
+    for (const actor of actors) expect(ActivityActor.parse(actor)).toEqual(actor);
+    expect(ActivityActor.safeParse({ kind: 'system', email: 'ops@arca.example' }).success).toBe(false);
+    expect(ActivityActor.safeParse({ kind: 'platform', email: null }).success).toBe(false);
+  });
+
   it('ActivityEventView shows a translated target and an allowed change, never the raw data', () => {
     expect(ActivityEventView.safeParse({ ...activityEvent, targetLabel: null, change: null }).success).toBe(true);
     expect(ActivityEventView.safeParse({ ...activityEvent, action: 'action.updated', change: { from: null, to: '2026-12-01' } }).success)
@@ -482,6 +516,17 @@ describe('the platform admin views', () => {
     expect(AdminAuditEventView.safeParse({ ...auditEvent, actorKind: 'arca' }).success).toBe(false);
     expect(AdminAuditEventView.safeParse({ ...auditEvent, actorEmail: 'not-an-email' }).success).toBe(false);
     expect(AdminAuditEventView.safeParse({ ...auditEvent, data: {} }).success).toBe(false);
+  });
+
+  it('AdminAuditEventView gives an email to ARCA staff and members only, never to the system', () => {
+    for (const actorKind of ['member', 'platform']) {
+      for (const actorEmail of ['someone@firm.com', null]) {
+        expect(AdminAuditEventView.safeParse({ ...auditEvent, actorKind, actorEmail }).success, `${actorKind} ${actorEmail}`).toBe(true);
+      }
+    }
+    expect(AdminAuditEventView.safeParse({ ...auditEvent, actorKind: 'system', actorEmail: null }).success).toBe(true);
+    expect(AdminAuditEventView.safeParse({ ...auditEvent, actorKind: 'system', actorEmail: 'ops@arca.example' }).success).toBe(false);
+    expect(AdminAuditPage.safeParse({ events: [{ ...auditEvent, actorKind: 'system' }], nextBefore: null }).success).toBe(false);
   });
 
   it('AdminAuditPage pages backwards like the activity', () => {

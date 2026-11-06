@@ -143,7 +143,7 @@ export const ActionPlanResponse = z.object({
  * Who acted, as the organization sees it (DN-11 §4.3). Only a member carries an email, even after leaving; ARCA staff and
  * the system never do. A member whose profile is gone has none either.
  */
-const ActivityActor = z.discriminatedUnion('kind', [
+export const ActivityActor = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('member'), email: z.string().email().nullable() }).strict(),
   z.object({ kind: z.literal('arca'), email: z.null() }).strict(),
   z.object({ kind: z.literal('system'), email: z.null() }).strict(),
@@ -171,12 +171,17 @@ export const AdminOrgDetailView = z.object({
 // audit_log.actor_kind: `platform` is ARCA staff acting from /admin/*, `system` a billing event or the seed.
 export const AUDIT_ACTOR_KINDS = ['member', 'platform', 'system'] as const;
 export type AuditActorKind = (typeof AUDIT_ACTOR_KINDS)[number];
-/** ARCA's own audit, across organizations. Unlike an organization's activity, it shows the email of ARCA staff too. */
+/**
+ * ARCA's own audit, across organizations. Unlike an organization's activity, it shows the email of ARCA staff too (DN-11
+ * §4.5). The system never has one, as in the activity; a member or staff whose profile is gone has none either. That rule is
+ * a refinement rather than a union of two shapes, so the type stays one object that a consumer can build field by field.
+ */
 export const AdminAuditEventView = z.object({
   id: z.string().min(1), at: timestamp, orgId: z.string().min(1).nullable(), orgName: z.string().nullable(),
   actorKind: z.enum(AUDIT_ACTOR_KINDS), actorEmail: z.string().email().nullable(), action: z.string().min(1),
   targetLabel: z.string().nullable(),
-}).strict();
+}).strict().refine(event => event.actorKind !== 'system' || event.actorEmail === null,
+  { message: 'The system has no email', path: ['actorEmail'] });
 export const AdminAuditPage = z.object({ events: z.array(AdminAuditEventView), nextBefore: auditSeq.nullable() }).strict();
 /** Counts only, never a figure about money (DN-11 §4.5). */
 export const AdminMetricsView = z.object({
@@ -206,11 +211,18 @@ export const UpdatePlanRequest = z.object({
   currency: currency.optional(), interval: interval.optional(), active: z.boolean().optional(),
 }).strict().refine(change => Object.values(change).some(value => value !== undefined), { message: 'Nothing to update' });
 // Null clears the assignee or the due date. Sending either of them, even as null, takes actions.assign (DN-11 §4.2).
+// The assignee is a user id: a UUID of any version (Supabase issues version 4, the mock login version 8), lowercased the way
+// Postgres prints it. Anything else fails with the body, before the permission, and never reaches a uuid column.
 export const UpdateActionRequest = z.object({
-  status: actionStatus.optional(), assigneeUserId: z.string().min(1).nullable().optional(), dueDate: isoDate.nullable().optional(),
+  status: actionStatus.optional(), assigneeUserId: z.string().uuid().toLowerCase().nullable().optional(),
+  dueDate: isoDate.nullable().optional(),
 }).strict().refine(change => Object.values(change).some(value => value !== undefined), { message: 'Nothing to update' });
+// A detail that is null, or blank once trimmed, parses as null: "no detail" has one value, which the service stores, so the
+// plan never shows an empty detail. A detail left out stays out.
 export const CreateActionRequest = z.object({
-  title: z.string().trim().min(1).max(200), detail: z.string().trim().max(2000).optional(), domain: DomainKey.nullable().optional(),
+  title: z.string().trim().min(1).max(200),
+  detail: z.string().trim().max(2000).transform(detail => detail === '' ? null : detail).nullable().optional(),
+  domain: DomainKey.nullable().optional(),
 }).strict();
 
 export type PlanView = z.infer<typeof PlanView>;
@@ -225,6 +237,7 @@ export type DeletionRequestView = z.infer<typeof DeletionRequestView>;
 export type AdminOrgView = z.infer<typeof AdminOrgView>;
 export type ActionItemView = z.infer<typeof ActionItemView>;
 export type ActionPlanResponse = z.infer<typeof ActionPlanResponse>;
+export type ActivityActor = z.infer<typeof ActivityActor>;
 export type ActivityEventView = z.infer<typeof ActivityEventView>;
 export type ActivityPage = z.infer<typeof ActivityPage>;
 export type AdminOrgDetailView = z.infer<typeof AdminOrgDetailView>;
