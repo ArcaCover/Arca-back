@@ -4,6 +4,10 @@
 **Alcance:** Arca-back (todo el peso) y Arca-front (esqueleto mock). Ramas locales `feat/webapp-orgs`, creadas desde `feat/arca-modes`, porque se apoya en los modos de DN-09.
 **Decisiones:** de Jesús, marcadas **[Jesús]**; del asistente, marcadas **[mía]** (revisables).
 
+> **Cambiada por DN-11** (`DN-11-vistas-por-rol.md`, vistas por rol, 2026-11-05). DN-11 cambia la tabla de permisos (§4.3),
+> suma dos rutas exentas de pago (§4.5), reemplaza la regla de los botones activos en los modos de debug (§5 y §9, punto 16) y
+> el punto 3 de la demo (§11). Las rutas nuevas (plan de acción, actividad, renombrar y panel de ARCA) están en DN-11 §4.9.
+
 ---
 
 ## 1. Por qué
@@ -112,10 +116,17 @@ El reclamo va en dos pasos (§4.7). El token del scan viaja en el cuerpo de `POS
 
 Hay una sola tabla de permisos en código, en `@arca/contracts` (`packages/contracts/src/webapp.ts`): `can(role, permission)` y `canManageMember(actor, target, nextRole?)`, compartidas con el front. En el back, `WebappService.authorize(user, orgId, permission, { payment })` las aplica en cada ruta, en este orden: quien no es miembro recibe 404, la organización borrada 410, el rol sin permiso 403 y la falta de pago 402. **[Jesús + mía]**
 
+La tabla quedó así con DN-11 §4.1: el `member` perdió `analysis.create` y hay cuatro permisos nuevos (`org.update`,
+`actions.update`, `actions.assign` y `activity.read`).
+
 | Permiso | owner | admin | member | viewer |
 |---|---|---|---|---|
-| `org.read`: panel, análisis, resultados | ✓ | ✓ | ✓ | ✓ |
-| `analysis.create`: lanzar un nuevo scan o assessment para la organización | ✓ | ✓ | ✓ | — |
+| `org.read`: panel, análisis, resultados, plan de acción, miembros | ✓ | ✓ | ✓ | ✓ |
+| `org.update` (DN-11): renombrar la organización | ✓ | ✓ | — | — |
+| `analysis.create`: lanzar un nuevo scan o assessment para la organización | ✓ | ✓ | — (DN-11 D2) | — |
+| `actions.update` (DN-11): cambiar el estado de una acción del plan | ✓ | ✓ | ✓ | — |
+| `actions.assign` (DN-11): responsable, fecha, crear y borrar acciones propias | ✓ | ✓ | — | — |
+| `activity.read` (DN-11): actividad de la organización | ✓ | ✓ | — | — |
 | `members.invite` / `members.remove` / `members.set_role` | ✓ | ✓ (no puede tocar owners ni dar `owner`) | — | — |
 | `billing.manage`: checkout, portal de Stripe | ✓ | — | — | — |
 | `org.transfer_ownership` | ✓ | — | — | — |
@@ -140,7 +151,7 @@ Hay una sola tabla de permisos en código, en `@arca/contracts` (`packages/contr
 
 ### 4.5 Bloqueo hasta pagar
 
-- **Rutas protegidas.** Todas las rutas de datos de la webapp (`/orgs/:id/...`, salvo `billing/*`, `deletion-request` y la lectura mínima de la organización) exigen `billing_status` en (`active`, `past_due`). Si no, **402** `payment_required`.
+- **Rutas protegidas.** Todas las rutas de datos de la webapp (`/orgs/:id/...`, salvo `billing/*`, `deletion-request`, la lectura mínima de la organización, renombrarla con `PATCH /orgs/:id` y su actividad, `GET /orgs/:id/activity`) exigen `billing_status` en (`active`, `past_due`). Si no, **402** `payment_required`. Renombrar y la actividad se sumaron a las exentas con DN-11 (D5 y D6): el owner conserva su rastro aunque no pague.
 - **Solicitud de borrado pendiente:** el acceso sigue igual, con un aviso. **Organización borrada** (`deleted_at`): **410** en todo. [mía]
 - **`past_due`** sigue entrando, con un aviso; no se bloquea a un cliente por un pago fallido puntual. **[mía]**
 - **En el front**, `/app` redirige a `/app/billing` ante un 402. El bloqueo real es el del back.
@@ -223,7 +234,7 @@ En `mock` no hace falta ninguna de las claves. Todas siguen las reglas de DN-09:
   - `/app/billing/mock-checkout`: la página que hace de Stripe en `mock`, con el botón del pago simulado. Fuera de `mock` responde **404** (componente de servidor con `notFound()`) y **no está en el bundle de producción**: el componente del pago se carga con `next/dynamic` dentro de la guarda literal, así que el build de producción no emite su chunk.
   - `/app/admin`: prueba de concepto del panel de ARCA, solo para admins de plataforma: precios de los planes y cola de solicitudes de borrado.
 - **En `/assessment/results`:** un CTA "Save your results and activate your account". **Solo existe en `mock`** (guarda literal `process.env.NEXT_PUBLIC_ARCA_MODE === "mock"`, DN-09) hasta que lleguen los adaptadores reales de Auth y Stripe; fuera de `mock` no se pinta. Al pulsarlo cambia el token del scan por un reclamo (`POST /claims`, con el token en el cuerpo) y aplica las reglas de §4.7: el análisis se añade a la organización activa solo si el email de la sesión coincide con el del reclamo (sin distinguir mayúsculas), el rol tiene `analysis.create` y la organización tiene acceso pagado; si no, va a `/app/signup` con el reclamo, y un **402** lleva a `/app/billing`.
-- **Sin diseño:** componentes simples con los tokens de la marca. Los botones que el rol no permite se ocultan o se deshabilitan en producción, pero **el back es el que niega**. En los modos de debug (guarda literal de DN-09) se muestran activos, para que la demo enseñe el 403 del back. [mía]
+- **Sin diseño:** componentes simples con los tokens de la marca. Lo que un rol no puede hacer se oculta, en todos los modos, y **el back es el que niega** (DN-11 D3). En mock, el interruptor "Show forbidden actions" del panel de debug lo vuelve a mostrar (controles, ítems de la barra y pantallas), para que la demo enseñe el 403 del back. Esto reemplaza la regla anterior, que dejaba los botones activos en los modos de debug. **[Jesús]**
 - **El código de la app** vive en carpetas propias: `app/app/...`, `components/app/...` y `lib/app/...`.
 
 ## 6. Seguridad
@@ -280,7 +291,7 @@ Se recomienda cuando la app tenga usuarios reales. Separa riesgos, aísla las co
 13. Un cliente con organización que repite el embudo añade el análisis a su organización (`analysis.create`), no crea otra.
 14. Admin de plataforma por script (`admin:grant`) o, en mock, desde el login simulado.
 15. El login simulado existe solo en `mock`; en `live-debug` el login es el real.
-16. En los modos de debug los botones sin permiso se ven activos para mostrar el 403 del back.
+16. ~~En los modos de debug los botones sin permiso se ven activos para mostrar el 403 del back.~~ Reemplazada por DN-11 D3: se ocultan en todos los modos, y en mock el interruptor "Show forbidden actions" los vuelve a mostrar (§5).
 
 ## 10. Alcance de la demo de mañana y lo que viene después
 
@@ -354,10 +365,11 @@ Está listo cuando salen `[back] [api] MODE=mock sources=mock storage=memory (de
 1. En "Members", escribe un email (por ejemplo, `member@arca.example`), deja el rol `member` y pulsa "Send invitation".
 2. Pulsa "Copy invite link". La página solo enseña el principio del enlace, nunca el token entero.
 3. En la ventana de incógnito, pega el enlace, escribe ese mismo email y pulsa "Sign in and accept". Entra directo a `/app` y ve el análisis: no pasa por el embudo ni paga.
-4. En "Billing", pulsa "Pay". Sale "Your role does not allow this": es el 403 del back.
-5. En "Members", cambia el rol del owner. Sale el mismo aviso y el rol no cambia.
+4. Abre el panel de debug y enciende "Show forbidden actions". Sin el interruptor, el member no ve los controles que su rol no permite (DN-11 D3).
+5. En "Billing", pulsa "Pay". Sale "Your role does not allow this": es el 403 del back.
+6. En "Members", cambia el rol del owner. Sale el mismo aviso y el rol no cambia.
 
-En mock los botones salen activos a propósito, para que se vea que quien niega es el back (§5).
+El interruptor solo existe en mock y solo vuelve a mostrar lo oculto: quien niega es el back (§5).
 
 **Punto 4. Cambiar un precio como admin de ARCA.**
 1. En la ventana del admin, abre `http://localhost:3000/app/login`.
@@ -386,6 +398,7 @@ npm run test:browser:webapp
 ```
 
 - Recorre los cinco puntos de §10 con el guion de §11.1, en un solo navegador y con un contexto para el owner, otro para el invitado y otro para el admin. Cada punto parte del anterior: si uno falla, el smoke se para ahí.
+- En el punto 3, el contexto del invitado enciende "Show forbidden actions" antes de ir a Billing y Members (DN-11 §7).
 - Al final del punto 5, el admin rechaza la solicitud, para comprobar que el panel actúa y que el acceso sigue. Nunca la aprueba.
 - Bloquea cualquier host que no sea `localhost`, `127.0.0.1` o `[::1]`, y falla si se pide alguno.
 - Deja las capturas en `Arca-front\artifacts\webapp\`.
