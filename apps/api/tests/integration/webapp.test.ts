@@ -296,6 +296,36 @@ describe('the webapp API in mock', () => {
     expect(MeResponse.parse((await s.call('GET', '/me', { token: a.owner.token })).body).organizations.map(org => org.id)).toEqual([a.org.id]);
   });
 
+  it('an id that is not a UUID answers 404, as an unknown one does, and a UUID is read in any case', async () => {
+    const s = await mockApp();
+    const { owner, org } = await s.ownedOrg(OWNER, { assessed: true });
+    const ops = await s.login('ops@arca.example', true);
+    // Every route under /orgs/:id, with an organization id a uuid column would refuse.
+    for (const [method, path, body] of orgRoutes({ orgId: 'org_missing', memberId: 'user_missing', invitationId: 'inv_missing',
+      actionKey: 'c.missing' })) {
+      expect(await s.call(method, path, { token: owner.token, body }), `${method} ${path}`).toEqual(failure(404, 'not_found'));
+    }
+    // A member or an invitation id of a real organization.
+    expect(await s.call('PATCH', `/orgs/${org.id}/members/user_missing`, { token: owner.token, body: { role: 'viewer' } }))
+      .toEqual(failure(404, 'not_found'));
+    expect(await s.call('DELETE', `/orgs/${org.id}/members/user_missing`, { token: owner.token })).toEqual(failure(404, 'not_found'));
+    expect(await s.call('DELETE', `/orgs/${org.id}/invitations/inv_missing`, { token: owner.token })).toEqual(failure(404, 'not_found'));
+    // A deletion request: 404 for ARCA, and the same 403 as ever for anyone else.
+    for (const decision of ['approve', 'reject']) {
+      expect(await s.call('POST', `/admin/deletion-requests/x/${decision}`, { token: ops.token, body: {} })).toEqual(failure(404, 'not_found'));
+      expect(await s.call('POST', `/admin/deletion-requests/x/${decision}`, { token: owner.token, body: {} })).toEqual(failure(403, 'forbidden'));
+    }
+
+    const ORG = org.id.toUpperCase();
+    for (const path of ['', '/analyses', '/members', '/actions', '/activity']) {
+      const reply = await s.call('GET', `/orgs/${ORG}${path}`, { token: owner.token });
+      expect(reply.status, path).toBe(200);
+      expect(reply, path).toEqual(await s.call('GET', `/orgs/${org.id}${path}`, { token: owner.token }));
+    }
+    const own = await s.createAction(owner.token, ORG);
+    expect((await s.actionPlan(owner.token, org.id)).items).toContainEqual(own);
+  });
+
   it('a deleted organization answers 410 everywhere', async () => {
     const s = await mockApp();
     const { owner, org } = await s.ownedOrg();

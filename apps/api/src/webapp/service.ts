@@ -9,9 +9,9 @@ import { verifySessionToken } from '../auth/session-token.js';
 import type { ScanRecord, ScanRepository } from '../repositories/types.js';
 import type { AppUser } from './auth.js';
 import type { BillingEvent, BillingProvider } from './billing.js';
-import { MAX_CUSTOM_ACTIONS, WebappConflict, type ActionPatch, type AuditRecord, type CustomActionRecord, type DeletionRequestRecord,
-  type InvitationRecord, type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord, type PlanRecord,
-  type WebappConflictReason, type WebappRepository } from './types.js';
+import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, WebappConflict, type ActionPatch, type AuditRecord, type CustomActionRecord,
+  type DeletionRequestRecord, type InvitationRecord, type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord,
+  type PlanRecord, type WebappConflictReason, type WebappRepository } from './types.js';
 
 const STATUS = { invalid_request: 400, unauthorized: 401, payment_required: 402, forbidden: 403, not_found: 404, conflict: 409, gone: 410,
   rate_limited: 429 } as const;
@@ -37,6 +37,15 @@ const CONFLICTS: Record<WebappConflictReason, string> = {
 async function orConflict<T>(write: Promise<T>): Promise<T> {
   try { return await write; } catch (error) {
     if (error instanceof WebappConflict) throw fail('conflict', CONFLICTS[error.reason]);
+    throw error;
+  }
+}
+// One answer whether the user exists or not, from the service's early check and from the write's own (DN-11 D11).
+const ASSIGNEE_REFUSED = 'The assignee must be a member of the organization who can update actions';
+/** The write checks the assignee again, against their role at that moment: a race the early check lost is the same 400. */
+async function orIneligible<T>(write: Promise<T>): Promise<T> {
+  try { return await write; } catch (error) {
+    if (error instanceof IneligibleAssignee) throw fail('invalid_request', ASSIGNEE_REFUSED);
     throw error;
   }
 }
@@ -82,10 +91,11 @@ function parseActionKey(key: string): ParsedKey | null {
   return null;
 }
 /**
- * An organization id from ARCA's panel, read the way Postgres reads a uuid (any case), or null when it is not one. The store is never
- * asked about anything else: its uuid column would refuse the value with an error instead of finding nothing.
+ * An id the store keeps in a uuid column (an organization, a user, an invitation, a deletion request), read the way Postgres reads
+ * a uuid (any case), or null when it is not one. The store is never asked about anything else: its column would refuse the value
+ * with an error instead of finding nothing. What follows a lookup uses the id the store returned.
  */
-const organizationId = (id: string) => UUID.test(id) ? id.toLowerCase() : null;
+const asUuid = (id: string) => UUID.test(id) ? id.toLowerCase() : null;
 const assessmentKey = (scanId: string, actionKey: string) => `a.${scanId}.${actionKey}`;
 const customKey = (id: string) => `c.${id}`;
 
@@ -109,10 +119,14 @@ export const ACTOR_KIND_OF_ACTION: Readonly<Record<string, Exclude<AuditActorKin
   'org.deletion_approved': 'platform', 'org.deletion_rejected': 'platform', 'plan.updated': 'platform',
   'billing.event_applied': 'system',
 });
-const actorKindOf = (row: AuditRecord): AuditActorKind => ACTOR_KIND_OF_ACTION[row.action] ?? row.actor_kind;
+// An action is a string from a row, so the tables below are read by own key only: one named like a property every object has
+// ('constructor', '__proto__') names no entry.
+const entryOf = <T>(table: Readonly<Record<string, T>>, action: string): T | undefined =>
+  Object.hasOwn(table, action) ? table[action] : undefined;
+const actorKindOf = (row: AuditRecord): AuditActorKind => entryOf(ACTOR_KIND_OF_ACTION, row.action) ?? row.actor_kind;
 // What the target of each audited action is, so the back can name it; an action not listed here (a billing event, a deletion
 // request) has no label.
-const TARGETS: Record<string, 'user' | 'email' | 'scan' | 'org' | 'action' | 'plan'> = {
+const TARGETS: Readonly<Record<string, 'user' | 'email' | 'scan' | 'org' | 'action' | 'plan'>> = {
   'member.joined': 'user', 'member.role_changed': 'user', 'member.removed': 'user',
   'member.invited': 'email', 'invitation.revoked': 'email',
   'analysis.claimed': 'scan',
@@ -180,11 +194,15 @@ export class WebappService {
     return new WebappService({ ...this.deps, auditAsSystem: true });
   }
 
-  /** In this order, so an outsider learns nothing: not a member 404, deleted 410, role 403, unpaid 402. */
+  /**
+   * In this order, so an outsider learns nothing: not a member 404 (an id that is not a UUID included), deleted 410, role 403,
+   * unpaid 402. The caller goes on with `org.id`, the id as stored, whatever case the request used.
+   */
   async authorize(user: AppUser, orgId: string, permission: Permission | null,
     opts: { payment: boolean }): Promise<{ org: OrganizationRecord; role: Role }> {
-    const membership = await this.repo.getMembership(orgId, user.userId);
-    const org = membership && await this.repo.getOrganization(orgId);
+    const id = asUuid(orgId);
+    const membership = id && await this.repo.getMembership(id, user.userId);
+    const org = id && membership && await this.repo.getOrganization(id);
     if (!membership || !org) throw fail('not_found', 'Organization not found');
     if (org.deleted_at !== null) throw fail('gone', 'This organization was deleted');
     if (permission && !can(membership.role, permission)) throw fail('forbidden', 'Your role does not allow this');
@@ -230,18 +248,18 @@ export class WebappService {
       { org_id: org.id, scan_id: scan.scan_id, assessment_id: assessmentId, claimed_by: user.userId, claimed_at: at }));
     // Spent only once the organization exists: a creation that fails does not burn the ticket.
     await this.repo.markClaimTicketUsed(idHash, at);
-    await this.audit(user.userId, org.id, 'org.created', org.id, { name: org.name, scanId: scan.scan_id });
+    await this.audit(user.userId, org.id, 'org.created', org.id, { name: org.name, scanId: scan.scan_id }, 'member');
     return this.view(org, 'owner');
   }
 
   async attachAnalysis(user: AppUser, orgId: string, claimId: string): Promise<AnalysisView> {
-    await this.authorize(user, orgId, 'analysis.create', { payment: true });
+    const { org } = await this.authorize(user, orgId, 'analysis.create', { payment: true });
     const { idHash, scan, assessmentId } = await this.redeemable(user, claimId);
-    const analysis: OrgAnalysisRecord = { org_id: orgId, scan_id: scan.scan_id, assessment_id: assessmentId, claimed_by: user.userId,
+    const analysis: OrgAnalysisRecord = { org_id: org.id, scan_id: scan.scan_id, assessment_id: assessmentId, claimed_by: user.userId,
       claimed_at: this.timestamp() };
     await orConflict(this.repo.claimAnalysis(analysis));
     await this.repo.markClaimTicketUsed(idHash, analysis.claimed_at);
-    await this.audit(user.userId, orgId, 'analysis.claimed', scan.scan_id, {});
+    await this.audit(user.userId, org.id, 'analysis.claimed', scan.scan_id, {}, 'member');
     return this.analysisView(analysis, scan);
   }
 
@@ -254,12 +272,13 @@ export class WebappService {
   async renameOrganization(user: AppUser, orgId: string, name: string): Promise<OrgView> {
     const { org, role } = await this.authorize(user, orgId, 'org.update', { payment: false });
     if (org.name !== name) {
-      await this.repo.updateOrganizationName(orgId, name);
-      await this.audit(user.userId, orgId, 'org.renamed', orgId, { from: org.name, to: name });
+      await this.repo.updateOrganizationName(org.id, name);
+      await this.audit(user.userId, org.id, 'org.renamed', org.id, { from: org.name, to: name }, 'member');
     }
     return this.view({ ...org, name }, role);
   }
 
+  /** `orgId` is the id `authorize` returned. */
   async listAnalyses(orgId: string): Promise<AnalysisView[]> {
     const views: AnalysisView[] = [];
     for (const analysis of await this.repo.listAnalyses(orgId)) {
@@ -270,6 +289,7 @@ export class WebappService {
     return views;
   }
 
+  /** `orgId` is the id `authorize` returned. */
   async listMembers(orgId: string): Promise<{ members: MemberView[]; invitations: InvitationView[] }> {
     const members = await Promise.all((await this.repo.listMembers(orgId)).map(member => this.memberView(member)));
     const invitations = (await this.repo.listInvitations(orgId)).filter(invitation => !this.expired(invitation.expires_at)).map(invitationView);
@@ -277,29 +297,31 @@ export class WebappService {
   }
 
   async invite(actor: AppUser, orgId: string, req: InviteRequest): Promise<InvitationView> {
-    await this.authorize(actor, orgId, 'members.invite', { payment: true });
+    const { org } = await this.authorize(actor, orgId, 'members.invite', { payment: true });
     const email = req.email.toLowerCase();
-    for (const member of await this.repo.listMembers(orgId)) {
+    for (const member of await this.repo.listMembers(org.id)) {
       if (sameEmail((await this.repo.getProfile(member.user_id))?.email ?? '', email)) throw fail('conflict', CONFLICTS.already_member);
     }
     // One pending invitation per email (invitations_pending_email_idx): the new link replaces the old one, expired or not.
-    await this.revokePending(actor.userId, orgId, email, 'reinvited');
+    await this.revokePending(actor.userId, org.id, email, 'reinvited');
     const token = secretToken();
-    const invitation: InvitationRecord = { id: randomUUID(), org_id: orgId, email, role: req.role, token_hash: sha256(token),
+    const invitation: InvitationRecord = { id: randomUUID(), org_id: org.id, email, role: req.role, token_hash: sha256(token),
       invited_by: actor.userId, expires_at: this.at(INVITATION_TTL_MS), accepted_at: null, revoked_at: null, created_at: this.timestamp() };
     await orConflict(this.repo.createInvitation(invitation));
-    await this.audit(actor.userId, orgId, 'member.invited', invitation.email, { role: invitation.role, invitationId: invitation.id });
+    await this.audit(actor.userId, org.id, 'member.invited', invitation.email, { role: invitation.role, invitationId: invitation.id },
+      'member');
     // The only time the token exists in clear.
     return { ...invitationView(invitation), inviteUrl: `${this.appBaseUrl}/app/invite/${token}` };
   }
 
   async revokeInvitation(actor: AppUser, orgId: string, invitationId: string): Promise<void> {
-    await this.authorize(actor, orgId, 'members.invite', { payment: true });
+    const { org } = await this.authorize(actor, orgId, 'members.invite', { payment: true });
     // Looked up among this organization's pending invitations only: another organization's id is not found.
-    const invitation = (await this.repo.listInvitations(orgId)).find(pending => pending.id === invitationId);
+    const id = asUuid(invitationId);
+    const invitation = id && (await this.repo.listInvitations(org.id)).find(pending => pending.id === id);
     if (!invitation) throw fail('not_found', 'Invitation not found');
     await this.repo.updateInvitation(invitation.id, { revoked_at: this.timestamp() });
-    await this.audit(actor.userId, orgId, 'invitation.revoked', invitation.email, { invitationId });
+    await this.audit(actor.userId, org.id, 'invitation.revoked', invitation.email, { invitationId: invitation.id }, 'member');
   }
 
   async acceptInvitation(user: AppUser, token: string): Promise<OrgView> {
@@ -326,34 +348,35 @@ export class WebappService {
     await this.repo.updateInvitation(invitation.id, { accepted_at: at });
     // No other link stays live, or a member removed later could use it to come back.
     await this.revokePending(user.userId, org.id, invitation.email, 'accepted');
-    await this.audit(user.userId, org.id, 'member.joined', user.userId, { role: invitation.role, invitationId: invitation.id });
+    await this.audit(user.userId, org.id, 'member.joined', user.userId, { role: invitation.role, invitationId: invitation.id }, 'member');
     return this.view(org, invitation.role);
   }
 
+  /**
+   * Only someone who can mark an action may hold it (D11): the store's setRole releases the actions of a role that cannot, in the
+   * same call as the change, as removeMember does (D15). The audit row follows the write, as for every other change.
+   */
   async setRole(actor: AppUser, orgId: string, targetUserId: string, role: Role): Promise<MemberView> {
-    const { role: actorRole } = await this.authorize(actor, orgId, 'members.set_role', { payment: true });
-    const target = await this.member(orgId, targetUserId);
+    const { org, role: actorRole } = await this.authorize(actor, orgId, 'members.set_role', { payment: true });
+    const target = await this.member(org.id, targetUserId);
     if (!canManageMember(actorRole, target.role, role)) throw fail('forbidden', 'Your role cannot give this role to this member');
     if (target.role !== role) {
-      await orConflict(this.repo.setRole(orgId, targetUserId, role));
-      // Only someone who can mark an action may hold it (D11): a role that cannot lets go of them, as a removal does (D15).
-      if (!can(role, 'actions.update')) await this.repo.clearAssignee(orgId, targetUserId);
-      await this.audit(actor.userId, orgId, 'member.role_changed', targetUserId, { from: target.role, to: role });
+      await orConflict(this.repo.setRole(org.id, target.user_id, role));
+      await this.audit(actor.userId, org.id, 'member.role_changed', target.user_id, { from: target.role, to: role }, 'member');
     }
     return this.memberView({ ...target, role });
   }
 
+  /** Their actions go back to nobody in the same call that removes them, and stay so if they come back (DN-11 D15). */
   async removeMember(actor: AppUser, orgId: string, targetUserId: string): Promise<void> {
-    const { role: actorRole } = await this.authorize(actor, orgId, 'members.remove', { payment: true });
-    const target = await this.member(orgId, targetUserId);
+    const { org, role: actorRole } = await this.authorize(actor, orgId, 'members.remove', { payment: true });
+    const target = await this.member(org.id, targetUserId);
     if (!canManageMember(actorRole, target.role)) throw fail('forbidden', 'Your role cannot remove this member');
-    await orConflict(this.repo.removeMember(orgId, targetUserId));
-    // Their actions go back to nobody, and stay so if they come back (DN-11 D15).
-    await this.repo.clearAssignee(orgId, targetUserId);
-    await this.audit(actor.userId, orgId, 'member.removed', targetUserId, { role: target.role });
+    await orConflict(this.repo.removeMember(org.id, target.user_id));
+    await this.audit(actor.userId, org.id, 'member.removed', target.user_id, { role: target.role }, 'member');
     // A link still pending for their email would let the removed member back in.
-    const profile = await this.repo.getProfile(targetUserId);
-    if (profile) await this.revokePending(actor.userId, orgId, profile.email, 'member_removed');
+    const profile = await this.repo.getProfile(target.user_id);
+    if (profile) await this.revokePending(actor.userId, org.id, profile.email, 'member_removed');
   }
 
   /** Paying is how an organization gets in, so checkout and portal ask for billing.manage but not for a payment. */
@@ -363,48 +386,53 @@ export class WebappService {
     if (hasPaidAccess(org.billing_status)) throw fail('conflict', 'This organization is already paid; use billing/portal');
     const plan = await this.repo.getPlan(planCode);
     if (!plan?.active) throw fail('invalid_request', 'Unknown or inactive plan');
-    const { url } = await this.deps.billing.createCheckout({ orgId, plan, successUrl: `${this.appBaseUrl}/app?paid=1`,
+    const { url } = await this.deps.billing.createCheckout({ orgId: org.id, plan, successUrl: `${this.appBaseUrl}/app?paid=1`,
       cancelUrl: `${this.appBaseUrl}/app/billing` });
     return { url };
   }
 
   async portal(actor: AppUser, orgId: string): Promise<{ url: string }> {
-    await this.authorize(actor, orgId, 'billing.manage', { payment: false });
-    const { url } = await this.deps.billing.createPortal({ orgId, returnUrl: `${this.appBaseUrl}/app/billing` });
+    const { org } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
+    const { url } = await this.deps.billing.createPortal({ orgId: org.id, returnUrl: `${this.appBaseUrl}/app/billing` });
     return { url };
   }
 
-  /** Moves the subscription and billing_status, never the deletion state (DN-10 §4.4). Each event id counts once. */
+  /**
+   * Moves the subscription and billing_status, never the deletion state (DN-10 §4.4). Each event id counts once. An event names
+   * its organization by the id its checkout carried; one that is not a UUID names none.
+   */
   async applyBillingEvent(event: BillingEvent): Promise<'applied' | 'duplicate' | 'unknown_org'> {
-    if (!(await this.repo.getOrganization(event.orgId))) return 'unknown_org';
+    const orgId = asUuid(event.orgId);
+    const org = orgId && await this.repo.getOrganization(orgId);
+    if (!org) return 'unknown_org';
     if (!(await this.repo.recordBillingEvent(event.id, event.type))) return 'duplicate';
-    const current = await this.repo.getSubscription(event.orgId);
+    const current = await this.repo.getSubscription(org.id);
     const planCode = event.planCode ?? current?.plan_code ?? null;
     // An event that names no plan, for an organization that never subscribed, only moves billing_status.
     if (planCode) {
-      await this.repo.upsertSubscription({ org_id: event.orgId, plan_code: planCode, customer_id: event.customerId ?? current?.customer_id ?? null,
+      await this.repo.upsertSubscription({ org_id: org.id, plan_code: planCode, customer_id: event.customerId ?? current?.customer_id ?? null,
         subscription_id: event.subscriptionId ?? current?.subscription_id ?? null, status: event.status,
         current_period_end: event.currentPeriodEnd ?? current?.current_period_end ?? null, updated_at: this.timestamp() });
     }
-    await this.repo.setBillingStatus(event.orgId, event.status);
-    await this.audit(null, event.orgId, 'billing.event_applied', event.id, { type: event.type, status: event.status, planCode }, 'system');
+    await this.repo.setBillingStatus(org.id, event.status);
+    await this.audit(null, org.id, 'billing.event_applied', event.id, { type: event.type, status: event.status, planCode }, 'system');
     return 'applied';
   }
 
   /** Only a request: nothing changes until an ARCA person reviews it, and access stays meanwhile (DN-10 §4.5). */
   async requestDeletion(actor: AppUser, orgId: string, reason: string): Promise<DeletionRequestView> {
-    await this.authorize(actor, orgId, 'org.request_deletion', { payment: false });
-    const request: DeletionRequestRecord = { id: randomUUID(), org_id: orgId, requested_by: actor.userId, reason, status: 'pending',
+    const { org } = await this.authorize(actor, orgId, 'org.request_deletion', { payment: false });
+    const request: DeletionRequestRecord = { id: randomUUID(), org_id: org.id, requested_by: actor.userId, reason, status: 'pending',
       reviewed_by: null, reviewed_at: null, review_note: null, created_at: this.timestamp() };
     await orConflict(this.repo.createDeletionRequest(request));
-    await this.audit(actor.userId, orgId, 'org.deletion_requested', request.id, { reason });
+    await this.audit(actor.userId, org.id, 'org.deletion_requested', request.id, { reason }, 'member');
     return deletionView(request);
   }
 
   /** The current plan and the organization's own actions (DN-11 §4.2). An action of the assessment nobody touched reads as todo. */
   async listActions(user: AppUser, orgId: string): Promise<ActionPlanResponse> {
-    await this.authorize(user, orgId, 'org.read', { payment: true });
-    const { plan, entries } = await this.planEntries(orgId);
+    const { org } = await this.authorize(user, orgId, 'org.read', { payment: true });
+    const { plan, entries } = await this.planEntries(org.id);
     return { source: plan && { scanId: plan.scan.scan_id, domain: plan.scan.canonical_domain, claimedAt: iso(plan.analysis.claimed_at) },
       items: await Promise.all(entries.map(entry => this.actionView(entry))) };
   }
@@ -412,13 +440,14 @@ export class WebappService {
   /**
    * In a fixed order (DN-11 §4.2): the permission follows the fields sent, then the key, then the assignee. Sending the assignee or
    * the due date, even as null, takes actions.assign for the whole request: nothing is applied in part. A request that changes
-   * nothing writes and audits nothing.
+   * nothing writes and audits nothing, and answers with the action as it is now.
    */
   async updateAction(user: AppUser, orgId: string, key: string, req: UpdateActionRequest): Promise<ActionItemView> {
     const assigns = req.assigneeUserId !== undefined || req.dueDate !== undefined;
-    await this.authorize(user, orgId, assigns ? 'actions.assign' : 'actions.update', { payment: true });
-    const target = await this.resolveAction(orgId, key);
-    if (typeof req.assigneeUserId === 'string') await this.requireAssignee(orgId, req.assigneeUserId);
+    const { org } = await this.authorize(user, orgId, assigns ? 'actions.assign' : 'actions.update', { payment: true });
+    const target = await this.resolveAction(org.id, key);
+    // An early answer that spends no write slot; the write checks the assignee again, which settles a race with a role change.
+    if (typeof req.assigneeUserId === 'string') await this.requireAssignee(org.id, req.assigneeUserId);
     const before: Tracked = target.row ?? UNTOUCHED;
     // Only the fields sent that differ from what was read are written and audited. Another request may have changed the row since
     // the read: writing nothing else leaves its change in place, and the audit names no change this request did not make.
@@ -427,7 +456,8 @@ export class WebappService {
     if (req.assigneeUserId !== undefined && req.assigneeUserId !== before.assignee_user_id) changes.assignee_user_id = req.assigneeUserId;
     if (req.dueDate !== undefined && req.dueDate !== before.due_date) changes.due_date = req.dueDate;
     const changed = TRACKED_FIELDS.filter(field => field in changes);
-    if (changed.length === 0) return this.actionView(target);
+    // What was read may be stale by now; read again rather than answer with it.
+    if (changed.length === 0) return this.actionView(await this.reread(org.id, target));
     this.checkActionWrites(user.userId);
     const at = this.timestamp();
     const patch: ActionPatch = { ...changes, updated_by: user.userId, updated_at: at };
@@ -436,49 +466,52 @@ export class WebappService {
     if (target.source === 'assessment') {
       // The first change creates the row. A row that exists by now, from an earlier change or from a request that raced this one,
       // only gets the patch.
-      const upserted = await this.repo.upsertAssessmentAction({ id: randomUUID(), org_id: orgId, source: 'assessment',
+      const upserted = await orIneligible(this.repo.upsertAssessmentAction({ id: randomUUID(), org_id: org.id, source: 'assessment',
         scan_id: target.scanId, action_key: target.item.id, title: null, detail: null, domain: null, ...UNTOUCHED, ...patch,
-        created_by: user.userId, created_at: at }, patch);
+        created_by: user.userId, created_at: at }, patch));
       row = upserted;
       written = { ...target, row: upserted };
     } else {
-      const updated = await this.repo.updateAction(orgId, target.row.id, patch);
+      const updated = await orIneligible(this.repo.updateAction(org.id, target.row.id, patch));
+      // Deleted by another request since it was read: nothing was written, so nothing is audited.
+      if (!updated) throw fail('not_found', 'Action not found');
       if (updated.source !== 'custom') throw new Error('An action of the organization\'s own changed its source');
       row = updated;
       written = { source: 'custom', row: updated };
     }
     // Before is what this request read, after what its write left: the row as written, which may also hold another request's change.
     const title = target.source === 'assessment' ? target.item.title : target.row.title;
-    await this.audit(user.userId, orgId, 'action.updated', entryKey(target), { title, before: trackedData(before, changed),
-      after: trackedData(row, changed) });
+    await this.audit(user.userId, org.id, 'action.updated', entryKey(target), { title, before: trackedData(before, changed),
+      after: trackedData(row, changed) }, 'member');
     return this.actionView(written);
   }
 
   async createAction(user: AppUser, orgId: string, req: CreateActionRequest): Promise<ActionItemView> {
-    await this.authorize(user, orgId, 'actions.assign', { payment: true });
+    const { org } = await this.authorize(user, orgId, 'actions.assign', { payment: true });
     // An early answer that spends no write slot; the repository enforces the cap with the insert, which settles a race.
-    if (await this.repo.countCustomActions(orgId) >= MAX_CUSTOM_ACTIONS) throw fail('conflict', CONFLICTS.action_limit);
+    if (await this.repo.countCustomActions(org.id) >= MAX_CUSTOM_ACTIONS) throw fail('conflict', CONFLICTS.action_limit);
     this.checkActionWrites(user.userId);
     const at = this.timestamp();
-    const action: CustomActionRecord = { id: randomUUID(), org_id: orgId, source: 'custom', scan_id: null, action_key: null, title: req.title,
-      detail: req.detail || null, domain: req.domain ?? null, ...UNTOUCHED, created_by: user.userId, created_at: at, updated_by: user.userId,
-      updated_at: at };
+    const action: CustomActionRecord = { id: randomUUID(), org_id: org.id, source: 'custom', scan_id: null, action_key: null,
+      title: req.title, detail: req.detail || null, domain: req.domain ?? null, ...UNTOUCHED, created_by: user.userId, created_at: at,
+      updated_by: user.userId, updated_at: at };
     await orConflict(this.repo.createCustomAction(action));
-    await this.audit(user.userId, orgId, 'action.created', customKey(action.id), { title: action.title });
+    await this.audit(user.userId, org.id, 'action.created', customKey(action.id), { title: action.title }, 'member');
     return this.actionView({ source: 'custom', row: action });
   }
 
   /** Only the organization's own actions are deleted; the assessment's only change status (DN-11 D13). */
   async deleteAction(user: AppUser, orgId: string, key: string): Promise<void> {
-    await this.authorize(user, orgId, 'actions.assign', { payment: true });
+    const { org } = await this.authorize(user, orgId, 'actions.assign', { payment: true });
     // Any assessment key gets the same answer, whatever plan it names, so the refusal says nothing about the plan.
     if (key.startsWith('a.')) throw fail('invalid_request', 'An action of the assessment cannot be deleted, only its status changed');
     const parsed = parseActionKey(key);
-    const action = parsed?.source === 'custom' ? await this.repo.getCustomAction(orgId, parsed.id) : null;
+    const action = parsed?.source === 'custom' ? await this.repo.getCustomAction(org.id, parsed.id) : null;
     if (!action) throw fail('not_found', 'Action not found');
     this.checkActionWrites(user.userId);
-    await this.repo.deleteCustomAction(orgId, action.id);
-    await this.audit(user.userId, orgId, 'action.deleted', customKey(action.id), { title: action.title });
+    // Two deletions that race both find the action; only the one that deleted it audits.
+    if (!(await this.repo.deleteCustomAction(org.id, action.id))) throw fail('not_found', 'Action not found');
+    await this.audit(user.userId, org.id, 'action.deleted', customKey(action.id), { title: action.title }, 'member');
   }
 
   /**
@@ -486,9 +519,9 @@ export class WebappService {
    * unpaid. Only a member's email shows; ARCA staff and the system are named by kind alone.
    */
   async activity(user: AppUser, orgId: string, page: { before?: number; limit: number }): Promise<ActivityPage> {
-    await this.authorize(user, orgId, 'activity.read', { payment: false });
+    const { org } = await this.authorize(user, orgId, 'activity.read', { payment: false });
     // One row past the page says whether there is a next one.
-    const rows = await this.repo.listAudit(orgId, { before: page.before, limit: page.limit + 1 });
+    const rows = await this.repo.listAudit(org.id, { before: page.before, limit: page.limit + 1 });
     const shown = rows.slice(0, page.limit);
     const names = this.names();
     const actor = async (row: AuditRecord): Promise<ActivityEventView['actor']> => {
@@ -517,7 +550,7 @@ export class WebappService {
 
   /** A deleted organization is found too: ARCA keeps seeing what it deleted. */
   async adminOrganization(id: string): Promise<AdminOrgDetailView> {
-    const orgId = organizationId(id);
+    const orgId = asUuid(id);
     const org = orgId && await this.repo.getOrganization(orgId);
     if (!orgId || !org) throw fail('not_found', 'Organization not found');
     const pending = await this.repo.getPendingDeletionRequest(orgId);
@@ -531,7 +564,7 @@ export class WebappService {
   /** ARCA's own audit, across organizations or of one. Unlike an organization's activity, it names ARCA staff too. */
   async adminAudit(page: { orgId?: string; before?: number; limit: number }): Promise<AdminAuditPage> {
     // An orgId that names no organization gives an empty page (DN-11 §4.5), one that is not even a UUID included.
-    const orgId = page.orgId === undefined ? undefined : organizationId(page.orgId);
+    const orgId = page.orgId === undefined ? undefined : asUuid(page.orgId);
     if (orgId === null) return { events: [], nextBefore: null };
     const rows = await this.repo.listAllAudit({ orgId, before: page.before, limit: page.limit + 1 });
     const shown = rows.slice(0, page.limit);
@@ -566,18 +599,20 @@ export class WebappService {
 
   /** Approving marks the organization deleted and stops the subscription; the data stays (DN-10 §4.6). Rejecting only closes the request. */
   async reviewDeletion(admin: AppUser, id: string, decision: 'approve' | 'reject', note?: string): Promise<DeletionRequestView> {
+    // Anyone but ARCA staff gets the 403 first, whatever id they send.
     await this.requirePlatformAdmin(admin);
-    const request = await this.repo.getDeletionRequest(id);
+    const requestId = asUuid(id);
+    const request = requestId && await this.repo.getDeletionRequest(requestId);
     if (!request) throw fail('not_found', 'Deletion request not found');
     if (request.status !== 'pending') throw fail('conflict', 'This deletion request was already reviewed');
     const status = decision === 'approve' ? 'approved' : 'rejected';
     const at = this.timestamp();
-    await this.repo.reviewDeletionRequest(id, status, admin.userId, note ?? null, at);
+    await this.repo.reviewDeletionRequest(request.id, status, admin.userId, note ?? null, at);
     if (status === 'approved') {
       await this.repo.markOrganizationDeleted(request.org_id, at);
       await this.deps.billing.cancel(request.org_id);
     }
-    await this.audit(admin.userId, request.org_id, `org.deletion_${status}`, id, { note: note ?? null }, 'platform');
+    await this.audit(admin.userId, request.org_id, `org.deletion_${status}`, request.id, { note: note ?? null }, 'platform');
     return deletionView({ ...request, status, reviewed_by: admin.userId, reviewed_at: at, review_note: note ?? null });
   }
 
@@ -629,8 +664,10 @@ export class WebappService {
       deletionPending: (await this.repo.getPendingDeletionRequest(org.id)) !== null, paidAccess: hasPaidAccess(org.billing_status) };
   }
 
+  /** The caller goes on with `user_id`, the id as stored. */
   private async member(orgId: string, userId: string): Promise<MembershipRecord> {
-    const membership = await this.repo.getMembership(orgId, userId);
+    const id = asUuid(userId);
+    const membership = id && await this.repo.getMembership(orgId, id);
     if (!membership) throw fail('not_found', 'Member not found');
     return membership;
   }
@@ -646,7 +683,7 @@ export class WebappService {
     const at = this.timestamp();
     for (const invitation of (await this.repo.listInvitations(orgId)).filter(pending => sameEmail(pending.email, email))) {
       await this.repo.updateInvitation(invitation.id, { revoked_at: at });
-      await this.audit(actor, orgId, 'invitation.revoked', invitation.email, { invitationId: invitation.id, reason });
+      await this.audit(actor, orgId, 'invitation.revoked', invitation.email, { invitationId: invitation.id, reason }, 'member');
     }
   }
 
@@ -659,10 +696,11 @@ export class WebappService {
 
   /**
    * Who acted is fixed here, at write time (DN-11 §4.3): `platform` for ARCA staff acting from /admin/*, `system` for a
-   * billing event or the seed, and `member` for everything a signed-in user does in an organization.
+   * billing event or the seed, and `member` for everything a signed-in user does in an organization. Every call names the kind,
+   * with no default, so a new staff action cannot pass as a member's by leaving it out.
    */
   private async audit(actor: string | null, orgId: string | null, action: string, target: string, data: Record<string, unknown>,
-    actorKind: AuditActorKind = 'member') {
+    actorKind: AuditActorKind) {
     const system = this.deps.auditAsSystem === true && actorKind === 'member';
     await this.repo.appendAudit({ id: randomUUID(), actor_kind: system ? 'system' : actorKind, actor_user_id: system ? null : actor,
       org_id: orgId, action, target, data, created_at: this.timestamp() });
@@ -716,9 +754,15 @@ export class WebappService {
   /** Only someone who can mark an action may hold it (D11). One answer whether the user exists or not. */
   private async requireAssignee(orgId: string, userId: string) {
     const membership = await this.repo.getMembership(orgId, userId);
-    if (!membership || !can(membership.role, 'actions.update')) {
-      throw fail('invalid_request', 'The assignee must be a member of the organization who can update actions');
-    }
+    if (!membership || !can(membership.role, 'actions.update')) throw fail('invalid_request', ASSIGNEE_REFUSED);
+  }
+
+  /** The action as the store holds it now. An action of the organization's own deleted meanwhile is not found. */
+  private async reread(orgId: string, entry: PlanEntry): Promise<PlanEntry> {
+    if (entry.source === 'assessment') return { ...entry, row: await this.repo.getAssessmentAction(orgId, entry.scanId, entry.item.id) };
+    const row = await this.repo.getCustomAction(orgId, entry.row.id);
+    if (!row) throw fail('not_found', 'Action not found');
+    return { source: 'custom', row };
   }
 
   private async actionView(entry: PlanEntry): Promise<ActionItemView> {
@@ -771,7 +815,7 @@ export class WebappService {
     const target = async (row: AuditRecord): Promise<string | null> => {
       const { target } = row;
       if (target === null) return null;
-      switch (TARGETS[row.action]) {
+      switch (entryOf(TARGETS, row.action)) {
         case 'user': return email(target);
         case 'email': case 'plan': return target;
         case 'scan': return once(`scan:${target}`, async () => (await this.deps.scans.get(target))?.canonical_domain ?? null);

@@ -3,7 +3,7 @@ import { PlanView } from '@arca/contracts';
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
 import {
-  MAX_CUSTOM_ACTIONS, WebappConflict, type ActionPatch, type AssessmentActionRecord, type ClaimTicketRecord, type CustomActionRecord, type DeletionRequestRecord,
+  IneligibleAssignee, MAX_CUSTOM_ACTIONS, WebappConflict, type ActionPatch, type AssessmentActionRecord, type ClaimTicketRecord, type CustomActionRecord, type DeletionRequestRecord,
   type InvitationRecord, type MembershipRecord, type NewAuditRecord, type OrgAnalysisRecord, type OrganizationRecord, type ProfileRecord,
   type SubscriptionRecord,
 } from '../../src/webapp/types.js';
@@ -359,6 +359,7 @@ describe('action plan', () => {
 
   it('gives an action of the assessment one row per plan, created by the first change and moved by later ones', async () => {
     const repo = await repoWithPlans();
+    await repo.addMember(member('org_1', 'user_b'));
     expect(await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.1')).toBeNull();
     const first = tracked('act_1', 'scan_1', 'improve:D1.1', { status: 'in_progress' });
     expect(await repo.upsertAssessmentAction(first, { status: 'in_progress', updated_by: 'user_a', updated_at: NOW })).toEqual(first);
@@ -409,6 +410,7 @@ describe('action plan', () => {
 
   it('updates only the tracked fields given, always recording who changed them and when', async () => {
     const repo = await repoWithPlans();
+    await repo.addMember(member('org_1', 'user_b'));
     await repo.createCustomAction(custom('act_1'));
     await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'));
     const by = (updatedBy: string, updatedAt: string) => ({ updated_by: updatedBy, updated_at: updatedAt });
@@ -426,8 +428,9 @@ describe('action plan', () => {
     expect(await repo.updateAction('org_1', 'act_2', { status: 'done', ...by('user_b', LATER) }))
       .toEqual(tracked('act_2', 'scan_1', 'improve:D1.1', { status: 'done', ...by('user_b', LATER) }));
 
-    await expect(repo.updateAction('org_2', 'act_1', { status: 'done', ...by('user_b', LATER) })).rejects.toThrow('Action not found');
-    await expect(repo.updateAction('org_1', 'act_missing', { status: 'done', ...by('user_b', LATER) })).rejects.toThrow('Action not found');
+    // A row that is not there, deleted meanwhile or of another organization, is not an error: null, and nothing is written.
+    expect(await repo.updateAction('org_2', 'act_1', { status: 'done', ...by('user_b', LATER) })).toBeNull();
+    expect(await repo.updateAction('org_1', 'act_missing', { status: 'done', ...by('user_b', LATER) })).toBeNull();
     expect((await repo.getCustomAction('org_1', 'act_1'))?.status).toBe('in_progress');
   });
 
@@ -436,30 +439,86 @@ describe('action plan', () => {
     await repo.createCustomAction(custom('act_1'));
     await repo.createCustomAction(custom('act_2'));
     await upsert(repo, tracked('act_3', 'scan_1', 'improve:D1.1'));
-    await expect(repo.deleteCustomAction('org_2', 'act_1')).rejects.toThrow('Action not found');
-    await expect(repo.deleteCustomAction('org_1', 'act_3')).rejects.toThrow('Action not found');
-    await expect(repo.deleteCustomAction('org_1', 'act_missing')).rejects.toThrow('Action not found');
+    // False when nothing was deleted, so the second of two deletions that race can tell.
+    expect(await repo.deleteCustomAction('org_2', 'act_1')).toBe(false);
+    expect(await repo.deleteCustomAction('org_1', 'act_3')).toBe(false);
+    expect(await repo.deleteCustomAction('org_1', 'act_missing')).toBe(false);
     expect(await repo.listActions('org_1')).toHaveLength(3);
 
-    await repo.deleteCustomAction('org_1', 'act_1');
+    expect(await repo.deleteCustomAction('org_1', 'act_1')).toBe(true);
     expect(await repo.getCustomAction('org_1', 'act_1')).toBeNull();
     expect(await repo.countCustomActions('org_1')).toBe(1);
     expect((await repo.listActions('org_1')).map(a => a.id)).toEqual(['act_2', 'act_3']);
-    await expect(repo.deleteCustomAction('org_1', 'act_1')).rejects.toThrow('Action not found');
+    expect(await repo.deleteCustomAction('org_1', 'act_1')).toBe(false);
   });
 
-  it('unassigns one user in one organization, and nothing else', async () => {
+  it('refuses, in the write itself, an assignee who is not a member that can mark actions (DN-11 D11)', async () => {
     const repo = await repoWithPlans();
+    await repo.addMember(member('org_1', 'user_b'));
+    await repo.addMember(member('org_1', 'user_c', 'viewer'));
+    await repo.addMember(member('org_2', 'user_d'));
+    await repo.createCustomAction(custom('act_1'));
+    await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'));
+    const by = { updated_by: 'user_a', updated_at: LATER };
+    // A viewer, a member of another organization only, and nobody at all.
+    for (const userId of ['user_c', 'user_d', 'ghost']) {
+      const patch = { assignee_user_id: userId, status: 'done', ...by } as const;
+      await expect(repo.updateAction('org_1', 'act_1', patch), userId).rejects.toBeInstanceOf(IneligibleAssignee);
+      await expect(repo.upsertAssessmentAction(tracked('act_new', 'scan_1', 'improve:D1.1', patch), patch), userId)
+        .rejects.toBeInstanceOf(IneligibleAssignee);
+      // The write that would create the row is checked too, and creates nothing.
+      await expect(repo.upsertAssessmentAction(tracked('act_new', 'scan_1', 'improve:D2.1', patch), patch), userId)
+        .rejects.toBeInstanceOf(IneligibleAssignee);
+      await expect(repo.createCustomAction(custom('act_new', 'org_1', { assignee_user_id: userId })), userId)
+        .rejects.toBeInstanceOf(IneligibleAssignee);
+    }
+    // None of the refused writes landed, their other fields included.
+    expect(await repo.listActions('org_1')).toEqual([custom('act_1'), tracked('act_2', 'scan_1', 'improve:D1.1')]);
+
+    // An owner, an admin or a member may hold one, and null always clears.
+    await repo.setRole('org_1', 'user_c', 'admin');
+    for (const userId of ['user_a', 'user_b', 'user_c']) {
+      expect(await repo.updateAction('org_1', 'act_1', { assignee_user_id: userId, ...by })).toMatchObject({ assignee_user_id: userId });
+      expect(await repo.upsertAssessmentAction(tracked('act_2', 'scan_1', 'improve:D1.1'), { assignee_user_id: userId, ...by }))
+        .toMatchObject({ assignee_user_id: userId });
+    }
+    expect(await repo.updateAction('org_1', 'act_1', { assignee_user_id: null, ...by })).toMatchObject({ assignee_user_id: null });
+    // A patch that leaves the assignee out checks nobody, and keeps whoever holds the row.
+    expect(await repo.upsertAssessmentAction(tracked('act_2', 'scan_1', 'improve:D1.1'), { status: 'done', ...by }))
+      .toMatchObject({ status: 'done', assignee_user_id: 'user_c' });
+  });
+
+  it('releases a user\'s actions in the same call that makes them viewer or removes them, and only there (DN-11 D11, D15)', async () => {
+    const repo = await repoWithPlans();
+    await repo.addMember(member('org_1', 'user_b'));
+    await repo.addMember(member('org_1', 'user_c'));
+    await repo.addMember(member('org_2', 'user_c'));
     await repo.createCustomAction(custom('act_1', 'org_1', { assignee_user_id: 'user_b' }));
     await repo.createCustomAction(custom('act_2', 'org_1', { assignee_user_id: 'user_c' }));
     await upsert(repo, tracked('act_3', 'scan_1', 'improve:D1.1', { assignee_user_id: 'user_b', due_date: '2026-12-01' }));
-    await repo.createCustomAction(custom('act_4', 'org_2', { assignee_user_id: 'user_b' }));
+    await repo.createCustomAction(custom('act_4', 'org_2', { assignee_user_id: 'user_c' }));
+    await repo.createCustomAction(custom('act_5', 'org_1', { assignee_user_id: 'user_a' }));
+    const holders = async (orgId: string) => (await repo.listActions(orgId)).map(a => [a.id, a.assignee_user_id]);
 
-    await repo.clearAssignee('org_1', 'user_b');
+    // A role that can still mark actions keeps them.
+    await repo.setRole('org_1', 'user_b', 'admin');
+    await repo.setRole('org_1', 'user_b', 'member');
+    expect(await holders('org_1')).toEqual([['act_1', 'user_b'], ['act_2', 'user_c'], ['act_3', 'user_b'], ['act_5', 'user_a']]);
+    // Made viewer: released by that same call, and the rest of each row stays as it was.
+    await repo.setRole('org_1', 'user_b', 'viewer');
     expect(await repo.listActions('org_1')).toEqual([custom('act_1'), custom('act_2', 'org_1', { assignee_user_id: 'user_c' }),
-      tracked('act_3', 'scan_1', 'improve:D1.1', { due_date: '2026-12-01' })]);
-    expect(await repo.listActions('org_2')).toEqual([custom('act_4', 'org_2', { assignee_user_id: 'user_b' })]);
-    await repo.clearAssignee('org_1', 'nobody');
+      tracked('act_3', 'scan_1', 'improve:D1.1', { due_date: '2026-12-01' }), custom('act_5', 'org_1', { assignee_user_id: 'user_a' })]);
+    // Getting the role back gives nothing back.
+    await repo.setRole('org_1', 'user_b', 'member');
+    expect(await holders('org_1')).toEqual([['act_1', null], ['act_2', 'user_c'], ['act_3', null], ['act_5', 'user_a']]);
+    // Removed: released in that organization only.
+    await repo.removeMember('org_1', 'user_c');
+    expect(await holders('org_1')).toEqual([['act_1', null], ['act_2', null], ['act_3', null], ['act_5', 'user_a']]);
+    expect(await holders('org_2')).toEqual([['act_4', 'user_c']]);
+    // A change the store refuses releases nothing either: the role and the assignments move together or not at all.
+    await expect(repo.setRole('org_1', 'user_a', 'viewer')).rejects.toMatchObject({ reason: 'last_owner' });
+    await expect(repo.removeMember('org_1', 'user_a')).rejects.toMatchObject({ reason: 'last_owner' });
+    expect(await holders('org_1')).toEqual([['act_1', null], ['act_2', null], ['act_3', null], ['act_5', 'user_a']]);
   });
 });
 
@@ -584,7 +643,7 @@ describe('copies and reset', () => {
     written.title = 'mutated input';
     upserted.status = 'done';
     (await upsert(repo, tracked('act_2', 'scan_1', 'improve:D1.1'))).status = 'done';
-    (await repo.updateAction('org_1', 'act_1', { updated_by: 'user_a', updated_at: NOW })).title = 'mutated';
+    (await repo.updateAction('org_1', 'act_1', { updated_by: 'user_a', updated_at: NOW }))!.title = 'mutated';
     (await repo.getCustomAction('org_1', 'act_1'))!.title = 'mutated';
     (await repo.getAssessmentAction('org_1', 'scan_1', 'improve:D1.1'))!.status = 'done';
     (await repo.listActions('org_1'))[0]!.status = 'done';

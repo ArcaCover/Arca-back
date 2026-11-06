@@ -45,15 +45,16 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth }): H
   app.get('/orgs/:id', signedIn(async (c, me) => c.json(await service.orgView(me, param(c, 'id')))));
   app.patch('/orgs/:id', signedIn(async (c, me) =>
     c.json(await service.renameOrganization(me, param(c, 'id'), (await body(c, UpdateOrgRequest)).name))));
+  // These two read with the organization id as stored, which authorize returns whatever case the path used.
   app.get('/orgs/:id/analyses', signedIn(async (c, me) => {
-    await service.authorize(me, param(c, 'id'), 'org.read', { payment: true });
-    return c.json(await service.listAnalyses(param(c, 'id')));
+    const { org } = await service.authorize(me, param(c, 'id'), 'org.read', { payment: true });
+    return c.json(await service.listAnalyses(org.id));
   }));
   app.post('/orgs/:id/analyses', signedIn(async (c, me) =>
     c.json(await service.attachAnalysis(me, param(c, 'id'), (await body(c, AttachAnalysisRequest)).claimId), 201)));
   app.get('/orgs/:id/members', signedIn(async (c, me) => {
-    await service.authorize(me, param(c, 'id'), 'org.read', { payment: true });
-    return c.json(await service.listMembers(param(c, 'id')));
+    const { org } = await service.authorize(me, param(c, 'id'), 'org.read', { payment: true });
+    return c.json(await service.listMembers(org.id));
   }));
   app.post('/orgs/:id/invitations', signedIn(async (c, me) =>
     c.json(await service.invite(me, param(c, 'id'), await body(c, InviteRequest)), 201)));

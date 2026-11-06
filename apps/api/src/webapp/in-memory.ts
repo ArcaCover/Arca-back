@@ -1,5 +1,5 @@
-import { AUDIT_ACTOR_KINDS, type BillingStatus, type Role } from '@arca/contracts';
-import { MAX_CUSTOM_ACTIONS, WebappConflict } from './types.js';
+import { AUDIT_ACTOR_KINDS, can, type BillingStatus, type Role } from '@arca/contracts';
+import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, WebappConflict } from './types.js';
 import type { ActionPatch, AssessmentActionRecord, AuditPageQuery, AuditRecord, ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord,
   InvitationRecord, MembershipRecord, NewAuditRecord, OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, PlanRecord, ProfileRecord,
   SubscriptionRecord, WebappRepository } from './types.js';
@@ -82,12 +82,14 @@ export class InMemoryWebappRepository implements WebappRepository {
     if (!membership) throw new Error('Member not found');
     if (membership.role === 'owner' && role !== 'owner' && this.ownerCount(orgId) === 1) throw new WebappConflict('last_owner');
     membership.role = role;
+    if (!can(role, 'actions.update')) this.release(orgId, userId);
   }
   async removeMember(orgId: string, userId: string) {
     const membership = this.membership(orgId, userId);
     if (!membership) throw new Error('Member not found');
     if (membership.role === 'owner' && this.ownerCount(orgId) === 1) throw new WebappConflict('last_owner');
     this.memberships.splice(this.memberships.indexOf(membership), 1);
+    this.release(orgId, userId);
   }
 
   async createInvitation(invitation: InvitationRecord) {
@@ -176,6 +178,7 @@ export class InMemoryWebappRepository implements WebappRepository {
     // The composite foreign key to org_analyses: only a scan this organization claimed has actions.
     if (this.analyses.get(action.scan_id)?.org_id !== action.org_id) throw new Error('Analysis not found');
     const existing = this.assessmentAction(action.org_id, action.scan_id, action.action_key);
+    this.requireEligible(action.org_id, existing ? patch.assignee_user_id : action.assignee_user_id);
     if (existing) return structuredClone(applyPatch(existing, patch));
     if (this.actions.some(a => a.id === action.id)) throw new Error('Duplicate action');
     this.actions.push(structuredClone(action));
@@ -186,21 +189,21 @@ export class InMemoryWebappRepository implements WebappRepository {
     if (this.actions.some(a => a.id === action.id)) throw new Error('Duplicate action');
     // Counted here, with no await before the insert, so creations that race cannot pass the cap together.
     if (this.customCount(action.org_id) >= MAX_CUSTOM_ACTIONS) throw new WebappConflict('action_limit');
+    this.requireEligible(action.org_id, action.assignee_user_id);
     this.actions.push(structuredClone(action));
   }
   async countCustomActions(orgId: string) { return this.customCount(orgId); }
   async updateAction(orgId: string, id: string, patch: ActionPatch) {
     const action = this.actions.find(a => a.org_id === orgId && a.id === id);
-    if (!action) throw new Error('Action not found');
+    if (!action) return null;
+    this.requireEligible(orgId, patch.assignee_user_id);
     return structuredClone(applyPatch(action, patch));
   }
   async deleteCustomAction(orgId: string, id: string) {
     const action = this.customAction(orgId, id);
-    if (!action) throw new Error('Action not found');
+    if (!action) return false;
     this.actions.splice(this.actions.indexOf(action), 1);
-  }
-  async clearAssignee(orgId: string, userId: string) {
-    for (const action of this.actions) if (action.org_id === orgId && action.assignee_user_id === userId) action.assignee_user_id = null;
+    return true;
   }
 
   async appendAudit(record: NewAuditRecord) {
@@ -222,6 +225,20 @@ export class InMemoryWebappRepository implements WebappRepository {
     if (cursor === undefined) return [];
     const rows = this.auditLog.filter(r => include(r) && (cursor === null || newestFirst(cursor, r) < 0));
     return structuredClone(rows.sort(newestFirst).slice(0, limit));
+  }
+  /**
+   * Who holds an action is checked and written with no await in between, as setRole and removeMember change the role and release
+   * in one step: whichever runs first, the other sees its result, so a viewer or a former member never ends up holding one
+   * (DN-11 D11, D15).
+   */
+  private requireEligible(orgId: string, assignee: string | null | undefined) {
+    if (typeof assignee !== 'string') return;
+    const membership = this.membership(orgId, assignee);
+    if (!membership || !can(membership.role, 'actions.update')) throw new IneligibleAssignee();
+  }
+  /** Nothing else on the rows changes. */
+  private release(orgId: string, userId: string) {
+    for (const action of this.actions) if (action.org_id === orgId && action.assignee_user_id === userId) action.assignee_user_id = null;
   }
   private customCount(orgId: string) { return this.actions.filter(a => a.org_id === orgId && a.source === 'custom').length; }
   private customAction(orgId: string, id: string) {

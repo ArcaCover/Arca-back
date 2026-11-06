@@ -56,11 +56,49 @@ async function expectFailure(promise: Promise<unknown>, code: WebappFailure['cod
 type ScanOptions = { email?: string; status?: ScanRecord['status']; assessment?: 'COMPLETED' | 'IN_PROGRESS'; actions?: ActionItem[];
   injected?: boolean };
 
-async function scene() {
+type HeldRead = 'getMembership' | 'getCustomAction' | 'getAssessmentAction';
+/**
+ * A store that can hold the answer of one read: the value is read when the call is made and handed back only once the test
+ * releases it, so another request lands in between, as it would between two statements against a database.
+ */
+class HoldingRepository extends InMemoryWebappRepository {
+  private hold: { method: HeldRead; matches: (args: string[]) => boolean; reached: () => void; gate: Promise<void> } | null = null;
+
+  /** Holds the next read of `method` whose arguments match; `reached` settles once that read has been made. */
+  holdNext(method: HeldRead, matches: (args: string[]) => boolean) {
+    let reached!: () => void;
+    let release!: () => void;
+    const hit = new Promise<void>(resolve => { reached = resolve; });
+    this.hold = { method, matches, reached, gate: new Promise<void>(resolve => { release = resolve; }) };
+    return { reached: hit, release };
+  }
+
+  override async getMembership(orgId: string, userId: string) {
+    return this.held('getMembership', [orgId, userId], await super.getMembership(orgId, userId));
+  }
+  override async getCustomAction(orgId: string, id: string) {
+    return this.held('getCustomAction', [orgId, id], await super.getCustomAction(orgId, id));
+  }
+  override async getAssessmentAction(orgId: string, scanId: string, actionKey: string) {
+    return this.held('getAssessmentAction', [orgId, scanId, actionKey], await super.getAssessmentAction(orgId, scanId, actionKey));
+  }
+
+  private async held<T>(method: HeldRead, args: string[], value: T): Promise<T> {
+    const hold = this.hold;
+    if (hold?.method === method && hold.matches(args)) {
+      this.hold = null;
+      hold.reached();
+      await hold.gate;
+    }
+    return value;
+  }
+}
+
+async function scene<R extends InMemoryWebappRepository = InMemoryWebappRepository>(
+  repository: R = new InMemoryWebappRepository(DEFAULT_PLANS) as R) {
   let clock = T0;
   const scans = new InMemoryRepository();
   const assessments = new InMemoryAssessmentRepository();
-  const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
   const billing = new MockBillingProvider(APP, () => clock);
   const auth = new MockAppAuth(secret, () => clock);
   const injected = new Set<string>();
@@ -118,8 +156,9 @@ async function scene() {
     advance: (ms: number) => { clock += ms; }, now: () => clock };
 }
 const inviteToken = (invitation: InvitationView) => invitation.inviteUrl!.split('/app/invite/')[1]!;
-const roleOf = async (s: Awaited<ReturnType<typeof scene>>, orgId: string, userId: string) =>
+const roleOf = async (s: { repository: InMemoryWebappRepository }, orgId: string, userId: string) =>
   (await s.repository.getMembership(orgId, userId))?.role ?? null;
+const ASSIGNEE_REFUSED = 'The assignee must be a member of the organization who can update actions';
 
 describe('claiming the funnel analysis', () => {
   it('the funnel claim creates an organization owned by the claimant', async () => {
@@ -239,7 +278,10 @@ describe('access', () => {
     const { owner, org } = await s.ownedOrg();
     const stranger = await s.user('stranger@other.com');
     await expectFailure(s.service.authorize(stranger, org.id, 'org.read', { payment: false }), 'not_found', 404);
-    await expectFailure(s.service.authorize(owner, randomUUID(), 'org.read', { payment: false }), 'not_found', 404);
+    // An id that is not a UUID gets the same answer as one that names no organization.
+    for (const orgId of [randomUUID(), 'org_missing']) {
+      await expectFailure(s.service.authorize(owner, orgId, 'org.read', { payment: false }), 'not_found', 404);
+    }
     // Before paying the owner reaches the organization itself but no paid route.
     await expectFailure(s.service.authorize(owner, org.id, 'org.read', { payment: true }), 'payment_required', 402);
     expect(await s.service.authorize(owner, org.id, 'billing.manage', { payment: false })).toMatchObject({ role: 'owner', org: { id: org.id } });
@@ -286,7 +328,10 @@ describe('members', () => {
     await expectFailure(s.service.setRole(admin, org.id, member.userId, 'owner'), 'forbidden', 403);
     await expectFailure(s.service.setRole(member, org.id, viewer.userId, 'member'), 'forbidden', 403);
     await expectFailure(s.service.removeMember(viewer, org.id, member.userId), 'forbidden', 403);
-    await expectFailure(s.service.setRole(admin, org.id, randomUUID(), 'member'), 'not_found', 404);
+    for (const userId of [randomUUID(), 'user_missing']) {
+      await expectFailure(s.service.setRole(admin, org.id, userId, 'member'), 'not_found', 404);
+      await expectFailure(s.service.removeMember(admin, org.id, userId), 'not_found', 404);
+    }
     expect(MemberView.parse(await s.service.setRole(admin, org.id, viewer.userId, 'member')))
       .toEqual({ userId: viewer.userId, email: 'viewer@firm.com', role: 'member', joinedAt: iso(T0) });
     await s.service.removeMember(admin, org.id, viewer.userId);
@@ -435,10 +480,12 @@ describe('billing', () => {
     expect(await s.repository.getSubscription(org.id)).toMatchObject({ status: 'past_due', plan_code: 'monthly',
       customer_id: event.customerId, subscription_id: event.subscriptionId, current_period_end: event.currentPeriodEnd });
 
-    const stray = { ...event, id: 'evt_stray', orgId: randomUUID() };
-    expect(await s.service.applyBillingEvent(stray)).toBe('unknown_org');
-    expect(await s.repository.getSubscription(stray.orgId)).toBeNull();
-    expect(await s.repository.getOrganization(stray.orgId)).toBeNull();
+    for (const orgId of [randomUUID(), 'org_missing']) {
+      const stray = { ...event, id: `evt_stray_${orgId}`, orgId };
+      expect(await s.service.applyBillingEvent(stray)).toBe('unknown_org');
+      expect(await s.repository.getSubscription(stray.orgId)).toBeNull();
+      expect(await s.repository.getOrganization(stray.orgId)).toBeNull();
+    }
   });
 
   it('a payment activates the organization and a cancellation keeps the deletion state untouched', async () => {
@@ -522,7 +569,7 @@ describe('deletion and the platform admin', () => {
     expect(s.billing.canceled).toEqual([]);
     expect(await s.service.orgView(owner, org.id)).toMatchObject({ deletionPending: false });
     await expectFailure(s.service.reviewDeletion(ops, first.id, 'approve'), 'conflict', 409);
-    await expectFailure(s.service.reviewDeletion(ops, randomUUID(), 'approve'), 'not_found', 404);
+    for (const id of [randomUUID(), 'dr_missing']) await expectFailure(s.service.reviewDeletion(ops, id, 'approve'), 'not_found', 404);
 
     const second = await s.service.requestDeletion(owner, org.id, 'Closing the firm, signed letter attached');
     expect(await s.service.listDeletionRequests()).toEqual([rejected, second].map(r => DeletionRequestView.parse(r)));
@@ -992,6 +1039,90 @@ describe('the action plan', () => {
   });
 });
 
+describe('the action plan under requests that race', () => {
+  async function racing() {
+    const repository = new HoldingRepository(DEFAULT_PLANS);
+    const s = await scene(repository);
+    const team = await s.team();
+    return { ...s, ...team, own: await s.service.createAction(team.owner, team.org.id, { title: 'Name an AI lead' }) };
+  }
+
+  it('an assignee made viewer or removed after the check is refused by the write itself, and holds nothing (D11, D15)', async () => {
+    const r = await racing();
+    const cases = [
+      { key: A1, holder: r.member, change: () => r.service.setRole(r.owner, r.org.id, r.member.userId, 'viewer') },
+      { key: r.own.key, holder: r.member, change: () => r.service.setRole(r.owner, r.org.id, r.member.userId, 'viewer') },
+      { key: A1, holder: r.member, change: () => r.service.removeMember(r.owner, r.org.id, r.member.userId) },
+      { key: r.own.key, holder: r.admin, change: () => r.service.removeMember(r.owner, r.org.id, r.admin.userId) },
+    ];
+    const appendAudit = vi.spyOn(r.repository, 'appendAudit');
+    for (const { key, holder, change } of cases) {
+      if (await roleOf(r, r.org.id, holder.userId) === 'viewer') await r.service.setRole(r.owner, r.org.id, holder.userId, 'member');
+      appendAudit.mockClear();
+      // The service's own check reads a role that can mark actions, and its answer is held until the change has landed.
+      const hold = r.repository.holdNext('getMembership', ([, userId]) => userId === holder.userId);
+      const assigning = r.service.updateAction(r.owner, r.org.id, key, { assigneeUserId: holder.userId })
+        .then(() => null, (caught: unknown) => caught);
+      await hold.reached;
+      await change();
+      hold.release();
+      const error = await assigning;
+      expect(error, key).toBeInstanceOf(WebappFailure);
+      expect(error, key).toMatchObject({ code: 'invalid_request', status: 400, message: ASSIGNEE_REFUSED });
+      expect((await r.service.listActions(r.owner, r.org.id)).items.find(item => item.key === key)?.assignee, key).toBeNull();
+      expect(appendAudit.mock.calls.map(([record]) => record.action), key).not.toContain('action.updated');
+    }
+  });
+
+  it('a change or a deletion of an action another request deleted meanwhile is a 404, and audits nothing', async () => {
+    const r = await racing();
+    const appendAudit = vi.spyOn(r.repository, 'appendAudit');
+    const requests = [
+      (key: string) => r.service.updateAction(r.member, r.org.id, key, { status: 'done' }),
+      (key: string) => r.service.updateAction(r.admin, r.org.id, key, { dueDate: '2026-12-01' }),
+      // A change that changes nothing answers with a fresh read, which finds nothing either.
+      (key: string) => r.service.updateAction(r.member, r.org.id, key, { status: 'todo' }),
+      (key: string) => r.service.deleteAction(r.admin, r.org.id, key),
+    ];
+    for (const [index, request] of requests.entries()) {
+      const { key } = await r.service.createAction(r.owner, r.org.id, { title: `Doomed ${index}` });
+      appendAudit.mockClear();
+      const hold = r.repository.holdNext('getCustomAction', ([, id]) => key === `c.${id}`);
+      const late = request(key).then(() => null, (caught: unknown) => caught);
+      await hold.reached;
+      await r.service.deleteAction(r.owner, r.org.id, key);
+      hold.release();
+      const error = await late;
+      expect(error, `request ${index}`).toBeInstanceOf(WebappFailure);
+      expect(error, `request ${index}`).toMatchObject({ code: 'not_found', status: 404, message: 'Action not found' });
+      expect(appendAudit.mock.calls.map(([record]) => [record.action, record.actor_user_id]), `request ${index}`)
+        .toEqual([['action.deleted', r.owner.userId]]);
+    }
+  });
+
+  it('a change that changes nothing answers with the action as it is now, not as it was read', async () => {
+    const r = await racing();
+    const appendAudit = vi.spyOn(r.repository, 'appendAudit');
+    const holds = [
+      { key: A1, read: 'getAssessmentAction', matches: ([, scanId, actionKey]: string[]) => A1 === `a.${scanId}.${actionKey}` },
+      { key: r.own.key, read: 'getCustomAction', matches: ([, id]: string[]) => r.own.key === `c.${id}` },
+    ] as const;
+    for (const { key, read, matches } of holds) {
+      const hold = r.repository.holdNext(read, matches);
+      const answer = r.service.updateAction(r.member, r.org.id, key, { status: 'todo' });
+      await hold.reached;
+      r.advance(HOUR);
+      const dated = await r.service.updateAction(r.owner, r.org.id, key, { dueDate: '2026-12-01' });
+      expect(dated, key).toMatchObject({ status: 'todo', dueDate: '2026-12-01', updatedAt: iso(r.now()) });
+      hold.release();
+      expect(await answer, key).toEqual(dated);
+    }
+    // Only the change that wrote is audited.
+    expect(appendAudit.mock.calls.map(([record]) => [record.action, record.actor_user_id, record.target]))
+      .toEqual([['action.updated', r.owner.userId, A1], ['action.updated', r.owner.userId, r.own.key]]);
+  });
+});
+
 describe('activity', () => {
   it('owners and admins read it, unpaid too; members and viewers do not', async () => {
     const s = await scene();
@@ -1062,6 +1193,24 @@ describe('activity', () => {
       ['billing.event_applied', 'system', null], ['plan.updated', 'platform', 'ops@arca.example'],
       ['org.deletion_approved', 'platform', 'ops@arca.example'], ['org.deletion_rejected', 'platform', 'ops@arca.example'],
       ['org.created', 'member', OWNER]]);
+  });
+
+  it('looks an action up among the listed ones only, so one named like a property of every object stays a member\'s', async () => {
+    const s = await scene();
+    const { owner, org } = await s.ownedOrg();
+    const names = ['constructor', 'toString', '__proto__', 'hasOwnProperty'];
+    for (const action of names) {
+      s.advance(1);
+      await s.repository.appendAudit({ id: randomUUID(), actor_kind: 'member', actor_user_id: owner.userId, org_id: org.id, action,
+        target: owner.userId, data: {}, created_at: iso(s.now()) });
+    }
+    const page = ActivityPage.parse(await s.service.activity(owner, org.id, { limit: 50 }));
+    expect(page.events.map(event => [event.action, event.actor, event.targetLabel])).toEqual([
+      ...[...names].reverse().map(action => [action, { kind: 'member', email: OWNER }, null]),
+      ['org.created', { kind: 'member', email: OWNER }, 'Smith & Co']]);
+    const audit = AdminAuditPage.parse(await s.service.adminAudit({ orgId: org.id, limit: 100 }));
+    expect(audit.events.map(event => [event.action, event.actorKind, event.actorEmail, event.targetLabel])).toEqual([
+      ...[...names].reverse().map(action => [action, 'member', OWNER, null]), ['org.created', 'member', OWNER, 'Smith & Co']]);
   });
 
   it('labels each target and shows only the allowed changes', async () => {
@@ -1243,5 +1392,67 @@ describe('the platform admin panel', () => {
     expect(AdminMetricsView.parse(await s.service.adminMetrics())).toEqual({
       organizations: { pending_payment: 1, active: 1, past_due: 0, canceled: 0, deleted: 1 },
       members: 5, analyses: 2, pendingDeletionRequests: 1, actions: { todo: 4, in_progress: 1, done: 1 } });
+  });
+});
+
+// Every id the store keeps in a uuid column (DN-11 §5): a column like that refuses anything else with an error, not a miss.
+describe('ids of the store', () => {
+  it('an id that is not a UUID gets the answer of an unknown one, and the store is never asked about it', async () => {
+    const s = await scene();
+    const { owner, org, member } = await s.team();
+    const ops = await s.platformAdmin();
+    const spies = (['getMembership', 'getOrganization', 'listInvitations', 'getDeletionRequest'] as const)
+      .map(method => vi.spyOn(s.repository, method));
+    const notUuids = ['org_missing', `${org.id}x`, '', 'null'];
+    for (const id of notUuids) {
+      await expectFailure(s.service.authorize(owner, id, 'org.read', { payment: false }), 'not_found', 404);
+      await expectFailure(s.service.listActions(owner, id), 'not_found', 404);
+      await expectFailure(s.service.activity(owner, id, { limit: 50 }), 'not_found', 404);
+      await expectFailure(s.service.setRole(owner, org.id, id, 'viewer'), 'not_found', 404);
+      await expectFailure(s.service.removeMember(owner, org.id, id), 'not_found', 404);
+      await expectFailure(s.service.revokeInvitation(owner, org.id, id), 'not_found', 404);
+      await expectFailure(s.service.reviewDeletion(ops, id, 'approve'), 'not_found', 404);
+      expect(await s.service.applyBillingEvent({ ...canceled(org.id, `evt_${id}`), orgId: id })).toBe('unknown_org');
+    }
+    // Asked about the organization, its members and the platform admin, but never about one of these ids.
+    for (const spy of spies) for (const args of spy.mock.calls) for (const arg of args) expect(notUuids).not.toContain(arg);
+    const [, , listInvitations, getDeletionRequest] = spies;
+    expect(listInvitations).not.toHaveBeenCalled();
+    expect(getDeletionRequest).not.toHaveBeenCalled();
+    // The answers that come before the lookup still come first.
+    await expectFailure(s.service.setRole(member, org.id, 'user_missing', 'viewer'), 'forbidden', 403);
+    await expectFailure(s.service.revokeInvitation(member, org.id, 'inv_missing'), 'forbidden', 403);
+    await expectFailure(s.service.reviewDeletion(owner, 'dr_missing', 'approve'), 'forbidden', 403);
+    expect(await s.repository.getOrganization(org.id)).toMatchObject({ billing_status: 'active', deleted_at: null });
+  });
+
+  it('an id is read in any case, as Postgres reads a uuid, and the stored one is what is written', async () => {
+    const s = await scene();
+    const { owner, org, member } = await s.team();
+    const ORG = org.id.toUpperCase();
+    expect(ORG).not.toBe(org.id);
+    expect(await s.service.orgView(owner, ORG)).toEqual(await s.service.orgView(owner, org.id));
+    expect(await s.service.listActions(owner, ORG)).toEqual(await s.service.listActions(owner, org.id));
+    expect(await s.service.setRole(owner, ORG, member.userId.toUpperCase(), 'viewer')).toMatchObject({ userId: member.userId, role: 'viewer' });
+    const own = await s.service.createAction(owner, ORG, { title: 'Name an AI lead' });
+    expect(await s.repository.getCustomAction(org.id, own.key.slice(2))).toMatchObject({ org_id: org.id });
+    const invitation = await s.service.invite(owner, ORG, { email: 'late@firm.com', role: 'viewer' });
+    await s.service.revokeInvitation(owner, ORG, invitation.id.toUpperCase());
+    expect(await s.repository.listInvitations(org.id)).toEqual([]);
+    const portal = vi.spyOn(s.billing, 'createPortal');
+    await s.service.portal(owner, ORG);
+    expect(portal).toHaveBeenCalledWith({ orgId: org.id, returnUrl: `${APP}/app/billing` });
+    const request = await s.service.requestDeletion(owner, ORG, 'Closing the firm');
+    expect(request.orgId).toBe(org.id);
+    expect(await s.service.reviewDeletion(await s.platformAdmin(), request.id.toUpperCase(), 'reject')).toMatchObject({ id: request.id,
+      status: 'rejected' });
+    expect(await s.service.applyBillingEvent(canceled(ORG))).toBe('applied');
+    expect(await s.repository.getOrganization(org.id)).toMatchObject({ billing_status: 'canceled' });
+    // Every row written names the stored ids.
+    const rows = await s.repository.listAllAudit({ limit: 500 });
+    expect(rows.filter(row => row.org_id !== null && row.org_id !== org.id)).toEqual([]);
+    expect(rows.filter(row => ['member.role_changed', 'org.deletion_rejected', 'invitation.revoked'].includes(row.action))
+      .map(row => [row.action, row.target, row.data.invitationId])).toEqual([['org.deletion_rejected', request.id, undefined],
+      ['invitation.revoked', 'late@firm.com', invitation.id], ['member.role_changed', member.userId, undefined]]);
   });
 });
