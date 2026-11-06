@@ -95,17 +95,18 @@ export class IneligibleAssignee extends Error {
 
 /**
  * Storage of the webapp. Reads return null (or an empty list) for what does not exist; a write that names a record
- * that does not exist throws a plain Error, so the caller looks it up first, except for an action, which another request may
- * delete between that lookup and the write (updateAction, deleteCustomAction). The rules of the data model throw
- * WebappConflict or IneligibleAssignee and leave nothing half written.
+ * that does not exist throws a plain Error, so the caller looks it up first, except for a membership or an action, which another
+ * request may delete between that lookup and the write: setRole, removeMember, updateAction and deleteCustomAction say so in
+ * what they return. The rules of the data model throw WebappConflict or IneligibleAssignee and leave nothing half written.
  *
  * Who holds an action (DN-11 D11, D15) is a rule of the writes, not of an earlier read: every write that names an assignee checks
  * them, and the change that takes a user's right to hold actions away releases theirs in the same call. A SQL repository runs
  * each of these as one transaction:
  * - a write that names an assignee first takes `select role from memberships where org_id = $1 and user_id = $2 for share`
  *   and refuses unless the role can update actions, then writes;
- * - setRole and removeMember first take `select ... from memberships where org_id = $1 and user_id = $2 for update`, then
- *   change or delete the row and run `update org_actions set assignee_user_id = null where org_id = $1 and assignee_user_id = $2`.
+ * - setRole and removeMember first take `select ... from memberships where org_id = $1 and user_id = $2 for update` (no row:
+ *   return false and write nothing), then change or delete the row and run
+ *   `update org_actions set assignee_user_id = null where org_id = $1 and assignee_user_id = $2`.
  * The two locks conflict, so a role change waits for an assignment in flight and then releases it, or the assignment waits for
  * the role change and then reads the new role.
  */
@@ -127,14 +128,16 @@ export interface WebappRepository {
   addMember(member: MembershipRecord): Promise<void>;
   /**
    * `last_owner` when it would leave the organization without an owner. A role that cannot update actions (a viewer) holds none:
-   * the same call unassigns every action of the organization the user held, and nothing else on those rows changes.
+   * the same call unassigns every action of the organization the user held, and nothing else on those rows changes. True when it
+   * changed the role, false when the user is not a member, as when another request removed them after the caller read it.
    */
-  setRole(orgId: string, userId: string, role: Role): Promise<void>;
+  setRole(orgId: string, userId: string, role: Role): Promise<boolean>;
   /**
    * `last_owner` when it would leave the organization without an owner. The same call unassigns every action of the organization
-   * the user held (DN-11 D15), and they stay unassigned if the user comes back.
+   * the user held (DN-11 D15), and they stay unassigned if the user comes back. True when it removed the member, false when there
+   * was none to remove, as for the second of two removals that race.
    */
-  removeMember(orgId: string, userId: string): Promise<void>;
+  removeMember(orgId: string, userId: string): Promise<boolean>;
 
   createInvitation(invitation: InvitationRecord): Promise<void>;
   /** Finds it whatever its state, so the caller can tell an accepted or revoked invitation from an unknown one. */

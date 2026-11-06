@@ -79,17 +79,19 @@ export class InMemoryWebappRepository implements WebappRepository {
   }
   async setRole(orgId: string, userId: string, role: Role) {
     const membership = this.membership(orgId, userId);
-    if (!membership) throw new Error('Member not found');
+    if (!membership) return false;
     if (membership.role === 'owner' && role !== 'owner' && this.ownerCount(orgId) === 1) throw new WebappConflict('last_owner');
     membership.role = role;
     if (!can(role, 'actions.update')) this.release(orgId, userId);
+    return true;
   }
   async removeMember(orgId: string, userId: string) {
     const membership = this.membership(orgId, userId);
-    if (!membership) throw new Error('Member not found');
+    if (!membership) return false;
     if (membership.role === 'owner' && this.ownerCount(orgId) === 1) throw new WebappConflict('last_owner');
     this.memberships.splice(this.memberships.indexOf(membership), 1);
     this.release(orgId, userId);
+    return true;
   }
 
   async createInvitation(invitation: InvitationRecord) {

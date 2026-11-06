@@ -361,7 +361,8 @@ export class WebappService {
     const target = await this.member(org.id, targetUserId);
     if (!canManageMember(actorRole, target.role, role)) throw fail('forbidden', 'Your role cannot give this role to this member');
     if (target.role !== role) {
-      await orConflict(this.repo.setRole(org.id, target.user_id, role));
+      // Removed by another request since it was read: nothing was written, so nothing is audited.
+      if (!(await orConflict(this.repo.setRole(org.id, target.user_id, role)))) throw fail('not_found', 'Member not found');
       await this.audit(actor.userId, org.id, 'member.role_changed', target.user_id, { from: target.role, to: role }, 'member');
     }
     return this.memberView({ ...target, role });
@@ -372,7 +373,8 @@ export class WebappService {
     const { org, role: actorRole } = await this.authorize(actor, orgId, 'members.remove', { payment: true });
     const target = await this.member(org.id, targetUserId);
     if (!canManageMember(actorRole, target.role)) throw fail('forbidden', 'Your role cannot remove this member');
-    await orConflict(this.repo.removeMember(org.id, target.user_id));
+    // Two removals that race both find the member; only the one that removed them audits.
+    if (!(await orConflict(this.repo.removeMember(org.id, target.user_id)))) throw fail('not_found', 'Member not found');
     await this.audit(actor.userId, org.id, 'member.removed', target.user_id, { role: target.role }, 'member');
     // A link still pending for their email would let the removed member back in.
     const profile = await this.repo.getProfile(target.user_id);
@@ -495,7 +497,8 @@ export class WebappService {
     const action: CustomActionRecord = { id: randomUUID(), org_id: org.id, source: 'custom', scan_id: null, action_key: null,
       title: req.title, detail: req.detail || null, domain: req.domain ?? null, ...UNTOUCHED, created_by: user.userId, created_at: at,
       updated_by: user.userId, updated_at: at };
-    await orConflict(this.repo.createCustomAction(action));
+    // Created unassigned today, but the store checks any assignee it is given; its refusal stays the 400, never a 500.
+    await orIneligible(orConflict(this.repo.createCustomAction(action)));
     await this.audit(user.userId, org.id, 'action.created', customKey(action.id), { title: action.title }, 'member');
     return this.actionView({ source: 'custom', row: action });
   }

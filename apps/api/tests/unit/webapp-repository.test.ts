@@ -174,11 +174,18 @@ describe('members', () => {
     expect(await repo.listMembers('org_1')).toHaveLength(1);
   });
 
-  it('refuses to change a member that does not exist', async () => {
+  it('says whether there was a member to change, as when another request removed them first', async () => {
     const repo = await repoWithOrg();
-    await expect(repo.setRole('org_1', 'ghost', 'admin')).rejects.toThrow('Member not found');
-    await expect(repo.removeMember('org_1', 'ghost')).rejects.toThrow('Member not found');
-    await expect(repo.setRole('org_9', 'user_a', 'admin')).rejects.toThrow('Member not found');
+    await repo.addMember(member('org_1', 'user_b', 'member'));
+    expect(await repo.setRole('org_1', 'ghost', 'admin')).toBe(false);
+    expect(await repo.removeMember('org_1', 'ghost')).toBe(false);
+    expect(await repo.setRole('org_9', 'user_a', 'admin')).toBe(false);
+    expect(await repo.setRole('org_1', 'user_b', 'admin')).toBe(true);
+    expect(await repo.removeMember('org_1', 'user_b')).toBe(true);
+    // The second of two removals finds nobody.
+    expect(await repo.removeMember('org_1', 'user_b')).toBe(false);
+    expect(await repo.setRole('org_1', 'user_b', 'viewer')).toBe(false);
+    expect((await repo.listMembers('org_1')).map(m => [m.user_id, m.role])).toEqual([['user_a', 'owner']]);
   });
 });
 

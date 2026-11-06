@@ -13,6 +13,7 @@ import { MockBillingProvider, type BillingEvent } from '../../src/webapp/billing
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
 import { WebappFailure, WebappService } from '../../src/webapp/service.js';
+import { IneligibleAssignee } from '../../src/webapp/types.js';
 import { fixtureResult } from '../fixtures/result.js';
 
 const secret = 'webapp-service-test-secret-'.repeat(2);
@@ -348,6 +349,31 @@ describe('members', () => {
     const { members } = await s.service.listMembers(org.id);
     expect(members.map(m => MemberView.parse(m)).map(m => [m.email, m.role]).sort())
       .toEqual([['admin@firm.com', 'owner'], ['member@firm.com', 'member'], [OWNER, 'admin']]);
+  });
+
+  it('a role change or a removal of a member another request removed meanwhile is a 404, and audits nothing', async () => {
+    const s = await scene(new HoldingRepository(DEFAULT_PLANS));
+    const { owner, org, admin, member, viewer } = await s.team();
+    const appendAudit = vi.spyOn(s.repository, 'appendAudit');
+    const cases = [
+      { target: member, request: () => s.service.setRole(owner, org.id, member.userId, 'viewer') },
+      { target: viewer, request: () => s.service.removeMember(owner, org.id, viewer.userId) },
+    ];
+    for (const { target, request } of cases) {
+      appendAudit.mockClear();
+      // The late request finds the member, and its answer is held until another request has removed them.
+      const hold = s.repository.holdNext('getMembership', ([, userId]) => userId === target.userId);
+      const late = request().then(() => null, (caught: unknown) => caught);
+      await hold.reached;
+      await s.service.removeMember(admin, org.id, target.userId);
+      hold.release();
+      const error = await late;
+      expect(error, target.email).toBeInstanceOf(WebappFailure);
+      expect(error, target.email).toMatchObject({ code: 'not_found', status: 404, message: 'Member not found' });
+      expect(await roleOf(s, org.id, target.userId), target.email).toBeNull();
+      expect(appendAudit.mock.calls.map(([record]) => [record.action, record.actor_user_id, record.target]), target.email)
+        .toEqual([['member.removed', admin.userId, target.userId]]);
+    }
   });
 
   it('an invitation is accepted once, by its own email', async () => {
@@ -826,6 +852,20 @@ describe('the action plan', () => {
     }
     // The key is checked before the assignee.
     await expectFailure(s.service.updateAction(owner, org.id, 'a.sc_1.missing', { assigneeUserId: viewer.userId }), 'not_found', 404);
+  });
+
+  it('a creation the store refuses for its assignee is the same 400, never a 500', async () => {
+    // No request names an assignee on creation today; the store checks one anyway, and its refusal must keep its answer.
+    class Refusing extends InMemoryWebappRepository {
+      override async createCustomAction(): Promise<void> { throw new IneligibleAssignee(); }
+    }
+    const s = await scene(new Refusing(DEFAULT_PLANS));
+    const { owner, org } = await s.team();
+    const appendAudit = vi.spyOn(s.repository, 'appendAudit');
+    const error = await s.service.createAction(owner, org.id, { title: 'Name an AI lead' }).then(() => null, (caught: unknown) => caught);
+    expect(error).toBeInstanceOf(WebappFailure);
+    expect(error).toMatchObject({ code: 'invalid_request', status: 400, message: ASSIGNEE_REFUSED });
+    expect(appendAudit).not.toHaveBeenCalled();
   });
 
   it('a change that changes nothing writes and audits nothing', async () => {
