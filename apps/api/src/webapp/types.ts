@@ -104,11 +104,18 @@ export class IneligibleAssignee extends Error {
  * each of these as one transaction:
  * - a write that names an assignee first takes `select role from memberships where org_id = $1 and user_id = $2 for share`
  *   and refuses unless the role can update actions, then writes;
- * - setRole and removeMember first take `select ... from memberships where org_id = $1 and user_id = $2 for update` (no row:
- *   return false and write nothing), then change or delete the row and run
- *   `update org_actions set assignee_user_id = null where org_id = $1 and assignee_user_id = $2`.
- * The two locks conflict, so a role change waits for an assignment in flight and then releases it, or the assignment waits for
- * the role change and then reads the new role.
+ * - setRole and removeMember first take `select role from memberships where org_id = $1 and user_id = $2 for update` (no row:
+ *   return false and write nothing), then change or delete the row. Only when the user is removed, or their new role cannot
+ *   update actions (a viewer), do they also run `update org_actions set assignee_user_id = null where org_id = $1 and
+ *   assignee_user_id = $2`; a change to a role that can (member, admin or owner) keeps the user's actions.
+ * The two locks conflict, so a change to viewer or a removal waits for an assignment in flight and then releases it, or the
+ * assignment waits for the change and then reads the new role.
+ *
+ * Not closed yet: the service checks the actor's right over the target (canManageMember) against the target's role as it read it
+ * before the write, and setRole and removeMember change or delete the row whatever its role is by then, so an admin whose request
+ * overlaps an owner's promotion of the target can demote or remove an owner, and the audit row records the stale role. The SQL
+ * version must re-check that right against the role it reads under the `for update` lock, and change or delete nothing when it no
+ * longer holds; that means passing the store what the service checked. The in-memory store has the same window today.
  */
 export interface WebappRepository {
   upsertProfile(profile: ProfileRecord): Promise<void>;
