@@ -620,6 +620,24 @@ describe('audit', () => {
       .toMatchObject({ target: viewer.userId, data: { from: 'viewer', to: 'member' } });
     expect(await s.repository.listAudit(org.id, { limit: 200 })).toHaveLength(log.length - 1);
   });
+
+  it('the copy for the mock demo seed audits as the system what a member would, naming no user', async () => {
+    const s = await scene();
+    const appendAudit = vi.spyOn(s.repository, 'appendAudit');
+    const system = s.service.asSystem();
+    const owner = await s.user(OWNER);
+    const org = await system.createOrganization(owner, { name: 'Robust Law (demo)', claimId: await s.claim('sc_1') });
+    await s.pay(owner, org.id);
+    const invitation = await system.invite(owner, org.id, { email: 'admin@firm.com', role: 'admin' });
+    const admin = await s.user('admin@firm.com');
+    await system.acceptInvitation(admin, inviteToken(invitation));
+    // The same rules and store: the member is in, and the original service keeps auditing members as members.
+    expect(await roleOf(s, org.id, admin.userId)).toBe('admin');
+    await s.service.renameOrganization(owner, org.id, 'Robust Law');
+    expect(appendAudit.mock.calls.map(([record]) => [record.action, record.actor_user_id, record.actor_kind])).toEqual([
+      ['org.created', null, 'system'], ['billing.event_applied', null, 'system'], ['member.invited', null, 'system'],
+      ['member.joined', null, 'system'], ['org.renamed', owner.userId, 'member']]);
+  });
 });
 
 // The DN-11 rules: the action plan, the activity, renaming and the platform admin panel.

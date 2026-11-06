@@ -1,7 +1,8 @@
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
 import type { DirectorySource, Layer1Pipeline, Layer1Result, WebsiteSource } from '@arca/contracts';
-import { DEBUG_REQUEST_HEADER, DebugModeResponse, DebugScanState, DebugScenario, isInjected } from '@arca/contracts/debug';
+import { DEBUG_REQUEST_HEADER, DebugModeResponse, DebugScanState, DebugScenario, isInjected,
+  type DebugSeedResponse } from '@arca/contracts/debug';
 import { verifySessionToken } from '../auth/session-token.js';
 import type { AssessmentAgent } from '../assessment/service.js';
 import type { ScanLimiter } from '../http/rate-limit.js';
@@ -11,6 +12,7 @@ import type { MockBillingProvider } from '../webapp/billing.js';
 import type { InMemoryWebappRepository } from '../webapp/in-memory.js';
 import type { WebappService } from '../webapp/service.js';
 import type { RoutingAssessmentRepository, RoutingScanRepository } from './isolation.js';
+import { describeDemo, seedDemo, type SeedDeps, type SeededDemo } from './seed.js';
 import { injectDirectory, injectWebsite } from './sources.js';
 
 /** What createApp needs from the debug modes. Production never builds one, so none of it is reachable there (DN-09 5.1). */
@@ -25,7 +27,8 @@ export type DebugTools = {
   takePollFault(scanId: string): 'unauthorized' | 'server_error' | 'hang' | null;
   reportFault(scanId: string): boolean;
   assessmentAgentFor(scanId: string): AssessmentAgent | undefined;
-  routes(context: { limiter: ScanLimiter; sessionSecret: string }): Hono;
+  /** `runScan` and `assessments` are the app's own, for the mock demo seed; every other mode leaves them unused. */
+  routes(context: { limiter: ScanLimiter; sessionSecret: string } & Pick<SeedDeps, 'runScan' | 'assessments'>): Hono;
 };
 
 // A server error or a hang spoils this many polls, then the scan answers again, so the front can be seen recovering.
@@ -45,14 +48,20 @@ const withoutDebugHeader = (c: Context, what: string) => c.req.header(DEBUG_REQU
   : c.json({ error: 'invalid_request', message: `${what} needs the ${DEBUG_REQUEST_HEADER}: 1 header` }, 400);
 const MockLogin = z.object({ email: z.string().trim().email().max(320), platformAdmin: z.boolean().optional() }).strict();
 const MockPayment = z.object({ sessionId: z.string().min(1) }).strict();
+const SEED_TIMEOUT_MS = 60_000;
 
 export function createDebugTools(options: {
   mode: 'mock' | 'live-debug'; describe: DebugModeResponse;
   sources: { website: WebsiteSource; bar: DirectorySource; avvo: DirectorySource };
   scans: RoutingScanRepository; assessments: RoutingAssessmentRepository; pipelineTimeoutMs: number;
   clearDurableMemory?: () => void;
-  /** The mock login and payment of the webapp (DN-10 §4.1, §4.4). Mock only: live-debug signs in with the real Supabase Auth. */
+  /**
+   * The mock login and payment of the webapp (DN-10 §4.1, §4.4) and its demo seed (DN-11 §4.6). Mock only: live-debug signs in
+   * with the real Supabase Auth.
+   */
   webapp?: { auth: MockAppAuth; billing: MockBillingProvider; service: WebappService; repository: InMemoryWebappRepository };
+  /** How long a seed request waits before it answers 504; the run itself goes on. */
+  seedTimeoutMs?: number;
 }): DebugTools {
   const { scans, assessments, sources, webapp } = options;
   if (webapp && options.mode !== 'mock') throw new Error('The mock login and payment exist only in mock');
@@ -61,6 +70,32 @@ export function createDebugTools(options: {
   const scenarios = new Map<string, DebugScenario>();
   const polls = new Map<string, number>();
   const failedSources = new Map<string, Layer1Result['sources']>();
+  // The demo organization last seeded, and the run in flight, which every request meanwhile shares. A reset forgets both, and a
+  // run it overtook is not remembered when it ends.
+  let seeded: SeededDemo | null = null;
+  let seeding: Promise<DebugSeedResponse> | null = null;
+  let resets = 0;
+  function seed(deps: SeedDeps): Promise<DebugSeedResponse> {
+    if (seeding) return seeding;
+    const epoch = resets;
+    const run = (async () => {
+      const current = seeded && await describeDemo(deps.repository, seeded);
+      if (current) return current;
+      const fresh = await seedDemo(deps);
+      if (epoch === resets) seeded = fresh;
+      const described = await describeDemo(deps.repository, fresh);
+      if (!described) throw new Error('The demo organization was gone as soon as it was seeded');
+      return described;
+    })();
+    seeding = run;
+    const settle = () => { if (seeding === run) seeding = null; };
+    // Logged here, so a run that fails after its requests gave up with a 504 still says why.
+    void run.then(settle, (error: unknown) => {
+      settle();
+      console.error('[debug] demo seed failed', error instanceof Error ? error.message : 'Unknown error');
+    });
+    return run;
+  }
   return {
     parseScenario(header) {
       if (header === undefined) return { ok: true, scenario: null };
@@ -96,7 +131,7 @@ export function createDebugTools(options: {
     },
     reportFault: scanId => scenarios.get(scanId)?.http.report === 'unavailable',
     assessmentAgentFor: scanId => scenarios.get(scanId)?.planner === 'timeout' ? stalledPlanner : undefined,
-    routes({ limiter, sessionSecret }) {
+    routes({ limiter, sessionSecret, runScan, assessments: assessmentService }) {
       const app = new Hono();
       app.use('*', async (c, next) => { c.header('Cache-Control', 'no-store'); await next(); });
       app.get('/mode', c => c.json(description));
@@ -129,6 +164,9 @@ export function createDebugTools(options: {
           assessments.overlay.clear();
           options.clearDurableMemory?.();
           webapp?.repository.clear();
+          seeded = null;
+          seeding = null;
+          resets++;
         }
         return c.json({ ok: true });
       });
@@ -142,6 +180,25 @@ export function createDebugTools(options: {
         const session = await webapp.auth.issue(body.data.email);
         if (body.data.platformAdmin) await webapp.repository.grantPlatformAdmin(session.user.userId, session.user.userId);
         return c.json(session);
+      });
+      // The demo organization (DN-11 §4.6): a paid one with a user of each role, built through the real flow. Asking again
+      // returns it as the demo left it; a new one is built only when there is none, it was deleted or a reset forgot it.
+      app.post('/seed', async c => {
+        const refused = withoutDebugHeader(c, 'A demo seed');
+        if (refused) return refused;
+        const run = seed({ ...webapp, runScan, assessments: assessmentService });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const late = new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), options.seedTimeoutMs ?? SEED_TIMEOUT_MS); });
+        try {
+          // On a timeout the run goes on: asking again joins it, or returns what it built.
+          const demo = await Promise.race([run, late]);
+          return demo ? c.json(demo) : c.json({ error: 'timeout', message: 'The demo seed did not finish in time' }, 504);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : 'unknown error';
+          return c.json({ error: 'internal_error', message: `The demo seed failed: ${reason}` }, 500);
+        } finally {
+          clearTimeout(timer);
+        }
       });
       // Stands in for Stripe's checkout.session.completed webhook: the event goes through the same service method.
       app.post('/billing/pay', async c => {

@@ -1,9 +1,10 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
-import { ActionItemView, ActionPlanResponse, ActivityPage, AdminAuditPage, AdminMetricsView, AdminOrgDetailView, AnalysisView, AssessmentView,
-  ClaimResponse, DeletionRequestView, InvitationView, MeResponse, MemberView, OrgView, PlanView, PollResponse, ROLES, ScanResponse,
+import { ActionItemView, ActionPlanResponse, ActivityPage, AdminAuditPage, AdminMetricsView, AdminOrgDetailView, AdminOrgView, AnalysisView,
+  AssessmentView, ClaimResponse, DeletionRequestView, InvitationView, MeResponse, MemberView, OrgView, PlanView, PollResponse, ROLES, ScanResponse,
   StartedAssessmentResponse, UrlResponse, type AnswerValue, type RenderedQuestion, type Role } from '@arca/contracts';
-import { DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, type DebugModeResponse, type DebugScenarioInput } from '@arca/contracts/debug';
+import { DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, DebugSeedResponse, type DebugModeResponse,
+  type DebugScenarioInput } from '@arca/contracts/debug';
 import { InMemoryAssessmentRepository } from '../../src/assessment/repository.js';
 import { compose } from '../../src/compose.js';
 import { loadEnv } from '../../src/config/env.js';
@@ -751,8 +752,125 @@ describe('the mock login and payment', () => {
   });
 });
 
+describe('the demo seed', () => {
+  const DEMO = 'demo.arca.example';
+  const SEEDED_USERS = [{ email: `owner@${DEMO}`, role: 'owner' }, { email: `admin@${DEMO}`, role: 'admin' },
+    { email: `member@${DEMO}`, role: 'member' }, { email: `viewer@${DEMO}`, role: 'viewer' }, { email: `ops@${DEMO}`, role: 'platform_admin' }];
+  async function seed(s: Awaited<ReturnType<typeof mockApp>>) {
+    const reply = await s.call('POST', '/__debug/seed', { debug: true });
+    expect(reply.status).toBe(200);
+    return DebugSeedResponse.parse(reply.body);
+  }
+  async function organizations(s: Awaited<ReturnType<typeof mockApp>>) {
+    const ops = await s.login(`ops@${DEMO}`);
+    return z.array(AdminOrgView).parse((await s.call('GET', '/admin/organizations', { token: ops.token })).body);
+  }
+
+  it('builds a paid organization with a user of each role through the real flow, its plan holding at least three actions', async () => {
+    const s = await mockApp();
+    const response = await s.app.request('/__debug/seed', { method: 'POST' });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'invalid_request', message: expect.stringContaining(DEBUG_REQUEST_HEADER) });
+    const demo = await seed(s);
+    // Strict: never a token.
+    expect(demo).toEqual({ organization: { id: expect.any(String), name: 'Robust Law (demo)' }, users: SEEDED_USERS });
+    // Each user signs in through the mock login, as the debug panel does, and finds the organization paid, with their role.
+    for (const { email, role } of SEEDED_USERS.slice(0, 4)) {
+      const { token } = await s.login(email);
+      expect(MeResponse.parse((await s.call('GET', '/me', { token })).body).organizations, email)
+        .toEqual([expect.objectContaining({ id: demo.organization.id, role, billingStatus: 'active', paidAccess: true })]);
+    }
+    const owner = await s.login(`owner@${DEMO}`);
+    const plan = await s.actionPlan(owner.token, demo.organization.id);
+    expect(plan.source).toMatchObject({ domain: DOMAIN });
+    expect(plan.items.filter(item => item.source === 'assessment').length).toBeGreaterThanOrEqual(3);
+    // ops is an ARCA admin without asking the login for it, and the seed audited everything it did as the system.
+    const ops = await s.login(`ops@${DEMO}`);
+    expect(MeResponse.parse((await s.call('GET', '/me', { token: ops.token })).body)).toMatchObject({ organizations: [], platformAdmin: true });
+    const audit = AdminAuditPage.parse((await s.call('GET', `/admin/audit?orgId=${demo.organization.id}`, { token: ops.token })).body);
+    expect(audit.events.map(event => event.action).sort()).toEqual(['billing.event_applied', 'member.invited', 'member.invited',
+      'member.invited', 'member.joined', 'member.joined', 'member.joined', 'org.created']);
+    expect(audit.events.every(event => event.actorKind === 'system' && event.actorEmail === null)).toBe(true);
+    const activity = ActivityPage.parse((await s.call('GET', `/orgs/${demo.organization.id}/activity`, { token: owner.token })).body);
+    expect(activity.events.every(event => event.actor.kind === 'system' && event.actor.email === null)).toBe(true);
+  });
+
+  it('runs its scan past the limiter, without spending an attempt', async () => {
+    const s = await mockApp();
+    const attempt = () => s.app.request('/scan', { method: 'POST', body: JSON.stringify({ email: `owner@${DEMO}`, domain: DOMAIN }),
+      headers: { 'Content-Type': 'application/json' } });
+    for (let allowed = 0; allowed < 3; allowed++) expect([200, 202]).toContain((await attempt()).status);
+    expect((await attempt()).status).toBe(429);
+    await seed(s);
+  });
+
+  it('returns the seeded organization as the demo left it, and seeds a new one once it is deleted or after a reset', async () => {
+    const s = await mockApp();
+    const first = await seed(s);
+    const orgId = first.organization.id;
+    const owner = await s.login(`owner@${DEMO}`);
+    const [member, viewer] = [await s.login(`member@${DEMO}`), await s.login(`viewer@${DEMO}`)];
+    expect((await s.call('PATCH', `/orgs/${orgId}`, { token: owner.token, body: { name: 'Robust Law (renamed)' } })).status).toBe(200);
+    expect((await s.call('PATCH', `/orgs/${orgId}/members/${viewer.user.userId}`, { token: owner.token, body: { role: 'member' } })).status)
+      .toBe(200);
+    expect((await s.call('DELETE', `/orgs/${orgId}/members/${member.user.userId}`, { token: owner.token })).status).toBe(204);
+    expect(await seed(s)).toEqual({ organization: { id: orgId, name: 'Robust Law (renamed)' }, users: [SEEDED_USERS[0], SEEDED_USERS[1],
+      { email: `viewer@${DEMO}`, role: 'member' }, SEEDED_USERS[4]] });
+    expect((await organizations(s)).map(org => org.id)).toEqual([orgId]);
+    // Deleted: ARCA approves the owner's request, and the next seed builds a new organization.
+    const request = await s.call('POST', `/orgs/${orgId}/deletion-request`, { token: owner.token, body: { reason: 'The demo is over' } });
+    const ops = await s.login(`ops@${DEMO}`);
+    expect((await s.call('POST', `/admin/deletion-requests/${DeletionRequestView.parse(request.body).id}/approve`,
+      { token: ops.token, body: {} })).status).toBe(200);
+    const second = await seed(s);
+    expect(second).toEqual({ organization: { id: expect.any(String), name: 'Robust Law (demo)' }, users: SEEDED_USERS });
+    expect(second.organization.id).not.toBe(orgId);
+    // A reset forgets it along with the rest of the memory.
+    expect(await s.call('POST', '/__debug/reset', { debug: true })).toEqual({ status: 200, body: { ok: true } });
+    const third = await seed(s);
+    expect(third.organization.id).not.toBe(second.organization.id);
+    expect((await organizations(s)).map(org => org.id)).toEqual([third.organization.id]);
+  });
+
+  it('gives requests that arrive together the one run in flight', async () => {
+    const s = await mockApp();
+    const replies = await Promise.all([1, 2, 3].map(() => s.call('POST', '/__debug/seed', { debug: true })));
+    expect(replies.map(reply => reply.status)).toEqual([200, 200, 200]);
+    expect(new Set(replies.map(reply => DebugSeedResponse.parse(reply.body).organization.id)).size).toBe(1);
+    expect(await organizations(s)).toHaveLength(1);
+  });
+
+  it('answers 504 when the run outlives the deadline, and the run goes on', async () => {
+    const scans = new RoutingScanRepository(new InMemoryRepository(), new InMemoryRepository());
+    const assessments = new RoutingAssessmentRepository(new InMemoryAssessmentRepository(), new InMemoryAssessmentRepository(), scans);
+    const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
+    const billing = new MockBillingProvider(origin);
+    const auth = new MockAppAuth(secret);
+    const service = new WebappService({ repository, scans, assessments, billing, sessionSecret: secret, appBaseUrl: origin });
+    // The scan's pipeline holds until the test lets it go.
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const real = new InProcessPipeline({ ...mockSources(), repository: scans, timeoutMs: 600_000 });
+    const debug = createDebugTools({ mode: 'mock', sources: mockSources(), scans, assessments, pipelineTimeoutMs: 600_000,
+      describe: { mode: 'mock', sourceMode: 'mock', storageBackend: 'memory', websiteEvidenceProvider: 'mock', assessmentPlanner: 'rules',
+        signalLlmModel: null, inUse: { openai: false, apify: false, supabase: false } },
+      webapp: { auth, billing, service, repository }, seedTimeoutMs: 50 });
+    const { app } = createApp({ repository: scans, assessmentRepository: assessments, debug, webapp: { service, auth },
+      pipeline: { run: async input => { await held; return real.run(input); } },
+      domainResolver: new PublicDomainResolver(async () => {}), sessionSecret: secret, corsOrigins: [origin], clientIp: () => '127.0.0.1' });
+    const post = () => app.request('/__debug/seed', { method: 'POST', headers: { [DEBUG_REQUEST_HEADER]: '1' } });
+    const late = await post();
+    expect(late.status).toBe(504);
+    expect(await late.json()).toEqual({ error: 'timeout', message: expect.any(String) });
+    release();
+    const seeded = await until(post, response => response.status === 200);
+    expect(DebugSeedResponse.parse(await seeded.json()).users).toEqual(SEEDED_USERS);
+    expect(await repository.listOrganizations()).toHaveLength(1);
+  });
+});
+
 describe('production wiring', () => {
-  it('answers 501 on every webapp route, has no mock login and keeps CORS exact', async () => {
+  it('answers 501 on every webapp route, has no mock login or demo seed and keeps CORS exact', async () => {
     const { app } = await compose(loadEnv({ SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory', SESSION_TOKEN_SECRET: secret,
       CORS_ALLOWED_ORIGINS: origin }));
     const routes: Array<[string, string]> = [['GET', '/me'], ['POST', '/claims'], ['GET', '/plans'], ['POST', '/orgs'], ['GET', '/orgs/x'],
@@ -767,7 +885,7 @@ describe('production wiring', () => {
       expect(response.status, `${method} ${path}`).toBe(501);
       expect(await response.json()).toEqual({ error: 'not_configured', message: expect.any(String) });
     }
-    for (const path of ['/__debug/auth/login', '/__debug/billing/pay']) {
+    for (const path of ['/__debug/auth/login', '/__debug/billing/pay', '/__debug/seed']) {
       const response = await app.request(path, { method: 'POST', body: JSON.stringify({ email: OWNER, sessionId: 'cs_x' }),
         headers: { 'Content-Type': 'application/json', [DEBUG_REQUEST_HEADER]: '1' } });
       expect(response.status).toBe(404);
@@ -792,13 +910,13 @@ describe('live-debug has no mock login', () => {
       pipelineTimeoutMs: 600_000 } };
   }
 
-  it('answers 404 on /__debug/auth/login and /__debug/billing/pay', async () => {
+  it('answers 404 on /__debug/auth/login, /__debug/billing/pay and /__debug/seed', async () => {
     const { scans, assessments, options } = liveDebug();
     const { app } = createApp({ repository: scans, assessmentRepository: assessments, debug: createDebugTools(options),
       pipeline: new InProcessPipeline({ ...mockSources(), repository: scans, timeoutMs: 600_000 }),
       domainResolver: new PublicDomainResolver(async () => {}), sessionSecret: secret, corsOrigins: [origin], clientIp: () => '127.0.0.1' });
     expect((await app.request('/__debug/mode')).status).toBe(200);
-    for (const path of ['/__debug/auth/login', '/__debug/billing/pay']) {
+    for (const path of ['/__debug/auth/login', '/__debug/billing/pay', '/__debug/seed']) {
       const response = await app.request(path, { method: 'POST', body: JSON.stringify({ email: OWNER, sessionId: 'cs_x' }),
         headers: { 'Content-Type': 'application/json', [DEBUG_REQUEST_HEADER]: '1' } });
       expect(response.status).toBe(404);
@@ -817,6 +935,7 @@ describe('live-debug has no mock login', () => {
       const login = await app.request('/__debug/auth/login', { method: 'POST', body: JSON.stringify({ email: OWNER }),
         headers: { 'Content-Type': 'application/json', [DEBUG_REQUEST_HEADER]: '1' } });
       expect(login.status).toBe(404);
+      expect((await app.request('/__debug/seed', { method: 'POST', headers: { [DEBUG_REQUEST_HEADER]: '1' } })).status).toBe(404);
       const me = await app.request('/me', { headers: { Authorization: 'Bearer x' } });
       expect(me.status).toBe(501);
       expect(await me.json()).toEqual({ error: 'not_configured', message: expect.any(String) });

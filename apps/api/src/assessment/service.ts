@@ -111,6 +111,11 @@ export class AssessmentService {
     await this.drain();
   }
   async drain() { while (this.jobs.size) await Promise.all([...this.jobs.values()]); }
+  /** The assessment once the planning that start() dispatched for it has ended, whichever way. */
+  async planned(id: string) {
+    await this.jobs.get(id);
+    return this.get(id);
+  }
   private currentQuestions(record: AssessmentRecord) {
     if (!record.plan) return [];
     const ids = visibleQuestions(record.bank_snapshot, record.plan, record.layer1_snapshot, record.answers).map(question => question.id);

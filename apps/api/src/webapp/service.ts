@@ -135,6 +135,8 @@ export type WebappServiceDeps = {
   /** False for a scan that lives only in memory (an injected fault, DN-09 §5.5): it can never be claimed. */
   isDurableScan?: (scanId: string) => boolean;
   now?: () => number;
+  /** Set only through asSystem(), for the mock demo seed. */
+  auditAsSystem?: boolean;
 };
 
 /**
@@ -152,6 +154,14 @@ export class WebappService {
     this.repo = deps.repository;
     this.appBaseUrl = deps.appBaseUrl.replace(/\/+$/, '');
     this.now = deps.now ?? Date.now;
+  }
+
+  /**
+   * The same rules over the same store for the mock demo seed (DN-11 §4.6), which acts for no one: what a member's request would
+   * audit is audited as the system's, with no user (§4.3).
+   */
+  asSystem(): WebappService {
+    return new WebappService({ ...this.deps, auditAsSystem: true });
   }
 
   /** In this order, so an outsider learns nothing: not a member 404, deleted 410, role 403, unpaid 402. */
@@ -614,8 +624,9 @@ export class WebappService {
    */
   private async audit(actor: string | null, orgId: string | null, action: string, target: string, data: Record<string, unknown>,
     actorKind: AuditActorKind = 'member') {
-    await this.repo.appendAudit({ id: randomUUID(), actor_kind: actorKind, actor_user_id: actor, org_id: orgId, action, target, data,
-      created_at: this.timestamp() });
+    const system = this.deps.auditAsSystem === true && actorKind === 'member';
+    await this.repo.appendAudit({ id: randomUUID(), actor_kind: system ? 'system' : actorKind, actor_user_id: system ? null : actor,
+      org_id: orgId, action, target, data, created_at: this.timestamp() });
   }
 
   /** The analysis behind the current plan, or null when no analysis of the organization has a completed assessment. */
