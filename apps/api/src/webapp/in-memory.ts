@@ -1,10 +1,16 @@
 import type { BillingStatus, Role } from '@arca/contracts';
 import { WebappConflict } from './types.js';
-import type { AuditRecord, ClaimTicketRecord, DeletionRequestRecord, InvitationRecord, MembershipRecord, OrgAnalysisRecord,
-  OrganizationRecord, PlanRecord, ProfileRecord, SubscriptionRecord, WebappRepository } from './types.js';
+import type { ActionPatch, AssessmentActionRecord, AuditPageQuery, AuditRecord, ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord,
+  InvitationRecord, MembershipRecord, NewAuditRecord, OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, PlanRecord, ProfileRecord,
+  SubscriptionRecord, WebappRepository } from './types.js';
 
 // updatePlan can change these and nothing else; the code is the identity of the plan.
 const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active'] as const;
+// What upsertAssessmentAction and updateAction may move on an existing row.
+const TRACKED_FIELDS = ['status', 'assignee_user_id', 'due_date', 'updated_by', 'updated_at'] as const;
+
+// The audit order, created_at desc then seq desc: negative when `a` comes first.
+const newestFirst = (a: AuditRecord, b: AuditRecord) => (Date.parse(b.created_at) - Date.parse(a.created_at)) || b.seq - a.seq;
 
 /** Deliberately ephemeral, like the other in-memory repositories: reusing the object survives an app recreation, never a restart. */
 export class InMemoryWebappRepository implements WebappRepository {
@@ -21,7 +27,10 @@ export class InMemoryWebappRepository implements WebappRepository {
   private readonly billingEvents = new Map<string, string>();
   private readonly deletionRequests = new Map<string, DeletionRequestRecord>();
   private readonly platformAdmins = new Map<string, string>();
+  private readonly actions: OrgActionRecord[] = [];
   private readonly auditLog: AuditRecord[] = [];
+  // Like the identity column, it is never reset: a page cursor from before a clear() names no row instead of a new one.
+  private auditSeq = 0;
 
   constructor(plans: readonly PlanRecord[]) {
     this.seedPlans = structuredClone(plans);
@@ -32,7 +41,7 @@ export class InMemoryWebappRepository implements WebappRepository {
   clear(): void {
     this.profiles.clear(); this.organizations.clear(); this.memberships.length = 0; this.invitations.clear();
     this.analyses.clear(); this.tickets.clear(); this.subscriptions.clear(); this.billingEvents.clear();
-    this.deletionRequests.clear(); this.platformAdmins.clear(); this.auditLog.length = 0;
+    this.deletionRequests.clear(); this.platformAdmins.clear(); this.actions.length = 0; this.auditLog.length = 0;
     this.plans.clear();
     for (const plan of this.seedPlans) this.plans.set(plan.code, structuredClone(plan));
   }
@@ -51,6 +60,7 @@ export class InMemoryWebappRepository implements WebappRepository {
     if (copy.analysis) this.analyses.set(copy.analysis.scan_id, copy.analysis);
   }
   async getOrganization(id: string) { return structuredClone(this.organizations.get(id) ?? null); }
+  async updateOrganizationName(orgId: string, name: string) { this.requireOrganization(orgId).name = name; }
   async listOrganizationsForUser(userId: string) {
     return structuredClone([...this.organizations.values()].flatMap(org => {
       const membership = this.membership(org.id, userId);
@@ -154,9 +164,67 @@ export class InMemoryWebappRepository implements WebappRepository {
   async grantPlatformAdmin(userId: string, grantedBy: string) {
     if (!this.platformAdmins.has(userId)) this.platformAdmins.set(userId, grantedBy);
   }
-  async appendAudit(record: AuditRecord) { this.auditLog.push(structuredClone(record)); }
-  async listAudit(orgId: string) { return structuredClone(this.auditLog.filter(r => r.org_id === orgId)); }
 
+  async listActions(orgId: string) { return structuredClone(this.actions.filter(a => a.org_id === orgId)); }
+  async getCustomAction(orgId: string, id: string) { return structuredClone(this.customAction(orgId, id) ?? null); }
+  async getAssessmentAction(orgId: string, scanId: string, actionKey: string) {
+    return structuredClone(this.assessmentAction(orgId, scanId, actionKey) ?? null);
+  }
+  async upsertAssessmentAction(action: AssessmentActionRecord) {
+    // The composite foreign key to org_analyses: only a scan this organization claimed has actions.
+    if (this.analyses.get(action.scan_id)?.org_id !== action.org_id) throw new Error('Analysis not found');
+    const existing = this.assessmentAction(action.org_id, action.scan_id, action.action_key);
+    if (existing) {
+      Object.assign(existing, Object.fromEntries(TRACKED_FIELDS.map(field => [field, action[field]])));
+      return structuredClone(existing);
+    }
+    if (this.actions.some(a => a.id === action.id)) throw new Error('Duplicate action');
+    this.actions.push(structuredClone(action));
+    return structuredClone(action);
+  }
+  async createCustomAction(action: CustomActionRecord) {
+    this.requireOrganization(action.org_id);
+    if (this.actions.some(a => a.id === action.id)) throw new Error('Duplicate action');
+    this.actions.push(structuredClone(action));
+  }
+  async countCustomActions(orgId: string) { return this.actions.filter(a => a.org_id === orgId && a.source === 'custom').length; }
+  async updateAction(orgId: string, id: string, patch: ActionPatch) {
+    const action = this.actions.find(a => a.org_id === orgId && a.id === id);
+    if (!action) throw new Error('Action not found');
+    Object.assign(action, Object.fromEntries(TRACKED_FIELDS.filter(field => patch[field] !== undefined).map(field => [field, patch[field]])));
+    return structuredClone(action);
+  }
+  async deleteCustomAction(orgId: string, id: string) {
+    const action = this.customAction(orgId, id);
+    if (!action) throw new Error('Action not found');
+    this.actions.splice(this.actions.indexOf(action), 1);
+  }
+  async clearAssignee(orgId: string, userId: string) {
+    for (const action of this.actions) if (action.org_id === orgId && action.assignee_user_id === userId) action.assignee_user_id = null;
+  }
+
+  async appendAudit(record: NewAuditRecord) {
+    this.auditLog.push({ ...structuredClone(record), seq: ++this.auditSeq, actor_kind: record.actor_kind ?? 'member' });
+  }
+  async listAudit(orgId: string, page: AuditPageQuery) { return this.auditPage(r => r.org_id === orgId, page); }
+  async listAllAudit({ orgId, ...page }: AuditPageQuery & { orgId?: string }) {
+    return this.auditPage(r => orgId === undefined || r.org_id === orgId, page);
+  }
+
+  /** Keyset pagination on (created_at, seq), so rows whose clock disagrees with the insertion order are neither skipped nor repeated. */
+  private auditPage(include: (row: AuditRecord) => boolean, { before, limit }: AuditPageQuery) {
+    const cursor = before === undefined ? null : this.auditLog.find(r => r.seq === before);
+    if (cursor === undefined) return [];
+    const rows = this.auditLog.filter(r => include(r) && (cursor === null || newestFirst(cursor, r) < 0));
+    return structuredClone(rows.sort(newestFirst).slice(0, limit));
+  }
+  private customAction(orgId: string, id: string) {
+    return this.actions.find((a): a is CustomActionRecord => a.org_id === orgId && a.id === id && a.source === 'custom');
+  }
+  private assessmentAction(orgId: string, scanId: string, actionKey: string) {
+    return this.actions.find((a): a is AssessmentActionRecord => a.org_id === orgId && a.source === 'assessment' && a.scan_id === scanId
+      && a.action_key === actionKey);
+  }
   private membership(orgId: string, userId: string) { return this.memberships.find(m => m.org_id === orgId && m.user_id === userId); }
   private ownerCount(orgId: string) { return this.memberships.filter(m => m.org_id === orgId && m.role === 'owner').length; }
   private pendingDeletion(orgId: string) {

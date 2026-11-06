@@ -5,9 +5,9 @@ import { readFile, readdir } from 'node:fs/promises';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
 
 const TABLES = ['profiles', 'organizations', 'memberships', 'invitations', 'org_analyses', 'claim_tickets', 'plans',
-  'subscriptions', 'stripe_events', 'deletion_requests', 'platform_admins', 'audit_log'] as const;
+  'subscriptions', 'stripe_events', 'deletion_requests', 'platform_admins', 'audit_log', 'org_actions'] as const;
 
-describe('PostgreSQL webapp schema (DN-10)', () => {
+describe('PostgreSQL webapp schema (DN-10, DN-11)', () => {
   let db: PGlite;
   let sequence = 0;
   beforeAll(async () => {
@@ -48,6 +48,16 @@ describe('PostgreSQL webapp schema (DN-10)', () => {
       values ($1,$2,$3,$4,$5, now() + interval '7 days')`, [orgId, email, role, tokenHash, randomUUID()]);
   const requestDeletion = (orgId: string) => db.query(
     "insert into public.deletion_requests (org_id,requested_by,reason) values ($1,$2,'Closing the firm') returning id", [orgId, randomUUID()]);
+  async function claimedScan(orgId: string) {
+    const scanId = await scan();
+    await claim(orgId, scanId);
+    return scanId;
+  }
+  const assessmentAction = (orgId: string, scanId: string, actionKey: string) => db.query(
+    `insert into public.org_actions (org_id,source,scan_id,action_key,created_by,updated_by)
+      values ($1,'assessment',$2,$3,$4,$4) returning id,status`, [orgId, scanId, actionKey, randomUUID()]);
+  const customAction = (orgId: string, title: string) => db.query(
+    "insert into public.org_actions (org_id,source,title,created_by,updated_by) values ($1,'custom',$2,$3,$3)", [orgId, title, randomUUID()]);
   async function asRole<T>(role: 'anon' | 'authenticated' | 'service_role', action: () => Promise<T>) {
     await db.exec(`set role ${role}`);
     try { return await action(); } finally { await db.exec('reset role'); }
@@ -206,6 +216,106 @@ describe('PostgreSQL webapp schema (DN-10)', () => {
       await expect(db.query("update public.audit_log set action='x' where id=$1", [row.id])).rejects.toThrow('permission denied');
       await expect(db.query('delete from public.audit_log where id=$1', [row.id])).rejects.toThrow('permission denied');
     });
+  });
+
+  it('an action of the assessment belongs to a scan its own organization claimed', async () => {
+    const first = await organization();
+    const second = await organization();
+    const scanId = await claimedScan(first.id);
+    await assessmentAction(first.id, scanId, 'improve:D1.1');
+    // The plan of another organization's scan, a scan nobody claimed, and one that does not exist.
+    await expect(assessmentAction(second.id, scanId, 'improve:D1.1')).rejects.toThrow('org_actions_analysis_fk');
+    await expect(assessmentAction(first.id, await scan(), 'improve:D1.1')).rejects.toThrow('org_actions_analysis_fk');
+    await expect(assessmentAction(first.id, 'sc_missing', 'improve:D1.1')).rejects.toThrow('org_actions_analysis_fk');
+    await expect(customAction(randomUUID(), 'Write an AI policy')).rejects.toThrow('foreign key');
+    expect((await db.query('select org_id,source,status,assignee_user_id,due_date from public.org_actions where scan_id=$1', [scanId])).rows)
+      .toEqual([{ org_id: first.id, source: 'assessment', status: 'todo', assignee_user_id: null, due_date: null }]);
+  });
+
+  it('keeps one row per action of each plan, which an upsert moves', async () => {
+    const { id } = await organization();
+    const other = await organization();
+    const scanId = await claimedScan(id);
+    const created = (await assessmentAction(id, scanId, 'improve:D1.1')).rows[0] as { id: string };
+    await expect(assessmentAction(id, scanId, 'improve:D1.1')).rejects.toThrow('org_actions_assessment_idx');
+    // The same action key in a newer plan, or in another organization's, is another action (DN-11 D14).
+    await assessmentAction(id, await claimedScan(id), 'improve:D1.1');
+    await assessmentAction(other.id, await claimedScan(other.id), 'improve:D1.1');
+    // An organization may write the same title twice: the unique index covers only the assessment's actions.
+    await customAction(id, 'Write an AI policy');
+    await customAction(id, 'Write an AI policy');
+
+    const actor = randomUUID();
+    const upsert = await db.query(`insert into public.org_actions (org_id,source,scan_id,action_key,status,created_by,updated_by)
+      values ($1,'assessment',$2,'improve:D1.1','done',$3,$3)
+      on conflict (org_id,scan_id,action_key) where source = 'assessment'
+      do update set status = excluded.status, updated_by = excluded.updated_by, updated_at = excluded.updated_at
+      returning id,status,updated_by`, [id, scanId, actor]);
+    expect(upsert.rows).toEqual([{ id: created.id, status: 'done', updated_by: actor }]);
+    expect((await db.query('select source from public.org_actions where org_id=$1 order by source', [id])).rows)
+      .toEqual([{ source: 'assessment' }, { source: 'assessment' }, { source: 'custom' }, { source: 'custom' }]);
+  });
+
+  it('keeps the columns of each source apart, and the values of an action in range', async () => {
+    const { id } = await organization();
+    const scanId = await claimedScan(id);
+    const user = randomUUID();
+    const insert = (columns: string, values: string, params: unknown[] = []) => db.query(
+      `insert into public.org_actions (org_id,created_by,updated_by,${columns}) values ($1,$2,$2,${values})`, [id, user, ...params]);
+    const attempts: Array<[string, string, unknown[]]> = [
+      ['source,action_key', "'assessment','improve:D1.1'", []],
+      ['source,scan_id', "'assessment',$3", [scanId]],
+      ['source,scan_id,action_key', "'assessment',$3,''", [scanId]],
+      ['source,scan_id,action_key,title', "'assessment',$3,'improve:D1.1','Own title'", [scanId]],
+      ['source,scan_id,action_key,domain', "'assessment',$3,'improve:D1.2','governance'", [scanId]],
+      ['source', "'custom'", []],
+      ['source,title', "'custom','   '", []],
+      ['source,title', "'custom',$3", ['x'.repeat(201)]],
+      ['source,title,detail', "'custom','Policy',$3", ['x'.repeat(2001)]],
+      ['source,title,domain', "'custom','Policy','finance'", []],
+      ['source,title,scan_id', "'custom','Policy',$3", [scanId]],
+      ['source,title,action_key', "'custom','Policy','improve:D1.1'", []],
+      ['source,title,status', "'custom','Policy','blocked'", []],
+      ['source,title', "'broker','Policy'", []],
+    ];
+    for (const [columns, values, params] of attempts) {
+      await expect(insert(columns, values, params), `${columns} = ${values}`).rejects.toThrow('check constraint');
+    }
+    await insert('source,title,detail,domain,status,assignee_user_id,due_date', "'custom',$3,$4,'governance','in_progress',$5,'2026-12-01'",
+      ['x'.repeat(200), 'x'.repeat(2000), randomUUID()]);
+    await insert('source,title', "'custom','Train the team'");
+    expect((await db.query("select status,domain from public.org_actions where org_id=$1 and source='custom' order by status", [id])).rows)
+      .toEqual([{ status: 'in_progress', domain: 'governance' }, { status: 'todo', domain: null }]);
+  });
+
+  it('numbers the audit log in a strict order and records the kind of actor', async () => {
+    const { id, owner } = await organization();
+    const append = (createdAt: string, actorKind = 'member') => db.query<{ seq: number; actor_kind: string }>(
+      `insert into public.audit_log (actor_user_id,org_id,action,created_at,actor_kind)
+        values ($1,$2,'member.invited',$3,$4) returning seq::int,actor_kind`, [owner, id, createdAt, actorKind]);
+    // Inserted out of clock order: the second row is the oldest.
+    const rows = [(await append('2026-11-05T10:00:00Z')).rows[0]!, (await append('2026-11-05T09:00:00Z', 'platform')).rows[0]!,
+      (await append('2026-11-05T11:00:00Z', 'system')).rows[0]!];
+    expect(rows.map(({ actor_kind }) => actor_kind)).toEqual(['member', 'platform', 'system']);
+    expect(rows[1]!.seq).toBeGreaterThan(rows[0]!.seq);
+    expect(rows[2]!.seq).toBeGreaterThan(rows[1]!.seq);
+    // A row that names no kind is a member's; the store numbers every row itself.
+    expect((await db.query("insert into public.audit_log (org_id,action) values ($1,'org.renamed') returning actor_kind", [id])).rows)
+      .toEqual([{ actor_kind: 'member' }]);
+    await expect(append('2026-11-05T12:00:00Z', 'arca')).rejects.toThrow('check constraint');
+    await expect(db.query("insert into public.audit_log (seq,org_id,action) values (1,$1,'org.created')", [id]))
+      .rejects.toThrow('cannot insert a non-DEFAULT value into column "seq"');
+
+    // A page goes on after the (created_at, seq) of its cursor row, so the oldest row is not lost behind a lower seq.
+    const page = async (before: number | null) => (await db.query<{ seq: number }>(
+      `select seq::int from public.audit_log where org_id=$1 and action='member.invited'
+        and ($2::bigint is null or (created_at, seq) < (select created_at, seq from public.audit_log where seq = $2))
+        order by created_at desc, seq desc limit 2`, [id, before])).rows.map(({ seq }) => seq);
+    const first = await page(null);
+    expect(first).toEqual([rows[2]!.seq, rows[0]!.seq]);
+    expect(await page(first[1]!)).toEqual([rows[1]!.seq]);
+    const index = await db.query<{ indexdef: string }>("select indexdef from pg_indexes where indexname='audit_log_org_seq_idx'");
+    expect(index.rows[0]?.indexdef).toContain('(org_id, seq)');
   });
 
   it('anon and authenticated cannot read the tables', async () => {

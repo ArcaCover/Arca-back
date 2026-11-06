@@ -1,4 +1,4 @@
-import type { BillingStatus, Role } from '@arca/contracts';
+import type { ActionStatus, AuditActorKind, BillingStatus, DomainKey, Role } from '@arca/contracts';
 
 // Records of the private webapp (DN-10 §4.2), in snake_case like the rows they map to.
 export type ProfileRecord = {
@@ -32,10 +32,35 @@ export type DeletionRequestRecord = {
   id: string; org_id: string; requested_by: string; reason: string; status: 'pending' | 'approved' | 'rejected';
   reviewed_by: string | null; reviewed_at: string | null; review_note: string | null; created_at: string;
 };
+/** `seq` is numbered by the store on append (an identity column in SQL) and gives a strict order (DN-11 §4.3). */
 export type AuditRecord = {
-  id: string; actor_user_id: string | null; org_id: string | null; action: string; target: string | null;
-  data: Record<string, unknown>; created_at: string;
+  id: string; seq: number; actor_kind: AuditActorKind; actor_user_id: string | null; org_id: string | null; action: string;
+  target: string | null; data: Record<string, unknown>; created_at: string;
 };
+/** What appendAudit takes. A row that names no actor kind is a member's, like the column default. */
+export type NewAuditRecord = Omit<AuditRecord, 'seq' | 'actor_kind'> & { actor_kind?: AuditActorKind };
+/**
+ * A page of the audit log, newest first (`created_at desc, seq desc`). `before` is the seq of the last row of the previous
+ * page and the page goes on after that row in this order; a seq that names no row gives an empty page.
+ */
+export type AuditPageQuery = { before?: number; limit: number };
+
+// The action plan (DN-11 §4.2). An action of the assessment gets its row the first time something changes, and takes its
+// title, detail and domain from the assessment; an action the organization wrote itself carries them in the row.
+type ActionRecordBase = {
+  id: string; org_id: string; status: ActionStatus; assignee_user_id: string | null; due_date: string | null;
+  created_by: string; created_at: string; updated_by: string; updated_at: string;
+};
+export type AssessmentActionRecord = ActionRecordBase & {
+  source: 'assessment'; scan_id: string; action_key: string; title: null; detail: null; domain: null;
+};
+export type CustomActionRecord = ActionRecordBase & {
+  source: 'custom'; scan_id: null; action_key: null; title: string; detail: string | null; domain: DomainKey | null;
+};
+export type OrgActionRecord = AssessmentActionRecord | CustomActionRecord;
+/** What a change to the plan can move. Who changed it and when are always written. */
+export type ActionPatch = Partial<Pick<ActionRecordBase, 'status' | 'assignee_user_id' | 'due_date'>>
+  & Pick<ActionRecordBase, 'updated_by' | 'updated_at'>;
 
 /**
  * `already_invited` is what a SQL repository maps the unique index `invitations_pending_email_idx` to: one pending
@@ -61,6 +86,7 @@ export interface WebappRepository {
   /** Atomic: the organization, its first owner and the claimed analysis go in together or not at all (`scan_claimed`). */
   createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null): Promise<void>;
   getOrganization(id: string): Promise<OrganizationRecord | null>;
+  updateOrganizationName(orgId: string, name: string): Promise<void>;
   /** Includes deleted organizations (`deleted_at` set): the caller decides what to show. */
   listOrganizationsForUser(userId: string): Promise<Array<{ org: OrganizationRecord; role: Role }>>;
   /** Every organization, deleted ones included. */
@@ -117,7 +143,30 @@ export interface WebappRepository {
 
   isPlatformAdmin(userId: string): Promise<boolean>;
   grantPlatformAdmin(userId: string, grantedBy: string): Promise<void>;
+
+  /** Every row of the organization, from both sources and every plan, oldest first: the caller picks the current plan. */
+  listActions(orgId: string): Promise<OrgActionRecord[]>;
+  /** Null for an id of another organization too: the organization is part of the lookup. */
+  getCustomAction(orgId: string, id: string): Promise<CustomActionRecord | null>;
+  getAssessmentAction(orgId: string, scanId: string, actionKey: string): Promise<AssessmentActionRecord | null>;
+  /**
+   * Unique by (org_id, scan_id, action_key). The first write creates the row as given; a later one moves only the status,
+   * the assignee, the due date and who changed it when. The scan must be one this organization claimed.
+   */
+  upsertAssessmentAction(action: AssessmentActionRecord): Promise<AssessmentActionRecord>;
+  /** No cap here: the caller checks countCustomActions first (DN-11 §4.2). */
+  createCustomAction(action: CustomActionRecord): Promise<void>;
+  countCustomActions(orgId: string): Promise<number>;
+  /** An action of either source, by its id within the organization. */
+  updateAction(orgId: string, id: string, patch: ActionPatch): Promise<OrgActionRecord>;
+  /** Only an action the organization wrote itself; the assessment's are never deleted (DN-11 D13). */
+  deleteCustomAction(orgId: string, id: string): Promise<void>;
+  /** Unassigns every action of the organization held by this user (DN-11 D15). Nothing else on the rows changes. */
+  clearAssignee(orgId: string, userId: string): Promise<void>;
+
   /** Append-only. */
-  appendAudit(record: AuditRecord): Promise<void>;
-  listAudit(orgId: string): Promise<AuditRecord[]>;
+  appendAudit(record: NewAuditRecord): Promise<void>;
+  listAudit(orgId: string, page: AuditPageQuery): Promise<AuditRecord[]>;
+  /** Across organizations, or only one with `orgId`; rows with no organization appear only without it. */
+  listAllAudit(page: AuditPageQuery & { orgId?: string }): Promise<AuditRecord[]>;
 }

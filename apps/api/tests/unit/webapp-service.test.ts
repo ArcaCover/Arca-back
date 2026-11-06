@@ -606,6 +606,6 @@ describe('audit', () => {
     ]);
     expect(appendAudit.mock.calls.find(([record]) => record.action === 'member.role_changed')![0])
       .toMatchObject({ target: viewer.userId, data: { from: 'viewer', to: 'member' } });
-    expect(await s.repository.listAudit(org.id)).toHaveLength(log.length - 1);
+    expect(await s.repository.listAudit(org.id, { limit: 200 })).toHaveLength(log.length - 1);
   });
 });
