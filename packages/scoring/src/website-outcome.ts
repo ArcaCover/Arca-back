@@ -2,19 +2,21 @@ import type { SourceStatus } from '@arca/contracts';
 
 /**
  * A website that gave no evidence, sorted by what a second scan would find.
- * DEFINITIVE: the site's own standing answer (robots.txt disallows it, it refuses with 401/403 or a challenge
- * page, or it has nothing readable). Scanning again returns the same thing.
- * TRANSIENT: something that can pass (a deadline, a network error, robots.txt unreachable, rate limiting, a 5xx,
- * our own providers). Scanning again can return real evidence, so nothing may be concluded about the firm.
+ * DEFINITIVE: the site refuses to be read (robots.txt disallows it, or its pages answer 401/403 or a challenge
+ * page). Scanning again returns the same thing.
+ * TRANSIENT: everything else (a deadline, a network error, robots.txt unreachable, rate limiting, a 5xx, our own
+ * providers, a page that came back missing or empty). Scanning again can return real evidence, so nothing may be
+ * concluded about the firm.
  */
 export type UnreadableWebsite = 'DEFINITIVE' | 'TRANSIENT';
 
 /**
- * The codes a source reports only for the site's standing answer. This list is the whole rule: whoever builds
- * a website status picks the code by cause, and every reader (pipeline, scoring, scan cache) asks here.
+ * The codes a source reports only for the site's refusal. This list is the whole rule: whoever builds a website
+ * status picks the code by cause, and every reader (pipeline, scoring, scan cache) asks here.
+ * NO_READABLE_EVIDENCE is not on it: an empty page is also what a script that failed to load once, or content
+ * that had not arrived when the page was read, leaves behind, and the two cannot be told apart afterwards.
  */
-export const DEFINITIVE_UNREADABLE_CODES: ReadonlySet<NonNullable<SourceStatus['code']>> =
-  new Set(['ACCESS_BLOCKED', 'NO_READABLE_EVIDENCE']);
+export const DEFINITIVE_UNREADABLE_CODES: ReadonlySet<NonNullable<SourceStatus['code']>> = new Set(['ACCESS_BLOCKED']);
 
 /** Null when the website was read (ok or partial). Otherwise which kind of unreadable it is. */
 export function classifyUnreadableWebsite(status: Pick<SourceStatus, 'status' | 'code'>): UnreadableWebsite | null {

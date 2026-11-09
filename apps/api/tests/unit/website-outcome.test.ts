@@ -6,6 +6,7 @@ import { crawlNotes, unreadableWebsite } from '../../src/pipeline/website-outcom
 
 const home = 'https://firm.com/';
 const page = (code: CrawlIssue['code'], status: number | null = null, url = home): CrawlIssue => ({ url, code, status, scope: 'page' });
+const request = (code: CrawlIssue['code'], status: number | null, url: string): CrawlIssue => ({ url, code, status, scope: 'request' });
 const unread = (issues: CrawlIssue[], aborted = false): CrawlResult => ({ pages: [], partial: true, issues, aborted });
 
 describe('why a website could not be read', () => {
@@ -15,10 +16,20 @@ describe('why a website could not be read', () => {
     ['the pages answer 401', unread([page('ACCESS_BLOCKED', 401)]), 'DEFINITIVE', 'error', 'ACCESS_BLOCKED', /HTTP 401/],
     ['the pages answer 403', unread([page('ACCESS_BLOCKED', 403)]), 'DEFINITIVE', 'error', 'ACCESS_BLOCKED', /HTTP 403/],
     ['a challenge page', unread([page('ACCESS_BLOCKED', 200)]), 'DEFINITIVE', 'error', 'ACCESS_BLOCKED', /challenge page/],
-    ['the home page does not exist', unread([page('HTTP_ERROR', 404)]), 'DEFINITIVE', 'error', 'NO_READABLE_EVIDENCE', /HTTP 404/],
-    ['the home page is gone', unread([page('HTTP_ERROR', 410)]), 'DEFINITIVE', 'error', 'NO_READABLE_EVIDENCE', /HTTP 410/],
-    ['the home page is not HTML', unread([page('NOT_HTML', 200)]), 'DEFINITIVE', 'error', 'NO_READABLE_EVIDENCE', /HTML/],
-    ['the home page has no text', unread([page('NO_READABLE_CONTENT', 200)]), 'DEFINITIVE', 'error', 'NO_READABLE_EVIDENCE', /no readable text/],
+    // Not on the definitive list: none of these is the site refusing to be read, and an empty page is what a
+    // script that failed to load once leaves behind.
+    ['the home page does not exist', unread([page('HTTP_ERROR', 404)]), 'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /HTTP 404/],
+    ['the home page is gone', unread([page('HTTP_ERROR', 410)]), 'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /HTTP 410/],
+    ['the home page is not HTML', unread([page('NOT_HTML', 200)]), 'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /HTML/],
+    ['the home page has no text', unread([page('NO_READABLE_CONTENT', 200)]), 'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /no readable text$/],
+    ['the home page has no text after its own script answered 503', unread([page('NO_READABLE_CONTENT', 200), request('HTTP_ERROR', 503, 'https://firm.com/app.js')]),
+      'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /no readable text \(1 of its requests failed\)/],
+    ['the home page has no text after a third-party script failed', unread([request('REQUEST_FAILED', null, 'https://cdn.example/app.js'), page('NO_READABLE_CONTENT', 200)]),
+      'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /no readable text \(1 of its requests failed\)/],
+    ['the home page has no text and robots.txt excludes what it loads', unread([page('NO_READABLE_CONTENT', 200),
+      request('ROBOTS_DISALLOWED', null, 'https://firm.com/assets/app.js'), request('ROBOTS_DISALLOWED', null, 'https://firm.com/assets/data.json'),
+      request('ACCESS_BLOCKED', 429, 'https://firm.com/api')]),
+      'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /no readable text \(1 of its requests failed; 2 excluded by robots\.txt\)/],
     ['the crawl deadline', unread([], true), 'TRANSIENT', 'timeout', 'DEADLINE_REACHED', /deadline/],
     ['an abort after a definitive answer', unread([page('ACCESS_BLOCKED', 403)], true), 'TRANSIENT', 'timeout', 'DEADLINE_REACHED', /deadline/],
     ['a network error', unread([page('REQUEST_FAILED')]), 'TRANSIENT', 'error', 'PROVIDER_ERROR', /could not be reached/],
@@ -47,15 +58,21 @@ describe('why a website could not be read', () => {
     expect(unreadableWebsite(crawl)).toMatchObject({ classification: 'TRANSIENT', code: 'PROVIDER_ERROR' });
   });
 
-  it('judges the pages, not the requests behind them', () => {
-    // A third-party widget refused with 403 and the firm's own robots.txt failed for the www origin only:
-    // neither says how the page itself ended.
+  it('judges a refusal by the page, not by the requests behind it', () => {
+    // A third-party widget that failed and the firm's own robots.txt failing for the www origin only:
+    // neither changes that the page itself answered 403.
     const crawl = unread([
-      { url: 'https://widgets.example/w.js', code: 'ACCESS_BLOCKED', status: 403, scope: 'request' },
+      request('REQUEST_FAILED', null, 'https://widgets.example/w.js'),
       { url: 'https://www.firm.com/robots.txt', code: 'ROBOTS_UNAVAILABLE', status: 503, scope: 'robots' },
-      page('NO_READABLE_CONTENT', 200),
+      page('ACCESS_BLOCKED', 403),
     ]);
-    expect(unreadableWebsite(crawl)).toMatchObject({ classification: 'DEFINITIVE', code: 'NO_READABLE_EVIDENCE' });
+    expect(unreadableWebsite(crawl)).toMatchObject({ classification: 'DEFINITIVE', code: 'ACCESS_BLOCKED' });
+  });
+
+  it('does not count the failed navigation of another page among the requests behind an empty page', () => {
+    const crawl = unread([page('NO_READABLE_CONTENT', 200), page('HTTP_ERROR', 500, 'https://firm.com/start'),
+      request('HTTP_ERROR', 500, 'https://firm.com/start')]);
+    expect(unreadableWebsite(crawl).reason).toBe('The website returned a page with no readable text');
   });
 
   it('reads an issue stored without a scope as a page issue', () => {

@@ -1,5 +1,6 @@
 import { it, expect } from 'vitest';
 import { MAX_PAGE_ATTEMPTS, crawlWebsite, type CrawlResult } from '../../src/pipeline/crawler.js';
+import { unreadableWebsite } from '../../src/pipeline/website-outcome.js';
 
 // Every test here drives a real headless Chromium against fixture transports: no request leaves the machine.
 // Nothing below asserts on elapsed time, and the timeouts are wide, so a loaded machine slows them without failing them.
@@ -106,7 +107,8 @@ it('records decided pages, a refused XHR and a failed third-party script without
       switch (url.pathname) {
         case '/': return html('<h1>Smith Law</h1><a href="/about">About</a><a href="/wp-admin/">Admin</a><a href="/gone">Old</a>'
           + '<a href="/retired">Retired</a><a href="/feed">Feed</a><a href="/brochure.docx">Brochure</a>'
-          + '<script src="https://widgets.example/w.js"></script><script>fetch("/wp-json/private/data").catch(() => {})</script>');
+          + '<script src="https://widgets.example/w.js"></script><script>fetch("/wp-json/private/data").catch(() => {})</script>'
+          + '<iframe src="/wp-admin/frame"></iframe>');
         case '/about': return html('About the firm');
         case '/gone': return html('Not found', 404);
         case '/retired': return html('Gone', 410);
@@ -126,6 +128,8 @@ it('records decided pages, a refused XHR and a failed third-party script without
     'page NOT_HTML 200 fixture.example/feed',
     'page ROBOTS_DISALLOWED null fixture.example/wp-admin/',
     'request REQUEST_FAILED null widgets.example/w.js',
+    // A frame inside a page is not a page of the crawl: it is on record like the script's request.
+    'request ROBOTS_DISALLOWED null fixture.example/wp-admin/frame',
     'request ROBOTS_DISALLOWED null fixture.example/wp-json/private/data',
   ]);
   // What robots.txt excludes is never requested, as a page or from a page's own script.
@@ -149,7 +153,47 @@ it('calls the crawl partial when a page of the site keeps failing', async () => 
   expect(result.pages.map(page => path(page.url))).toEqual(['/']);
   expect(result.partial).toBe(true);
   expect(attempts).toBe(MAX_PAGE_ATTEMPTS);
-  expect(listed(result)).toEqual(['page HTTP_ERROR 500 fixture.example/team']);
+  expect(listed(result)).toEqual(['page HTTP_ERROR 500 fixture.example/team', 'request HTTP_ERROR 500 fixture.example/team']);
+}, 30_000);
+
+it('does not take a home page left empty by a script that failed to load for a site that refuses to be read', async () => {
+  const shell = (script: string) => html(`<div id="root"></div><script src="${script}"></script>`);
+  // The firm's own bundle answers 503 this once.
+  const own = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async () => ({ status: 404, text: '' }),
+    response: async raw => path(raw) === '/' ? shell('/app.js')
+      : { status: 503, headers: { 'content-type': 'text/plain' }, body: Buffer.from('busy') },
+  });
+  expect(own.pages).toEqual([]);
+  expect(listed(own)).toEqual(['page NO_READABLE_CONTENT 200 fixture.example/', 'request HTTP_ERROR 503 fixture.example/app.js']);
+  expect(unreadableWebsite(own)).toMatchObject({ classification: 'TRANSIENT', code: 'NO_READABLE_EVIDENCE',
+    reason: 'The website returned a page with no readable text (1 of its requests failed)' });
+
+  // The bundle is on another host that does not resolve: the kind of failure the founder's scan had.
+  const thirdParty = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async () => ({ status: 404, text: '' }),
+    response: async raw => {
+      if (new URL(raw).hostname !== 'fixture.example') throw new Error('getaddrinfo ENOTFOUND cdn.example');
+      return shell('https://cdn.example/app.js');
+    },
+  });
+  expect(thirdParty.pages).toEqual([]);
+  expect(listed(thirdParty)).toEqual(['page NO_READABLE_CONTENT 200 fixture.example/', 'request REQUEST_FAILED null cdn.example/app.js']);
+  expect(unreadableWebsite(thirdParty)).toMatchObject({ classification: 'TRANSIENT', code: 'NO_READABLE_EVIDENCE',
+    reason: 'The website returned a page with no readable text (1 of its requests failed)' });
+}, 30_000);
+
+it('does not take a page whose content had not arrived yet for a site that refuses to be read', async () => {
+  // No request fails here: the page fills itself in later than the crawler waits. A long timer stands for the
+  // slow script, so the outcome does not depend on how fast the machine is.
+  const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async () => ({ status: 404, text: '' }),
+    response: async () => html('<script>setTimeout(() => { document.body.textContent = "Smith Law"; }, 600000)</script>'),
+  });
+  expect(result.pages).toEqual([]);
+  expect(listed(result)).toEqual(['page NO_READABLE_CONTENT 200 fixture.example/']);
+  expect(unreadableWebsite(result)).toMatchObject({ classification: 'TRANSIENT', code: 'NO_READABLE_EVIDENCE',
+    reason: 'The website returned a page with no readable text' });
 }, 30_000);
 
 it('reads a site whose robots.txt answers 403, and nothing from one whose robots.txt answers 503', async () => {

@@ -54,8 +54,9 @@ function clip(text: string): string {
   const bytes = Buffer.from(text, 'utf8');
   if (bytes.byteLength <= ROBOTS_MAX_BYTES) return text;
   // The cut can land in the middle of a rule, and half a path is a different rule: drop the broken last line.
+  // A line ends with LF, CRLF or a lone CR (RFC 9309 2.2).
   const kept = bytes.subarray(0, ROBOTS_MAX_BYTES);
-  return kept.subarray(0, kept.lastIndexOf(0x0a) + 1).toString('utf8');
+  return kept.subarray(0, Math.max(kept.lastIndexOf(0x0a), kept.lastIndexOf(0x0d)) + 1).toString('utf8');
 }
 
 function policy(url: string, state: RobotsState, status: number | null, detail: string | null, text = ''): RobotsPolicy {
@@ -94,7 +95,11 @@ async function load(origin: string, signal: AbortSignal, fetchText: RobotsFetch,
   }
 }
 
-/** The robots policy of one origin (scheme and host). With a cache, the file is fetched once and the answer shared. */
+/**
+ * The robots policy of one origin (scheme and host). With a cache, the file is fetched once and the answer shared.
+ * A fetch still in flight belongs to the caller that started it: if that caller aborts, whoever else is waiting on
+ * it is rejected too. The readers of one scan run under one signal or one after another, so that is the same abort.
+ */
 export function robotsPolicy(origin: string, signal: AbortSignal, options: RobotsOptions = {}): Promise<RobotsPolicy> {
   const cached = options.cache?.get(origin);
   if (cached) return cached;
@@ -106,8 +111,4 @@ export function robotsPolicy(origin: string, signal: AbortSignal, options: Robot
     entry.catch(() => { if (cache.get(origin) === entry) cache.delete(origin); });
   }
   return entry;
-}
-
-export async function robotsAllows(url: string, signal: AbortSignal, options: RobotsOptions = {}): Promise<boolean> {
-  return (await robotsPolicy(new URL(url).origin, signal, options)).allows(url);
 }

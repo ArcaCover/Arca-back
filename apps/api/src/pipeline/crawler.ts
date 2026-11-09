@@ -155,12 +155,15 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
           if (policy.allows(target)) return false;
           const page = navigation ? ownPage(request) : null;
           if (page) decided.set(page, robotsIssue(policy));
-          else if (!navigation) issues.push({ url: target, ...robotsIssue(policy), scope: 'request' });
+          // A script's request or a frame inside a page: no page of the crawl ends on it, so it is recorded here.
+          else issues.push({ url: target, ...robotsIssue(policy), scope: 'request' });
           return true;
         };
         if (await refusedByRobots(url)) { await route.abort(); return; }
         const response = await transport.response(url, signal, request.method(), request.postDataBuffer());
+        // Kept for audit, and to say what failed behind a page that then rendered no text.
         if ([401, 403, 429].includes(response.status)) issues.push({ url, code: 'ACCESS_BLOCKED', status: response.status, scope: 'request' });
+        else if (response.status >= 500) issues.push({ url, code: 'HTTP_ERROR', status: response.status, scope: 'request' });
         const headers = { ...response.headers };
         // The browser follows a redirect by itself and never shows the next hop to this handler, so the rules of
         // where it leads (the www origin, another path) are checked before the redirect is handed over.

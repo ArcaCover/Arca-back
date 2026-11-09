@@ -3,12 +3,14 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { collectBody, fetchPublicText, USER_AGENT as SENT_USER_AGENT, type PublicResponse } from '../../src/pipeline/network.js';
-import { ROBOTS_MAX_BYTES, USER_AGENT, createRobotsCache, robotsAllows, robotsPolicy, robotsStateForStatus,
-  type RobotsFetch } from '../../src/pipeline/robots.js';
+import { ROBOTS_MAX_BYTES, USER_AGENT, createRobotsCache, robotsPolicy, robotsStateForStatus,
+  type RobotsFetch, type RobotsOptions } from '../../src/pipeline/robots.js';
 
 const signal = () => new AbortController().signal;
 const serving = (status: number, text = '') => vi.fn<RobotsFetch>(async () => ({ status, text }));
 const rules = (text: string) => robotsPolicy('https://firm.com', signal(), { fetchText: serving(200, text) });
+// How every reader asks: the policy of the URL's own origin, then the URL.
+const robotsAllows = async (url: string, options: RobotsOptions) => (await robotsPolicy(new URL(url).origin, signal(), options)).allows(url);
 
 describe('robots.txt fetch outcomes (RFC 9309)', () => {
   it('parses a 2xx answer and obeys it', async () => {
@@ -107,6 +109,13 @@ describe('robots.txt fetch outcomes (RFC 9309)', () => {
     expect(policy.allows('https://firm.com/team-directory')).toBe(true);
     expect(policy.allows('https://firm.com/beyond-the-cap')).toBe(true);
   });
+
+  it('cuts an oversized body at the last line end of any kind', async () => {
+    // Old Mac line ends: with no LF to cut at, the rules before the cap must still be obeyed, not thrown away.
+    const policy = await rules(`User-agent: *\rDisallow: /private\r${'#'.repeat(ROBOTS_MAX_BYTES)}`);
+    expect(policy.allows('https://firm.com/private')).toBe(false);
+    expect(policy.allows('https://firm.com/about')).toBe(true);
+  });
 });
 
 describe('response body limits', () => {
@@ -204,8 +213,8 @@ describe('per-scan robots cache', () => {
     const fetchText = serving(200, 'User-agent: *\nDisallow: /private');
     const cache = createRobotsCache();
     const answers = await Promise.all(['https://firm.com/', 'https://firm.com/about', 'https://firm.com/private/x']
-      .map(url => robotsAllows(url, signal(), { fetchText, cache })));
-    answers.push(await robotsAllows('https://firm.com/team', signal(), { fetchText, cache }));
+      .map(url => robotsAllows(url, { fetchText, cache })));
+    answers.push(await robotsAllows('https://firm.com/team', { fetchText, cache }));
     expect(answers).toEqual([true, true, false, true]);
     expect(fetchText).toHaveBeenCalledTimes(1);
   });
@@ -213,24 +222,24 @@ describe('per-scan robots cache', () => {
   it('keeps one answer per origin: www and the bare domain each have their own robots.txt', async () => {
     const fetchText = vi.fn<RobotsFetch>(async url => ({ status: 200, text: url.includes('www.') ? 'User-agent: *\nDisallow: /' : '' }));
     const cache = createRobotsCache();
-    expect(await robotsAllows('https://firm.com/about', signal(), { fetchText, cache })).toBe(true);
-    expect(await robotsAllows('https://www.firm.com/about', signal(), { fetchText, cache })).toBe(false);
-    expect(await robotsAllows('https://www.firm.com/team', signal(), { fetchText, cache })).toBe(false);
+    expect(await robotsAllows('https://firm.com/about', { fetchText, cache })).toBe(true);
+    expect(await robotsAllows('https://www.firm.com/about', { fetchText, cache })).toBe(false);
+    expect(await robotsAllows('https://www.firm.com/team', { fetchText, cache })).toBe(false);
     expect(fetchText.mock.calls.map(call => call[0])).toEqual(['https://firm.com/robots.txt', 'https://www.firm.com/robots.txt']);
   });
 
   it('keeps an unreachable answer for the scan instead of asking a failing server again', async () => {
     const fetchText = serving(503);
     const cache = createRobotsCache();
-    expect(await robotsAllows('https://firm.com/', signal(), { fetchText, cache })).toBe(false);
-    expect(await robotsAllows('https://firm.com/about', signal(), { fetchText, cache })).toBe(false);
+    expect(await robotsAllows('https://firm.com/', { fetchText, cache })).toBe(false);
+    expect(await robotsAllows('https://firm.com/about', { fetchText, cache })).toBe(false);
     expect(fetchText).toHaveBeenCalledTimes(1);
   });
 
   it('fetches again without a cache', async () => {
     const fetchText = serving(404);
-    await robotsAllows('https://firm.com/', signal(), { fetchText });
-    await robotsAllows('https://firm.com/about', signal(), { fetchText });
+    await robotsAllows('https://firm.com/', { fetchText });
+    await robotsAllows('https://firm.com/about', { fetchText });
     expect(fetchText).toHaveBeenCalledTimes(2);
   });
 });

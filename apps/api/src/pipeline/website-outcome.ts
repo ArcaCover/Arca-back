@@ -8,8 +8,17 @@ export type UnreadableOutcome = Cause & { classification: UnreadableWebsite };
 const pageIssues = (crawl: CrawlResult) => (crawl.issues ?? []).filter(issue => (issue.scope ?? 'page') === 'page');
 const http = (status: number | null) => status === null ? 'no answer' : `HTTP ${status}`;
 
+// What the browser could not load for a page that came out empty: the usual reason a client-rendered page has no text.
+function behindEmptyPage(crawl: CrawlResult): string {
+  const pages = new Set(pageIssues(crawl).map(issue => issue.url));
+  const requests = (crawl.issues ?? []).filter(issue => issue.scope === 'request' && !pages.has(issue.url));
+  const excluded = requests.filter(issue => issue.code === 'ROBOTS_DISALLOWED').length, failed = requests.length - excluded;
+  const notes = [...(failed ? [`${failed} of its requests failed`] : []), ...(excluded ? [`${excluded} excluded by robots.txt`] : [])];
+  return notes.length ? ` (${notes.join('; ')})` : '';
+}
+
 // The reason is returned by the API: a status code is fine, a raw transport message is not.
-function cause(issue: CrawlIssue): Cause {
+function cause(issue: CrawlIssue, crawl: CrawlResult): Cause {
   const error = (code: Cause['code'], reason: string): Cause => ({ status: 'error', code, reason });
   switch (issue.code) {
     case 'ROBOTS_DISALLOWED': return error('ACCESS_BLOCKED', 'robots.txt does not allow automated reading of the website');
@@ -24,7 +33,8 @@ function cause(issue: CrawlIssue): Cause {
         ? error('PROVIDER_ERROR', `The website did not serve its pages (${http(issue.status)})`)
         : error('NO_READABLE_EVIDENCE', `The website has no page to read (HTTP ${issue.status})`);
     case 'NOT_HTML': return error('NO_READABLE_EVIDENCE', 'The website did not return an HTML page');
-    case 'NO_READABLE_CONTENT': return error('NO_READABLE_EVIDENCE', 'The website returned a page with no readable text');
+    case 'NO_READABLE_CONTENT':
+      return error('NO_READABLE_EVIDENCE', `The website returned a page with no readable text${behindEmptyPage(crawl)}`);
     case 'REQUEST_FAILED': return error('PROVIDER_ERROR', 'The website could not be reached');
   }
 }
@@ -32,11 +42,12 @@ function cause(issue: CrawlIssue): Cause {
 /**
  * Why a crawl read no page at all, as the website source reports it: the cause picks the code and the reason,
  * and the code alone says whether the outcome is definitive or transient (`classifyUnreadableWebsite`).
- * One passing failure is enough to call the whole outcome transient: a firm is never branded unreadable
- * while a second scan could still read it.
+ * Only a refusal is definitive: robots.txt excluding the site, or its pages answering 401/403 or a challenge page.
+ * One passing failure is enough to call the whole outcome transient, and so is a page that came back missing or
+ * empty: a firm is never branded unreadable while a second scan could still read it.
  */
 export function unreadableWebsite(crawl: CrawlResult): UnreadableOutcome {
-  const causes = pageIssues(crawl).map(cause);
+  const causes = pageIssues(crawl).map(issue => cause(issue, crawl));
   const chosen: Cause = crawl.aborted
     ? { status: 'timeout', code: 'DEADLINE_REACHED', reason: 'The crawl deadline was reached before any page was read' }
     : causes.find(item => classifyUnreadableWebsite(item) === 'TRANSIENT') ?? causes[0]
