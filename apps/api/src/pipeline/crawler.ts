@@ -89,6 +89,12 @@ export function canonicalUrl(raw: string, base: string): string | null {
   } catch { return null; }
 }
 const HTML = /text\/html|application\/xhtml/i;
+/**
+ * The request handler stops a link that answers with a file, but it never sees what comes after a redirect (the
+ * browser follows it by itself), and on a site that redirects its bare domain to www that is every link. There the
+ * file reaches the browser, which ends the navigation with this error: the same answer, not a failure to retry.
+ */
+const startedDownload = (error: unknown) => error instanceof Error && /Download is starting/i.test(error.message);
 // Measured on gallardolawyers.com: 3 pages at once took 21-25 s, 6 took 14 s for the same 19 pages.
 export const CRAWL_CONCURRENCY = 6;
 export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
@@ -118,7 +124,8 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
   signal.addEventListener('abort', abort, { once: true });
   try {
     signal.throwIfAborted();
-    const context = await browser.newContext({ userAgent: USER_AGENT, serviceWorkers: 'block' });
+    // Nothing is ever saved: a link that turns out to be a file is refused, not downloaded in the background.
+    const context = await browser.newContext({ userAgent: USER_AGENT, serviceWorkers: 'block', acceptDownloads: false });
     const robotsCache = options.robots ?? createRobotsCache();
     const sameSite = (raw: string) => new URL(raw).hostname.replace(/^www\./, '') === domain;
     let crawlDelayMs: number | null = null;
@@ -186,6 +193,8 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
     await context.routeWebSocket('**/*', socket => socket.close());
     let queue = [...new Set(options.seedOnly ? [seedUrl] : [rootUrl, seedUrl])].map(url => ({ url, depth: 0, attempt: 0 }));
     const visited = new Set<string>();
+    // Links robots.txt excludes. Settled before a batch is picked: they cost no request, so they take no page of the budget.
+    const excluded = new Set<string>();
     // Requeued pages leave `visited`, so a retry costs another attempt but never another page budget.
     const fail = (item: { url: string; depth: number; attempt: number }, issue: CrawlIssue) => {
       if (shouldRetryPage(issue, item.attempt, signal.aborted)) {
@@ -199,7 +208,18 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
     const groupCounts = new Map<number, number>();
     let lastStart = 0;
     while (queue.length && visited.size < maxPages && !signal.aborted) {
-      // Read per batch: the delay is known once the first page has fetched the rules, and the www origin may add its own.
+      const allowed: typeof queue = [];
+      for (const item of queue) {
+        // Only an aborted crawl rejects here, and the loop ends on it.
+        const policy = await robotsFor(item.url).catch(() => null);
+        if (!policy) break;
+        if (policy.allows(item.url)) { allowed.push(item); continue; }
+        excluded.add(item.url);
+        fail(item, { url: item.url, ...robotsIssue(policy) });
+      }
+      queue = allowed;
+      if (!queue.length || signal.aborted) break;
+      // Read per batch: the rules of the site were fetched just above, and the www origin may add its own delay later.
       const pacing = crawlPacing(crawlDelayMs, { timeoutMs, maxPages, concurrency: options.concurrency ?? CRAWL_CONCURRENCY });
       const wait = lastStart + pacing.delayMs - Date.now();
       if (wait > 0 && await sleep(wait, false, { signal }).catch(() => true)) break;
@@ -228,8 +248,6 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
       await Promise.all(batch.map(async item => {
         let page: import('playwright').Page | undefined;
         try {
-          const policy = await robotsFor(item.url);
-          if (!policy.allows(item.url)) { fail(item, { url: item.url, ...robotsIssue(policy) }); return; }
           page = await context.newPage();
           const response = await page.goto(item.url, { timeout: 8000, waitUntil: 'domcontentloaded' });
           const status = response?.status() ?? null;
@@ -261,10 +279,10 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
           pages.push({ url: canonicalUrl(page.url(), rootUrl) ?? page.url(), html, text });
           if (item.depth < maxDepth) for (const link of links) {
             const url = canonicalUrl(link, page.url());
-            if (url && !visited.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1, attempt: 0 });
+            if (url && !visited.has(url) && !excluded.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1, attempt: 0 });
           }
         } catch (error) {
-          const known = page && decided.get(page);
+          const known = (page && decided.get(page)) ?? (startedDownload(error) ? { code: 'NOT_HTML' as const, status: null } : undefined);
           fail(item, known ? { url: item.url, ...known } : { url: item.url, code: 'REQUEST_FAILED', status: null,
             detail: error instanceof Error ? error.message.slice(0, 200) : 'Unknown navigation error' });
         }

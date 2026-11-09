@@ -1,6 +1,8 @@
+import { createServer } from 'node:http';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { it, expect } from 'vitest';
 import { MAX_PAGE_ATTEMPTS, crawlWebsite, type CrawlResult } from '../../src/pipeline/crawler.js';
-import { unreadableWebsite } from '../../src/pipeline/website-outcome.js';
+import { crawlNotes, unreadableWebsite } from '../../src/pipeline/website-outcome.js';
 
 // Every test here drives a real headless Chromium against fixture transports: no request leaves the machine.
 // Nothing below asserts on elapsed time, and the timeouts are wide, so a loaded machine slows them without failing them.
@@ -138,6 +140,118 @@ it('records decided pages, a refused XHR and a failed third-party script without
   for (const decided of ['/gone', '/retired', '/feed', '/brochure.docx']) {
     expect([decided, requested.filter(url => path(url) === decided).length]).toEqual([decided, 1]);
   }
+}, 30_000);
+
+it('takes a file behind a redirect for a link to non-HTML content, not for a page that failed', async () => {
+  // A site that redirects its bare domain to www answers every link with a 301 first, and the browser follows a
+  // redirect with its own network stack, so the file arrives as a download. A loopback server stands for the www
+  // host: no request leaves the machine.
+  const files: Record<string, Record<string, string>> = {
+    '/card': { 'content-type': 'text/vcard', 'content-disposition': 'attachment; filename="jane.vcf"' },
+    '/brochure': { 'content-type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+    '/report': { 'content-type': 'application/pdf' },
+    '/feed': { 'content-type': 'application/rss+xml' },
+  };
+  const served: string[] = [];
+  const server = createServer((request, response) => {
+    served.push(request.url ?? '');
+    response.writeHead(200, files[request.url ?? '']).end(request.url === '/feed' ? '<rss></rss>' : 'PK');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as { port: number };
+  const requested: string[] = [];
+  try {
+    const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+      robots: async () => ({ status: 404, text: '' }),
+      response: async raw => {
+        requested.push(path(raw));
+        if (path(raw) === '/') return html(`Smith Law<a href="/about">About</a>${Object.keys(files).map(file => `<a href="${file}">File</a>`).join('')}`);
+        if (path(raw) === '/about') return html('About the firm');
+        return { status: 301, headers: { location: `http://127.0.0.1:${port}${path(raw)}` }, body: Buffer.alloc(0) };
+      },
+    });
+    expect(result.pages.map(page => path(page.url))).toEqual(['/', '/about']);
+    expect(result.partial).toBe(false);
+    expect(listed(result)).toEqual([
+      // The download carries no status the crawler can see; the feed is rendered by the browser, so it has one.
+      'page NOT_HTML 200 fixture.example/feed',
+      'page NOT_HTML null fixture.example/brochure',
+      'page NOT_HTML null fixture.example/card',
+      'page NOT_HTML null fixture.example/report',
+    ]);
+    expect(crawlNotes(result)).toBe('4 links to non-HTML content');
+    // Asked once each: a download is an answer, and retrying it would only spend the deadline.
+    expect(requested.sort()).toEqual(['/', '/about', '/brochure', '/card', '/feed', '/report']);
+    expect(served.sort()).toEqual(['/brochure', '/card', '/feed', '/report']);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+}, 30_000);
+
+it('drops the download of a file it will not read', async () => {
+  // The server never finishes the file, so only the browser giving the download up closes the connection.
+  let drop!: () => void;
+  const dropped = new Promise<true>(resolve => { drop = () => resolve(true); });
+  const server = createServer((_request, response) => {
+    response.on('close', drop);
+    response.writeHead(200, { 'content-type': 'application/zip' }).write('PK');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as { port: number };
+  let droppedBeforeNextPage = false;
+  try {
+    const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+      robots: async () => ({ status: 404, text: '' }),
+      response: async raw => {
+        if (path(raw) === '/') return html('Smith Law<a href="/archive">Archive</a><a href="/later">Later</a>');
+        if (path(raw) === '/archive') return { status: 301, headers: { location: `http://127.0.0.1:${port}/archive` }, body: Buffer.alloc(0) };
+        // One page at a time, so this page is asked for after the file. The wait ends as soon as the connection
+        // closes; the timer only bounds a crawler that kept the download running.
+        droppedBeforeNextPage = await Promise.race([dropped, sleep(5000, false, { ref: false })]);
+        return html('Later');
+      },
+    }, { concurrency: 1 });
+    expect(result.pages.map(page => path(page.url))).toEqual(['/', '/later']);
+    expect(listed(result)).toEqual(['page NOT_HTML null fixture.example/archive']);
+    expect(result.partial).toBe(false);
+    expect(droppedBeforeNextPage).toBe(true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+}, 30_000);
+
+it('does not spend the page budget on links robots.txt excludes', async () => {
+  // Excluded links sort before the readable pages here. They cost no request, so they must not take their place.
+  const excluded = Array.from({ length: 5 }, (_, index) => `<a href="/category/c${index}">Category</a>`).join('');
+  const readable = ['/contact', '/results', '/visas'];
+  const requested: string[] = [];
+  const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async () => ({ status: 200, text: 'User-agent: *\nDisallow: /category/' }),
+    response: async raw => {
+      requested.push(path(raw));
+      // Every page repeats the menu, as real sites do.
+      return html(`Page ${path(raw)}${excluded}${readable.map(link => `<a href="${link}">Page</a>`).join('')}`);
+    },
+  }, { maxPages: 4 });
+  expect(result.pages.map(page => path(page.url))).toEqual(['/', ...readable]);
+  expect(requested.sort()).toEqual(['/', ...readable]);
+  expect(result.partial).toBe(false);
+  expect(crawlNotes(result)).toBe('5 pages excluded by robots.txt');
+}, 30_000);
+
+it('does not ask another host for its robots.txt before loading what a page takes from it', async () => {
+  const robots: string[] = [];
+  const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+    // The CDN excludes every crawler. It is not being crawled: the page is, and it needs its script to render.
+    robots: async url => { robots.push(url); return { status: 200, text: new URL(url).hostname === 'cdn.example' ? 'User-agent: *\nDisallow: /' : '' }; },
+    response: async raw => new URL(raw).hostname === 'cdn.example'
+      ? { status: 200, headers: { 'content-type': 'text/javascript' }, body: Buffer.from('document.getElementById("root").textContent = "Smith Law"') }
+      : html('<div id="root"></div><script src="https://cdn.example/app.js"></script>'),
+  });
+  expect(result.pages.map(page => page.text)).toEqual(['Smith Law']);
+  expect(robots).toEqual(['https://fixture.example/robots.txt']);
+  expect(listed(result)).toEqual([]);
 }, 30_000);
 
 it('calls the crawl partial when a page of the site keeps failing', async () => {
