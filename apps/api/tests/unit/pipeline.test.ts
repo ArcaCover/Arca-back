@@ -4,7 +4,9 @@ import { mockSources } from '../../src/pipeline/mock-sources.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import { createApp } from '../../src/http/app.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
-import { unknownWebsite, type SourceResult, type AttorneyMatch } from '@arca/contracts';
+import { Layer1Result, unknownWebsite, type SourceResult, type AttorneyMatch } from '@arca/contracts';
+import type { CrawlIssue, CrawlResult } from '../../src/pipeline/crawler.js';
+import { WebsiteExtractionSource } from '../../src/pipeline/website-source.js';
 
 const failed = (): Promise<SourceResult<AttorneyMatch[]>> => Promise.resolve({ data: null, rawContent: null,
   status: { status: 'error', dataStatus: 'UNKNOWN', durationMs: 0 } });
@@ -76,6 +78,73 @@ describe('three-source orchestration', () => {
     expect(result.result.preScore.decision).toBe('UNKNOWN');
     expect(result.result.preScore.assessmentStatus).toBe('INSUFFICIENT_EVIDENCE');
     expect(result.result.sources.bar.code).toBe('INSUFFICIENT_IDENTITY');
+    // Our own failure says nothing about the firm.
+    expect(result.result.preScore.flags).not.toContain('WEBSITE_UNAVAILABLE');
+    expect(result.result.preScore.overrides).toEqual([]);
+  });
+  describe('a website that gave no page', () => {
+    const home = 'https://firm.com/';
+    const page = (code: CrawlIssue['code'], status: number | null = null): CrawlIssue => ({ url: home, code, status, scope: 'page' });
+    // The real website source over a crawl that read nothing, so the cause reaches the pipeline as it does in a live scan.
+    async function scan(crawl: CrawlResult) {
+      const run = vi.fn(failed), extract = vi.fn(), repository = new InMemoryRepository();
+      const pipeline = new InProcessPipeline({ repository, bar: { run }, avvo: { run },
+        website: new WebsiteExtractionSource(repository, { id: 'fixture', version: '1', extract }, async () => crawl) });
+      const outcome = await pipeline.run({ scanId: 'sc_unread', canonicalDomain: 'firm.com', email: 'owner@firm.com' });
+      // Nothing was read, so nothing is paid for: no extraction, no directory lookup.
+      expect(extract).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+      return outcome;
+    }
+    it.each<[string, CrawlIssue[]]>([
+      ['robots.txt disallows the site', [page('ROBOTS_DISALLOWED')]],
+      ['its pages answer 403', [page('ACCESS_BLOCKED', 403)]],
+      ['its pages answer 401', [page('ACCESS_BLOCKED', 401)]],
+      ['it answers with a challenge page', [page('ACCESS_BLOCKED', 200)]],
+    ])('ends PARTIAL and high risk when %s', async (_name, issues) => {
+      const { status, result } = await scan({ pages: [], partial: true, issues });
+      expect(status).toBe('PARTIAL');
+      expect(result.sources.website).toMatchObject({ status: 'error', dataStatus: 'UNKNOWN', code: 'ACCESS_BLOCKED', pagesCrawled: 0 });
+      expect(result.sources.bar).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY', costUsd: 0 });
+      expect(result.sources.avvo).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY', costUsd: 0 });
+      expect(result.identity?.status).toBe('INSUFFICIENT');
+      expect(result.preScore).toMatchObject({ total: 0, tier: 'CRITICAL', confidence: 'LOW', assessmentStatus: 'INSUFFICIENT_EVIDENCE',
+        decision: 'REFERRAL_SENIOR',
+        overrides: [{ id: 'WEBSITE_UNAVAILABLE', decision: 'REFERRAL_SENIOR', reason: 'The firm website could not be read' }] });
+      expect(result.preScore.flags).toEqual(['INCOMPLETE_SOURCES', 'WEBSITE_UNAVAILABLE', 'INCOMPLETE_EVIDENCE', 'COMMERCIAL_DECISION_BLOCKED']);
+      // The published 0.4.0 schema takes it as it is: no new field, no new enum value.
+      expect(() => Layer1Result.parse(result)).not.toThrow();
+    });
+    it.each<[string, CrawlResult]>([
+      ['the crawl deadline passed', { pages: [], partial: true, aborted: true, issues: [] }],
+      ['the deadline passed after a refusal', { pages: [], partial: true, aborted: true, issues: [page('ACCESS_BLOCKED', 403)] }],
+      ['the site could not be reached', { pages: [], partial: true, issues: [page('REQUEST_FAILED')] }],
+      ['robots.txt answered 503', { pages: [], partial: true, issues: [page('ROBOTS_UNAVAILABLE', 503)] }],
+      ['robots.txt answered 429', { pages: [], partial: true, issues: [page('ROBOTS_UNAVAILABLE', 429)] }],
+      ['its pages answer 429', { pages: [], partial: true, issues: [page('ACCESS_BLOCKED', 429)] }],
+      ['its pages answer 503', { pages: [], partial: true, issues: [page('HTTP_ERROR', 503)] }],
+      ['the home page came back empty', { pages: [], partial: true, issues: [page('NO_READABLE_CONTENT', 200)] }],
+      ['a refusal came with a passing failure', { pages: [], partial: true, issues: [page('ACCESS_BLOCKED', 403),
+        { url: 'https://firm.com/about', code: 'REQUEST_FAILED', status: null, scope: 'page' }] }],
+      ['nothing says why', { pages: [], partial: true, issues: [] }],
+    ])('still ends FAILED, with nothing concluded about the firm, when %s', async (_name, crawl) => {
+      const { status, result } = await scan(crawl);
+      expect(status).toBe('FAILED');
+      expect(result.preScore.flags).not.toContain('WEBSITE_UNAVAILABLE');
+      expect(result.preScore.overrides).toEqual([]);
+      expect(result.preScore.decision).toBe('UNKNOWN');
+    });
+  });
+  it('still ends FAILED when the extraction of a site that was read fails', async () => {
+    const repository = new InMemoryRepository(), run = vi.fn(failed);
+    const website = new WebsiteExtractionSource(repository,
+      { id: 'fixture', version: '1', extract: async () => { throw new Error('Model unavailable'); } },
+      async () => ({ pages: [{ url: 'https://firm.com/', html: '<body>Firm</body>', text: 'Firm' }], partial: false }));
+    const { status, result } = await new InProcessPipeline({ repository, website, bar: { run }, avvo: { run } })
+      .run({ scanId: 'sc_extraction', canonicalDomain: 'firm.com', email: 'owner@firm.com' });
+    expect(status).toBe('FAILED');
+    expect(result.sources.website).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR', pagesCrawled: 1 });
+    expect(result.preScore.flags).not.toContain('WEBSITE_UNAVAILABLE');
   });
   it('enforces the global deadline even if an adapter ignores cancellation', async () => {
     const signalSeen: AbortSignal[] = [];

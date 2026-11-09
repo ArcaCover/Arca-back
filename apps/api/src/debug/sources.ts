@@ -35,6 +35,8 @@ export function injectWebsite(real: WebsiteSource, scenario: DebugScenario, opti
         return { data: unknownWebsite(), rawContent: injected('no_identity'), status: { status: 'ok', dataStatus: 'EMPTY',
           durationMs: 0, pagesCrawled: 1, reason: null } };
       case 'blocked':
+        // The one definitive value of this axis: the site refuses to be read, so the scan ends PARTIAL and high risk
+        // (DN-12). `error` and `timeout` below are passing failures and end FAILED.
         return { data: null, rawContent: injected('blocked'), status: { status: 'error', dataStatus: 'UNKNOWN', durationMs: 0,
           pagesCrawled: 0, code: 'ACCESS_BLOCKED', reason: 'Website access was blocked' } };
       case 'error':

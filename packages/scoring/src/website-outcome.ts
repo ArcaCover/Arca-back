@@ -1,4 +1,4 @@
-import type { SourceStatus } from '@arca/contracts';
+import type { PreScore, SourceStatus } from '@arca/contracts';
 
 /**
  * A website that gave no evidence, sorted by what a second scan would find.
@@ -25,3 +25,12 @@ export function classifyUnreadableWebsite(status: Pick<SourceStatus, 'status' | 
   return status.status === 'error' && status.code !== undefined && DEFINITIVE_UNREADABLE_CODES.has(status.code)
     ? 'DEFINITIVE' : 'TRANSIENT';
 }
+
+/**
+ * The flag, and the id of the override, of a firm whose website refuses to be read. Nothing the website would have
+ * shown could be verified, so the firm goes to a senior underwriter whatever the directories or the questionnaire say.
+ * Both are free strings of the contract: no schema value was added for them.
+ */
+export const WEBSITE_UNAVAILABLE = 'WEBSITE_UNAVAILABLE';
+export const WEBSITE_UNAVAILABLE_OVERRIDE: PreScore['overrides'][number] = { id: WEBSITE_UNAVAILABLE,
+  decision: 'REFERRAL_SENIOR', reason: 'The firm website could not be read' };

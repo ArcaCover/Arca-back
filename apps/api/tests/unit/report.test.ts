@@ -5,6 +5,8 @@ import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import { issueSessionToken } from '../../src/auth/session-token.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
 import { renderQuickScanHtml, reportFilename } from '../../src/report/quick-scan.js';
+import { InProcessPipeline } from '../../src/pipeline/in-process-pipeline.js';
+import { mockSources } from '../../src/pipeline/mock-sources.js';
 import { fixtureResult } from '../../../../packages/contracts/tests/fixture.js';
 
 const secret = 's'.repeat(40);
@@ -30,6 +32,28 @@ describe('Quick Scan Report content', () => {
     const html = renderQuickScanHtml(result, 'PARTIAL');
     expect(html).toMatch(/partial evidence/i);
     expect(html).toMatch(/not enough public evidence/i);
+    expect(html).not.toMatch(/website could not be read/i);
+  });
+
+  it('says in one sentence that the website could not be read, without a decision or a price', async () => {
+    const { status, result } = await new InProcessPipeline({ ...mockSources(), repository: new InMemoryRepository() })
+      .run({ scanId: 'sc_blocked', canonicalDomain: 'blocked.arca.example', email: 'owner@blocked.arca.example' });
+    expect(status).toBe('PARTIAL');
+    const html = renderQuickScanHtml(result, 'PARTIAL');
+    const notes = [...html.matchAll(/<li>([^<]*)<\/li>/g)].map(match => match[1]).filter(text => /website could not be read/.test(text!));
+    expect(notes).toEqual(['The firm&#39;s website could not be read, so everything that could not be verified counts as unknown ' +
+      'and the firm sits in the highest-risk group until the assessment is completed.']);
+    // The cause stands in for the generic notice, and the report still says no decision was made.
+    expect(html).not.toMatch(/did not answer in full/i);
+    expect(html).toMatch(/not enough public evidence yet for an underwriting decision/i);
+    expect(html).toMatch(/not an offer of insurance, a quote or an underwriting decision/i);
+    // The firm name falls back to the domain, the one thing known about a site that was not read.
+    expect(html).toContain('<h1>blocked.arca.example</h1>');
+    expect(html).toMatch(/>0<small> \/ 100/);
+    expect(html).toContain('CRITICAL');
+    expect(html).toContain('Firm website: unavailable');
+    // Nothing in the report names the restriction, a premium or a coverage outcome.
+    expect(html).not.toMatch(/REFERRAL|referral|declin|premium|\$|approved|eligible|coverage/);
   });
 
   it('never lets scanned text become markup', () => {

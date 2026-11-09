@@ -1,0 +1,29 @@
+{
+  "website": null,
+  "bar": null,
+  "avvo": null,
+  "sources": {
+    "website": {
+      "status": "error",
+      "dataStatus": "UNKNOWN",
+      "durationMs": 1,
+      "pagesCrawled": 0,
+      "code": "ACCESS_BLOCKED",
+      "reason": "robots.txt does not allow automated reading of the website"
+    },
+    "bar": {
+      "status": "skipped",
+      "dataStatus": "UNKNOWN",
+      "durationMs": 0,
+      "code": "INSUFFICIENT_IDENTITY",
+      "reason": "No verified firm name or attorney identity was extracted"
+    },
+    "avvo": {
+      "status": "skipped",
+      "dataStatus": "UNKNOWN",
+      "durationMs": 0,
+      "code": "INSUFFICIENT_IDENTITY",
+      "reason": "No verified firm name or attorney identity was extracted"
+    }
+  }
+}

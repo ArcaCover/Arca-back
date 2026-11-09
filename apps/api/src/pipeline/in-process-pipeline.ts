@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Layer1Evidence, Layer1Result, type Layer1Pipeline, type WebsiteSource, type DirectorySource, type SourceResult,
   type SourceName, type PipelineResult, type WebsiteData, type AttorneyMatch } from '@arca/contracts';
-import { evaluateLayer1Evidence } from '@arca/scoring';
+import { classifyUnreadableWebsite, evaluateLayer1Evidence } from '@arca/scoring';
 import { normalizeDomain } from './domain-resolution.js';
 import { buildFirmIdentity } from './firm-identity.js';
 import type { ScanRepository } from '../repositories/types.js';
@@ -70,7 +70,13 @@ export class InProcessPipeline implements Layer1Pipeline {
         ...assessment,
         meta: { scanDurationMs: Math.max(0, now() - start), cached: false, completedAt: new Date(now()).toISOString() } });
       const successful = Object.values(sources).filter(source => source.status === 'ok' || source.status === 'partial').length;
-      return { status: successful === 0 ? 'FAILED' : Object.values(sources).every(source => source.status === 'ok') ? 'COMPLETED' : 'PARTIAL', result };
+      // No usable source normally means there is nothing to report. A website that refuses to be read is the
+      // exception: a second scan would find the same, so the scan ends with the result that says so (flag and
+      // override WEBSITE_UNAVAILABLE) and the assessment can start from it. A passing failure, or one of our own,
+      // stays FAILED: the visitor tries again and nothing is concluded about the firm.
+      const refused = classifyUnreadableWebsite(sources.website) === 'DEFINITIVE';
+      return { status: successful === 0 ? refused ? 'PARTIAL' : 'FAILED'
+        : Object.values(sources).every(source => source.status === 'ok') ? 'COMPLETED' : 'PARTIAL', result };
     } finally { clearTimeout(timer); }
   }
 }

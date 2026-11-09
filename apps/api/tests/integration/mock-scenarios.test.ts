@@ -44,7 +44,15 @@ describe('mock scenarios cover every terminal status the frontend renders', () =
     expect(poll.result?.sources.avvo.status).toBe('error');
   });
 
-  it('fails with no result when no source is usable', async () => {
+  it('stays partial, and high risk, when the website refuses to be read', async () => {
+    const poll = await scan('blocked.arca.example');
+    expect(poll.status).toBe('PARTIAL');
+    expect(poll.result?.sources.website).toMatchObject({ status: 'error', code: 'ACCESS_BLOCKED' });
+    expect(poll.result?.preScore).toMatchObject({ total: 0, tier: 'CRITICAL', confidence: 'LOW', decision: 'REFERRAL_SENIOR' });
+    expect(poll.result?.preScore.flags).toContain('WEBSITE_UNAVAILABLE');
+  });
+
+  it('fails with no result when the website could not be reached', async () => {
     const poll = await scan('failed.arca.example');
     expect(poll.status).toBe('FAILED');
     // PollResponse has no room for a result on FAILED. Parsing above is the real assertion:

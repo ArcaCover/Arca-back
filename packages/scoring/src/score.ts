@@ -4,6 +4,7 @@ import { mean, oneDecimal, sum, allKnownTrue, anyKnownTrue, tierForScore, decisi
 import { disciplinaryEvidence, yearsSince } from './discipline.js';
 import { normalizeAreas, jaccard, PRACTICE_AREAS } from './areas.js';
 import { canonicalMatches, compareText } from './canonical.js';
+import { classifyUnreadableWebsite, WEBSITE_UNAVAILABLE, WEBSITE_UNAVAILABLE_OVERRIDE } from './website-outcome.js';
 
 function uniqueMatches(matches: AttorneyMatch[] | null): AttorneyMatch[] | null {
   if (matches === null) return null;
@@ -66,6 +67,11 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
   const okSources = Object.values(input.sources).filter(source => source.status === 'ok').length;
   const flags: string[] = [];
   if (Object.values(input.sources).some(source => source.status !== 'ok')) flags.push('INCOMPLETE_SOURCES');
+  // A website that refuses to be read is a fact about the firm, and a second scan would find the same. A website
+  // that failed for a passing reason says nothing about it, so it adds nothing here.
+  const websiteRefused = classifyUnreadableWebsite(input.sources.website) === 'DEFINITIVE';
+  if (websiteRefused) flags.push(WEBSITE_UNAVAILABLE);
+  const overrides = websiteRefused ? [...disciplinary.overrides, { ...WEBSITE_UNAVAILABLE_OVERRIDE }] : disciplinary.overrides;
   if (barPeople.some(person => !person || person.admissionDate === null || person.barStatus === null || person.barStatus === 'UNKNOWN') ||
     avvoPeople.some(person => !person || [person.avvoRating, person.reviewCount, person.averageReviewRating,
       person.awardsCount ?? person.awards, person.practiceAreas].some(value => value === null))) flags.push('PARTIAL_ATTORNEY_DATA');
@@ -79,9 +85,9 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
   const assessmentStatus = Object.values(categories).every(category => category.status === 'KNOWN') &&
     !flags.includes('AMBIGUOUS_IDENTITY_MATCH') ? 'SUFFICIENT' as const : 'INSUFFICIENT_EVIDENCE' as const;
   if (assessmentStatus === 'INSUFFICIENT_EVIDENCE') flags.push('COMMERCIAL_DECISION_BLOCKED');
-  const decision = restrictDecision(assessmentStatus === 'SUFFICIENT' ? decisionForTier(tier) : 'UNKNOWN', disciplinary.overrides);
+  const decision = restrictDecision(assessmentStatus === 'SUFFICIENT' ? decisionForTier(tier) : 'UNKNOWN', overrides);
   const preScore: PreScore = { total, categories, tier, decision, assessmentStatus,
-    confidence: okSources === 3 ? 'HIGH' : okSources === 2 ? 'MEDIUM' : 'LOW', overrides: disciplinary.overrides, flags };
+    confidence: okSources === 3 ? 'HIGH' : okSources === 2 ? 'MEDIUM' : 'LOW', overrides, flags };
   const points = (category: keyof typeof categories, id: string) => categories[category].rules.find(rule => rule.id === id)?.points ?? null;
   const tools = website.ai_in_services.tools_mentioned;
   const signals: Signals = {

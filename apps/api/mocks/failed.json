@@ -7,8 +7,9 @@
       "status": "error",
       "dataStatus": "UNKNOWN",
       "durationMs": 1,
-      "code": "ACCESS_BLOCKED",
-      "reason": "The site refused every request"
+      "pagesCrawled": 0,
+      "code": "PROVIDER_ERROR",
+      "reason": "The website could not be reached"
     },
     "bar": {
       "status": "error",

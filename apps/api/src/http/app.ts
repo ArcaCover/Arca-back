@@ -141,8 +141,9 @@ export function createApp(deps: AppDeps) {
         const result = Layer1Result.parse({ ...outcome.result, scanId, domain: canonicalDomain, email,
           meta: { ...outcome.result.meta, reusedEvidence } });
         if (result.domain !== canonicalDomain) throw new Error('Assessment domain identity mismatch');
-        // A failed scan carries no result, whichever way it failed. Every source was unusable,
-        // so the assessment is an empty shell, and PollResponse has no room for one on FAILED.
+        // A failed scan carries no result, whichever way it failed. Every source was unusable for a
+        // passing reason, so the assessment is an empty shell, and PollResponse has no room for one on FAILED.
+        // (A website that refuses to be read is not a failure: the pipeline ends that scan PARTIAL.)
         // Raw evidence still lands in scan_raw_data, so nothing diagnostic is lost.
         // The debug view keeps the per-source summary the record drops; it is set before a poll can see FAILED.
         if (outcome.status === 'FAILED') debug?.keepFailedSources(scanId, result.sources);

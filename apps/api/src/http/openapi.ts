@@ -71,7 +71,7 @@ export function buildOpenApiDocument() {
     } });
   registry.registerPath({ method: 'get', path: '/scan/{scanId}', summary: 'Poll scan status',
     security: [{ sessionToken: [] }], request: { params: z.object({ scanId: z.string() }) },
-    responses: { 200: { description: 'RUNNING, COMPLETED, PARTIAL or FAILED. All but RUNNING are terminal.', content: json(PollResponse, {
+    responses: { 200: { description: 'RUNNING, COMPLETED, PARTIAL or FAILED. All but RUNNING are terminal. A website that refuses to be read (robots.txt, HTTP 401/403 or a challenge page) ends PARTIAL: the result carries the flag and the override WEBSITE_UNAVAILABLE and an assessment can start from it. FAILED means a passing failure, has no result, and the scan can be tried again.', content: json(PollResponse, {
       running: { summary: 'Scan still running', value: { scanId: 'sc_abc123', status: 'RUNNING', elapsed: 12400 } },
       completed: { summary: 'Completed scan', value: { scanId: 'sc_abc123', status: 'COMPLETED', cached: false, result } },
       partial: { summary: 'Partial scan: a source could not be repaired', value: { scanId: 'sc_abc123', status: 'PARTIAL', cached: false,

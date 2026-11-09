@@ -2,8 +2,10 @@ import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { WebsiteData, AttorneyMatch, SourceStatus, type WebsiteSource, type DirectorySource, type SourceResult } from '@arca/contracts';
 
+// `blocked` is a site that refuses to be read (definitive: PARTIAL, high risk); `failed` one that could not be
+// reached (transient: FAILED, try again).
 export const MOCK_DOMAINS = ['robust.arca.example', 'minimal.arca.example', 'sanctioned.arca.example',
-  'partial.arca.example', 'failed.arca.example'] as const;
+  'partial.arca.example', 'blocked.arca.example', 'failed.arca.example'] as const;
 const Scenario = z.object({ website: WebsiteData.nullable(), bar: z.array(AttorneyMatch).nullable(),
   avvo: z.array(AttorneyMatch).nullable(), sources: z.object({ website: SourceStatus, bar: SourceStatus, avvo: SourceStatus }) });
 async function load(domain: string) {

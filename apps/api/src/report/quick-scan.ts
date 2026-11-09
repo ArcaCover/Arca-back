@@ -1,4 +1,5 @@
 import { adaptScore, type Layer1Result } from '@arca/contracts';
+import { WEBSITE_UNAVAILABLE } from '@arca/scoring';
 
 // The Quick Scan Report: the /score screen on one A4 page. Every sentence comes from adaptScore
 // and signalsToCards, the same code the screen renders, so the PDF can never say more than the
@@ -19,6 +20,10 @@ const TIER_LINES: Record<string, string> = {
   CRITICAL: 'Very few positive public signals',
   UNKNOWN: 'Not enough public evidence to place the firm in a tier',
 };
+
+// Shown when the result carries the WEBSITE_UNAVAILABLE flag (DN-12).
+export const WEBSITE_UNREAD_NOTE = "The firm's website could not be read, so everything that could not be verified counts as unknown " +
+  'and the firm sits in the highest-risk group until the assessment is completed.';
 
 const SOURCE_NAMES: Record<string, string> = { website: 'Firm website', bar: 'Florida Bar', avvo: 'Avvo' };
 
@@ -44,8 +49,12 @@ export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 
   const list = (items: typeof helping, mark: string) => items.length
     ? `<ul>${items.map(item => `<li><span class="dot" style="background:${mark}"></span><span>${escape(item.label)} <em>${escape(item.source)}</em></span></li>`).join('')}</ul>`
     : '<p class="none">Nothing observed.</p>';
+  // The cause replaces the generic notice about incomplete sources. It says what was observed and what that does to
+  // the score, never a decision or a price.
+  const websiteUnread = result.preScore.flags.includes(WEBSITE_UNAVAILABLE);
   const notes = [
-    view.incomplete ? 'Some sources did not answer in full, so this score rests on partial evidence.' : null,
+    websiteUnread ? WEBSITE_UNREAD_NOTE
+      : view.incomplete ? 'Some sources did not answer in full, so this score rests on partial evidence.' : null,
     view.decisionWithheld ? 'There is not enough public evidence yet for an underwriting decision.' : null,
   ].filter(Boolean) as string[];
 
