@@ -32,7 +32,7 @@ Según `Arca-front/CLAUDE.md` **[doc]**, ARCA es una MGA de *surplus lines* que 
 
 - **El embudo completo está cableado:** `/quote` → `POST /scan` → `/quote/scanning` (polling) → `/score` (más el PDF) → `/assessment` → `/assessment/results`. Front y back comparten contratos zod `.strict()`.
 - **El CI del back pasó en verde el 2026-10-16:** 42 archivos y 387 tests **[GitHub]**. El front tiene 9 archivos de test y **no tiene CI**.
-- **El modo `mock` del back recorre el flujo en milisegundos** con cinco dominios `*.arca.example`, sin OpenAI, Apify ni DNS, y con el scoring real.
+- **El modo `mock` del back recorre el flujo en milisegundos** con cinco dominios `*.arca.example` (seis desde el 2026-11-09, con `blocked`; DN-12), sin OpenAI, Apify ni DNS, y con el scoring real.
 - **No hay ninguna medición documentada de un scan live completo con el código actual.** Las últimas son del 2026-09-15, con código anterior: 1 min 48 s (FAILED) y 7 min 13 s (PARTIAL) **[doc]**.
 
 ### Qué es solo demo
@@ -193,8 +193,8 @@ Navegador ──> Arca-front (Next 16, Vercel)          [solo páginas; no hay r
 |---|---|
 | `RUNNING` | Desde `create` hasta el final del job. También es lo que responde un `POST` cuyo PARTIAL cacheado está dentro del cooldown. |
 | `COMPLETED` | Las tres fuentes en `ok`, después de `settle()`, que puede convertir un TRUNCATED o un NO_MATCH confirmados. |
-| `PARTIAL` | Al menos una fuente `ok`/`partial`, pero no las tres `ok`. Desde el 2026-11-09 el website queda `partial` solo por el plazo del crawl o por una página del propio sitio que no se pudo leer (falla tras sus reintentos, responde 401/403 u otro 4xx que no sea 404/410, o sale sin texto). Un enlace excluido por robots, un 404/410, algo que no es HTML o un subrecurso fallido se anotan en `issues` y en `reason`, pero el website sigue `ok` (DN-07 de crawl, §6). |
-| `FAILED` | Ninguna fuente útil, en la práctica cualquier fallo del website. También una excepción en el job o `recoverInterrupted` sobre un RUNNING de más de `PIPELINE_TIMEOUT_MS` + 120 s. **Nunca lleva `result`.** |
+| `PARTIAL` | Al menos una fuente `ok`/`partial`, pero no las tres `ok`. Desde el 2026-11-09 el website queda `partial` solo por el plazo del crawl o por una página del propio sitio que no se pudo leer (falla tras sus reintentos, responde 401/403 u otro 4xx que no sea 404/410, o sale sin texto). Un enlace excluido por robots, un 404/410, algo que no es HTML o un subrecurso fallido se anotan en `issues` y en `reason`, pero el website sigue `ok` (DN-07 de crawl, §6). Desde el 2026-11-09 (DN-12) también termina PARTIAL, sin ninguna fuente útil, el scan de una web que **se niega** a ser leída (causa DEFINITIVE: robots.txt excluye el sitio, 401/403 o página de desafío). Lleva el `result` completo, con el flag y el override `WEBSITE_UNAVAILABLE` (decisión `REFERRAL_SENIOR`), y el assessment puede empezar desde él. |
+| `FAILED` | Ninguna fuente útil **y** la web no falló por una negativa del sitio: plazo, error de red, robots.txt inalcanzable, 429, 5xx, portada vacía o fallo de la extracción (causas TRANSIENT). Hasta el 2026-11-09 era cualquier fallo del website. También una excepción en el job o `recoverInterrupted` sobre un RUNNING de más de `PIPELINE_TIMEOUT_MS` + 120 s. **Nunca lleva `result`.** |
 
 **Cachés:**
 
@@ -256,7 +256,7 @@ La UI y `CLAUDE.md` prometen "menos de 60 s" y no se corresponden con nada de es
 **El modo mock de hoy** (`SOURCE_MODE=mock`; `server.ts:30-47`, `pipeline/mock-sources.ts`):
 - **Qué sustituye:** las tres fuentes, a nivel de interfaz, por `apps/api/mocks/<prefijo>.json`. Los archivos se leen en cada scan, así que editarlos no exige reiniciar.
 - **Qué sigue siendo real:** identidad, reconciliación, scoring, persistencia y estados. El mock devuelve evidencia, no un resultado fijo.
-- **Dominios:** el resolver solo acepta los 5 de `MOCK_DOMAINS` y no hace DNS. Cualquier otro dominio da `400 invalid_domain`.
+- **Dominios:** el resolver solo acepta los de `MOCK_DOMAINS` (5 en la fecha de esta nota; 6 desde el 2026-11-09) y no hace DNS. Cualquier otro dominio da `400 invalid_domain`.
 - **Qué desactiva:** no se crean ni Apify ni el proveedor LLM, y el planner de L2 siempre es `rules`.
 - **Qué no desactiva:**
   - la caché de 7 días y el rate limit;
@@ -270,9 +270,10 @@ La UI y `CLAUDE.md` prometen "menos de 60 s" y no se corresponden con nada de es
 | `minimal` | COMPLETED | 25 EXPOSED | UNKNOWN (INSUFFICIENT_EVIDENCE) |
 | `sanctioned` | COMPLETED | 72 FORTIFIED | REFERRAL_SENIOR (RECENT_SANCTION; la fecha es hoy − 30 días) |
 | `partial` | PARTIAL (Avvo `error/PROVIDER_ERROR`) | 17 CRITICAL, calculado a mano | UNKNOWN (MEDIUM) |
-| `failed` | FAILED, sin `result` | — | El website da `error/ACCESS_BLOCKED`; los bloques `bar` y `avvo` de `failed.json` nunca se leen |
+| `blocked` (desde el 2026-11-09, DN-12) | PARTIAL (website `error/ACCESS_BLOCKED`: robots.txt excluye el sitio) | 0 CRITICAL | REFERRAL_SENIOR (override `WEBSITE_UNAVAILABLE`; LOW, INSUFFICIENT_EVIDENCE). Bar y Avvo quedan `skipped` por falta de identidad |
+| `failed` | FAILED, sin `result` | — | El website da `error/PROVIDER_ERROR` ("The website could not be reached", causa transitoria). Hasta el 2026-11-09 daba `ACCESS_BLOCKED`, que ahora terminaría PARTIAL. Los bloques `bar` y `avvo` de `failed.json` nunca se leen |
 
-Los tests afirman los totales 82, 25 y 72 y los estados de `robust`, `partial` y `failed` (`tests/unit/pipeline.test.ts`, `tests/integration/mock-scenarios.test.ts`).
+Los tests afirman los totales 82, 25 y 72 y los estados de `robust`, `partial`, `blocked` y `failed` (`tests/unit/pipeline.test.ts`, `tests/integration/mock-scenarios.test.ts`, `tests/integration/unreadable-website.test.ts`).
 
 **Lo que el mock no cubre:**
 - website `partial` o timeout;
@@ -852,7 +853,7 @@ La prioridad es mi criterio (Alta, Media o Baja). La columna "Fuente" indica dó
   - las rutas de `SignalPath` que el banco no usa (`W2.tools`, `W5_teamSize`, `A8_disciplined`);
   - el índice `assessments_expiry_idx`, sin ningún barrido que lo use.
 - **Front:** las ramas de `planning_failed`, `assessment_exists` y `FAILED`, y `lib/supabase.ts`.
-- **Mocks:** los bloques `bar` y `avvo` de `mocks/failed.json`.
+- **Mocks:** los bloques `bar` y `avvo` de `mocks/failed.json` (y, desde el 2026-11-09, los de `mocks/blocked.json`).
 - **Variables:** `NODE_ENV` en el back; `NVIDIA_NIM_API_KEY` y `SIGNAL_LLM_ENDPOINT` en `.env.local`.
 
 ### 9.3 Deuda técnica
@@ -920,7 +921,7 @@ npm run build                  # tsc -b: emite dist de los 4 proyectos (lo neces
 
 # Modo mock sin servicios externos. Las variables del shell ganan a .env.local.
 $env:SOURCE_MODE = 'mock'; $env:STORAGE_BACKEND = 'memory'; npm run dev    # API en :8080
-# Dominios válidos: robust|minimal|sanctioned|partial|failed.arca.example
+# Dominios válidos: robust|minimal|sanctioned|partial|blocked|failed.arca.example
 # Al terminar: Remove-Item Env:SOURCE_MODE, Env:STORAGE_BACKEND
 ```
 

@@ -171,6 +171,9 @@ hubo peticiones fallidas o excluidas por robots detrás de esa página, el `reas
 Una portada 404/410 o que no es HTML también queda fuera, porque la decisión D3 no las incluye. Meterlas
 exigiría decidirlo antes y darles un código distinto del de la página vacía, porque la clase se lee solo del código.
 
+Qué hace cada clase con el scan está en DN-12 §3: DEFINITIVE termina PARTIAL con el resultado de alto riesgo
+(flag y override `WEBSITE_UNAVAILABLE`) y TRANSIENT sigue terminando FAILED.
+
 **Límite conocido, sin resolver aquí.** Playwright no pasa por el manejador de peticiones los saltos de
 una redirección HTTP: Chromium los sigue con su propia red. Por eso el destino de una redirección no pasa
 por `network.ts` (anti-SSRF con IP fijada), y los saltos posteriores al primero tampoco pasan por robots.

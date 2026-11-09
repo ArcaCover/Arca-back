@@ -70,9 +70,10 @@ Invoke-RestMethod "http://localhost:8080/scan/$($scan.scanId)" -Headers @{ Autho
 | minimal.arca.example | COMPLETED | Score 25, EXPOSED; evidencia incompleta |
 | sanctioned.arca.example | COMPLETED | Score 72, FORTIFIED; decisión REFERRAL_SENIOR por sanción reciente |
 | partial.arca.example | PARTIAL | Avvo caído; `INSUFFICIENT_EVIDENCE` y decisión `UNKNOWN` |
-| failed.arca.example | FAILED | Ninguna fuente utilizable; sin `result` en la respuesta |
+| blocked.arca.example | PARTIAL | La web se niega a ser leída (robots.txt): score 0, CRITICAL, flag y override `WEBSITE_UNAVAILABLE`, decisión `REFERRAL_SENIOR` |
+| failed.arca.example | FAILED | No se pudo llegar a la web (causa transitoria); sin `result` en la respuesta |
 
-Los dos últimos existen para que el frontend pueda desarrollar sus ramas de error sin
+Los tres últimos existen para que el frontend pueda desarrollar sus ramas de error sin
 desenchufar la red.
 
 Los fixtures están en `apps/api/mocks`; la sanción reciente se fecha al cargar el escenario.
@@ -100,6 +101,18 @@ desconocida tiene score 0; los parciales suman únicamente reglas evaluables y m
 La confianza HIGH/MEDIUM/LOW corresponde al número de fuentes técnicamente completas, no certifica veracidad.
 `preScore.assessmentStatus=INSUFFICIENT_EVIDENCE` bloquea la decisión comercial automática y devuelve
 `decision=UNKNOWN`, salvo que evidencia disciplinaria conocida imponga una restricción explícita.
+
+Una web que no se puede leer no siempre falla el scan (DN-12):
+
+- **Causa definitiva** (robots.txt excluye el sitio, sus páginas responden 401/403 o una página de desafío): el scan
+  termina **PARTIAL** con el resultado completo. Usa solo valores que ya existían en el contrato: score con lo que
+  se sabe (0 si no hay nada más), tier por las bandas de siempre, confianza LOW, `INSUFFICIENT_EVIDENCE`, el flag
+  `WEBSITE_UNAVAILABLE` y el override `{ id: 'WEBSITE_UNAVAILABLE', decision: 'REFERRAL_SENIOR' }`. El assessment
+  puede empezar desde ese resultado y no borra ni el flag ni la restricción.
+- **Causa transitoria o nuestra** (plazo, error de red, robots.txt inalcanzable, 429, 5xx, fallo del proveedor):
+  sigue **FAILED**, sin `result`. No se concluye nada sobre la firma y el visitante puede reintentar.
+
+La clasificación está en un solo sitio, `classifyUnreadableWebsite` (`@arca/scoring`); la tabla de causas, en el DN-07 de crawl, §6.
 
 La caché dura `SCAN_CACHE_TTL_MS` por dominio canónico, 7 días por defecto, y nunca reutiliza FAILED.
 **Un cache hit siempre es COMPLETED.** Un scan que quedó PARTIAL sí entra en la caché, pero no se

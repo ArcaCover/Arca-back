@@ -3,7 +3,8 @@
 This isolated implementation follows DN-07's fixed-bank, deterministic-score architecture.
 The bank and 30% Layer 1 / 70% Layer 2 composite are **engineering demo fixtures**, not approved
 underwriting policy. Every result carries `bankStatus: DEMO`, `commercialDecisionBlocked: true`,
-and demo flags. A questionnaire cannot erase a known Layer 1 disciplinary restriction or
+and demo flags. A questionnaire cannot erase a known Layer 1 restriction (a disciplinary override, or
+`WEBSITE_UNAVAILABLE` when the firm website refused to be read: DN-12) or
 make missing public evidence sufficient. No pricing, binding, PDF report, or magic-link flow is implemented.
 
 ## Local operation
