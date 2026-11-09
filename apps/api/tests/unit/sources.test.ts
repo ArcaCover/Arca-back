@@ -125,6 +125,27 @@ describe('provider evidence boundaries', () => {
     expect(result.status).toMatchObject({ costUsd: .25, candidatesReceived: 1, recordsValid: 1,
       providerRuns: [{ runId: 'run-1', acceptedCount: 1, costUsd: .25 }] });
   });
+  it('lists provider runs by query fingerprint, not by the order the lookups finished in', async () => {
+    const names = ['Ana Perez', 'Bruno Diaz', 'Carla Ruiz', 'Diego Soto'];
+    // Fingerprints are hashes: their order is unrelated to the order of the names.
+    const fingerprints: Record<string, string> = { 'Ana Perez': 'c', 'Bruno Diaz': 'a', 'Carla Ruiz': 'd', 'Diego Soto': 'b' };
+    const run = (delays: Record<string, number>) => async (_actor: string, input: Record<string, unknown>) => {
+      const target = String((input.searchQueries as string[])[0]);
+      await new Promise(resolve => setTimeout(resolve, delays[target]));
+      return { items: [{ name: target }], metadata: { provider: 'apify' as const, actor: AVVO_ACTOR, runId: `run-${target}`,
+        status: 'SUCCEEDED', queryFingerprint: fingerprints[target]!.repeat(64), itemCount: 1, acceptedCount: 0, costUsd: .01 } };
+    };
+    const lookup = (delays: Record<string, number>) => new ApifyDirectorySource('avvo', { run: run(delays) })
+      .run({ ...query, names }, new AbortController().signal);
+    const first = await lookup({ 'Ana Perez': 30, 'Bruno Diaz': 20, 'Carla Ruiz': 10, 'Diego Soto': 1 });
+    const second = await lookup({ 'Ana Perez': 1, 'Bruno Diaz': 10, 'Carla Ruiz': 20, 'Diego Soto': 30 });
+    expect(first.status.providerRuns?.map(item => item.runId))
+      .toEqual(['run-Bruno Diaz', 'run-Diego Soto', 'run-Ana Perez', 'run-Carla Ruiz']);
+    expect(first.status.providerRuns?.every(item => item.acceptedCount === 1)).toBe(true);
+    expect(second.status.providerRuns).toEqual(first.status.providerRuns);
+    // The stored raw evidence, and so its content hash, is the same for the same answers.
+    expect(second.rawContent).toBe(first.rawContent);
+  });
   it('isolates malformed rows instead of discarding valid rows from the same paid dataset', async () => {
     const source = new ApifyDirectorySource('bar', { run: async () => [{ name: 'Jane Smith' }, 'invalid'] });
     const result = await source.run(query, new AbortController().signal);

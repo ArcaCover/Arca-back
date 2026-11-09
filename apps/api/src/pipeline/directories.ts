@@ -3,7 +3,7 @@ import { unknownAttorney, Attorney, type AttorneyMatch, type DirectoryQuery, typ
 import { z } from 'zod';
 import { ApifyClientError, type ApifyRunMetadata, type ApifyRunResult } from './apify-client.js';
 import { normalizeName, stableSample, matchAttorney } from './matching.js';
-import { validDate } from '@arca/scoring';
+import { compareText, validDate } from '@arca/scoring';
 
 export const BAR_ACTOR = 'scrapers_lat/florida-bar-lawyers-scraper';
 export const AVVO_ACTOR = 'scrapers_lat/avvo-lawyers-scraper';
@@ -229,6 +229,9 @@ export class ApifyDirectorySource implements DirectorySource {
     };
     await Promise.all(Array.from({ length: Math.min(DIRECTORY_LOOKUPS_IN_FLIGHT, targets.length) }, worker));
     const successful = successfulQueries > 0;
+    // Lookups finish in any order. The fingerprint is the same for the same query on every scan, so the
+    // runs, and the raw evidence that lists them, read the same on a second scan.
+    providerRuns.sort((a, b) => compareText(a.queryFingerprint, b.queryFingerprint) || compareText(a.runId, b.runId));
     matches.sort((a, b) => a.searchedName.localeCompare(b.searchedName) || (a.attorney?.name ?? '').localeCompare(b.attorney?.name ?? ''));
     const found = matches.filter(match => match.attorney !== null).length;
     const chargeableRuns = providerRuns.filter(run => run.chargedToScan !== false);

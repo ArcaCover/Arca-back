@@ -50,3 +50,35 @@ estructurados o entrada humana conforme aparezcan casos reales, sin cambiar el c
 
 El endurecimiento posterior de identidad, proveedores y evidencia insuficiente se documenta en
 [DN-04](DN-04-live-evidence-hardening.md) y prevalece para esos temas.
+
+## Mismo resultado en cualquier orden (9 de noviembre de 2026)
+
+«Las mismas entradas» incluye la misma evidencia entregada en otro orden. Antes no se cumplía: las
+calificaciones 2.2, 9.1 y 9.7 promediaban 7 o 6.999999999999999 según el orden de suma (6 o 2 puntos
+en A1), y una firma de siete abogados con promedio exacto de 8.0 alternaba entre 81 FORTRESS y
+78 FORTIFIED. Reglas vigentes en `packages/scoring`:
+
+- **Orden canónico en la frontera.** `evaluateLayer1Evidence` ordena los matches de Bar y Avvo por
+  nombre buscado normalizado y luego por persona (número de colegiado, URL de perfil, nombre), y los
+  candidatos de cada match por persona. `scoreEvidence` aplica el mismo orden. Se compara por unidades
+  de código, no con `localeCompare`, para no depender del locale del proceso. Qué duplicado de una
+  misma persona se descarta y qué consulta toma el cruce entre directorios dependen de ese orden fijo.
+- **Promedios.** `mean` suma en orden ascendente y redondea a nueve decimales antes de comparar con
+  un umbral. No cambia ninguna banda de [DN-01](DN-01-layer1-handbook-resolution.md): solo elimina el
+  ruido de coma flotante.
+- **Experiencia promedio.** `B4_avgExperience` se publica con un decimal para que el resultado no
+  cambie cada día; la regla B4 sigue leyendo el promedio exacto, de modo que los umbrales reales de
+  tres y diez años no se mueven.
+- **Premio principal.** `A6_topAward` es el del abogado con más premios; el empate se resuelve por el
+  texto del premio, nunca por la posición en la lista.
+- **Listas del resultado.** Herramientas de IA (W2), alias, nombres de abogados y referencias de
+  identidad, y `sources.*.providerRuns` (por `queryFingerprint`) salen ordenados. Las listas propias
+  de una persona (premios, áreas de práctica, sanciones) conservan el orden del proveedor: el score
+  no depende de él.
+- **`PROVIDER_COST_UNKNOWN` deja de ser un flag.** Describía la ejecución y no a la firma: aparecía
+  en un scan recién cobrado y desaparecía en uno servido desde la caché de Apify.
+  `sources.*.accountingComplete` sigue informando la contabilidad pendiente.
+
+`packages/scoring/tests/determinism.test.ts` lo prueba con permutaciones de semilla fija sobre varios
+casos, incluidos los dos umbrales anteriores. Los resultados ya guardados en la caché de scans
+conservan su forma anterior hasta que vencen.

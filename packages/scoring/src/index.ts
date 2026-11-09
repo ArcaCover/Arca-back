@@ -4,5 +4,6 @@ export * from './categories.js';
 export * from './discipline.js';
 export * from './score.js';
 export * from './matching.js';
+export * from './canonical.js';
 export * from './evaluate.js';
 export * from './layer2.js';

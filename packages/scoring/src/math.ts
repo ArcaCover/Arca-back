@@ -10,9 +10,20 @@ export function category(max: number, rules: RulePoints[]): z.infer<typeof Categ
 export function observedBoolean(value: boolean | null, positive: number, negative = 0): number | null {
   return value === null ? null : value ? positive : negative;
 }
+/**
+ * Averages are compared with band thresholds, so they must not carry floating-point noise:
+ * 2.2, 9.1 and 9.7 average exactly 7, yet summed as 9.7 + 9.1 + 2.2 they gave 6.999999999999999
+ * and fell into the band below. Adding in ascending order makes the sum independent of the input
+ * order, and nine decimals is far finer than any real difference between two averages.
+ */
 export function mean(values: (number | null)[]): number | null {
-  const known = values.filter((value): value is number => value !== null);
-  return known.length ? known.reduce((sum, value) => sum + value, 0) / known.length : null;
+  const known = values.filter((value): value is number => value !== null).sort((a, b) => a - b);
+  if (!known.length) return null;
+  return Math.round(known.reduce((sum, value) => sum + value, 0) / known.length * 1e9) / 1e9;
+}
+/** One decimal, for values shown to a reader. Rules keep reading the unrounded value. */
+export function oneDecimal(value: number | null): number | null {
+  return value === null ? null : Math.round(value * 10) / 10;
 }
 export function sum(values: (number | null)[]): number {
   const known = values.filter((value): value is number => value !== null);
