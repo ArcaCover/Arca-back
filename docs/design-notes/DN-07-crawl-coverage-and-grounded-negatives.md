@@ -112,7 +112,15 @@ crawler, el lector de PDFs, el lector de sitemaps y las herramientas del agente 
 - **`Crawl-delay` se respeta de forma acotada.** Si el grupo de `ArcaBot` (o `*`) lo declara, el crawl lee
   una página cada vez y espera esa pausa entre el inicio de una página y el de la siguiente. La pausa tiene
   un tope de `plazo / páginas` (1,5 s con 30 s y 20 páginas), para que la espera sola no pueda agotar el
-  plazo. Consecuencia: un sitio que lo declara se lee en serie y puede no llegar a 20 páginas en 30 s.
+  plazo. Consecuencia medida con páginas de fixture sin latencia: con una pausa declarada de 1,5 s o más,
+  20 páginas tardan 29,6 s de los 30 s. Un sitio real con esa pausa y 20 páginas alcanzables termina por
+  tanto en el plazo: website `partial` con `Crawl deadline reached`, y cuántas páginas entran depende del
+  tiempo de carga. La causa es estructural, pero el plazo se lee como transitorio. **Pendiente de decisión
+  del founder** antes de aplicar D5 (reparación cada hora). Las lecturas del agente (`site-access.ts`) son
+  un crawl de una página por llamada y no esperan la pausa entre una llamada y la siguiente.
+- Los enlaces que robots excluye no gastan el presupuesto de 20 páginas. Se resuelven antes de elegir cada
+  tanda, porque no cuestan ninguna petición. Antes, 19 enlaces excluidos dejaban el crawl en la portada y el
+  website salía `ok`. Un 404/410 o un fichero sí cuentan: hubo que pedirlos para saberlo.
 
 **Qué marca el crawl como `partial`.** Cada incidencia lleva ahora un `scope`: `page` (cómo terminó una
 página del crawl), `request` (una petición del navegador, de cualquier host) o `robots` (el
@@ -122,7 +130,7 @@ página del crawl), `request` (una petición del navegador, de cualquier host) o
 |---|---|
 | Enlace excluido por robots (`ROBOTS_DISALLOWED`) | No |
 | Enlace muerto, HTTP 404 o 410 | No |
-| Enlace a algo que no es HTML (`NOT_HTML`: un feed, un `.docx`) | No |
+| Enlace a algo que no es HTML (`NOT_HTML`: un feed, un `.docx`, una vCard), con o sin redirección delante | No |
 | Subrecurso fallido, propio o de terceros (`scope: request`) | No |
 | Página del propio sitio que falla tras sus reintentos (red, 5xx, 429) | Sí |
 | Página con 401/403, página de desafío o sin texto legible | Sí |
@@ -132,6 +140,12 @@ Todas quedan en `issues` del raw. El `reason` del website las cuenta, por ejempl
 `2 pages excluded by robots.txt; 1 dead link (HTTP 404/410)`, también cuando el estado es `ok`.
 Las peticiones que responden 401, 403, 429 o 5xx y las que fallan por transporte se anotan con
 `scope: request`, sean del host que sean.
+
+Un fichero detrás de una redirección no pasa por el manejador de peticiones (ver el límite de abajo), y en un
+sitio que redirige el dominio desnudo a `www` eso son todos los enlaces. Llega a Chromium, que corta la
+navegación con `Download is starting`. El crawler lo reconoce como `NOT_HTML` con `status: null`, sin
+reintentos. Antes salía como `REQUEST_FAILED`, se reintentaba tres veces y dejaba el website `partial`.
+El contexto del navegador rechaza las descargas (`acceptDownloads: false`): nunca se guarda un fichero.
 
 **Web ilegible: definitiva o transitoria.** Cuando el crawl no lee ninguna página, `website-outcome.ts`
 elige el código y el motivo según la causa, y `classifyUnreadableWebsite` (`@arca/scoring`) clasifica solo
