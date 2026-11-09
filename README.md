@@ -165,7 +165,7 @@ Una página que falla por transporte, error 5xx o 429 se reintenta hasta complet
 marcar el rastreo parcial; robots, 4xx y contenido ilegible no se reintentan. Un enlace excluido por robots,
 un 404/410 o un enlace a algo que no es HTML quedan anotados, pero no marcan el rastreo parcial
 (DN-07 de crawl, §6). El rastreo tiene su propio
-plazo de 20 segundos, y al agotarse el resultado es parcial aunque queden reintentos disponibles.
+plazo de 30 segundos, y al agotarse el resultado es parcial aunque queden reintentos disponibles.
 La prioridad de rastreo reconoce vocabulario en inglés y en español, para que un sitio en español no empate
 todas sus páginas en la prioridad mínima y gaste el plazo en el blog.
 El nombre del despacho se toma de `JSON-LD` cuando existe; al recurrir a `og:site_name` se descarta la cola

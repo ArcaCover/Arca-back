@@ -193,7 +193,7 @@ Navegador ──> Arca-front (Next 16, Vercel)          [solo páginas; no hay r
 |---|---|
 | `RUNNING` | Desde `create` hasta el final del job. También es lo que responde un `POST` cuyo PARTIAL cacheado está dentro del cooldown. |
 | `COMPLETED` | Las tres fuentes en `ok`, después de `settle()`, que puede convertir un TRUNCATED o un NO_MATCH confirmados. |
-| `PARTIAL` | Al menos una fuente `ok`/`partial`, pero no las tres `ok`. Desde el 2026-11-09 el website queda `partial` solo por el plazo del crawl o por una página del propio sitio que falla tras sus reintentos. Un enlace excluido por robots, un 404/410, algo que no es HTML o un subrecurso fallido se anotan en `issues` y en `reason`, pero el website sigue `ok` (DN-07 de crawl, §6). |
+| `PARTIAL` | Al menos una fuente `ok`/`partial`, pero no las tres `ok`. Desde el 2026-11-09 el website queda `partial` solo por el plazo del crawl o por una página del propio sitio que no se pudo leer (falla tras sus reintentos, responde 401/403 u otro 4xx que no sea 404/410, o sale sin texto). Un enlace excluido por robots, un 404/410, algo que no es HTML o un subrecurso fallido se anotan en `issues` y en `reason`, pero el website sigue `ok` (DN-07 de crawl, §6). |
 | `FAILED` | Ninguna fuente útil, en la práctica cualquier fallo del website. También una excepción en el job o `recoverInterrupted` sobre un RUNNING de más de `PIPELINE_TIMEOUT_MS` + 120 s. **Nunca lleva `result`.** |
 
 **Cachés:**
@@ -820,7 +820,7 @@ La prioridad es mi criterio (Alta, Media o Baja). La columna "Fuente" indica dó
 |---|---|---|
 | `README.md:9-10`, DN-03:43 | Proveedor por defecto `rules`; live no necesita OpenAI | `agentic` (`env.ts:12`), y exige `OPENAI_API_KEY` salvo con `rules` explícito (`env.ts:59-61`) |
 | `README.md:154`, DN-01:90 | Presupuesto del pipeline de 55 s | 600 s (`env.ts:40`); 55 s es solo el default de la clase |
-| `README.md:140`, DN-05 §3 | Crawl de 20 s | 30 s (`crawler.ts:82`) |
+| `README.md:140`, DN-05 §3 | Crawl de 20 s | 30 s (`crawler.ts:82`). El README quedó corregido el 2026-11-09 |
 | `README.md:116-118,148-150`, DN-01:32 | 2 identidades, 7 candidatos, 2 actores, 10 registros; muestra de 15 | Roster completo; 8 por directorio y 16 en total; 25 en Bar y 10 en Avvo |
 | `README.md:63-69` | 5 rutas HTTP | 11 rutas (§3.4) |
 | DN-01:27, `README.md:72` | Los overrides no tocan el score | Una investigación activa pone el total a 0 (`score.ts:56-57`) |

@@ -101,11 +101,13 @@ crawler, el lector de PDFs, el lector de sitemaps y las herramientas del agente 
   envía y el nombre con el que se buscan las reglas. Nunca se suplanta el de un navegador.
 - `robots.txt` tiene su propio plazo de 6 s (`ROBOTS_TIMEOUT_MS`). Si se cuelga, ya no consume los 30 s del crawl.
 - El cuerpo se corta en 500 KiB (`ROBOTS_MAX_BYTES`) en vez de fallar. La regla que queda partida se descarta.
+  El corte busca el último fin de línea de cualquier tipo (LF, CRLF o CR solo).
 - Hay una caché por scan y por origen (`RobotsCache`). La crea `WebsiteExtractionSource` y la comparten el
   crawl y todas las lecturas del agente, así que `robots.txt` se descarga una vez por origen y scan. Antes
   se descargaba de nuevo en cada página pedida por el agente. `www` y el dominio desnudo son orígenes distintos.
 - Las peticiones que una página hace a su propio host (scripts, XHR, fetch) también pasan por robots. Antes
   solo se comprobaban las navegaciones, y un `fetch("/wp-json/…")` salía aunque estuviera excluido.
+  Un `iframe` del propio sitio excluido por robots queda anotado igual, con `scope: request`.
 - El destino de una redirección se comprueba antes de entregársela al navegador (ver el límite de abajo).
 - **`Crawl-delay` se respeta de forma acotada.** Si el grupo de `ArcaBot` (o `*`) lo declara, el crawl lee
   una página cada vez y espera esa pausa entre el inicio de una página y el de la siguiente. La pausa tiene
@@ -128,6 +130,8 @@ página del crawl), `request` (una petición del navegador, de cualquier host) o
 
 Todas quedan en `issues` del raw. El `reason` del website las cuenta, por ejemplo
 `2 pages excluded by robots.txt; 1 dead link (HTTP 404/410)`, también cuando el estado es `ok`.
+Las peticiones que responden 401, 403, 429 o 5xx y las que fallan por transporte se anotan con
+`scope: request`, sean del host que sean.
 
 **Web ilegible: definitiva o transitoria.** Cuando el crawl no lee ninguna página, `website-outcome.ts`
 elige el código y el motivo según la causa, y `classifyUnreadableWebsite` (`@arca/scoring`) clasifica solo
@@ -137,13 +141,21 @@ por el código. Es el único sitio donde se decide. No hay códigos nuevos en el
 |---|---|---|
 | robots.txt excluye el sitio | `error` / `ACCESS_BLOCKED` | DEFINITIVE |
 | Las páginas responden 401 o 403, o una página de desafío | `error` / `ACCESS_BLOCKED` | DEFINITIVE |
-| La portada responde otro 4xx, no es HTML o no tiene texto | `error` / `NO_READABLE_EVIDENCE` | DEFINITIVE |
+| La portada responde otro 4xx (404 y 410 incluidos), no es HTML o no tiene texto | `error` / `NO_READABLE_EVIDENCE` | TRANSIENT |
 | Plazo o abort | `timeout` / `DEADLINE_REACHED` | TRANSIENT |
 | robots.txt inalcanzable, 429, 5xx, error de red o causa desconocida | `error` / `PROVIDER_ERROR` | TRANSIENT |
 
 Antes, un robots que excluye el sitio, un robots inalcanzable, un error de red y el plazo salían todos como
 `NO_READABLE_EVIDENCE` ("No readable website evidence"). Si hay una sola causa transitoria, el resultado es
 TRANSIENT: no se marca una firma como ilegible mientras otro scan pueda leerla.
+
+Solo es DEFINITIVE la negativa del sitio, es decir, `ACCESS_BLOCKED`. Una portada sin texto no lo es: es
+también lo que deja un script que falló una vez (un 503 del propio bundle, un CDN que no resuelve DNS) o un
+contenido que aún no había llegado cuando se leyó la página, y después no se pueden distinguir. Cuando
+hubo peticiones fallidas o excluidas por robots detrás de esa página, el `reason` lo dice:
+`The website returned a page with no readable text (1 of its requests failed; 2 excluded by robots.txt)`.
+Una portada 404/410 o que no es HTML también queda fuera, porque la decisión D3 no las incluye. Meterlas
+exigiría decidirlo antes y darles un código distinto del de la página vacía, porque la clase se lee solo del código.
 
 **Límite conocido, sin resolver aquí.** Playwright no pasa por el manejador de peticiones los saltos de
 una redirección HTTP: Chromium los sigue con su propia red. Por eso el destino de una redirección no pasa
