@@ -1,27 +1,29 @@
 import { extractText, getDocumentProxy } from 'unpdf';
-import { fetchPublicResponse, fetchPublicText } from './network.js';
-import { robotsAllows } from './robots.js';
+import { fetchPublicResponse } from './network.js';
+import { fetchRobotsText, robotsPolicy, type RobotsCache, type RobotsFetch } from './robots.js';
 import type { CrawledPage } from './crawler.js';
 
 export const MAX_DOCUMENT_CHARS = 60_000;
 export type DocumentTransport = {
-  response: typeof fetchPublicResponse; robots: typeof fetchPublicText;
+  response: typeof fetchPublicResponse; robots: RobotsFetch;
   extract: (bytes: Uint8Array) => Promise<{ totalPages: number; text: string[] }>;
 };
-const defaults: DocumentTransport = { response: fetchPublicResponse, robots: fetchPublicText,
+export const documentTransport: DocumentTransport = { response: fetchPublicResponse, robots: fetchRobotsText,
   extract: async bytes => { const pdf = await getDocumentProxy(bytes, { verbosity: 0 });
     const result = await extractText(pdf, { mergePages: false });
     return { totalPages: result.totalPages, text: result.text as string[] }; } };
 const host = (url: string) => new URL(url).hostname.replace(/^www\./, '');
 
 /** Reads a same-host PDF. `complete` is true only when every extracted character is kept. */
-export async function readDocument(url: string, signal: AbortSignal, transport: DocumentTransport = defaults):
-  Promise<{ page: CrawledPage | null; detail: string | null }> {
+export async function readDocument(url: string, signal: AbortSignal, transport: DocumentTransport = documentTransport,
+  robots?: RobotsCache): Promise<{ page: CrawledPage | null; detail: string | null }> {
   try {
-    if (!(await robotsAllows(url, signal, transport.robots))) return { page: null, detail: 'ROBOTS_DISALLOWED' };
     let next = url;
     for (let redirects = 0; redirects <= 3; redirects++) {
       signal.throwIfAborted();
+      // Checked on every hop: a redirect to the www origin lands under that origin's own rules.
+      const policy = await robotsPolicy(new URL(next).origin, signal, { fetchText: transport.robots, cache: robots });
+      if (!policy.allows(next)) return { page: null, detail: policy.state === 'unreachable' ? 'ROBOTS_UNAVAILABLE' : 'ROBOTS_DISALLOWED' };
       const response = await transport.response(next, signal);
       if (response.status >= 300 && response.status < 400 && response.headers.location) {
         const target = new URL(response.headers.location, next).href;

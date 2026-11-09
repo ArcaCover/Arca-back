@@ -7,6 +7,7 @@ import { buildCorpus, serializeCorpus, withLinks, withPassages, type EvidenceCor
 import { acceptClaims, toWebsiteData } from './signal-grounding.js';
 import { groundNegativeSignals } from './negative-signal-grounding.js';
 import { createSiteAccess, type SiteAccess, type ToolCall } from './site-access.js';
+import { createRobotsCache, type RobotsCache } from './robots.js';
 import { findPassages } from './site-search.js';
 import { DERIVED_FIELDS, deriveTeamPageQuality, deriveWebsiteQuality, type TeamPageDerivation, type WebsiteDerivation } from './derived-signals.js';
 import { PAGE_CLASSIFICATION_PROMPT, PAGE_TYPE_VOTES, PageClassification, acquisitionFloor, majorityPageTypes, pageCandidates,
@@ -207,9 +208,11 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
     return parsed.data!;
   }
 
-  async extractDetailed(input: CrawlResult, signal: AbortSignal): Promise<DetailedExtraction> {
+  /** `context.robots` is the scan's robots cache: the tools then reuse the rules the crawl already fetched. */
+  async extractDetailed(input: CrawlResult, signal: AbortSignal, context: { robots?: RobotsCache } = {}): Promise<DetailedExtraction> {
     const attempts: Attempt[] = [], toolCalls: ToolCall[] = [];
-    try { return await this.runWorkflow(input, signal, attempts, toolCalls); }
+    const access = this.access.withRobots?.(context.robots ?? createRobotsCache()) ?? this.access;
+    try { return await this.runWorkflow(input, signal, attempts, toolCalls, access); }
     catch (error) {
       if (error instanceof ExtractionFailure) throw error;
       throw new ExtractionFailure(error instanceof Error ? error.message : 'Extraction failed', attempts, { cause: error });
@@ -217,7 +220,7 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
   }
 
   private async runWorkflow(input: CrawlResult, signal: AbortSignal, attempts: Attempt[],
-    toolCalls: ToolCall[]): Promise<DetailedExtraction> {
+    toolCalls: ToolCall[], access: SiteAccess): Promise<DetailedExtraction> {
     let crawl = input;
     let discovered: Array<{ url: string; kind: 'page' | 'document' }> = [];
     let passages: ReturnType<typeof findPassages> = [];
@@ -240,12 +243,12 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
       pageTypes = majorityPageTypes(candidates, votes.filter((vote): vote is PageClassification => vote !== null));
       const floor = acquisitionFloor(candidates, pageTypes);
       if (floor.pages.length) {
-        const result = await this.access.fetchPages(floor.pages, signal);
+        const result = await access.fetchPages(floor.pages, signal);
         toolCalls.push(...result.calls.map(call => ({ round: 0, ...call })));
         merge(result.pages.map(page => ({ ...page, requested: true })));
       }
       if (floor.documents.length) {
-        const result = await this.access.readDocuments(floor.documents, signal);
+        const result = await access.readDocuments(floor.documents, signal);
         toolCalls.push(...result.calls.map(call => ({ round: 0, ...call })));
         merge(result.pages);
       }
@@ -286,13 +289,13 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
       });
       if (action.type === 'fetch_pages') {
         const urls = [...new Set(resolve(action.linkIds, 'page'))].slice(0, 4);
-        if (urls.length) { const result = await this.access.fetchPages(urls, signal); record(result.calls); merge(result.pages.map(page => ({ ...page, requested: true }))); }
+        if (urls.length) { const result = await access.fetchPages(urls, signal); record(result.calls); merge(result.pages.map(page => ({ ...page, requested: true }))); }
       } else if (action.type === 'read_document') {
         const urls = [...new Set(resolve(action.linkIds, 'document'))].slice(0, 2);
-        if (urls.length) { const result = await this.access.readDocuments(urls, signal); record(result.calls); merge(result.pages); }
+        if (urls.length) { const result = await access.readDocuments(urls, signal); record(result.calls); merge(result.pages); }
       } else if (action.type === 'read_sitemap') {
         if (sitemapRead) record([{ tool: 'read_sitemap', target: `https://${domain}/`, status: 'skipped', detail: 'ALREADY_READ' }]);
-        else { sitemapRead = true; const result = await this.access.readSitemap(domain, signal); record(result.calls); discovered = [...discovered, ...result.links]; }
+        else { sitemapRead = true; const result = await access.readSitemap(domain, signal); record(result.calls); discovered = [...discovered, ...result.links]; }
       } else {
         const found = findPassages(crawl.pages, action.terms).filter(passage =>
           !passages.some(existing => existing.url === passage.url && existing.start === passage.start));

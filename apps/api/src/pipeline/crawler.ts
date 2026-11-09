@@ -1,13 +1,23 @@
 import { chromium } from 'playwright';
-import { createRequire } from 'node:module';
-import { fetchPublicResponse, fetchPublicText } from './network.js';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { fetchPublicResponse } from './network.js';
+import { USER_AGENT, createRobotsCache, fetchRobotsText, robotsPolicy, type RobotsCache, type RobotsFetch,
+  type RobotsPolicy } from './robots.js';
 
 /** `requested` marks a page the extraction agent asked for, so the corpus never drops it for crawled pages. */
 export type CrawledPage = { url: string; html: string; text: string; kind?: 'page' | 'document'; complete?: boolean; requested?: boolean };
 export type CrawlIssue = { url: string; code: 'ACCESS_BLOCKED' | 'ROBOTS_UNAVAILABLE' | 'ROBOTS_DISALLOWED' |
-  'HTTP_ERROR' | 'NO_READABLE_CONTENT' | 'REQUEST_FAILED'; status: number | null; detail?: string };
-export type CrawlResult = { pages: CrawledPage[]; partial: boolean; issues?: CrawlIssue[] };
-const USER_AGENT = 'ArcaBot/1.0';
+  'HTTP_ERROR' | 'NOT_HTML' | 'NO_READABLE_CONTENT' | 'REQUEST_FAILED'; status: number | null; detail?: string;
+  /**
+   * `page`: how a page of the crawl ended; only these decide `partial` and why a site could not be read.
+   * `request`: one request the browser made for a page (a redirect hop or a subresource, on any host).
+   * `robots`: the /robots.txt of an origin could not be read. The last two are kept for audit.
+   * Evidence stored before this field existed has none: read it as `page`.
+   */
+  scope?: 'page' | 'request' | 'robots' };
+/** `aborted`: the crawl deadline or the caller ended the crawl before the queue was done. */
+export type CrawlResult = { pages: CrawledPage[]; partial: boolean; issues?: CrawlIssue[]; aborted?: boolean };
+export type CrawlTransport = { response: typeof fetchPublicResponse; robots: RobotsFetch };
 /** Attempts allowed per page, the first one included. */
 export const MAX_PAGE_ATTEMPTS = 3;
 /**
@@ -23,8 +33,26 @@ export function shouldRetryPage(issue: CrawlIssue, attempt: number, aborted: boo
   if (issue.code === 'ACCESS_BLOCKED') return issue.status === 429;
   return false;
 }
-type RobotsRules = { isAllowed(url: string, agent: string): boolean | undefined };
-const robotsParser = createRequire(import.meta.url)('robots-parser') as (url: string, text: string) => RobotsRules;
+/**
+ * Whether a page that ended with this issue leaves the crawl incomplete. A link robots.txt excludes, a dead link
+ * (404/410) and a link to something that is not HTML are answers, not failures: the site was read as it asked
+ * to be and nothing a second crawl could recover is missing. They stay in `issues` for audit.
+ */
+export function leavesCrawlPartial(issue: CrawlIssue): boolean {
+  if (issue.code === 'ROBOTS_DISALLOWED' || issue.code === 'NOT_HTML') return false;
+  if (issue.code === 'HTTP_ERROR') return issue.status !== 404 && issue.status !== 410;
+  return true;
+}
+/**
+ * Crawl-delay is honoured as one page at a time with the declared pause between page starts. The pause is capped
+ * at the deadline divided by the page budget, so waiting alone can never use up the crawl deadline: a site that
+ * asks for 10 s between requests gets 1.5 s under the defaults, not a three-page crawl.
+ */
+export function crawlPacing(crawlDelayMs: number | null, limits: { timeoutMs: number; maxPages: number; concurrency: number }):
+  { concurrency: number; delayMs: number } {
+  if (crawlDelayMs === null) return { concurrency: limits.concurrency, delayMs: 0 };
+  return { concurrency: 1, delayMs: Math.min(crawlDelayMs, Math.floor(limits.timeoutMs / limits.maxPages)) };
+}
 export function pagePriority(raw: string): number {
   const path = new URL(raw).pathname.toLowerCase();
   if (path === '/') return 0;
@@ -60,16 +88,18 @@ export function canonicalUrl(raw: string, base: string): string | null {
     return url.href;
   } catch { return null; }
 }
+const HTML = /text\/html|application\/xhtml/i;
 // Measured on gallardolawyers.com: 3 pages at once took 21-25 s, 6 took 14 s for the same 19 pages.
 export const CRAWL_CONCURRENCY = 6;
-export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, transport: {
-  response: typeof fetchPublicResponse; robots: typeof fetchPublicText;
-} = { response: fetchPublicResponse, robots: fetchPublicText }, options: {
+export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
+  transport: CrawlTransport = { response: fetchPublicResponse, robots: fetchRobotsText }, options: {
   timeoutMs?: number; maxPages?: number; maxDepth?: number;
   /** Pages fetched at once. */
   concurrency?: number;
   /** Start from the requested URL only. Without it the root page is queued first and wins a one-page budget. */
   seedOnly?: boolean;
+  /** The scan's robots cache. Without one the rules are fetched for this crawl alone. */
+  robots?: RobotsCache;
 } = {}): Promise<CrawlResult> {
   const supplied = /^[a-z]+:\/\//i.test(domainOrUrl) ? new URL(domainOrUrl) : new URL(`https://${domainOrUrl}/`);
   const domain = supplied.hostname.replace(/^www\./, '');
@@ -78,8 +108,8 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
   const rootUrl = `https://${domain}/`;
   const seedUrl = canonicalUrl(supplied.href, rootUrl);
   if (!seedUrl) throw new Error('The requested website URL is outside the canonical domain');
-  const maxPages = options.maxPages ?? 20, maxDepth = options.maxDepth ?? 2;
-  const signal = AbortSignal.any([parent, AbortSignal.timeout(options.timeoutMs ?? 30_000)]);
+  const maxPages = options.maxPages ?? 20, maxDepth = options.maxDepth ?? 2, timeoutMs = options.timeoutMs ?? 30_000;
+  const signal = AbortSignal.any([parent, AbortSignal.timeout(timeoutMs)]);
   const pages: CrawledPage[] = [];
   const issues: CrawlIssue[] = [];
   let partial = false;
@@ -89,41 +119,63 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
   try {
     signal.throwIfAborted();
     const context = await browser.newContext({ userAgent: USER_AGENT, serviceWorkers: 'block' });
-    const robots = new Map<string, Promise<ReturnType<typeof robotsParser>>>();
-    async function allowed(raw: string): Promise<boolean> {
-      const url = new URL(raw);
-      let entry = robots.get(url.origin);
-      if (!entry) {
-        entry = (async () => {
-          const robotsUrl = `${url.origin}/robots.txt`;
-          const response = await transport.robots(robotsUrl, signal);
-          if (response.status === 404 || response.status === 410) return robotsParser(robotsUrl, '');
-          if (response.status < 200 || response.status >= 300) {
-            issues.push({ url: robotsUrl, code: 'ROBOTS_UNAVAILABLE', status: response.status });
-            throw new Error('Robots rules unavailable');
-          }
-          return robotsParser(robotsUrl, response.text);
-        })();
-        robots.set(url.origin, entry);
-      }
-      return (await entry).isAllowed(raw, USER_AGENT) !== false;
+    const robotsCache = options.robots ?? createRobotsCache();
+    const sameSite = (raw: string) => new URL(raw).hostname.replace(/^www\./, '') === domain;
+    let crawlDelayMs: number | null = null;
+    async function robotsFor(raw: string): Promise<RobotsPolicy> {
+      const policy = await robotsPolicy(new URL(raw).origin, signal, { fetchText: transport.robots, cache: robotsCache });
+      if (policy.state === 'unreachable') issues.push({ url: policy.url, code: 'ROBOTS_UNAVAILABLE', status: policy.status,
+        detail: policy.detail ?? undefined, scope: 'robots' });
+      if (policy.crawlDelayMs !== null && sameSite(raw)) crawlDelayMs = Math.max(crawlDelayMs ?? 0, policy.crawlDelayMs);
+      return policy;
     }
+    const robotsIssue = (policy: RobotsPolicy): Omit<CrawlIssue, 'url'> => policy.state === 'unreachable'
+      ? { code: 'ROBOTS_UNAVAILABLE', status: policy.status, detail: policy.detail ?? undefined }
+      : { code: 'ROBOTS_DISALLOWED', status: null };
+    // What the request handler already knows about a page's own navigation when it stops it: robots refused it
+    // after a redirect (bare domain to www, or to another path), or the answer is not HTML. The browser only
+    // reports a failed navigation, which would be retried and counted as a failure of ours.
+    const decided = new WeakMap<import('playwright').Page, Omit<CrawlIssue, 'url'>>();
+    const ownPage = (request: import('playwright').Request) => {
+      try { const frame = request.frame(); return frame.parentFrame() ? null : frame.page(); }
+      catch { return null; /* No frame yet for this navigation: the page loop reports the failed navigation instead. */ }
+    };
     await context.route('**/*', async route => {
+      const request = route.request();
       try {
         signal.throwIfAborted();
-        const request = route.request();
         if (['image', 'media', 'font'].includes(request.resourceType())) { await route.abort(); return; }
-        if (request.isNavigationRequest() && (!canonicalUrl(request.url(), `https://${domain}`) || !(await allowed(request.url())))) {
-          await route.abort(); return;
-        }
-        const response = await transport.response(request.url(), signal, request.method(), request.postDataBuffer());
-        if ([401, 403, 429].includes(response.status)) issues.push({ url: request.url(), code: 'ACCESS_BLOCKED', status: response.status });
+        const url = request.url(), navigation = request.isNavigationRequest();
+        if (navigation && !canonicalUrl(url, `https://${domain}`)) { await route.abort(); return; }
+        // robots.txt speaks for its own host. What a page loads from the firm's host (scripts, XHR, fetch) is the
+        // crawler reading that host, so it obeys the rules like a page does. Other hosts are not being crawled.
+        const refusedByRobots = async (target: string) => {
+          if (!navigation && !sameSite(target)) return false;
+          const policy = await robotsFor(target);
+          if (policy.allows(target)) return false;
+          const page = navigation ? ownPage(request) : null;
+          if (page) decided.set(page, robotsIssue(policy));
+          else if (!navigation) issues.push({ url: target, ...robotsIssue(policy), scope: 'request' });
+          return true;
+        };
+        if (await refusedByRobots(url)) { await route.abort(); return; }
+        const response = await transport.response(url, signal, request.method(), request.postDataBuffer());
+        if ([401, 403, 429].includes(response.status)) issues.push({ url, code: 'ACCESS_BLOCKED', status: response.status, scope: 'request' });
         const headers = { ...response.headers };
+        // The browser follows a redirect by itself and never shows the next hop to this handler, so the rules of
+        // where it leads (the www origin, another path) are checked before the redirect is handed over.
+        const location = response.status >= 300 && response.status < 400 ? headers['location'] : undefined;
+        const target = location && URL.canParse(location, url) ? new URL(location, url) : null;
+        if (target && ['https:', 'http:'].includes(target.protocol) && await refusedByRobots(target.href)) { await route.abort(); return; }
+        // A page link that answers with a file (a .docx, a feed) is not handed to the browser, which would start a download.
+        const page = navigation && response.status >= 200 && response.status < 300 && !HTML.test(headers['content-type'] ?? '')
+          ? ownPage(request) : null;
+        if (page) { decided.set(page, { code: 'NOT_HTML', status: response.status }); await route.abort(); return; }
         for (const name of ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer',
           'transfer-encoding', 'upgrade', 'content-length']) delete headers[name];
         await route.fulfill({ status: response.status, headers, body: response.body });
       } catch (error) {
-        issues.push({ url: route.request().url(), code: 'REQUEST_FAILED', status: null,
+        issues.push({ url: request.url(), code: 'REQUEST_FAILED', status: null, scope: 'request',
           detail: error instanceof Error ? error.message.slice(0, 200) : 'Unknown transport error' });
         await route.abort().catch(() => {});
       }
@@ -138,13 +190,19 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
         queue.push({ ...item, attempt: item.attempt + 1 });
         return;
       }
-      issues.push(issue);
-      partial = true;
+      issues.push({ ...issue, scope: 'page' });
+      if (leavesCrawlPartial(issue)) partial = true;
     };
     const groupCounts = new Map<number, number>();
+    let lastStart = 0;
     while (queue.length && visited.size < maxPages && !signal.aborted) {
+      // Read per batch: the delay is known once the first page has fetched the rules, and the www origin may add its own.
+      const pacing = crawlPacing(crawlDelayMs, { timeoutMs, maxPages, concurrency: options.concurrency ?? CRAWL_CONCURRENCY });
+      const wait = lastStart + pacing.delayMs - Date.now();
+      if (wait > 0 && await sleep(wait, false, { signal }).catch(() => true)) break;
+      lastStart = Date.now();
       queue.sort((a, b) => a.depth - b.depth || pagePriority(a.url) - pagePriority(b.url) || a.url.localeCompare(b.url));
-      const capacity = Math.min(options.concurrency ?? CRAWL_CONCURRENCY, maxPages - visited.size);
+      const capacity = Math.min(pacing.concurrency, maxPages - visited.size);
       // Group limits count the pages picked for this batch too: with a wide batch, counting only pages
       // already read would let one batch fill up with attorney bios.
       const picked = new Map<number, number>();
@@ -167,12 +225,17 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
       await Promise.all(batch.map(async item => {
         let page: import('playwright').Page | undefined;
         try {
+          const policy = await robotsFor(item.url);
+          if (!policy.allows(item.url)) { fail(item, { url: item.url, ...robotsIssue(policy) }); return; }
           page = await context.newPage();
-          if (!(await allowed(item.url))) { fail(item, { url: item.url, code: 'ROBOTS_DISALLOWED', status: null }); return; }
           const response = await page.goto(item.url, { timeout: 8000, waitUntil: 'domcontentloaded' });
-          if (!response || response.status() >= 400 || !/text\/html|application\/xhtml/i.test(response.headers()['content-type'] ?? '')) {
-            const status = response?.status() ?? null;
+          const status = response?.status() ?? null;
+          if (!response || status === null || status >= 400) {
             fail(item, { url: item.url, code: status !== null && [401, 403, 429].includes(status) ? 'ACCESS_BLOCKED' : 'HTTP_ERROR', status });
+            return;
+          }
+          if (!HTML.test(response.headers()['content-type'] ?? '')) {
+            fail(item, { url: item.url, code: 'NOT_HTML', status });
             return;
           }
           await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
@@ -180,9 +243,12 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
           const links = await page.locator('a[href]').evaluateAll(anchors => anchors.map(a => a.getAttribute('href') ?? ''));
           await page.locator('nav, footer, script, style, noscript, template, [aria-hidden="true"]').evaluateAll(elements => elements.forEach(element => element.remove()));
           const text = (await page.locator('body').innerText({ timeout: 1000 })).trim();
-          if (!text || /^(checking your browser|just a moment|access denied|verify you are human)/i.test(text)) {
-            fail(item, { url: item.url, code: /^(checking your browser|just a moment|access denied|verify you are human)/i.test(text)
-              ? 'ACCESS_BLOCKED' : 'NO_READABLE_CONTENT', status: response.status() });
+          const challenge = /^(checking your browser|just a moment|access denied|verify you are human)/i.test(text);
+          if (!text || challenge) {
+            // An empty shell whose script redirect was stopped for a known reason ends for that reason.
+            const known = challenge ? undefined : decided.get(page);
+            fail(item, known ? { url: item.url, ...known }
+              : { url: item.url, code: challenge ? 'ACCESS_BLOCKED' : 'NO_READABLE_CONTENT', status });
             return;
           }
           // Store under the canonical (www-stripped) identity, not the raw post-navigation url: a
@@ -194,8 +260,11 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
             const url = canonicalUrl(link, page.url());
             if (url && !visited.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1, attempt: 0 });
           }
-        } catch (error) { fail(item, { url: item.url, code: 'REQUEST_FAILED', status: null,
-          detail: error instanceof Error ? error.message.slice(0, 200) : 'Unknown navigation error' }); }
+        } catch (error) {
+          const known = page && decided.get(page);
+          fail(item, known ? { url: item.url, ...known } : { url: item.url, code: 'REQUEST_FAILED', status: null,
+            detail: error instanceof Error ? error.message.slice(0, 200) : 'Unknown navigation error' });
+        }
         finally { await page?.close().catch(() => {}); }
       }));
     }
@@ -203,7 +272,8 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal, tra
     const read = new Set(pages.map(page => page.url));
     return { pages: pages.sort((a, b) => a.url.localeCompare(b.url)), partial: partial || signal.aborted,
       issues: [...new Map(issues.filter(issue => !read.has(issue.url))
-        .map(issue => [`${issue.url}:${issue.code}:${issue.status}`, issue])).values()] };
+        .map(issue => [`${issue.scope}:${issue.url}:${issue.code}:${issue.status}`, issue])).values()],
+      aborted: signal.aborted };
   } finally {
     signal.removeEventListener('abort', abort);
     await browser.close().catch(() => {});

@@ -6,6 +6,7 @@ import { ApifyDirectorySource, AVVO_ACTOR, BAR_ACTOR, AVVO_TECHNICAL_MAX_LAWYERS
 import { ApifyClient, ApifyClientError } from '../../src/pipeline/apify-client.js';
 import { RagWebsiteSource, WebsiteExtractionSource } from '../../src/pipeline/website-source.js';
 import { RuleBasedEvidenceProvider } from '../../src/pipeline/website-evidence-provider.js';
+import type { CrawlResult } from '../../src/pipeline/crawler.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import type OpenAI from 'openai';
 
@@ -495,6 +496,60 @@ describe('website extraction', () => {
     const result = await source.run('firm.com', new AbortController().signal);
     expect(result.status).toMatchObject({ status: 'error', code: 'ACCESS_BLOCKED', pagesCrawled: 0 });
     expect(provider.extract).not.toHaveBeenCalled();
+  });
+  it('says why no page was read, with a code that tells the site\'s answer from a passing failure', async () => {
+    const provider = { id: 'fixture', version: '1', extract: vi.fn() };
+    const run = (crawl: CrawlResult) => new WebsiteExtractionSource(new InMemoryRepository(), provider, async () => crawl)
+      .run('firm.com', new AbortController().signal);
+    const home = 'https://firm.com/';
+    const disallowed = await run({ pages: [], partial: false, issues: [{ url: home, code: 'ROBOTS_DISALLOWED', status: null, scope: 'page' }] });
+    expect(disallowed.status).toMatchObject({ status: 'error', dataStatus: 'UNKNOWN', code: 'ACCESS_BLOCKED', pagesCrawled: 0,
+      reason: 'robots.txt does not allow automated reading of the website' });
+    expect(JSON.parse(disallowed.rawContent!)).toMatchObject({ unreadable: 'DEFINITIVE', analysis: null });
+    // Each of these used to read "NO_READABLE_EVIDENCE: No readable website evidence", like a site with nothing on it.
+    const unreachable = await run({ pages: [], partial: true, issues: [
+      { url: 'https://firm.com/robots.txt', code: 'ROBOTS_UNAVAILABLE', status: 503, scope: 'robots' },
+      { url: home, code: 'ROBOTS_UNAVAILABLE', status: 503, scope: 'page' }] });
+    expect(unreachable.status).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR',
+      reason: 'robots.txt could not be retrieved (HTTP 503), so the website was not read' });
+    expect(JSON.parse(unreachable.rawContent!).unreadable).toBe('TRANSIENT');
+    const deadline = await run({ pages: [], partial: true, aborted: true,
+      issues: [{ url: home, code: 'REQUEST_FAILED', status: null, scope: 'page' }] });
+    expect(deadline.status).toMatchObject({ status: 'timeout', code: 'DEADLINE_REACHED' });
+    const rateLimited = await run({ pages: [], partial: true, issues: [{ url: home, code: 'ACCESS_BLOCKED', status: 429, scope: 'page' }] });
+    expect(rateLimited.status).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR', reason: 'The website is rate limiting requests (HTTP 429)' });
+    expect(provider.extract).not.toHaveBeenCalled();
+  });
+  it('keeps a fully read site ok and notes what the crawl left out by rule', async () => {
+    const pages = [{ url: 'https://firm.com/', html: '<body>Firm</body>', text: 'Firm' }];
+    const provider = { id: 'fixture', version: '1', extract: vi.fn(async () => unknownWebsite()) };
+    const run = (crawl: CrawlResult) => new WebsiteExtractionSource(new InMemoryRepository(), provider, async () => crawl)
+      .run('firm.com', new AbortController().signal);
+    const decided = await run({ pages, partial: false, issues: [
+      { url: 'https://firm.com/wp-admin/', code: 'ROBOTS_DISALLOWED', status: null, scope: 'page' },
+      { url: 'https://firm.com/old', code: 'HTTP_ERROR', status: 404, scope: 'page' },
+      { url: 'https://widgets.example/w.js', code: 'REQUEST_FAILED', status: null, scope: 'request' }] });
+    expect(decided.status).toMatchObject({ status: 'ok', pagesCrawled: 1,
+      reason: '1 page excluded by robots.txt; 1 dead link (HTTP 404/410)' });
+    expect((await run({ pages, partial: false })).status).toMatchObject({ status: 'ok', reason: null });
+    const failed = await run({ pages, partial: true, issues: [{ url: 'https://firm.com/team', code: 'HTTP_ERROR', status: 500, scope: 'page' }] });
+    expect(failed.status).toMatchObject({ status: 'partial', reason: '1 page could not be read' });
+  });
+  it('gives the crawl and the extraction of one scan the same robots cache, and the next scan a new one', async () => {
+    const pages = [{ url: 'https://firm.com/', html: '<body>Firm</body>', text: 'Firm' }];
+    const crawl = vi.fn(async (_domain: string, _signal: AbortSignal, _robots: unknown): Promise<CrawlResult> => ({ pages, partial: false }));
+    const extractDetailed = vi.fn(async (_crawl: CrawlResult, _signal: AbortSignal, _context: { robots: unknown }) =>
+      ({ websiteData: unknownWebsite(), diagnostics: null }));
+    const provider = { id: 'fixture', version: '1', extract: vi.fn(), extractDetailed };
+    // A repository that remembers nothing, so the second scan cannot reuse the first analysis.
+    const source = new WebsiteExtractionSource(new InMemoryRepository(), provider, crawl);
+    await source.run('firm.com', new AbortController().signal);
+    await source.run('firm.com', new AbortController().signal);
+    const [first, second] = crawl.mock.calls.map(call => call[2]);
+    expect(first).toBeInstanceOf(Map);
+    expect(extractDetailed.mock.calls[0]![2].robots).toBe(first);
+    expect(extractDetailed.mock.calls[1]![2].robots).toBe(second);
+    expect(second).not.toBe(first);
   });
   it('keeps why the extraction failed in the stored evidence', async () => {
     // A failed extraction takes the whole scan down: without website data the identity is

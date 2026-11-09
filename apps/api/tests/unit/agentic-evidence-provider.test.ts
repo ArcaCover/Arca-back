@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { AgenticEvidenceProvider, ExtractionFailure, MAX_TRANSIENT_ATTEMPTS } from '../../src/pipeline/agentic-evidence-provider.js';
 import { openAiEndpoint, type LlmEndpoint } from '../../src/pipeline/llm-endpoint.js';
+import { createRobotsCache } from '../../src/pipeline/robots.js';
 
 // These tests script every model call; the page plan adds classification calls and floor reads they do not expect.
 const withoutPagePlan = (...args: ConstructorParameters<typeof AgenticEvidenceProvider>) =>
@@ -207,6 +208,30 @@ describe('Agentic evidence provider', () => {
     const result = await provider.extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
     expect(access.fetchPages).toHaveBeenCalledWith(['https://firm.com/about'], expect.anything());
     expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: 'https://firm.com/about', status: 'read', detail: null }]);
+  });
+
+  it('reads through the scan\'s robots cache, so the tools reuse the rules the crawl fetched', async () => {
+    const page = { url: 'https://firm.com/', html: '<a href="/about">About</a>', text: 'Smith Law is a law firm.' };
+    const script = () => scripted([
+      user => ({ claims: [], action: { type: 'fetch_pages', linkIds: [/\[(L-[^\]]+)\] PAGE/.exec(user)![1]], targetFields: ['firm_name'], reason: 'about' } }),
+      () => ({ claims: [], action: { type: 'finish', reason: 'done' } }),
+    ]);
+    const scoped = { fetchPages: vi.fn(async (urls: string[]) => ({
+      pages: urls.map(url => ({ url, html: '', text: 'About Smith Law.' })),
+      calls: urls.map(target => ({ tool: 'fetch_pages' as const, target, status: 'read' as const, detail: null })) })),
+      readDocuments: vi.fn(), readSitemap: vi.fn() };
+    const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn(), withRobots: vi.fn((_robots: unknown) => scoped) };
+    const robots = createRobotsCache();
+    await withoutPagePlan('key', undefined, { chat: { completions: { create: script() } } }, access as never)
+      .extractDetailed({ pages: [page], partial: false }, new AbortController().signal, { robots });
+    expect(access.withRobots).toHaveBeenCalledWith(robots);
+    expect(scoped.fetchPages).toHaveBeenCalledWith(['https://firm.com/about'], expect.anything());
+    expect(access.fetchPages).not.toHaveBeenCalled();
+    // Run on its own (the demo and evaluation scripts), the tools of one extraction still share a cache of their own.
+    await withoutPagePlan('key', undefined, { chat: { completions: { create: script() } } }, access as never)
+      .extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
+    expect(access.withRobots.mock.calls[1]![0]).toBeInstanceOf(Map);
+    expect(access.withRobots.mock.calls[1]![0]).not.toBe(robots);
   });
 
   it('never retries a URL whose earlier tool call already failed', async () => {
