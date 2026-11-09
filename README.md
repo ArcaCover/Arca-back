@@ -159,8 +159,12 @@ node apps/api/dist/server.js
 ```
 
 Website: Playwright, máximo 20 páginas y profundidad 2; robots y resolución pública fijada al socket.
+`robots.txt` sigue RFC 9309: un 4xx distinto de 429 significa que no hay reglas; un 429, un 5xx, un error de
+red o un timeout significan que no se lee nada de ese origen. Se descarga una vez por origen y scan.
 Una página que falla por transporte, error 5xx o 429 se reintenta hasta completar tres intentos antes de
-marcar el rastreo parcial; robots, 4xx y contenido ilegible no se reintentan. El rastreo tiene su propio
+marcar el rastreo parcial; robots, 4xx y contenido ilegible no se reintentan. Un enlace excluido por robots,
+un 404/410 o un enlace a algo que no es HTML quedan anotados, pero no marcan el rastreo parcial
+(DN-07 de crawl, §6). El rastreo tiene su propio
 plazo de 20 segundos, y al agotarse el resultado es parcial aunque queden reintentos disponibles.
 La prioridad de rastreo reconoce vocabulario en inglés y en español, para que un sitio en español no empate
 todas sus páginas en la prioridad mínima y gaste el plazo en el blog.

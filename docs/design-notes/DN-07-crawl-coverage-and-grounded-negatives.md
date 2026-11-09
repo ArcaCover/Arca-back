@@ -63,7 +63,8 @@ already produces.
 policy or a blog, these can appear on *any* page — the home page, an "about" page, a dedicated policy
 page, or nowhere identifiable at all. Certifying their absence honestly would require knowing the crawl
 covered the whole site, not just that it didn't fail. `CrawlResult.partial` does not mean that today:
-it means a page failed unrecoverably, and the loop can legitimately exit with `partial: false` while
+it means a page of the site failed after its retries or the deadline cut the crawl (see section 6), and
+the loop can legitimately exit with `partial: false` while
 pages remained queued, simply because `maxPages` was reached first. Grounding these three signals needs
 an explicit "queue exhausted vs. budget exhausted" flag on `CrawlResult` that does not exist yet. Until
 it does, they stay `null` when the model finds nothing — an honest unknown, not a manufactured false
@@ -79,3 +80,73 @@ exists precisely to say "we don't know, ask more", and Capa 2's questionnaire (�
 where a firm with no readable public content gets the chance to answer directly. Layer 1's job is to
 read what a normal, crawlable site publishes and ground what it certifiably didn't find — not to
 guarantee a verdict for every site regardless of what it published.
+
+## 6. robots.txt y qué significa `partial` (2026-11-09)
+
+Añadido tras el scan real de `immigrationlawfla.com` (hallazgo F4). Ese scan no tuvo ningún problema de
+robots: leyó 19 páginas y quedó `partial` por un enlace muerto (HTTP 404). Un script de terceros que no
+resolvía DNS quedó anotado. La revisión sí encontró reglas que había que corregir.
+
+**robots.txt (RFC 9309), en un solo módulo.** `pipeline/robots.ts` es la única implementación. La usan el
+crawler, el lector de PDFs, el lector de sitemaps y las herramientas del agente (`site-access.ts`).
+`site-search.ts` no hace peticiones: busca en texto ya leído.
+
+| Respuesta de `/robots.txt` | Qué se hace |
+|---|---|
+| 2xx | Se interpreta y se obedece. |
+| 4xx salvo 429 (401 y 403 incluidos) | El sitio no publica reglas: se puede leer. |
+| 429, 5xx, error de red, bucle de redirecciones o timeout | Reglas inalcanzables: no se lee nada de ese origen. Es una causa **transitoria**. |
+
+- El User-Agent es uno solo, `USER_AGENT` (`ArcaBot/1.0`), definido en `network.ts`. Es la cabecera que se
+  envía y el nombre con el que se buscan las reglas. Nunca se suplanta el de un navegador.
+- `robots.txt` tiene su propio plazo de 6 s (`ROBOTS_TIMEOUT_MS`). Si se cuelga, ya no consume los 30 s del crawl.
+- El cuerpo se corta en 500 KiB (`ROBOTS_MAX_BYTES`) en vez de fallar. La regla que queda partida se descarta.
+- Hay una caché por scan y por origen (`RobotsCache`). La crea `WebsiteExtractionSource` y la comparten el
+  crawl y todas las lecturas del agente, así que `robots.txt` se descarga una vez por origen y scan. Antes
+  se descargaba de nuevo en cada página pedida por el agente. `www` y el dominio desnudo son orígenes distintos.
+- Las peticiones que una página hace a su propio host (scripts, XHR, fetch) también pasan por robots. Antes
+  solo se comprobaban las navegaciones, y un `fetch("/wp-json/…")` salía aunque estuviera excluido.
+- El destino de una redirección se comprueba antes de entregársela al navegador (ver el límite de abajo).
+- **`Crawl-delay` se respeta de forma acotada.** Si el grupo de `ArcaBot` (o `*`) lo declara, el crawl lee
+  una página cada vez y espera esa pausa entre el inicio de una página y el de la siguiente. La pausa tiene
+  un tope de `plazo / páginas` (1,5 s con 30 s y 20 páginas), para que la espera sola no pueda agotar el
+  plazo. Consecuencia: un sitio que lo declara se lee en serie y puede no llegar a 20 páginas en 30 s.
+
+**Qué marca el crawl como `partial`.** Cada incidencia lleva ahora un `scope`: `page` (cómo terminó una
+página del crawl), `request` (una petición del navegador, de cualquier host) o `robots` (el
+`robots.txt` de un origen). Solo las de `page` deciden.
+
+| Incidencia | ¿`partial`? |
+|---|---|
+| Enlace excluido por robots (`ROBOTS_DISALLOWED`) | No |
+| Enlace muerto, HTTP 404 o 410 | No |
+| Enlace a algo que no es HTML (`NOT_HTML`: un feed, un `.docx`) | No |
+| Subrecurso fallido, propio o de terceros (`scope: request`) | No |
+| Página del propio sitio que falla tras sus reintentos (red, 5xx, 429) | Sí |
+| Página con 401/403, página de desafío o sin texto legible | Sí |
+| Plazo del crawl (`aborted`) | Sí |
+
+Todas quedan en `issues` del raw. El `reason` del website las cuenta, por ejemplo
+`2 pages excluded by robots.txt; 1 dead link (HTTP 404/410)`, también cuando el estado es `ok`.
+
+**Web ilegible: definitiva o transitoria.** Cuando el crawl no lee ninguna página, `website-outcome.ts`
+elige el código y el motivo según la causa, y `classifyUnreadableWebsite` (`@arca/scoring`) clasifica solo
+por el código. Es el único sitio donde se decide. No hay códigos nuevos en el contrato.
+
+| Causa | Estado y código | Clase |
+|---|---|---|
+| robots.txt excluye el sitio | `error` / `ACCESS_BLOCKED` | DEFINITIVE |
+| Las páginas responden 401 o 403, o una página de desafío | `error` / `ACCESS_BLOCKED` | DEFINITIVE |
+| La portada responde otro 4xx, no es HTML o no tiene texto | `error` / `NO_READABLE_EVIDENCE` | DEFINITIVE |
+| Plazo o abort | `timeout` / `DEADLINE_REACHED` | TRANSIENT |
+| robots.txt inalcanzable, 429, 5xx, error de red o causa desconocida | `error` / `PROVIDER_ERROR` | TRANSIENT |
+
+Antes, un robots que excluye el sitio, un robots inalcanzable, un error de red y el plazo salían todos como
+`NO_READABLE_EVIDENCE` ("No readable website evidence"). Si hay una sola causa transitoria, el resultado es
+TRANSIENT: no se marca una firma como ilegible mientras otro scan pueda leerla.
+
+**Límite conocido, sin resolver aquí.** Playwright no pasa por el manejador de peticiones los saltos de
+una redirección HTTP: Chromium los sigue con su propia red. Por eso el destino de una redirección no pasa
+por `network.ts` (anti-SSRF con IP fijada), y los saltos posteriores al primero tampoco pasan por robots.
+Seguir las redirecciones desde el backend lo cerraría, pero hoy las cookies que un sitio fija al redirigir
+solo las conserva el navegador, y sin ellas algunos sitios entrarían en bucle. Queda pendiente de decisión.

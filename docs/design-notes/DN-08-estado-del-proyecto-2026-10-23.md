@@ -175,6 +175,7 @@ Navegador ──> Arca-front (Next 16, Vercel)          [solo páginas; no hay r
 - **Website:**
   - crawl con Playwright: 20 páginas, profundidad 2, 6 en paralelo, 30 s en total y como máximo 3 páginas del grupo de equipo;
   - toda petición pasa por `network.ts`, con anti-SSRF y la IP fijada;
+  - `robots.txt` sigue RFC 9309 desde un solo módulo (`robots.ts`), con una descarga por origen y scan (2026-11-09; DN-07 de crawl, §6);
   - después, la extracción `agentic`: clasificación con 3 votos, un "suelo de adquisición" de hasta 4 páginas más 2 PDFs (cada una lanza otro Chromium, en secuencia), roster, hasta 3 rondas con herramientas, revisión semántica y grounding determinista;
   - cada llamada a OpenAI tiene 120 s y hasta 3 intentos.
 - **Identidad:** VERIFIED, PARTIAL o INSUFFICIENT. **Con INSUFFICIENT no se llama a Bar ni a Avvo**, que quedan `skipped/INSUFFICIENT_IDENTITY`.
@@ -192,7 +193,7 @@ Navegador ──> Arca-front (Next 16, Vercel)          [solo páginas; no hay r
 |---|---|
 | `RUNNING` | Desde `create` hasta el final del job. También es lo que responde un `POST` cuyo PARTIAL cacheado está dentro del cooldown. |
 | `COMPLETED` | Las tres fuentes en `ok`, después de `settle()`, que puede convertir un TRUNCATED o un NO_MATCH confirmados. |
-| `PARTIAL` | Al menos una fuente `ok`/`partial`, pero no las tres `ok`. **Cualquier** página no recuperable del crawl (un 404, robots o algo que no es HTML) marca el website como `partial`. |
+| `PARTIAL` | Al menos una fuente `ok`/`partial`, pero no las tres `ok`. Desde el 2026-11-09 el website queda `partial` solo por el plazo del crawl o por una página del propio sitio que falla tras sus reintentos. Un enlace excluido por robots, un 404/410, algo que no es HTML o un subrecurso fallido se anotan en `issues` y en `reason`, pero el website sigue `ok` (DN-07 de crawl, §6). |
 | `FAILED` | Ninguna fuente útil, en la práctica cualquier fallo del website. También una excepción en el job o `recoverInterrupted` sobre un RUNNING de más de `PIPELINE_TIMEOUT_MS` + 120 s. **Nunca lleva `result`.** |
 
 **Cachés:**
@@ -249,7 +250,7 @@ La UI y `CLAUDE.md` prometen "menos de 60 s" y no se corresponden con nada de es
 2. **Sesgo contra firmas de fuera de Florida.** Bar solo consulta la Florida Bar. Las búsquedas sin match quedan `ok/EMPTY` con consistencia 0, lo que da B3 −5 y el flag `LOW_BAR_CONSISTENCY`. La etiqueta "Florida Bar" está fija en `views.ts:22` y `report/quick-scan.ts:23`.
 3. **Una sanción reciente resta menos que una antigua.** Menos de 12 meses resta 0 puntos (la cubre el override); de 1 a 3 años resta −12 (`discipline.ts:51`). No hay justificación documentada.
 4. **El extractor `agentic` no puede producir dos penalizaciones:** `website_quality: 'minimal'` (W7 −3) ni `no_team_page` (W5a −2). Solo existen con `rules`, `openai` o los mocks (`derived-signals.ts:47,58`).
-5. **Es fácil quedar en PARTIAL para siempre.** Un 404 estable dentro del crawl, o un run de Apify truncado y cacheado 7 días, deja el scan en PARTIAL de forma persistente.
+5. **Es fácil quedar en PARTIAL para siempre.** Un run de Apify truncado y cacheado 7 días deja el scan en PARTIAL de forma persistente. Un 404 estable dentro del crawl ya no (2026-11-09; DN-07 de crawl, §6).
 6. **El abort descarta el raw del website.** El run de Apify queda en el ledger, pero el raw se pierde (también lo señala DN-06:33).
 
 **El modo mock de hoy** (`SOURCE_MODE=mock`; `server.ts:30-47`, `pipeline/mock-sources.ts`):
@@ -397,7 +398,7 @@ Los tests afirman los totales 82, 25 y 72 y los estados de `robust`, `partial` y
 - solo `http` y `https`, sin credenciales en la URL y solo puertos 80 y 443;
 - solo IPs unicast públicas, fijadas en el socket;
 - respuestas de 5 MB como máximo y 5 redirecciones revalidadas;
-- el crawler pasa todas sus peticiones por ese transporte.
+- el crawler pasa sus peticiones por ese transporte, **salvo los saltos de una redirección HTTP**, que Chromium sigue por su cuenta (comprobado el 2026-11-09; DN-07 de crawl, §6).
 
 **Escapado de contenido de terceros.** El PDF escapa el contenido rastreado (`report/quick-scan.ts:7-8`) y Chromium lo renderiza con JS desactivado y todas las peticiones abortadas. El front no usa `dangerouslySetInnerHTML`.
 
@@ -776,7 +777,7 @@ La prioridad es mi criterio (Alta, Media o Baja). La columna "Fuente" indica dó
 | Alta | Gates de DN-05 §12 sin cumplir (20 snapshots, ≥40 casos adversariales, conjunto reservado, 3 corridas, p95 ≤120 s) con `agentic` ya por defecto | DN-05:474-542; DN-05-evaluacion §6.6, §8 |
 | Media | Latencia: no hay medición después de `8659d6b`; la última daba de 338 a 618 s | DN-05-evaluacion §6.10, §8 |
 | Media | Deadline por fase en `InProcessPipeline`, y no descartar el raw al abortar | DN-05 §6; DN-07c:49-51; DN-05-review R05; DN-06:33 |
-| Media | Estado de la fuente según la cobertura real, no según `crawl.partial` (un 404 deja PARTIAL para siempre) | DN-05 §8; DN-05-review R08; `crawler.ts:135-143` |
+| Media | Estado de la fuente según la cobertura real, no según `crawl.partial`. Resuelto en parte el 2026-11-09: un 404, robots o algo que no es HTML ya no dejan PARTIAL | DN-05 §8; DN-05-review R08; DN-07 de crawl, §6 |
 | Media | Flag "cola agotada" frente a "presupuesto agotado", para poder fijar los negativos de IA | DN-07c:68-71 |
 | Media | Que `agentic` pueda producir W7 `minimal` y W5a `no_team_page` | `derived-signals.ts:47,58` |
 | Baja | `extractionFingerprint` y política de caché (hash frágil, solo el último raw) | DN-05 §9; `website-source.ts:24-36` |
