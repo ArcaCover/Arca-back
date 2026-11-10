@@ -29,7 +29,7 @@ function domainResults(bank:QuestionBank,answers:Answers): AssessmentResult['dom
  * one of it drops the plural ending of the unit's first word: '1 hour per lawyer / year'.
  */
 export function numberLabel(value:number,unit:string): string {
-  return `${value} ${value===1 ? unit.replace(/^([A-Za-z]+)s(?![A-Za-z])/,'$1') : unit}`;
+  return `${value} ${value===1 ? unit.replace(/^([A-Za-z]*[A-Za-rt-z])s(?![A-Za-z])/,'$1') : unit}`;
 }
 function betterAnswers(q:Question,answer:AnswerValue): Array<{answer:AnswerValue;label:string}> {
   if (q.options && answer.kind==='option') return q.options.map(o=>({answer:{kind:'option' as const,optionId:o.id},label:o.label}));

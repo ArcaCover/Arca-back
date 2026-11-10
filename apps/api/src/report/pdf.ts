@@ -60,12 +60,15 @@ export function limitRenders(render: PdfRender, options: { maxConcurrent?: numbe
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (holding) release();
+      // Settle this request first: handing the slot on starts the next render, which must not be able to keep it open.
       outcome();
+      if (holding) release();
     };
     const start = () => {
       holding = true;
-      render(html, controller.signal).then(pdf => finish(() => resolve(pdf)), (error: unknown) => finish(() => reject(error)));
+      // A renderer that throws before returning a promise fails like one that rejects, and frees its slot the same way.
+      Promise.resolve().then(() => render(html, controller.signal))
+        .then(pdf => finish(() => resolve(pdf)), (error: unknown) => finish(() => reject(error)));
     };
     const timer = setTimeout(() => {
       const index = waiting.indexOf(start);

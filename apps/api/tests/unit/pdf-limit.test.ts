@@ -77,6 +77,27 @@ describe('PDF renders share a small cap and a deadline', () => {
       vi.useRealTimers();
     }
   });
+
+  it('settles every request when the next render throws before returning a promise', async () => {
+    const calls: Array<() => void> = [];
+    let count = 0;
+    const render = vi.fn<PdfRender>(() => {
+      count++;
+      if (count === 2) throw new Error('renderer threw at once');
+      return new Promise(resolve => calls.push(() => resolve(PDF)));
+    });
+    const limited = limitRenders(render, { maxConcurrent: 1, timeoutMs: 60_000 });
+    const first = limited('first'), second = limited('second'), third = limited('third');
+    const secondResult = second.catch((error: unknown) => error);
+    await tick();
+    calls[0]!();
+    // The request that handed its slot on still gets its PDF, the throwing one is rejected, and the slot moves on.
+    await expect(first).resolves.toEqual(PDF);
+    expect(await secondResult).toEqual(new Error('renderer threw at once'));
+    await tick();
+    calls[1]!();
+    await expect(third).resolves.toEqual(PDF);
+  });
 });
 
 describe('GET /scan/:scanId/report.pdf with a render that runs out of time', () => {

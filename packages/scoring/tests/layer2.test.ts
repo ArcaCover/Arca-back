@@ -72,6 +72,9 @@ describe('demo Layer2 deterministic scoring',()=>{
     expect(numberLabel(12,'hours per lawyer / year')).toBe('12 hours per lawyer / year');
     expect(numberLabel(1,'lawyers')).toBe('1 lawyer');
     expect(numberLabel(1,'staff')).toBe('1 staff');
+    // A word that only ends in "ss" is not a plural: it is never cut.
+    expect(numberLabel(1,'business days')).toBe('1 business days');
+    expect(numberLabel(1,'class')).toBe('1 class');
   });
   it('is stable for the same versioned snapshot',()=>expect(scoreAssessment(structuredClone(input))).toEqual(scoreAssessment(input)));
 });
