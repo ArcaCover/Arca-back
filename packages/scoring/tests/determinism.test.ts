@@ -2,12 +2,12 @@ import { describe, expect, it } from 'vitest';
 import type { Layer1Evidence } from '@arca/contracts';
 import { evaluateLayer1Evidence, mean, scoreEvidence } from '../src/index.js';
 import { ambiguousDirectory, firmFallback, mockEvidence, OBSERVED_AT, ratingBoundary, reorder, reorderPeople, seeded, sevenAttorneys,
-  shuffle } from './fixtures/determinism.js';
+  sharedSearchedName, shuffle } from './fixtures/determinism.js';
 
 const MOCKS = ['robust', 'minimal', 'sanctioned', 'partial'] as const;
 const SYNTHETIC: [string, (observedAt?: string) => Layer1Evidence][] = [['seven attorneys averaging exactly 8.0', sevenAttorneys],
   ['three attorneys averaging exactly 7.0', ratingBoundary], ['cross-checked and ambiguous lookups', ambiguousDirectory],
-  ['firm-wide Bar roster', firmFallback]];
+  ['firm-wide Bar roster', firmFallback], ['two Avvo lookups for one normalised name', sharedSearchedName]];
 const FIXTURES: [string, (observedAt?: string) => Layer1Evidence][] = [...SYNTHETIC,
   ...MOCKS.map((name): [string, (observedAt?: string) => Layer1Evidence] => [`mock ${name}`, observedAt => mockEvidence(name, observedAt)])];
 const PERMUTATIONS = 500;
@@ -45,6 +45,22 @@ describe('Layer 1 gives one result for one set of evidence', () => {
     const random = seeded(99);
     for (let run = 0; run < 100; run++) {
       expect(scored(evaluateLayer1Evidence(reorderPeople(evidence, random))), `permutation ${run}`).toEqual(expected);
+    }
+  });
+
+  it('cross-checks the Bar against the same Avvo lookup whichever order two lookups for one name arrive in', () => {
+    // 'Ana Perez Ana Perez' and 'Ana Pérez' normalise to the Bar's 'Ana Perez Esq.'. The cross-check takes the first
+    // of them, so without one fixed order before it the Bar namesake accepted (admitted 2005 or 2020) follows the provider.
+    const evidence = sharedSearchedName(), [first, second] = evidence.avvo!;
+    const swapped = { ...evidence, avvo: [second!, first!] };
+    const expected = evaluateLayer1Evidence(evidence);
+    expect(expected.signals.bar.attorneys?.map(match => match.attorney?.barNumber)).toEqual(['500001']);
+    expect(evaluateLayer1Evidence(swapped)).toEqual(expected);
+    const random = seeded(2026);
+    for (let run = 0; run < 50; run++) {
+      const shuffled = { ...evidence, avvo: shuffle(evidence.avvo!, random), bar: evidence.bar!.map(match =>
+        ({ ...match, candidates: shuffle(match.candidates ?? [], random) })) };
+      expect(evaluateLayer1Evidence(shuffled), `permutation ${run}`).toEqual(expected);
     }
   });
 

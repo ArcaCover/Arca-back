@@ -161,6 +161,30 @@ export function firmFallback(observedAt = OBSERVED_AT): Layer1Evidence {
       candidatesReceived: 0, recordsValid: 0, providerRuns: [], costUsd: 0 } }, observedAt);
 }
 
+/**
+ * Two Avvo lookups whose searched names normalise to the same person ('Ana Perez Ana Perez', a name the site printed
+ * twice, and 'Ana Pérez'), each confirmed by a different address, against one ambiguous Bar lookup ('Ana Perez Esq.')
+ * with two namesakes. The Bar cross-check takes the first Avvo lookup for that name, so it accepts whichever namesake
+ * the first lookup points to, and the two were admitted fifteen years apart. Only a fixed order of the lookups,
+ * before the cross-check, keeps the result from following the order the provider answered in.
+ */
+export function sharedSearchedName(observedAt = OBSERVED_AT): Layer1Evidence {
+  const bar = (barNumber: string, addressStreet: string, admissionDate: string) => person('Ana Perez', { barNumber, barStatus: 'active',
+    admissionDate, addressStreet, city: null, firmName: null, hasDisciplinaryHistory: false, disciplinaryActions: [], activeInvestigation: false });
+  const avvo = (slug: string, addressStreet: string, avvoRating: number) => person('Ana Perez', { addressStreet,
+    profileUrl: `https://avvo.example/${slug}`, avvoRating, reviewCount: 5, averageReviewRating: 4.5, practiceAreas: ['Immigration'],
+    hasDisciplinaryHistory: false });
+  const status = { status: 'ok' as const, dataStatus: 'PRESENT' as const, durationMs: 1, attorneysSearched: 1, attorneysFound: 1 };
+  return evidence('perezlegal.example', website({ firm_name: 'Perez Legal', city: 'Miami',
+    team_members: [{ full_name: 'Ana Perez', title: 'Attorney' }], team_size: 1, practice_areas: ['Immigration'] }),
+  [{ searchedName: 'Ana Perez Esq.', matchConfidence: 'no_match', attorney: null, ambiguous: true,
+    candidates: [bar('500001', '1 Bay Street', '2005-03-01'), bar('500002', '9 Ocean Drive', '2020-03-01')] }],
+  [{ searchedName: 'Ana Perez Ana Perez', matchConfidence: 'exact_name', ambiguous: false, attorney: avvo('ana-perez-1', '1 Bay Street', 9.1) },
+    { searchedName: 'Ana Pérez', matchConfidence: 'exact_name', ambiguous: false, attorney: avvo('ana-perez-2', '9 Ocean Drive', 6.2) }],
+  { website: { status: 'ok', dataStatus: 'PRESENT', durationMs: 1, pagesCrawled: 3 }, bar: status, avvo: { ...status, attorneysSearched: 2 } },
+  observedAt);
+}
+
 /** A seeded generator, so a failing permutation can be reproduced from its seed. */
 export function seeded(seed: number): () => number {
   let state = seed >>> 0;
