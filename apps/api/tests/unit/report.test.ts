@@ -59,11 +59,26 @@ describe('Quick Scan Report content', () => {
     expect(html).toContain('CRITICAL');
     expect(html).toContain('Firm website: unavailable');
     // The directories were never asked: they were skipped, not unavailable.
-    expect(html).toContain('Florida Bar: not searched, because the firm could not be identified from its website');
-    expect(html).toContain('Avvo: not searched, because the firm could not be identified from its website');
+    expect(html).toContain('Florida Bar: not searched; we could not look the firm up there');
+    expect(html).toContain('Avvo: not searched; we could not look the firm up there');
     expect(html).not.toMatch(/(Florida Bar|Avvo): unavailable/);
     // Nothing in the report names the restriction, a premium or a coverage outcome.
     expect(html).not.toMatch(/REFERRAL|referral|declin|premium|\$|approved|eligible|coverage/);
+  });
+
+  it('never says the firm could not be identified when a directory was skipped for want of a city', () => {
+    // The live scan of 2026-11-06 (flow.test.ts): the firm was named and the Bar found it, but Avvo was not run
+    // because a firm-wide search needs a verified city. The code is INSUFFICIENT_IDENTITY all the same.
+    const result = fixtureResult();
+    result.sources = { website: { status: 'partial', dataStatus: 'PRESENT', durationMs: 73456, pagesCrawled: 19 },
+      bar: { status: 'ok', dataStatus: 'PRESENT', durationMs: 10 },
+      avvo: { status: 'skipped', dataStatus: 'UNKNOWN', durationMs: 0, code: 'INSUFFICIENT_IDENTITY',
+        reason: 'A firm-wide search needs a verified city; a nationwide search is not run' } };
+    const html = renderQuickScanHtml(result, 'PARTIAL');
+    expect(html).toContain('<h1>Smith Law</h1>');
+    expect(html).toContain('Florida Bar: complete');
+    expect(html).toContain('Avvo: not searched; we could not look the firm up there');
+    expect(html).not.toMatch(/could not be identified/i);
   });
 
   it('never lets scanned text become markup', () => {

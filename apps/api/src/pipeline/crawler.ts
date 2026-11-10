@@ -302,13 +302,46 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
         let page: import('playwright').Page | undefined;
         try {
           page = await context.newPage();
-          const response = await page.goto(item.url, { timeout: 8000, waitUntil: 'domcontentloaded' });
+          const current = page;
+          // Every answer the main frame navigated on: the goto, and any navigation the page starts by itself later (a
+          // meta refresh, a script). An aborted request has no answer, so a navigation the handler stopped is not here.
+          const navigations: import('playwright').Response[] = [];
+          current.on('response', answer => {
+            try { if (answer.request().isNavigationRequest() && answer.frame() === current.mainFrame()) navigations.push(answer); }
+            catch { /* A request with no frame (a service worker's) is no navigation of this page. */ }
+          });
+          const response = await current.goto(item.url, { timeout: 8000, waitUntil: 'domcontentloaded' });
           const status = response?.status() ?? null;
+          // Only the first hop of each navigation passes the request handler; the browser follows the later ones by
+          // itself. So every hop of every navigation of the page, and the URL it is on now, are checked here. A chain
+          // that reached another host is not the firm's page, and one that passed a URL robots.txt excludes is not kept,
+          // whatever it shows. The browser has already fetched them; this keeps their content out of the evidence
+          // (DN-07 §6, known limit). Run before the status (another host's challenge is not the firm refusing) and
+          // again after the content is read (the page may have navigated away while the network settled).
+          const leftTheSite = async (): Promise<Omit<CrawlIssue, 'url'> | null> => {
+            const hops: string[] = [];
+            for (const answer of response ? [response, ...navigations] : navigations) {
+              const chain: string[] = [];
+              for (let hop: import('playwright').Request | null = answer.request(); hop; hop = hop.redirectedFrom()) chain.push(hop.url());
+              hops.push(...chain.reverse());
+            }
+            // Only web addresses: an error page the browser shows for a stopped navigation is not a hop.
+            const web = [...new Set([...hops, current.url()])].filter(url => /^https?:/i.test(url));
+            const away = web.find(url => !onSite(url));
+            if (away) return { code: 'OFF_SITE_REDIRECT', status, detail: URL.canParse(away) ? new URL(away).hostname : undefined };
+            for (const hop of web) {
+              const policy = await robotsFor(hop);
+              if (!policy.allows(hop)) return robotsIssue(policy);
+            }
+            return null;
+          };
           // The page as the reader sees it: no menus, footers or scripts.
           const visibleText = async (target: import('playwright').Page) => {
             await target.locator('nav, footer, script, style, noscript, template, [aria-hidden="true"]').evaluateAll(elements => elements.forEach(element => element.remove()));
             return (await target.locator('body').innerText({ timeout: 1000 })).trim();
           };
+          const away = await leftTheSite();
+          if (away) { fail(item, { url: item.url, ...away }); return; }
           if (!response || status === null || status >= 400) {
             // Checked before the status: a challenge is a refusal whatever status carries it, never a 503 to retry.
             const challenge = !!response && (status === 403 || status === 429 || (status ?? 0) >= 500) &&
@@ -316,21 +349,6 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
             fail(item, challenge ? { url: item.url, code: 'ACCESS_BLOCKED', status, detail: CHALLENGE_PAGE }
               : { url: item.url, code: status !== null && [401, 403, 429].includes(status) ? 'ACCESS_BLOCKED' : 'HTTP_ERROR', status });
             return;
-          }
-          // Only the first hop of a redirect passes the request handler. A chain that still ended off the site
-          // (a www host that redirects again) is not the firm's page, whatever it shows.
-          if (!onSite(page.url())) {
-            fail(item, { url: item.url, code: 'OFF_SITE_REDIRECT', status, detail: URL.canParse(page.url()) ? new URL(page.url()).hostname : undefined });
-            return;
-          }
-          // The same reason applies to robots.txt: the browser followed the later hops by itself, so each one is
-          // checked here, and a page that ended on a URL the site excludes is not kept, whatever it shows. The browser
-          // has already fetched it; this only keeps its content out of the evidence (DN-07 §6, known limit).
-          const hops: string[] = [];
-          for (let hop: import('playwright').Request | null = response.request(); hop; hop = hop.redirectedFrom()) hops.push(hop.url());
-          for (const hop of [...new Set([...hops.reverse(), page.url()])].filter(onSite)) {
-            const policy = await robotsFor(hop);
-            if (!policy.allows(hop)) { fail(item, { url: item.url, ...robotsIssue(policy) }); return; }
           }
           if (!HTML.test(response.headers()['content-type'] ?? '')) {
             fail(item, { url: item.url, code: 'NOT_HTML', status });
@@ -340,6 +358,10 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
           const html = await page.content();
           const links = await page.locator('a[href]').evaluateAll(anchors => anchors.map(a => a.getAttribute('href') ?? ''));
           const text = await visibleText(page);
+          // Read first, checked after: a navigation answers before its document replaces the page, so whatever was read
+          // came from an answer already in `navigations`.
+          const leftLater = await leftTheSite();
+          if (leftLater) { fail(item, { url: item.url, ...leftLater }); return; }
           const challenge = CHALLENGE_TEXT.test(text);
           if (!text || challenge) {
             // An empty shell whose script redirect was stopped for a known reason ends for that reason.

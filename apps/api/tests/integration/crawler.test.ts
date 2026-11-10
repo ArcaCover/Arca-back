@@ -318,6 +318,86 @@ it('does not keep a page whose redirect chain ends on a path robots.txt excludes
   }
 }, 30_000);
 
+for (const [label, trigger] of [
+  ['a meta refresh', '<meta http-equiv="refresh" content="0.3;url=/private">'],
+  ['a script', '<script>setTimeout(() => { location.href = "/private"; }, 300)</script>'],
+] as const) {
+  it(`does not keep what ${label} navigates to after the page loaded, when a later hop of it is excluded`, async () => {
+    // The page passes every check on its own answer, then leaves by itself while the crawler waits for the network to
+    // settle. The request handler sees only the first hop of that new navigation (/private, allowed); the browser
+    // follows www's redirect to /private/, which robots.txt excludes, with its own network.
+    const served: string[] = [];
+    const www = await loopback((request, response) => {
+      served.push(request.url ?? '');
+      if (request.url === '/private') response.writeHead(301, { location: '/private/' }).end();
+      else response.writeHead(200, { 'content-type': 'text/html' }).end('<body>SECRET PRIVATE PAGE</body>');
+    });
+    try {
+      const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+        robots: async () => ({ status: 200, text: 'User-agent: *\nDisallow: /private/' }),
+        response: async raw => path(raw) === '/' ? html(`Smith Law ${trigger}`)
+          : { status: 301, headers: { location: `http://www.fixture.example${path(raw)}` }, body: Buffer.alloc(0) },
+      }, { hostResolverRules: www.hostResolverRules, seedOnly: true });
+      // The navigation did happen: the browser reached the excluded URL (the known limit of DN-07 §6).
+      expect(served).toContain('/private/');
+      expect(result.pages.some(page => page.text.includes('SECRET'))).toBe(false);
+      expect(result.pages).toEqual([]);
+      expect(listed(result)).toEqual(['page ROBOTS_DISALLOWED null fixture.example/']);
+      expect(result.partial).toBe(false);
+    } finally {
+      await www.close();
+    }
+  }, 30_000);
+}
+
+it('does not keep another host\'s page that a meta refresh reached through hops the handler never saw', async () => {
+  const served: string[] = [];
+  const server = createServer((request, response) => {
+    served.push(`${request.headers.host?.split(':')[0]}${request.url}`);
+    if (request.headers.host?.startsWith('www.fixture.example')) response.writeHead(301, { location: 'http://other.example/landing' }).end();
+    else response.writeHead(200, { 'content-type': 'text/html' }).end('<body>OTHER HOST CONTENT</body>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as { port: number };
+  try {
+    const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+      robots: async () => ({ status: 404, text: '' }),
+      response: async raw => path(raw) === '/' ? html('Smith Law <meta http-equiv="refresh" content="0.3;url=/go">')
+        : { status: 301, headers: { location: `http://www.fixture.example${path(raw)}` }, body: Buffer.alloc(0) },
+    }, { hostResolverRules: `MAP www.fixture.example 127.0.0.1:${port},MAP other.example 127.0.0.1:${port}`, seedOnly: true });
+    expect(served).toContain('other.example/landing');
+    expect(result.pages).toEqual([]);
+    expect(listed(result)).toEqual(['page OFF_SITE_REDIRECT 200 fixture.example/']);
+    expect(result.issues?.find(issue => issue.code === 'OFF_SITE_REDIRECT')?.detail).toBe('other.example');
+    expect(result.partial).toBe(false);
+  } finally {
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+  }
+}, 30_000);
+
+it('takes a redirect chain that left the site for a host serving a challenge as a redirect, not as the firm refusing', async () => {
+  // A rebrand: the bare domain goes to www, and www to the new firm's host, which sits behind a Cloudflare challenge.
+  // The challenge is that other host's answer; the chain left the site first, whatever status the last hop gives.
+  const server = createServer((request, response) => {
+    if (request.headers.host?.startsWith('www.fixture.example')) response.writeHead(301, { location: 'http://newfirm.example/' }).end();
+    else response.writeHead(503, { 'content-type': 'text/html', 'cf-mitigated': 'challenge' }).end('<body>Just a moment...</body>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as { port: number };
+  try {
+    const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+      robots: async () => ({ status: 404, text: '' }),
+      response: async raw => ({ status: 301, headers: { location: `http://www.fixture.example${path(raw)}` }, body: Buffer.alloc(0) }),
+    }, { hostResolverRules: `MAP www.fixture.example 127.0.0.1:${port},MAP newfirm.example 127.0.0.1:${port}`, seedOnly: true });
+    expect(result.pages).toEqual([]);
+    expect(result.issues?.filter(issue => issue.scope === 'page')).toEqual([
+      { url: 'https://fixture.example/', code: 'OFF_SITE_REDIRECT', status: 503, detail: 'newfirm.example', scope: 'page' }]);
+    expect(unreadableWebsite(result)).toMatchObject({ code: 'NO_READABLE_EVIDENCE', classification: 'TRANSIENT' });
+  } finally {
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+  }
+}, 30_000);
+
 it('takes a challenge page for a refusal whatever status carries it, and asks for it once', async () => {
   const challenge = 'Just a moment...<p>Checking your browser before accessing fixture.example.</p>';
   const cases: Array<[number, Record<string, string>, string]> = [

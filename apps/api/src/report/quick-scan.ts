@@ -32,10 +32,11 @@ function sourceLine(name: string, source: Layer1Result['sources'][keyof Layer1Re
   const searched = source.attorneysSearched ?? null;
   const found = source.attorneysFound ?? null;
   const coverage = searched && found !== null ? `, ${found} of ${searched} attorneys matched` : '';
-  // A directory that was skipped was never asked, so it was not unavailable: say why it was not searched, as /score does.
+  // A directory that was skipped was never asked, so it was not unavailable. It is said the way /score says it ("We
+  // could not look your firm up on Avvo."), whatever the reason: INSUFFICIENT_IDENTITY also covers a firm that was
+  // identified but has no attorney names and no verified city, so "the firm could not be identified" would be false.
   const state = source.status === 'ok' ? 'complete' : source.status === 'partial' ? 'partial'
-    : source.status === 'skipped' ? (source.code === 'INSUFFICIENT_IDENTITY'
-      ? 'not searched, because the firm could not be identified from its website' : 'not searched') : 'unavailable';
+    : source.status === 'skipped' ? 'not searched; we could not look the firm up there' : 'unavailable';
   return `${SOURCE_NAMES[name] ?? name}: ${state}${coverage}`;
 }
 
