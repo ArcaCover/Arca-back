@@ -1,6 +1,6 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
-import { ACTIVE_APIFY_STATUSES, RAW_MARKER } from './types.js';
+import { ACTIVE_APIFY_STATUSES, RAW_MARKER, SPEND_CEILING_STATUS } from './types.js';
 import type { ScanRepository, ScanRecord, RawRecord, RawReference, ReserveApifyRun, ApifyRunReservation, ApifyRunRecord,
   ApifyRunUpdate, ApifySpendRecord } from './types.js';
 
@@ -85,10 +85,11 @@ export class SupabaseRepository implements ScanRepository {
     if (error || !data) throw new Error('Unable to update Apify run', { cause: error });
   }
   async recentApifyRuns(since: string, limit: number): Promise<ApifySpendRecord[]> {
-    // Never `*`: `items` holds whole datasets.
+    // Never `*`: `items` holds whole datasets. Refused starts count nothing, and a roster refused scan after scan
+    // must not fill the rows the sum can read.
     const { data, error } = await this.client.from('apify_runs')
       .select('id,run_id,status,cost_usd,reserved_usd,accounting_complete,created_at,expires_at')
-      .gte('created_at', since).order('created_at', { ascending: false }).limit(limit);
+      .gte('created_at', since).neq('status', SPEND_CEILING_STATUS).order('created_at', { ascending: false }).limit(limit);
     if (error) throw new Error('Unable to read recent Apify runs', { cause: error });
     return (data ?? []) as ApifySpendRecord[];
   }

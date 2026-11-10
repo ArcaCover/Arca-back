@@ -495,9 +495,9 @@ describe('Apify spend ceiling', () => {
       await expect(client.run('owner/actor', { name: 'Three' }, signal())).rejects.toMatchObject({ code: 'SPEND_CEILING_REACHED' });
       settled = true;
       expect(await client.reconcileCosts()).toBe(2);
-      // USD 0.09 is spent, so a third run fits and may charge what the ceiling has left.
+      // USD 0.09 is spent, so a third run fits. It may charge its reservation, not all the USD 1.91 left.
       await expect(client.run('owner/actor', { name: 'Three' }, signal())).resolves.toMatchObject({ metadata: { status: 'SUCCEEDED' } });
-      expect(new URL(String(started(request.mock.calls).at(-1)![0])).searchParams.get('maxTotalChargeUsd')).toBe('1.91');
+      expect(new URL(String(started(request.mock.calls).at(-1)![0])).searchParams.get('maxTotalChargeUsd')).toBe('1');
     } finally { log.mockRestore(); }
   });
 
@@ -533,6 +533,8 @@ describe('Apify spend ceiling', () => {
     expect(committedUsd({ ...row, run_id: null, status: 'RESERVED' }, now)).toBe(0);
     expect(committedUsd({ ...row, run_id: null, status: 'SPEND_CEILING_REACHED', expires_at: '2026-11-09T12:10:00.000Z' }, now)).toBe(0);
     expect(committedUsd({ ...row, run_id: null, status: 'QUOTA_EXCEEDED', expires_at: '2026-11-09T12:10:00.000Z' }, now)).toBe(0);
+    // A lost start answer: maybe a run, for the whole window, expired or not.
+    expect(committedUsd({ ...row, run_id: null, status: 'START_UNCERTAIN' }, now)).toBe(1);
   });
 
   it('starts no run at all with a ceiling of 0, and still serves what is cached', async () => {
@@ -573,7 +575,7 @@ describe('Apify spend ceiling', () => {
     expect(new URL(String(started(request.mock.calls).at(-1)![0])).searchParams.has('maxTotalChargeUsd')).toBe(false);
   });
 
-  it('sends what the ceiling has left as the charge limit without touching the query or its fingerprint', async () => {
+  it('sends the reservation as the charge limit without touching the query or its fingerprint', async () => {
     const repository = new InMemoryRepository(), request = apify();
     const input = { firm: 'Smith Law', maxLawyers: 1_000_000 };
     const uncapped = await capped(repository, request, null).run('owner/actor', input, signal());
@@ -586,7 +588,6 @@ describe('Apify spend ceiling', () => {
     const other = { firm: 'Doe Law', maxLawyers: 1_000_000 };
     await client.run('owner/actor', other, signal());
     const [url, init] = started(request.mock.calls).at(-1)! as [string, RequestInit];
-    // The first run is unsettled and holds USD 1 of the USD 2.
     expect(new URL(url).searchParams.get('maxTotalChargeUsd')).toBe('1');
     expect(JSON.parse(String(init.body))).toEqual(other);
     expect(rows(repository).at(-1)).toMatchObject({ input_json: other });
@@ -594,13 +595,74 @@ describe('Apify spend ceiling', () => {
     expect(rows(repository).at(-1)!.query_fingerprint).toBe(plain.metadata.queryFingerprint);
   });
 
-  it('covers the firm-wide Bar search: the input still asks for every lawyer and the run may charge only what is left', async () => {
+  it('covers the firm-wide Bar search: the input still asks for every lawyer and the run may charge only its reservation', async () => {
     const repository = new InMemoryRepository(), request = apify();
     const source = new ApifyDirectorySource('bar', capped(repository, request));
     await source.run({ ...query, names: [] }, signal());
     const [url, init] = started(request.mock.calls)[0]! as [string, RequestInit];
     expect(JSON.parse(String(init.body))).toMatchObject({ firm: 'Smith Law', maxLawyers: BAR_TECHNICAL_MAX_LAWYERS, lastNames: [] });
-    expect(new URL(url).searchParams.get('maxTotalChargeUsd')).toBe('2');
+    // Alone under a ceiling of USD 2, and still limited to the USD 1 it reserved.
+    expect(new URL(url).searchParams.get('maxTotalChargeUsd')).toBe('1');
+  });
+
+  it('never hands runs admitted together more charge limit than the ceiling', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (const [ceiling, reserve] of [[2, 1], [5, .5], [20, 1], [2, .3]] as const) {
+        const repository = new InMemoryRepository(), request = apify(0);
+        const client = new ApifyClient('token', request as typeof fetch, 32,
+          { store: repository, expectedCostUsdPerRun: reserve, spendCeilingUsd: ceiling });
+        // Thirty firm-wide searches at once, none settled: each could charge up to its limit.
+        await Promise.allSettled(Array.from({ length: 30 }, (_, index) =>
+          client.run('owner/actor', { firm: `Firm ${index}`, maxLawyers: BAR_TECHNICAL_MAX_LAWYERS }, signal())));
+        const limits = started(request.mock.calls).map(call => Number(new URL(String(call[0])).searchParams.get('maxTotalChargeUsd')));
+        expect(limits).toHaveLength(Math.floor(ceiling / reserve + 1e-9));
+        expect(limits.every(limit => limit === reserve)).toBe(true);
+        expect(limits.reduce((total, limit) => total + limit, 0)).toBeLessThanOrEqual(ceiling + 1e-9);
+      }
+    } finally { log.mockRestore(); }
+  });
+
+  it('keeps counting a start whose answer was lost, and not one Apify refused', async () => {
+    const repository = new InMemoryRepository(), log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let clock = Date.now(), answer: 'lost' | 'refused' | 'ok' = 'lost';
+    const request = vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
+      if (!String(url).includes('/runs?')) return Response.json([{ name: 'Jane Smith' }]);
+      if (answer === 'lost') throw new TypeError('fetch failed');
+      if (answer === 'refused') return new Response('actor not found', { status: 404 });
+      return Response.json({ data: { id: `run-${started(request.mock.calls).length}`, status: 'SUCCEEDED', defaultDatasetId: 'dataset' } });
+    });
+    try {
+      const client = new ApifyClient('token', request as typeof fetch, 16,
+        { store: repository, expectedCostUsdPerRun: 1, spendCeilingUsd: 2, now: () => clock });
+      await expect(client.run('owner/actor', { name: 'Lost' }, signal())).rejects.toMatchObject({ code: 'PROVIDER_ERROR' });
+      answer = 'refused';
+      await expect(client.run('owner/actor', { name: 'Refused' }, signal())).rejects.toMatchObject({ code: 'PROVIDER_ERROR' });
+      expect(rows(repository).map(row => row.status)).toEqual(['START_UNCERTAIN', 'UNAVAILABLE']);
+      // A scan that comes to resume the lost start leaves it uncertain.
+      await expect(client.run('owner/actor', { name: 'Lost' }, signal())).rejects.toMatchObject({ code: 'PROVIDER_ERROR' });
+      expect(rows(repository)[0]).toMatchObject({ status: 'START_UNCERTAIN', last_error: 'Actor start response unavailable' });
+      // Long after its reservation expired the lost start may still have been a run: it holds USD 1 of the USD 2.
+      clock += 3_600_000;
+      answer = 'ok';
+      await client.run('owner/actor', { name: 'One' }, signal());
+      await expect(client.run('owner/actor', { name: 'Two' }, signal())).rejects.toMatchObject({ code: 'SPEND_CEILING_REACHED' });
+    } finally { log.mockRestore(); }
+  });
+
+  it('leaves refused starts out of the rows it adds up, so refusals cannot fill the window', async () => {
+    const repository = new InMemoryRepository(), request = apify(), log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const full = capped(repository, request, 0);
+      for (let index = 0; index < 1000; index++) {
+        await expect(full.run('owner/actor', { name: `Refused ${index}` }, signal())).rejects.toMatchObject({ code: 'SPEND_CEILING_REACHED' });
+      }
+      expect(rows(repository)).toHaveLength(1000);
+      // Raising the ceiling is enough: the thousand refusals in the window do not count as a thousand runs.
+      await expect(capped(repository, request, 2).run('owner/actor', { name: 'One' }, signal()))
+        .resolves.toMatchObject({ metadata: { status: 'SUCCEEDED' } });
+      expect(started(request.mock.calls)).toHaveLength(1);
+    } finally { log.mockRestore(); }
   });
 
   it('does not cache a run that spent its whole charge limit, and keeps its rows as partial evidence', async () => {
@@ -613,7 +675,7 @@ describe('Apify spend ceiling', () => {
       const [row] = rows(repository);
       expect(row).toMatchObject({ partial: true, last_error: 'Charge limit reached; the dataset may be incomplete' });
       expect(Date.parse(row!.expires_at)).toBeLessThanOrEqual(Date.now());
-      expect(log.mock.calls.map(call => String(call[0])).some(line => line.includes('reached its charge limit of USD 2'))).toBe(true);
+      expect(log.mock.calls.map(call => String(call[0])).some(line => line.includes('reached its charge limit of USD 1'))).toBe(true);
     } finally { log.mockRestore(); }
   });
 

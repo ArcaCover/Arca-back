@@ -3,7 +3,7 @@ import type { ScanRepository, ScanRecord, RawRecord, ApifyRunRecord, ReserveApif
   ApifyRunUpdate, ApifySpendRecord } from './types.js';
 import { RAW_MARKER } from './types.js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
-import { ACTIVE_APIFY_STATUSES } from './types.js';
+import { ACTIVE_APIFY_STATUSES, SPEND_CEILING_STATUS } from './types.js';
 
 export class InMemoryRepository implements ScanRepository {
   readonly scans = new Map<string, ScanRecord>();
@@ -91,7 +91,7 @@ export class InMemoryRepository implements ScanRepository {
     Object.assign(record, structuredClone(update), { updated_at: new Date().toISOString() });
   }
   async recentApifyRuns(since: string, limit: number): Promise<ApifySpendRecord[]> {
-    return [...this.apifyRuns.values()].filter(run => run.created_at >= since)
+    return [...this.apifyRuns.values()].filter(run => run.created_at >= since && run.status !== SPEND_CEILING_STATUS)
       .sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit)
       .map(({ id, run_id, status, cost_usd, reserved_usd, accounting_complete, created_at, expires_at }) =>
         ({ id, run_id, status, cost_usd, reserved_usd, accounting_complete, created_at, expires_at }));

@@ -109,7 +109,9 @@ describe('Supabase Data API adapter', () => {
       expect(select.split(',').sort()).toEqual(['accounting_complete', 'cost_usd', 'created_at', 'expires_at', 'id', 'reserved_usd', 'run_id', 'status']);
       // `items` and `input_json` hold whole datasets and queries: the sum needs neither.
       expect(select).not.toContain('items');
-      expect(Object.fromEntries(url.searchParams)).toMatchObject({ created_at: 'gte.2026-11-08T12:00:00.000Z', order: 'created_at.desc', limit: '1000' });
+      // Refused starts count nothing and are left out, so refusals cannot fill the rows read.
+      expect(Object.fromEntries(url.searchParams)).toMatchObject({ created_at: 'gte.2026-11-08T12:00:00.000Z',
+        status: 'neq.SPEND_CEILING_REACHED', order: 'created_at.desc', limit: '1000' });
       return Response.json([row]);
     });
     expect(await repository.recentApifyRuns('2026-11-08T12:00:00.000Z', 1000)).toEqual([row]);

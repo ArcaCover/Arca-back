@@ -2,6 +2,8 @@ import type { Layer1Result, ScanStatus, SourceName, DomainResolution } from '@ar
 
 // Ledger statuses of a run that may still start, run or be resumed.
 export const ACTIVE_APIFY_STATUSES = ['RESERVED', 'READY', 'RUNNING', 'TIMING-OUT', 'ABORTING', 'START_UNCERTAIN'];
+// Ledger status of a run the spend ceiling refused. Nothing was sent to Apify, so the ceiling's sum leaves it out.
+export const SPEND_CEILING_STATUS = 'SPEND_CEILING_REACHED';
 
 export type ScanRecord = {
   id: string; scan_id: string; email: string; canonical_domain: string; domain_resolution: DomainResolution; status: ScanStatus;
@@ -56,6 +58,9 @@ export interface ScanRepository {
   /** Finished runs whose charges are not booked yet: started (a run id exists) and no longer active. */
   pendingApifyAccounting(limit: number): Promise<ApifyRunRecord[]>;
   updateApifyRun(id: string, update: ApifyRunUpdate): Promise<void>;
-  /** Ledger rows created since `since`, newest first, at most `limit`, without their datasets. The spend ceiling adds them up. */
+  /**
+   * Ledger rows created since `since`, newest first, at most `limit`, without their datasets and without the starts
+   * the spend ceiling refused. The spend ceiling adds them up.
+   */
   recentApifyRuns(since: string, limit: number): Promise<ApifySpendRecord[]>;
 }

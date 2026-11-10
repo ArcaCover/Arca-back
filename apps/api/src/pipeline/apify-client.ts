@@ -1,7 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
-import { ACTIVE_APIFY_STATUSES, type ApifyRunRecord, type ApifyRunReservation, type ApifyRunUpdate,
+import { ACTIVE_APIFY_STATUSES, SPEND_CEILING_STATUS, type ApifyRunRecord, type ApifyRunReservation, type ApifyRunUpdate,
   type ApifySpendRecord, type ReserveApifyRun } from '../repositories/types.js';
 import { InMemoryRepository } from '../repositories/in-memory.js';
 import { scanMeter } from './scan-cost.js';
@@ -31,7 +31,8 @@ export type ApifyClientOptions = { store?: RunStore; build?: string; expectedCos
   quotaCooldownMs?: number; now?: () => number;
   /**
    * USD the ledger may hold over SPEND_WINDOW_MS before a new run is refused, and the reason each run is started
-   * with a charge limit. Null, the default, is no ceiling and no limit: spend is recorded and never capped.
+   * with its reservation as a charge limit. Null, the default, is no ceiling and no limit: spend is recorded and
+   * never capped.
    */
   spendCeilingUsd?: number | null };
 
@@ -62,17 +63,23 @@ export const SPEND_WINDOW_MS = 86_400_000;
 const SPEND_WINDOW_ROWS = 1000;
 const SPEND_CEILING_REASON = 'Apify spend ceiling reached';
 const CHARGE_LIMIT_REASON = 'Charge limit reached; the dataset may be incomplete';
+const START_UNCERTAIN = 'START_UNCERTAIN';
+const START_UNCERTAIN_REASON = 'Actor start response unavailable';
 const CENT = 0.01;
+/** Whole cents, rounded down; the hair added first keeps a sum such as 1.91 from landing on 1.90. */
+const cents = (usd: number) => Math.floor(usd * 100 + 1e-6) / 100;
 
 /**
  * What a ledger row counts for against the spend ceiling.
  * A settled run counts what Apify charged. A started run keeps its whole reservation until then: charges are
  * booked minutes after the run ends and the figure read before that understates them (a run of the Florida Bar
- * actor reads 0). A run that never started counts only while it still may.
+ * actor reads 0). A start whose answer was lost may have started a run nobody will ever settle, so it keeps its
+ * reservation for the whole window. A run that never started counts only while it still may.
  */
 export function committedUsd(row: ApifySpendRecord, now: number): number {
   if (row.accounting_complete) return row.cost_usd ?? 0;
   if (row.run_id !== null) return Math.max(row.cost_usd ?? 0, row.reserved_usd);
+  if (row.status === START_UNCERTAIN) return row.reserved_usd;
   return ACTIVE_APIFY_STATUSES.includes(row.status) && Date.parse(row.expires_at) > now ? row.reserved_usd : 0;
 }
 const reachedLimit = (costUsd: number | null | undefined, limitUsd: number | undefined) =>
@@ -170,13 +177,17 @@ export class ApifyClient {
         + ' No new run starts; cached queries are still served.');
     }
     scanMeter()?.apifyRefused();
-    await this.store.updateApifyRun(record.id, { status: 'SPEND_CEILING_REACHED', expires_at: new Date(now).toISOString(),
+    await this.store.updateApifyRun(record.id, { status: SPEND_CEILING_STATUS, expires_at: new Date(now).toISOString(),
       last_error: SPEND_CEILING_REASON });
     throw new ApifyClientError('SPEND_CEILING_REACHED', SPEND_CEILING_REASON);
   }
   /**
-   * The most the reserved run may charge: what the ceiling leaves once every other run of the window is counted.
-   * Throws when that is less than the run reserves.
+   * The most the reserved run may charge: its reservation, once the ceiling has room for it after every other run
+   * of the window is counted. Throws when it has not.
+   *
+   * Not what the ceiling has left: every unsettled run counts its reservation, so runs admitted together would each
+   * be handed the same room and their limits could add up to many times the ceiling. With the reservation as the
+   * limit, the runs this process started can never be charged more, together, than the ceiling.
    */
   private async admit(record: ApifyRunRecord): Promise<number> {
     const now = this.options.now();
@@ -189,10 +200,14 @@ export class ApifyClient {
       throw new ApifyClientError('PROVIDER_ERROR', 'Recorded Apify spend unavailable; run not started');
     }
     if (rows.length >= SPEND_WINDOW_ROWS) return this.ceilingReached(record, null);
-    const committed = rows.filter(row => row.id !== record.id).reduce((total, row) => total + committedUsd(row, now), 0);
+    // A run of this process counts at least the limit it was started with until it settles: below one cent of
+    // reservation the limit is the larger figure.
+    const counted = (row: ApifySpendRecord) => Math.max(committedUsd(row, now),
+      row.accounting_complete ? 0 : this.chargeLimits.get(row.id) ?? 0);
+    const committed = rows.filter(row => row.id !== record.id).reduce((total, row) => total + counted(row), 0);
     const remaining = this.options.spendCeilingUsd! - committed;
     if (remaining < record.reserved_usd - CENT / 2) return this.ceilingReached(record, committed);
-    return remaining;
+    return Math.max(CENT, cents(Math.min(record.reserved_usd, remaining)));
   }
   private async reserve(request: ReserveApifyRun): Promise<{ reservation: ApifyRunReservation; chargeLimitUsd: number | null }> {
     if (this.options.spendCeilingUsd === null) return { reservation: await this.store.reserveApifyRun(request), chargeLimitUsd: null };
@@ -227,7 +242,7 @@ export class ApifyClient {
         return { items, metadata: this.metadata(record, { cached: true, chargedToScan: false }) };
       } finally { this.release(); }
     }
-    let run: RunState | null = null;
+    let run: RunState | null = null, startUncertain = false;
     try {
       if (reservation.decision === 'resume') record = await this.waitForRunId(record, signal);
       if (record.run_id) {
@@ -236,26 +251,28 @@ export class ApifyClient {
       } else if (reservation.decision === 'start') {
         if (this.options.now() < this.quotaBlockedUntil) await this.quotaExceeded(record);
         // Without a ceiling there is no maxTotalChargeUsd: spend is recorded in the ledger, not capped at the
-        // provider, and the run timeout is what bounds a single run. Under a ceiling the run may charge what the
-        // ceiling has left, which is what bounds a firm-wide search that asks for every lawyer of a firm. The limit
+        // provider, and the run timeout is what bounds a single run. Under a ceiling the run may charge its
+        // reservation, which is what bounds a firm-wide search that asks for every lawyer of a firm. The limit
         // travels in the URL: the stored input and the query fingerprint are the same with or without it.
         const parameters = new URLSearchParams({ waitForFinish: '60', timeout: String(this.options.runTimeoutSecs),
           build: this.options.build });
         if (chargeLimitUsd !== null) {
-          // Whole cents, rounded down; the hair added first keeps a sum such as 1.91 from landing on 1.90.
-          const limit = Math.max(CENT, Math.floor(chargeLimitUsd * 100 + 1e-6) / 100);
-          parameters.set('maxTotalChargeUsd', String(limit));
-          this.chargeLimits.set(record.id, limit);
+          parameters.set('maxTotalChargeUsd', String(chargeLimitUsd));
+          this.chargeLimits.set(record.id, chargeLimitUsd);
         }
         let start: unknown;
         try {
           start = await this.json(`acts/${encodeURIComponent(actor.replace('/', '~'))}/runs?${parameters}`, signal,
             { method: 'POST', body: JSON.stringify(input) });
         } catch (error) {
+          // Nothing will settle this row: the ledger counts an uncertain start by its status from here on.
+          this.chargeLimits.delete(record.id);
           // An HTTP refusal proves the run never started; only a lost response leaves it uncertain.
-          if (error instanceof ApifyHttpError) this.chargeLimits.delete(record.id);
           if (error instanceof ApifyHttpError && (error.status === 402 || USAGE_LIMIT.test(error.detail))) await this.quotaExceeded(record);
-          await this.store.updateApifyRun(record.id, { status: 'START_UNCERTAIN', last_error: 'Actor start response unavailable' });
+          if (!(error instanceof ApifyHttpError)) {
+            startUncertain = true;
+            await this.store.updateApifyRun(record.id, { status: START_UNCERTAIN, last_error: START_UNCERTAIN_REASON });
+          }
           throw error;
         }
         run = z.object({ data: Run }).parse(start).data;
@@ -309,10 +326,15 @@ export class ApifyClient {
       return { items, metadata };
     } catch (error) {
       if (error instanceof ApifyClientError) throw error;
-      const status = signal.aborted ? (run?.status ?? record.status) : (run?.status ?? 'UNAVAILABLE');
+      // A start that may have happened stays uncertain, also for a scan that only came to resume it: its row must
+      // keep counting against the ceiling.
+      const uncertain = run === null && !record.run_id && (startUncertain || record.status === START_UNCERTAIN);
+      const status = uncertain ? START_UNCERTAIN
+        : signal.aborted ? (run?.status ?? record.status) : (run?.status ?? 'UNAVAILABLE');
       await this.store.updateApifyRun(record.id, { status, run_id: run?.id ?? record.run_id,
         dataset_id: run?.defaultDatasetId ?? record.dataset_id, cost_usd: run?.usageTotalUsd ?? record.cost_usd,
-        last_error: signal.aborted ? 'Caller deadline reached; remote run retained for recovery' : 'Apify run unavailable' }).catch(() => {});
+        last_error: uncertain ? START_UNCERTAIN_REASON
+          : signal.aborted ? 'Caller deadline reached; remote run retained for recovery' : 'Apify run unavailable' }).catch(() => {});
       record = await this.store.getApifyRun(record.id) ?? record;
       throw new ApifyClientError('PROVIDER_ERROR', signal.aborted ? 'Apify run retained for recovery' : 'Apify run unavailable',
         record.run_id ? this.metadata(record, { resumed: reservation.decision === 'resume',
