@@ -2,7 +2,7 @@
 
 - **Fecha:** 2026-11-09
 - **Estado:** en implementación. Cada arreglo tiene su sección (§3 a §8) y la amplía la tarea que lo hace.
-  Hoy están hechos §3 y la parte de scoring de §4.
+  Hoy están hechos §3 y §4 (back).
 - **Repos:** `Arca-back` y `Arca-front`, rama `fix/live-scan-findings` en ambos
 - **Parte de:** DN-07 de crawl (§6, robots y web ilegible), DN-09 (modos), DN-10 y DN-11 (webapp)
 
@@ -118,8 +118,8 @@ El preajuste "Every source down" usa `website: error`, así que sigue dando FAIL
 preajuste para la web bloqueada: los preajustes viven en `@arca/contracts/debug` y D6 no deja tocarlo. El eje
 `blocked` ya se puede elegir en el panel.
 
-**Caché.** Un PARTIAL de web bloqueada entra en la caché de scans como cualquier PARTIAL: hoy se sirve
-durante 1 hora y después se vuelve a ejecutar. Que se sirva los 7 días es D5 (§4).
+**Caché.** Un PARTIAL de web bloqueada es de causa definitiva, así que se sirve de la caché de scans durante
+toda la ventana de 7 días (D5, §4.2).
 
 **Tests.** `packages/scoring/tests/unreadable-website.test.ts`, `apps/api/tests/unit/pipeline.test.ts`
 (definitiva frente a transitoria, con el website source real sobre un crawl inyectado),
@@ -132,9 +132,188 @@ bloqueó") y el aviso de web ilegible en `/score` y en `/assessment/results`.
 
 ## 4. Mismo despacho, mismo score (F5, D5)
 
-Hecho: la misma evidencia da el mismo resultado en cualquier orden (DN-03, "Mismo resultado en cualquier orden").
+Hecho en el back. La garantía tiene tres capas, de arriba abajo:
 
-Pendiente: servir un PARTIAL estructural o definitivo durante toda la ventana de caché.
+| Capa | Qué garantiza | Dónde |
+|---|---|---|
+| Caché de scans | Dentro de la ventana (`SCAN_CACHE_TTL_MS`, 7 días) el resultado guardado **es** la respuesta, también un PARTIAL de causa estructural o definitiva | `apps/api/src/http/scan-cache.ts`, usado por `startScan` en `app.ts` |
+| Señales del website | Si el scan se vuelve a ejecutar y el sitio dice lo mismo, se reutiliza el análisis guardado: mismas señales, misma identidad, mismas consultas a Apify, cero llamadas al modelo | `apps/api/src/pipeline/website-source.ts` |
+| Scoring | La misma evidencia da el mismo resultado en cualquier orden | `packages/scoring` (DN-03, "Mismo resultado en cualquier orden") |
+
+Solo la primera capa garantiza el caso de Jesús. Las otras dos hacen que una re-ejecución (reparación,
+fin de la ventana, ejecución forzada) cambie el score solo cuando cambió algo real.
+
+### 4.1 Qué pasaba
+
+Un PARTIAL se servía de caché 1 hora y después se re-ejecutaba entero: crawl nuevo y extracción nueva con un
+modelo de razonamiento sin semilla. El scan de Jesús era PARTIAL por causas que ningún reintento arregla
+(Avvo omitido porque la web no muestra ciudad ni abogados), así que nunca podía llegar a COMPLETED y cada
+hora volvía a tirar los dados.
+
+### 4.2 Tabla de causas (D5) **[mía]**
+
+La tabla está escrita una sola vez, en `scan-cache.ts`. Lee solo `status` y `code` de cada fuente del
+resultado guardado: el código lo elige quien construye el estado según la causa, igual que en §3.2.
+
+**Website**
+
+| Estado guardado | Clase | Por qué |
+|---|---|---|
+| `ok` | — | Se leyó entero |
+| `partial` sin código | ESTRUCTURAL | Se leyó hasta donde el sitio deja: una página responde 401/403 o un desafío, viene vacía o da otro 4xx. El crawler no reintenta esas páginas y un segundo scan tampoco las leería |
+| `partial` + `DEADLINE_REACHED` | TRANSITORIA | El plazo cortó el crawl |
+| `partial` + `PROVIDER_ERROR` | TRANSITORIA | Una página propia falló por algo pasajero y agotó sus reintentos (error de red, 5xx, 429, robots inalcanzable para esa página) |
+| `error` + `ACCESS_BLOCKED` | ESTRUCTURAL | El resultado `WEBSITE_UNAVAILABLE` (D4) |
+| Cualquier otro `error` o `timeout` | TRANSITORIA | En la práctica el scan terminó FAILED y no está en la caché |
+
+**Bar y Avvo**
+
+| Estado guardado | Clase | Por qué |
+|---|---|---|
+| `ok` (con o sin `NO_MATCH`) | — | Respondió |
+| `skipped` + `INSUFFICIENT_IDENTITY` | ESTRUCTURAL | No hay a quién buscar: la web no muestra abogados ni ciudad |
+| `NO_MATCH` en un estado que no es `ok` | ESTRUCTURAL | Nadie coincide |
+| `partial` + `TRUNCATED` | ESTRUCTURAL | Página de resultados llena. El run de Apify queda cacheado 7 días, así que repetir da lo mismo |
+| `timeout`, o cualquier estado con `DEADLINE_REACHED` | TRANSITORIA | Plazo |
+| `PROVIDER_ERROR` | TRANSITORIA | Fallo del proveedor, incluido el límite de uso de Apify |
+| `PROVIDER_CONTRACT_ERROR` | TRANSITORIA | El actor devolvió otra forma: es un fallo del proveedor o nuestro, no un dato de la firma |
+| Sin código, o un código desconocido | TRANSITORIA | Ante la duda se repara, que es lo que se hacía con todo PARTIAL |
+
+La clase del resultado es la peor de las tres fuentes: **una sola causa transitoria basta para repararlo**.
+
+| Scan guardado dentro de la ventana | Qué hace `POST /scan` |
+|---|---|
+| COMPLETED | 200 con el resultado guardado y `cached: true`, como antes |
+| PARTIAL, todo estructural | 202 y el resultado guardado llega por polling con `cached: true`, **toda la ventana** |
+| PARTIAL con alguna causa transitoria | Igual durante `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` (1 hora) desde que terminó; después se ejecuta de nuevo, y esa ejecución pasa a ser la respuesta |
+| FAILED, o nada | Se ejecuta |
+
+Para que la caché pueda distinguir, el website `partial` ahora lleva código (`partialCrawlCode`, en
+`website-outcome.ts`). Son valores que el enum del contrato 0.4.0 ya tenía y el front no lee el código de
+las fuentes, así que no cambia nada en el formato (D6).
+
+**Resultados guardados antes de este cambio.** Un website `partial` antiguo no lleva código y no puede decir
+si lo cortó el plazo o un enlace muerto. **[mía]** Se trata como estructural y se sirve tal cual: lo que D5
+protege es el score que el despacho ya vio, la ambigüedad desaparece sola 7 días después del despliegue (esas
+filas caducan), y si alguna hiciera falta rehacerla está §4.4. El scan de Jesús (`immigrationlawfla.com`,
+2026-11-06: website `partial` con datos y sin código, Avvo `skipped` por `INSUFFICIENT_IDENTITY`, Bar `ok`)
+no tiene registrada ninguna causa transitoria, así que **se sirve hasta el final de su ventana**, alrededor
+del 2026-11-13 19:32 UTC. De hecho su `partial` era un enlace muerto, que hoy ni siquiera cuenta (D2).
+
+**Riesgo aceptado.** Un resultado mal extraído también queda fijado 7 días, y no hay forma pública de
+refrescarlo. La salida es §4.4.
+
+### 4.3 Reutilización de señales del website
+
+Debajo de la caché de scans, `WebsiteExtractionSource` reutiliza el análisis guardado en `scan_raw_data`.
+Antes la clave era el sha256 del HTML crudo y solo se miraba la fila más reciente: cualquier nonce o marca
+de tiempo obligaba a pagar el modelo otra vez, con otro resultado posible.
+
+- **Clave.** Un hash de lo que el modelo lee, no del HTML: por página y en orden de URL, el texto tal como
+  lo parte el corpus, los metadatos que el corpus extrae (título, descripción, JSON-LD) y los enlaces que
+  ofrece (`corpusFingerprint`, en `evidence-corpus.ts`), más `provider.id` y `provider.version`.
+- **Versión de extracción.** La del extractor agéntico es ahora
+  `agentic-signals-v5:openai:<modelo>:<esfuerzo de razonamiento>:<hash>`, donde el hash cubre los cuatro
+  prompts y los parámetros de la petición (`extractionVersion`). Editar un prompt invalida los análisis
+  guardados sin que nadie tenga que acordarse de subir `EXTRACTION_VERSION`, que sigue siendo manual para
+  lo que el hash no ve (el flujo, las reglas de grounding). Los proveedores `openai` (una pasada) y `rules`
+  conservan su versión fija.
+- **Búsqueda.** El registro guardado lleva dos marcas de texto plano: `wsk1-<hash>` (la clave) y
+  `wsf1-<hash>` (versión de extracción, solo si el crawl fue completo). `findRaw` le pide a la base de datos
+  las filas del dominio que contienen la marca (un `LIKE` sobre `raw_content`) y devuelve solo ids; después
+  `rawOf` lee **una** fila. Un acierto cuesta una lectura grande y un fallo ninguna (antes: una lectura
+  grande siempre). Se miran como mucho 3 candidatas.
+- **Filas sin análisis.** Una extracción fallida no lleva marca, así que nunca se elige. Una fila dañada o
+  de otra versión se salta y se prueba la siguiente.
+- **Edad máxima.** `WEBSITE_SIGNAL_REUSE_MAX_AGE_MS`, 30 días, contados desde el día en que el modelo
+  produjo el análisis (`reuse.analyzedAt`), no desde la última vez que se reutilizó: reutilizar no
+  rejuvenece. `0` desactiva la reutilización.
+- **Si falla la búsqueda.** Se registra en el log y se extrae de nuevo. Cuesta una llamada al modelo,
+  nunca el scan. Antes, un timeout de Supabase en esa lectura dejaba la fuente en `error`.
+- **Nunca a peor.** Si el crawl nuevo quedó `partial` y hay un análisis de un crawl completo dentro de la
+  edad máxima (misma versión, con al menos tantas páginas), se conserva ese. El estado sigue describiendo
+  el crawl de hoy (`partial`, sus páginas, su código) y el motivo añade "signals kept from the complete
+  reading of <fecha>".
+- **Sin migración.** Todo vive dentro del JSON de `raw_content`. Las filas anteriores a este cambio no
+  llevan marca: la primera re-ejecución de cada dominio extrae una vez y a partir de ahí reutiliza.
+- **Auditoría.** La fila que reutiliza guarda `reuse.from` con el scan que pagó la extracción y no copia
+  los intentos del modelo (`diagnostics`), que siguen en aquella fila.
+
+**Límites conocidos.**
+
+- La clave cubre las páginas del crawl inicial. Lo que el agente lee después (la página "about" que pide
+  el plan de páginas, un PDF) queda fuera: un cambio solo ahí no se ve hasta que caduca la edad máxima.
+- Sigue dependiendo del conjunto de páginas: un crawl con una página de más o de menos es otra clave. Por
+  eso es un ahorro y un estabilizador, no la garantía; la garantía es §4.2.
+- El `LIKE` no se pudo probar contra PostgREST real (la única base de datos es producción). El test del
+  adaptador fija la consulta exacta que se envía. Si en `live-debug` un segundo scan del mismo sitio vuelve
+  a llamar al modelo sin que el texto haya cambiado, hay que mirar esa consulta primero.
+
+### 4.4 Forzar una ejecución nueva
+
+Solo con variables de entorno del arranque, sin cabecera y sin cambio de contrato (D5, D6). Las variables
+del shell ganan a `.env.local`, que no se toca.
+
+| Variable | Valor | Efecto |
+|---|---|---|
+| `SCAN_CACHE_TTL_MS` | `1` | Ningún scan guardado cae dentro de la ventana: todo `POST /scan` ejecuta el pipeline |
+| `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` | `0` | Obligatoria junto a la anterior: el cooldown no puede superar al TTL y el arranque lo rechaza |
+| `WEBSITE_SIGNAL_REUSE_MAX_AGE_MS` | `0` | Opcional: además el modelo vuelve a leer el sitio. Sin ella se re-ejecuta el crawl pero se reutilizan las señales si el texto no cambió |
+
+En PowerShell, para una sesión de `live-debug`:
+
+```powershell
+$env:SCAN_CACHE_TTL_MS='1'; $env:SCAN_PARTIAL_REPAIR_COOLDOWN_MS='0'; $env:WEBSITE_SIGNAL_REUSE_MAX_AGE_MS='0'
+npm run stack -- live-debug
+```
+
+Después se escanea el despacho una vez, se para el back y se arranca sin esas variables (en una terminal
+nueva, o con `Remove-Item Env:SCAN_CACHE_TTL_MS, Env:SCAN_PARTIAL_REPAIR_COOLDOWN_MS, Env:WEBSITE_SIGNAL_REUSE_MAX_AGE_MS`).
+El scan nuevo es la fila más reciente del dominio y pasa a ser la respuesta de la ventana.
+
+Lo que estas variables **no** fuerzan: las consultas de Apify. Cada run guarda su caducidad al terminar (7
+días), y `APIFY_QUERY_CACHE_TTL_MS` solo afecta a los runs que terminen a partir de ahora. Es deliberado:
+esa parte cuesta dinero y la evidencia de un directorio no cambia en días.
+
+Mientras el back corre con esos valores, **todos** los scans se ejecutan de nuevo, no solo el que interesa.
+No hay que dejarlos puestos, y nunca van en `deploy/production.env`.
+
+### 4.5 Test de repetición
+
+`apps/api/tests/integration/replay-determinism.test.ts` ejecuta el pipeline real (website source,
+extracción agéntica, grounding, cliente y libro de Apify, directorios, scoring) sobre grabaciones, sin red,
+sin Chromium y sin proveedores:
+
+- un sitio pequeño escrito a mano (`fixtures/replay/harbor-vale/site.ts`), de una firma que no existe;
+- respuestas del modelo indexadas por el hash del prompt (`llm.json`);
+- items de Apify indexados por actor e input (`apify.json`).
+
+Comprueba que dos ejecuciones sobre almacenamientos nuevos dan el mismo resultado salvo ids, fechas y
+duraciones; que una tercera sobre el almacenamiento de la primera no llama al modelo ni arranca ningún
+actor y da el mismo `preScore`, señales y flags; que un crawl con ruido en el HTML (nonce, marca de
+tiempo, script) reutiliza las señales, y que un texto cambiado no.
+
+Las respuestas grabadas están **escritas a mano** (`scripted-model.ts`): nunca se llamó a un modelo. Como la
+clave es el hash del prompt, el test también avisa de un prompt que cambió: falla y dice cuál. Tras un
+cambio deliberado de prompt o de corpus se regraba con
+`REPLAY_RECORD=1 npx vitest run apps/api/tests/integration/replay-determinism.test.ts`.
+
+**Otros tests.** `apps/api/tests/unit/scan-cache.test.ts` (cada fila de la tabla),
+`apps/api/tests/integration/same-score.test.ts` (por HTTP: COMPLETED, PARTIAL estructural y web bloqueada
+devuelven el mismo `preScore` a los 6 días; un PARTIAL transitorio se re-ejecuta al acabar el cooldown),
+`flow.test.ts` (la forma del scan de Jesús), `sources.test.ts` ("website signal reuse"),
+`website-outcome.test.ts` (el código del `partial`) y `supabase-repository.test.ts` (las dos consultas nuevas).
+
+### 4.6 Lo que queda fuera
+
+- **Procedencia en el resultado** (`meta.evidence` con la versión de extracción y el hash del corpus) y
+  una **cabecera de re-ejecución forzada**: las dos necesitan publicar una versión nueva del contrato.
+- **Versión de scoring en la clave de caché.** Los resultados guardados conservan el `preScore` con el que
+  se calcularon hasta 7 días después de un cambio de scoring. La única palanca de invalidación es
+  `LAYER1_CONTRACT_VERSION`, que D6 no deja tocar.
+- **Variación del modelo en origen** (semilla, votos): cuesta tokens y no se pudo medir sin llamar a OpenAI.
+- **Reglas que dependen de la fecha** (experiencia, antigüedad de una sanción, edad de la firma): usan la
+  fecha del scan por diseño (DN-01). Dentro de la ventana no se nota porque se sirve el resultado guardado.
 
 ## 5. Control de coste (F6)
 

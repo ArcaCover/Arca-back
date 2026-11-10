@@ -115,14 +115,24 @@ Una web que no se puede leer no siempre falla el scan (DN-12):
 La clasificación está en un solo sitio, `classifyUnreadableWebsite` (`@arca/scoring`); la tabla de causas, en el DN-07 de crawl, §6.
 
 La caché dura `SCAN_CACHE_TTL_MS` por dominio canónico, 7 días por defecto, y nunca reutiliza FAILED.
-**Un cache hit siempre es COMPLETED.** Un scan que quedó PARTIAL sí entra en la caché, pero no se
-devuelve tal cual: se re-ejecuta reutilizando el análisis de website por hash de contenido y las
-consultas de directorio vigentes, de modo que solo se repara la evidencia que falta, y el solicitante
-recibe el resultado reparado. Devolverlo sin reparar congelaría el fallo durante toda la ventana.
-La reparación se intenta como mucho una vez por `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` (1 hora por defecto):
-dentro de ese intervalo se sirve la última reparación como PARTIAL con `cached=true`, siempre por
-polling (202 y después `GET /scan/:scanId`), nunca en el 200 rápido. Una fuente caída de forma
-permanente se sigue reintentando, pero no a costa de hacer esperar a cada visitante.
+**Mismo despacho, mismo score (DN-12 §4).** Dentro de la ventana, el resultado guardado es la respuesta:
+
+- Un COMPLETED se devuelve en el 200 rápido con `cached=true`.
+- Un PARTIAL cuyos huecos volvería a encontrar un segundo scan (un directorio omitido por
+  `INSUFFICIENT_IDENTITY`, `NO_MATCH`, `TRUNCATED`, la web que no se deja leer, un website leído hasta
+  donde el sitio permite) se sirve tal cual **toda la ventana**, siempre por polling (202 y después
+  `GET /scan/:scanId`), nunca en el 200 rápido.
+- Un PARTIAL con una causa transitoria (plazo, error del proveedor, límite de uso de Apify, crawl cortado
+  por el plazo) se sirve durante `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` (1 hora por defecto) y después se
+  re-ejecuta, una vez por intervalo: una fuente que sigue fallando se reintenta, pero no a costa de hacer
+  esperar a cada visitante.
+
+La tabla de causas está en un solo sitio, `apps/api/src/http/scan-cache.ts`. Una re-ejecución reutiliza
+el análisis de website guardado mientras el sitio diga lo mismo (clave: lo que lee el modelo, no el HTML;
+edad máxima `WEBSITE_SIGNAL_REUSE_MAX_AGE_MS`, 30 días) y las consultas de directorio vigentes, así que
+solo se repara la evidencia que falta. Para forzar una ejecución nueva de un despacho ya cacheado se
+arranca el back con `SCAN_CACHE_TTL_MS=1`, `SCAN_PARTIAL_REPAIR_COOLDOWN_MS=0` y, si además debe leer
+el modelo otra vez, `WEBSITE_SIGNAL_REUSE_MAX_AGE_MS=0` (DN-12 §4.4).
 Un scan solo queda PARTIAL después de que cada página recuperable agotó sus reintentos.
 `APIFY_QUERY_CACHE_TTL_MS` se mantiene acoplado a `SCAN_CACHE_TTL_MS`: si expirara antes, cada
 reparación volvería a pagar las consultas de directorio que debía reutilizar.

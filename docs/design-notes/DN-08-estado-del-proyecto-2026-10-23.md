@@ -200,8 +200,8 @@ Navegador ──> Arca-front (Next 16, Vercel)          [solo páginas; no hay r
 
 | Caché | Clave y TTL | Peculiaridades |
 |---|---|---|
-| Scan por dominio | Dominio, misma `contractVersion`, COMPLETED o PARTIAL; `SCAN_CACHE_TTL_MS` = 7 días | Un COMPLETED se re-sella para el nuevo solicitante. Un PARTIAL se vuelve a ejecutar si la última reparación tiene más de 1 h. Un FAILED nunca se reutiliza. El TTL no puede valer 0. |
-| Análisis del website | `provider.id`, `version` y el sha256 del HTML | Es frágil: un nonce en el HTML obliga a pagar el LLM otra vez, y solo se mira el **último** raw del dominio. |
+| Scan por dominio | Dominio, misma `contractVersion`, COMPLETED o PARTIAL; `SCAN_CACHE_TTL_MS` = 7 días | Un COMPLETED se re-sella para el nuevo solicitante. Un PARTIAL de causa estructural o definitiva también, toda la ventana; solo uno con una causa transitoria se vuelve a ejecutar si su última ejecución tiene más de 1 h (2026-11-09; DN-12 §4.2). Un FAILED nunca se reutiliza. El TTL no puede valer 0. |
+| Análisis del website | `provider.id`, `version` (con modelo, esfuerzo y hash de los prompts) y un hash de lo que lee el modelo: texto, metadatos y enlaces por página; `WEBSITE_SIGNAL_REUSE_MAX_AGE_MS` = 30 días | Desde 2026-11-09 (DN-12 §4.3) un nonce en el HTML ya no obliga a pagar el LLM. Se buscan hasta 3 filas por una marca, se saltan las que no tienen análisis y un crawl cortado conserva el análisis del completo. Sigue dependiendo del conjunto de páginas. |
 | Búsquedas de Apify | sha256 de actor, build e input; 7 días | Estados reuse, resume, failed (15 min de cooldown) y start. Un run truncado o parcial queda cacheado 7 días, así que reparar ese PARTIAL repite el mismo resultado. |
 
 **Tiempos:**
@@ -250,7 +250,7 @@ La UI y `CLAUDE.md` prometen "menos de 60 s" y no se corresponden con nada de es
 2. **Sesgo contra firmas de fuera de Florida.** Bar solo consulta la Florida Bar. Las búsquedas sin match quedan `ok/EMPTY` con consistencia 0, lo que da B3 −5 y el flag `LOW_BAR_CONSISTENCY`. La etiqueta "Florida Bar" está fija en `views.ts:22` y `report/quick-scan.ts:23`.
 3. **Una sanción reciente resta menos que una antigua.** Menos de 12 meses resta 0 puntos (la cubre el override); de 1 a 3 años resta −12 (`discipline.ts:51`). No hay justificación documentada.
 4. **El extractor `agentic` no puede producir dos penalizaciones:** `website_quality: 'minimal'` (W7 −3) ni `no_team_page` (W5a −2). Solo existen con `rules`, `openai` o los mocks (`derived-signals.ts:47,58`).
-5. **Es fácil quedar en PARTIAL para siempre.** Un run de Apify truncado y cacheado 7 días deja el scan en PARTIAL de forma persistente. Un 404 estable dentro del crawl ya no (2026-11-09; DN-07 de crawl, §6).
+5. **Es fácil quedar en PARTIAL para siempre.** Un run de Apify truncado y cacheado 7 días deja el scan en PARTIAL de forma persistente. Un 404 estable dentro del crawl ya no (2026-11-09; DN-07 de crawl, §6). Y un PARTIAL de causa estructural ya no se re-ejecuta cada hora: se sirve toda la ventana (2026-11-09; DN-12 §4.2).
 6. **El abort descarta el raw del website.** El run de Apify queda en el ledger, pero el raw se pierde (también lo señala DN-06:33).
 
 **El modo mock de hoy** (`SOURCE_MODE=mock`; `server.ts:30-47`, `pipeline/mock-sources.ts`):
@@ -438,7 +438,8 @@ Los tests afirman los totales 82, 25 y 72 y los estados de `robust`, `partial`, 
 | `SIGNAL_LLM_REASONING_EFFORT` | — | Solo para modelos de razonamiento; el planner no lo usa. |
 | `ASSESSMENT_PLANNER` | `rules` | `agent` solo actúa en live. |
 | `PIPELINE_TIMEOUT_MS` | 600 000 | Presupuesto del pipeline; +120 s es el umbral de recuperación. |
-| `SCAN_CACHE_TTL_MS` / `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` | 7 días / 1 h | El TTL tiene que ser > 0. |
+| `SCAN_CACHE_TTL_MS` / `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` | 7 días / 1 h | El TTL tiene que ser > 0. El cooldown solo aplica a un PARTIAL con causa transitoria (DN-12 §4.2). |
+| `WEBSITE_SIGNAL_REUSE_MAX_AGE_MS` | 30 días | Edad máxima de un análisis de website reutilizado; `0` extrae siempre (DN-12 §4.3 y §4.4). |
 | `MAX_APIFY_CONCURRENCY` | 16 | Limita la concurrencia, **no el gasto**. |
 | `APIFY_ACTOR_BUILD` | `latest` | Sin fijar. |
 | `APIFY_EXPECTED_COST_USD_PER_RUN` | 1 | Reserva contable, **no es un tope**. |
