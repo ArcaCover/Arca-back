@@ -43,7 +43,6 @@ export interface ScanRepository {
   complete(scanId: string, update: Pick<ScanRecord, 'status' | 'result' | 'completed_at' | 'duration_ms'>): Promise<void>;
   cached(domain: string, since: string): Promise<ScanRecord | null>;
   saveRaw(record: RawRecord): Promise<void>;
-  latestRaw(domain: string, source: SourceName): Promise<RawRecord | null>;
   /**
    * Which stored raw records of a domain's source carry `marker` in their content, newest first: fetched since
    * `since`, at most `limit`. It returns no content, which is megabytes for a website: read one record with `rawOf`.

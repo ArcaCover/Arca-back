@@ -31,12 +31,6 @@ export class SupabaseRepository implements ScanRepository {
     const { error } = await this.client.from('scan_raw_data').insert(record);
     if (error) throw new Error('Unable to save evidence', { cause: error });
   }
-  async latestRaw(domain: string, source: SourceName): Promise<RawRecord | null> {
-    const { data, error } = await this.client.from('scan_raw_data').select('*, scans!inner(canonical_domain)')
-      .eq('scans.canonical_domain', domain).eq('source', source).order('fetched_at', { ascending: false }).limit(1).maybeSingle();
-    if (error) throw new Error('Unable to read evidence', { cause: error });
-    return data;
-  }
   // The database searches the content and returns ids only: a website record is megabytes, and the storage
   // client gives every request five seconds.
   async findRaw(domain: string, source: SourceName, marker: string, since: string, limit: number): Promise<RawReference[]> {

@@ -17,7 +17,7 @@ const raw = (scanId: string): RawRecord => ({ scan_id: scanId, source: 'website'
 // Every method of the interface is a spy, so a call that reaches durable storage cannot go unnoticed.
 function durableScans() {
   return { create: vi.fn(async () => {}), get: vi.fn(async () => null), complete: vi.fn(async () => {}),
-    cached: vi.fn(async () => null), saveRaw: vi.fn(async () => {}), latestRaw: vi.fn(async () => null),
+    cached: vi.fn(async () => null), saveRaw: vi.fn(async () => {}),
     findRaw: vi.fn(async () => []), rawOf: vi.fn(async () => null),
     recoverInterrupted: vi.fn(async () => {}), reserveApifyRun: vi.fn(async () => ({ decision: 'failed' as const, record: null, chargedToScan: false })),
     getApifyRun: vi.fn(async () => null), pendingApifyAccounting: vi.fn(async () => []), updateApifyRun: vi.fn(async () => {}),
@@ -76,11 +76,8 @@ describe('scan repository routing', () => {
       result: { meta: { contractVersion: LAYER1_CONTRACT_VERSION } } as Layer1Result }));
     await repository.saveRaw(raw('sc_i'));
     expect(await overlay.cached('firm.com', '2026-01-01T00:00:00.000Z')).not.toBeNull();
-    expect(await overlay.latestRaw('firm.com', 'website')).not.toBeNull();
     expect(await repository.cached('firm.com', '2026-01-01T00:00:00.000Z')).toBeNull();
-    expect(await repository.latestRaw('firm.com', 'website')).toBeNull();
     expect(durable.cached).toHaveBeenCalledWith('firm.com', '2026-01-01T00:00:00.000Z');
-    expect(durable.latestRaw).toHaveBeenCalledWith('firm.com', 'website');
     // The analysis an injected scan stored is never the one a clean scan reuses.
     const marker = `wsk1-${'ab'.repeat(32)}`;
     await repository.saveRaw({ ...raw('sc_i'), raw_content: JSON.stringify({ reuse: { key: marker } }) });

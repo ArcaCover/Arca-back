@@ -43,7 +43,7 @@ async function verify() {
     assert.ifError(raw.error);
     assert.deepEqual(raw.data?.map(row => row.source).sort(), ['avvo', 'bar', 'website']);
     assert(raw.data?.every(row => /^[a-f0-9]{64}$/.test(row.content_hash)));
-    assert(await repository.latestRaw(canonicalDomain, 'website'));
+    assert(await repository.rawOf(ids[0]!, 'website'));
     const cached = await repository.cached(canonicalDomain, started);
     assert.equal(cached?.result?.preScore.total, 82);
     await repository.create({ ...makeScan(ids[1]!), status: 'COMPLETED', cached: true,

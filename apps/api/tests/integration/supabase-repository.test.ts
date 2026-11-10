@@ -20,16 +20,6 @@ describe('Supabase Data API adapter', () => {
     });
     expect(await repository.cached('firm.com', '2026-09-07T00:00:00.000Z')).toBeNull();
   });
-  it('joins raw evidence to its canonical domain through PostgREST', async () => {
-    const { repository } = setup(url => {
-      expect(url.pathname).toBe('/rest/v1/scan_raw_data');
-      expect(url.searchParams.get('select')).toBe('*,scans!inner(canonical_domain)');
-      expect(url.searchParams.get('scans.canonical_domain')).toBe('eq.firm.com');
-      expect(url.searchParams.get('source')).toBe('eq.website');
-      return Response.json([]);
-    });
-    expect(await repository.latestRaw('firm.com', 'website')).toBeNull();
-  });
   it('lets the database search raw evidence for a marker and returns ids, never the content', async () => {
     const marker = `wsk1-${'ab12'.repeat(16)}`;
     const { repository, request } = setup(url => {

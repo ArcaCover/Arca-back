@@ -31,10 +31,6 @@ export class InMemoryRepository implements ScanRepository {
       .sort((a, b) => b.completed_at!.localeCompare(a.completed_at!))[0] ?? null);
   }
   async saveRaw(record: RawRecord) { this.raw.push(structuredClone(record)); }
-  async latestRaw(domain: string, source: SourceName) {
-    return structuredClone(this.raw.filter(r => r.source === source && this.scans.get(r.scan_id)?.canonical_domain === domain)
-      .sort((a, b) => b.fetched_at.localeCompare(a.fetched_at))[0] ?? null);
-  }
   async findRaw(domain: string, source: SourceName, marker: string, since: string, limit: number) {
     if (!RAW_MARKER.test(marker)) throw new Error('Invalid raw evidence marker');
     return this.raw.filter(r => r.source === source && this.scans.get(r.scan_id)?.canonical_domain === domain &&
