@@ -10,6 +10,14 @@ const html = (body: string, status = 200) => ({ status, headers: { 'content-type
 const path = (url: string) => new URL(url).pathname;
 const listed = (result: CrawlResult) => (result.issues ?? [])
   .map(issue => `${issue.scope} ${issue.code} ${issue.status} ${new URL(issue.url).host}${path(issue.url)}`).sort();
+// The browser follows a redirect with its own network, so a loopback server stands for the www host behind one.
+async function loopback(handler: Parameters<typeof createServer>[1]) {
+  const server = createServer(handler);
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as { port: number };
+  return { port, hostResolverRules: `MAP www.fixture.example 127.0.0.1:${port}`,
+    close: async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); } };
+}
 
 it('renders real browser pages, respects robots, depth and text visibility without external traffic', async () => {
   const visited: string[] = [];
@@ -144,8 +152,7 @@ it('records decided pages, a refused XHR and a failed third-party script without
 
 it('takes a file behind a redirect for a link to non-HTML content, not for a page that failed', async () => {
   // A site that redirects its bare domain to www answers every link with a 301 first, and the browser follows a
-  // redirect with its own network stack, so the file arrives as a download. A loopback server stands for the www
-  // host: no request leaves the machine.
+  // redirect with its own network stack, so the file arrives as a download. No request leaves the machine.
   const files: Record<string, Record<string, string>> = {
     '/card': { 'content-type': 'text/vcard', 'content-disposition': 'attachment; filename="jane.vcf"' },
     '/brochure': { 'content-type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
@@ -153,12 +160,10 @@ it('takes a file behind a redirect for a link to non-HTML content, not for a pag
     '/feed': { 'content-type': 'application/rss+xml' },
   };
   const served: string[] = [];
-  const server = createServer((request, response) => {
+  const www = await loopback((request, response) => {
     served.push(request.url ?? '');
     response.writeHead(200, files[request.url ?? '']).end(request.url === '/feed' ? '<rss></rss>' : 'PK');
   });
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address() as { port: number };
   const requested: string[] = [];
   try {
     const result = await crawlWebsite('fixture.example', new AbortController().signal, {
@@ -167,9 +172,9 @@ it('takes a file behind a redirect for a link to non-HTML content, not for a pag
         requested.push(path(raw));
         if (path(raw) === '/') return html(`Smith Law<a href="/about">About</a>${Object.keys(files).map(file => `<a href="${file}">File</a>`).join('')}`);
         if (path(raw) === '/about') return html('About the firm');
-        return { status: 301, headers: { location: `http://127.0.0.1:${port}${path(raw)}` }, body: Buffer.alloc(0) };
+        return { status: 301, headers: { location: `http://www.fixture.example${path(raw)}` }, body: Buffer.alloc(0) };
       },
-    });
+    }, { hostResolverRules: www.hostResolverRules });
     expect(result.pages.map(page => path(page.url))).toEqual(['/', '/about']);
     expect(result.partial).toBe(false);
     expect(listed(result)).toEqual([
@@ -184,7 +189,7 @@ it('takes a file behind a redirect for a link to non-HTML content, not for a pag
     expect(requested.sort()).toEqual(['/', '/about', '/brochure', '/card', '/feed', '/report']);
     expect(served.sort()).toEqual(['/brochure', '/card', '/feed', '/report']);
   } finally {
-    await new Promise(resolve => server.close(resolve));
+    await www.close();
   }
 }, 30_000);
 
@@ -192,32 +197,97 @@ it('drops the download of a file it will not read', async () => {
   // The server never finishes the file, so only the browser giving the download up closes the connection.
   let drop!: () => void;
   const dropped = new Promise<true>(resolve => { drop = () => resolve(true); });
-  const server = createServer((_request, response) => {
+  const www = await loopback((_request, response) => {
     response.on('close', drop);
     response.writeHead(200, { 'content-type': 'application/zip' }).write('PK');
   });
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address() as { port: number };
   let droppedBeforeNextPage = false;
   try {
     const result = await crawlWebsite('fixture.example', new AbortController().signal, {
       robots: async () => ({ status: 404, text: '' }),
       response: async raw => {
         if (path(raw) === '/') return html('Smith Law<a href="/archive">Archive</a><a href="/later">Later</a>');
-        if (path(raw) === '/archive') return { status: 301, headers: { location: `http://127.0.0.1:${port}/archive` }, body: Buffer.alloc(0) };
+        if (path(raw) === '/archive') return { status: 301, headers: { location: 'http://www.fixture.example/archive' }, body: Buffer.alloc(0) };
         // One page at a time, so this page is asked for after the file. The wait ends as soon as the connection
         // closes; the timer only bounds a crawler that kept the download running.
         droppedBeforeNextPage = await Promise.race([dropped, sleep(5000, false, { ref: false })]);
         return html('Later');
       },
-    }, { concurrency: 1 });
+    }, { concurrency: 1, hostResolverRules: www.hostResolverRules });
     expect(result.pages.map(page => path(page.url))).toEqual(['/', '/later']);
     expect(listed(result)).toEqual(['page NOT_HTML null fixture.example/archive']);
     expect(result.partial).toBe(false);
     expect(droppedBeforeNextPage).toBe(true);
   } finally {
-    server.closeAllConnections();
-    await new Promise(resolve => server.close(resolve));
+    await www.close();
+  }
+}, 30_000);
+
+it('does not follow a link that redirects off the site, and does not count it as a failure', async () => {
+  // Law firm sites send /pay, /book or /reviews to LawPay, Calendly or Google. That is the site's answer about the link.
+  const robots: string[] = [], requested: string[] = [];
+  const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async url => { robots.push(url); return { status: 404, text: '' }; },
+    response: async raw => {
+      requested.push(raw);
+      if (path(raw) === '/') return html('Smith Law<a href="/book">Book</a><a href="/about">About</a>');
+      if (path(raw) === '/book') return { status: 302, headers: { location: 'https://calendly.example/smith' }, body: Buffer.alloc(0) };
+      return html('About the firm');
+    },
+  });
+  expect(result.pages.map(page => path(page.url))).toEqual(['/', '/about']);
+  expect(result.partial).toBe(false);
+  expect(listed(result)).toEqual(['page OFF_SITE_REDIRECT 302 fixture.example/book']);
+  expect(result.issues?.find(issue => issue.code === 'OFF_SITE_REDIRECT')?.detail).toBe('calendly.example');
+  expect(crawlNotes(result)).toBe('1 link redirecting to another site');
+  // Asked once, and the other host is never asked for anything, its robots.txt included.
+  expect(requested.filter(url => path(url) === '/book')).toHaveLength(1);
+  expect(requested.some(url => url.includes('calendly'))).toBe(false);
+  expect(robots).toEqual(['https://fixture.example/robots.txt']);
+}, 30_000);
+
+it('keeps a redirect to an address outside the site away from the browser and out of the firm\'s pages', async () => {
+  const hits: string[] = [];
+  const internal = await loopback((request, response) => {
+    hits.push(request.url ?? '');
+    response.writeHead(200, { 'content-type': 'text/html' }).end('<body>INTERNAL ONLY CONTENT</body>');
+  });
+  try {
+    const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+      robots: async () => ({ status: 404, text: '' }),
+      response: async raw => path(raw) === '/' ? html('Smith Law<a href="/go">Go</a>')
+        : { status: 302, headers: { location: `http://127.0.0.1:${internal.port}/latest/meta-data` }, body: Buffer.alloc(0) },
+    });
+    expect(result.pages.map(page => path(page.url))).toEqual(['/']);
+    expect(result.pages.some(page => page.text.includes('INTERNAL'))).toBe(false);
+    expect(listed(result)).toEqual(['page OFF_SITE_REDIRECT 302 fixture.example/go']);
+    expect(result.partial).toBe(false);
+    expect(hits).toEqual([]);
+  } finally {
+    await internal.close();
+  }
+}, 30_000);
+
+it('does not keep a page whose redirect chain ended off the site after a hop the handler never saw', async () => {
+  // The www host is on the site, so its redirect is handed to the browser; its own redirect onwards is followed by
+  // the browser alone. What it lands on is not the firm's page.
+  const www = await loopback((request, response) => {
+    if (request.url === '/elsewhere') response.writeHead(302, { location: `http://127.0.0.1:${(request.socket.localPort)}/foreign` }).end();
+    else response.writeHead(200, { 'content-type': 'text/html' }).end('<body>FOREIGN CONTENT</body>');
+  });
+  try {
+    const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+      robots: async () => ({ status: 404, text: '' }),
+      response: async raw => path(raw) === '/' ? html('Smith Law<a href="/elsewhere">Elsewhere</a>')
+        : { status: 301, headers: { location: 'http://www.fixture.example/elsewhere' }, body: Buffer.alloc(0) },
+    }, { hostResolverRules: www.hostResolverRules });
+    expect(result.pages.map(page => path(page.url))).toEqual(['/']);
+    expect(result.pages.some(page => page.text.includes('FOREIGN'))).toBe(false);
+    expect(listed(result)).toEqual(['page OFF_SITE_REDIRECT 200 fixture.example/elsewhere']);
+    expect(result.issues?.find(issue => issue.code === 'OFF_SITE_REDIRECT')?.detail).toBe('127.0.0.1');
+    expect(result.partial).toBe(false);
+  } finally {
+    await www.close();
   }
 }, 30_000);
 
@@ -353,18 +423,24 @@ it('does not follow a redirect into an origin whose robots.txt excludes the page
   expect(requested).toEqual(['https://fixture.example/']);
 }, 30_000);
 
-it('reads one page at a time when the site declares a Crawl-delay', async () => {
-  let open = 0, widest = 0;
+it('spaces the pages of a site that declares a long Crawl-delay and still reads the whole page budget', async () => {
+  // A 10 s Crawl-delay on a site whose pages take 4.5 s to answer. Read one at a time, as before, 7 pages need more
+  // than the 30 s deadline, so the crawl came back partial on every scan. Spaced, they take about half of it.
+  const links = Array.from({ length: 10 }, (_, index) => `<a href="/p${index}">Page</a>`).join('');
+  const starts: number[] = [];
   const result = await crawlWebsite('fixture.example', new AbortController().signal, {
-    robots: async () => ({ status: 200, text: 'User-agent: *\nCrawl-delay: 0.05' }),
+    robots: async () => ({ status: 200, text: 'User-agent: *\nCrawl-delay: 10' }),
     response: async raw => {
-      widest = Math.max(widest, ++open);
-      await new Promise(resolve => setTimeout(resolve, 100));
-      open--;
-      return path(raw) === '/' ? html('Home<a href="/a">A</a><a href="/b">B</a><a href="/c">C</a>') : html(`Page ${path(raw)}`);
+      starts.push(Date.now());
+      await sleep(4_500);
+      return path(raw) === '/' ? html(`Home${links}`) : html(`Page ${path(raw)}`);
     },
-  });
-  expect(result.pages.map(page => path(page.url))).toEqual(['/', '/a', '/b', '/c']);
-  expect(widest).toBe(1);
+  }, { maxPages: 7 });
+  expect(result.pages).toHaveLength(7);
+  expect(result.aborted).toBe(false);
   expect(result.partial).toBe(false);
-}, 30_000);
+  // The pause is capped at 30 s / 4 / 7 pages = 1071 ms, so the 6 pages after the home page span 5 pauses at least.
+  // A slow machine only spreads them further; a second of slack absorbs how long each request takes to leave.
+  expect(starts).toHaveLength(7);
+  expect(starts.at(-1)! - starts[1]!).toBeGreaterThanOrEqual(5 * 1_071 - 1_000);
+}, 60_000);

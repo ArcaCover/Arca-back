@@ -21,6 +21,8 @@ describe('why a website could not be read', () => {
     ['the home page does not exist', unread([page('HTTP_ERROR', 404)]), 'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /HTTP 404/],
     ['the home page is gone', unread([page('HTTP_ERROR', 410)]), 'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /HTTP 410/],
     ['the home page is not HTML', unread([page('NOT_HTML', 200)]), 'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /HTML/],
+    ['the home page redirects to another domain', unread([{ ...page('OFF_SITE_REDIRECT', 301), detail: 'newfirm.example' }]),
+      'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /^The website redirects to another domain \(newfirm\.example\)$/],
     ['the home page has no text', unread([page('NO_READABLE_CONTENT', 200)]), 'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /no readable text$/],
     ['the home page has no text after its own script answered 503', unread([page('NO_READABLE_CONTENT', 200), request('HTTP_ERROR', 503, 'https://firm.com/app.js')]),
       'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /no readable text \(1 of its requests failed\)/],
@@ -30,6 +32,8 @@ describe('why a website could not be read', () => {
       request('ROBOTS_DISALLOWED', null, 'https://firm.com/assets/app.js'), request('ROBOTS_DISALLOWED', null, 'https://firm.com/assets/data.json'),
       request('ACCESS_BLOCKED', 429, 'https://firm.com/api')]),
       'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /no readable text \(1 of its requests failed; 2 excluded by robots\.txt\)/],
+    ['the home page has no text and a frame of it was sent off the site', unread([page('NO_READABLE_CONTENT', 200),
+      request('OFF_SITE_REDIRECT', 302, 'https://firm.com/embed')]), 'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /no readable text$/],
     ['the crawl deadline', unread([], true), 'TRANSIENT', 'timeout', 'DEADLINE_REACHED', /deadline/],
     ['an abort after a definitive answer', unread([page('ACCESS_BLOCKED', 403)], true), 'TRANSIENT', 'timeout', 'DEADLINE_REACHED', /deadline/],
     ['a network error', unread([page('REQUEST_FAILED')]), 'TRANSIENT', 'error', 'PROVIDER_ERROR', /could not be reached/],
@@ -95,10 +99,11 @@ describe('what a crawl left out of a site it read', () => {
     expect(crawlNotes({ pages: [{ url: home, html: '', text: 'Firm' }], partial: false })).toBeNull();
   });
 
-  it('counts what was excluded, dead or not HTML', () => {
+  it('counts what was excluded, dead, not HTML or off the site', () => {
     expect(crawlNotes(read([page('ROBOTS_DISALLOWED', null, 'https://firm.com/wp-admin/'), page('ROBOTS_DISALLOWED', null, 'https://firm.com/portal'),
-      page('HTTP_ERROR', 404, 'https://firm.com/old'), page('NOT_HTML', 200, 'https://firm.com/feed')])))
-      .toBe('2 pages excluded by robots.txt; 1 dead link (HTTP 404/410); 1 link to non-HTML content');
+      page('HTTP_ERROR', 404, 'https://firm.com/old'), page('NOT_HTML', 200, 'https://firm.com/feed'),
+      page('OFF_SITE_REDIRECT', 302, 'https://firm.com/pay'), page('OFF_SITE_REDIRECT', 302, 'https://firm.com/book')])))
+      .toBe('2 pages excluded by robots.txt; 1 dead link (HTTP 404/410); 1 link to non-HTML content; 2 links redirecting to another site');
   });
 
   it('names the failures and the deadline that make a crawl partial', () => {
@@ -140,7 +145,8 @@ describe('why a crawl that read pages is partial', () => {
 
   it('ignores what does not leave a crawl partial, and requests that are not pages', () => {
     expect(partialCrawlCode(read([page('HTTP_ERROR', 404, about), page('ROBOTS_DISALLOWED', null, 'https://firm.com/wp-admin/'),
-      page('NOT_HTML', 200, 'https://firm.com/feed'), request('REQUEST_FAILED', null, 'https://cdn.example/w.js'),
+      page('NOT_HTML', 200, 'https://firm.com/feed'), page('OFF_SITE_REDIRECT', 302, 'https://firm.com/pay'),
+      request('REQUEST_FAILED', null, 'https://cdn.example/w.js'),
       request('HTTP_ERROR', 503, 'https://firm.com/api'),
       { url: 'https://www.firm.com/robots.txt', code: 'ROBOTS_UNAVAILABLE', status: 503, scope: 'robots' }]))).toBeUndefined();
   });

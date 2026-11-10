@@ -6,8 +6,9 @@ import { USER_AGENT, createRobotsCache, fetchRobotsText, robotsPolicy, type Robo
 
 /** `requested` marks a page the extraction agent asked for, so the corpus never drops it for crawled pages. */
 export type CrawledPage = { url: string; html: string; text: string; kind?: 'page' | 'document'; complete?: boolean; requested?: boolean };
+/** `OFF_SITE_REDIRECT`: a link of the site that redirects to another host; `detail` names that host. */
 export type CrawlIssue = { url: string; code: 'ACCESS_BLOCKED' | 'ROBOTS_UNAVAILABLE' | 'ROBOTS_DISALLOWED' |
-  'HTTP_ERROR' | 'NOT_HTML' | 'NO_READABLE_CONTENT' | 'REQUEST_FAILED'; status: number | null; detail?: string;
+  'HTTP_ERROR' | 'NOT_HTML' | 'NO_READABLE_CONTENT' | 'REQUEST_FAILED' | 'OFF_SITE_REDIRECT'; status: number | null; detail?: string;
   /**
    * `page`: how a page of the crawl ended; only these decide `partial` and why a site could not be read.
    * `request`: one request the browser made for a page (a redirect hop or a subresource, on any host).
@@ -35,23 +36,42 @@ export function shouldRetryPage(issue: CrawlIssue, attempt: number, aborted: boo
 }
 /**
  * Whether a page that ended with this issue leaves the crawl incomplete. A link robots.txt excludes, a dead link
- * (404/410) and a link to something that is not HTML are answers, not failures: the site was read as it asked
- * to be and nothing a second crawl could recover is missing. They stay in `issues` for audit.
+ * (404/410), a link to something that is not HTML and a link that leads off the site are answers, not failures:
+ * the site was read as it asked to be and nothing a second crawl could recover is missing. They stay in `issues`
+ * for audit.
  */
 export function leavesCrawlPartial(issue: CrawlIssue): boolean {
-  if (issue.code === 'ROBOTS_DISALLOWED' || issue.code === 'NOT_HTML') return false;
+  if (issue.code === 'ROBOTS_DISALLOWED' || issue.code === 'NOT_HTML' || issue.code === 'OFF_SITE_REDIRECT') return false;
   if (issue.code === 'HTTP_ERROR') return issue.status !== 404 && issue.status !== 410;
   return true;
 }
+/** The share of the crawl deadline that Crawl-delay may add to a crawl, at most: a quarter, 7.5 s of 30 s. */
+export const pacingBudgetMs = (timeoutMs: number) => Math.floor(timeoutMs / 4);
 /**
- * Crawl-delay is honoured as one page at a time with the declared pause between page starts. The pause is capped
- * at the deadline divided by the page budget, so waiting alone can never use up the crawl deadline: a site that
- * asks for 10 s between requests gets 1.5 s under the defaults, not a three-page crawl.
+ * Crawl-delay is honoured as spacing between page starts: no two pages of the site start closer together than the
+ * pause, while pages already started keep loading side by side. Reading one page at a time instead runs any real
+ * site into the deadline (a page takes seconds to load and settle), and a crawl that ends on its deadline is partial
+ * on every scan, retried as a passing failure and a different number of pages each time. So the pause is capped at
+ * the pacing budget spread over the page budget: 375 ms under the defaults, whatever the site asks for.
  */
-export function crawlPacing(crawlDelayMs: number | null, limits: { timeoutMs: number; maxPages: number; concurrency: number }):
-  { concurrency: number; delayMs: number } {
-  if (crawlDelayMs === null) return { concurrency: limits.concurrency, delayMs: 0 };
-  return { concurrency: 1, delayMs: Math.min(crawlDelayMs, Math.floor(limits.timeoutMs / limits.maxPages)) };
+export function crawlPacing(crawlDelayMs: number | null, limits: { timeoutMs: number; maxPages: number }): number {
+  if (crawlDelayMs === null) return 0;
+  return Math.min(crawlDelayMs, Math.floor(pacingBudgetMs(limits.timeoutMs) / limits.maxPages));
+}
+/**
+ * Hands out page starts in call order: each one at least `delayMs` after the previous one, and returns how long
+ * the caller waits for its start. Only the time the spacing adds to the crawl is counted against `budgetMs`, and
+ * once that is spent nobody waits, so a retried page or a long crawl cannot let the pacing grow past it.
+ */
+export function createPacer(budgetMs: number, now: () => number = Date.now): (delayMs: number) => number {
+  let last = -Infinity, spent = 0;
+  return delayMs => {
+    const at = now(), floor = Math.max(at, last);
+    const added = Math.max(0, Math.min(Math.max(at, last + delayMs) - floor, budgetMs - spent));
+    spent += added;
+    last = floor + added;
+    return last - at;
+  };
 }
 export function pagePriority(raw: string): number {
   const path = new URL(raw).pathname.toLowerCase();
@@ -106,6 +126,11 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
   seedOnly?: boolean;
   /** The scan's robots cache. Without one the rules are fetched for this crawl alone. */
   robots?: RobotsCache;
+  /**
+   * Tests only: Chromium's --host-resolver-rules. The browser follows a redirect with its own network stack, so a
+   * test maps the fixture's www host to a loopback server to stand for the site behind the redirect.
+   */
+  hostResolverRules?: string;
 } = {}): Promise<CrawlResult> {
   const supplied = /^[a-z]+:\/\//i.test(domainOrUrl) ? new URL(domainOrUrl) : new URL(`https://${domainOrUrl}/`);
   const domain = supplied.hostname.replace(/^www\./, '');
@@ -119,7 +144,8 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
   const pages: CrawledPage[] = [];
   const issues: CrawlIssue[] = [];
   let partial = false;
-  const browser = await chromium.launch({ headless: true, timeout: 10_000 });
+  const browser = await chromium.launch({ headless: true, timeout: 10_000,
+    args: options.hostResolverRules ? [`--host-resolver-rules=${options.hostResolverRules}`] : [] });
   const abort = () => { void browser.close().catch(() => {}); };
   signal.addEventListener('abort', abort, { once: true });
   try {
@@ -128,11 +154,19 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
     const context = await browser.newContext({ userAgent: USER_AGENT, serviceWorkers: 'block', acceptDownloads: false });
     const robotsCache = options.robots ?? createRobotsCache();
     const sameSite = (raw: string) => new URL(raw).hostname.replace(/^www\./, '') === domain;
+    // Where a link of the site may lead: the site itself, never another host, port or scheme.
+    const onSite = (raw: string) => {
+      const url = URL.canParse(raw) ? new URL(raw) : null;
+      return !!url && ['https:', 'http:'].includes(url.protocol) && sameSite(url.href) && !url.port && !url.username && !url.password;
+    };
     let crawlDelayMs: number | null = null;
+    const unreachableReported = new Set<string>();
     async function robotsFor(raw: string): Promise<RobotsPolicy> {
       const policy = await robotsPolicy(new URL(raw).origin, signal, { fetchText: transport.robots, cache: robotsCache });
-      if (policy.state === 'unreachable') issues.push({ url: policy.url, code: 'ROBOTS_UNAVAILABLE', status: policy.status,
-        detail: policy.detail ?? undefined, scope: 'robots' });
+      if (policy.state === 'unreachable' && !unreachableReported.has(policy.url)) {
+        unreachableReported.add(policy.url);
+        issues.push({ url: policy.url, code: 'ROBOTS_UNAVAILABLE', status: policy.status, detail: policy.detail ?? undefined, scope: 'robots' });
+      }
       if (policy.crawlDelayMs !== null && sameSite(raw)) crawlDelayMs = Math.max(crawlDelayMs ?? 0, policy.crawlDelayMs);
       return policy;
     }
@@ -155,9 +189,10 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
         const url = request.url(), navigation = request.isNavigationRequest();
         if (navigation && !canonicalUrl(url, `https://${domain}`)) { await route.abort(); return; }
         // robots.txt speaks for its own host. What a page loads from the firm's host (scripts, XHR, fetch) is the
-        // crawler reading that host, so it obeys the rules like a page does. Other hosts are not being crawled.
+        // crawler reading that host, so it obeys the rules like a page does. Other hosts are not being crawled, and
+        // no navigation reaches another host: the checks above and below stop it first.
         const refusedByRobots = async (target: string) => {
-          if (!navigation && !sameSite(target)) return false;
+          if (!sameSite(target)) return false;
           const policy = await robotsFor(target);
           if (policy.allows(target)) return false;
           const page = navigation ? ownPage(request) : null;
@@ -172,10 +207,19 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
         if ([401, 403, 429].includes(response.status)) issues.push({ url, code: 'ACCESS_BLOCKED', status: response.status, scope: 'request' });
         else if (response.status >= 500) issues.push({ url, code: 'HTTP_ERROR', status: response.status, scope: 'request' });
         const headers = { ...response.headers };
-        // The browser follows a redirect by itself and never shows the next hop to this handler, so the rules of
-        // where it leads (the www origin, another path) are checked before the redirect is handed over.
+        // The browser follows a redirect by itself and never shows the next hop to this handler, so where it leads
+        // is checked before the redirect is handed over.
         const location = response.status >= 300 && response.status < 400 ? headers['location'] : undefined;
         const target = location && URL.canParse(location, url) ? new URL(location, url) : null;
+        // A link that leads off the site (a payment portal, a booking page, a review site) is the site's answer, not
+        // a page of the firm. Handed over, the browser would fetch it outside the transport and its public-address
+        // check, and keep what it found as the firm's page.
+        if (target && navigation && !onSite(target.href)) {
+          const away: Omit<CrawlIssue, 'url'> = { code: 'OFF_SITE_REDIRECT', status: response.status, detail: target.hostname };
+          const page = ownPage(request);
+          if (page) decided.set(page, away); else issues.push({ url, ...away, scope: 'request' });
+          await route.abort(); return;
+        }
         if (target && ['https:', 'http:'].includes(target.protocol) && await refusedByRobots(target.href)) { await route.abort(); return; }
         // A page link that answers with a file (a .docx, a feed) is not handed to the browser, which would start a download.
         const page = navigation && response.status >= 200 && response.status < 300 && !HTML.test(headers['content-type'] ?? '')
@@ -206,7 +250,7 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
       if (leavesCrawlPartial(issue)) partial = true;
     };
     const groupCounts = new Map<number, number>();
-    let lastStart = 0;
+    const pace = createPacer(pacingBudgetMs(timeoutMs));
     while (queue.length && visited.size < maxPages && !signal.aborted) {
       const allowed: typeof queue = [];
       for (const item of queue) {
@@ -220,12 +264,9 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
       queue = allowed;
       if (!queue.length || signal.aborted) break;
       // Read per batch: the rules of the site were fetched just above, and the www origin may add its own delay later.
-      const pacing = crawlPacing(crawlDelayMs, { timeoutMs, maxPages, concurrency: options.concurrency ?? CRAWL_CONCURRENCY });
-      const wait = lastStart + pacing.delayMs - Date.now();
-      if (wait > 0 && await sleep(wait, false, { signal }).catch(() => true)) break;
-      lastStart = Date.now();
+      const delayMs = crawlPacing(crawlDelayMs, { timeoutMs, maxPages });
       queue.sort((a, b) => a.depth - b.depth || pagePriority(a.url) - pagePriority(b.url) || a.url.localeCompare(b.url));
-      const capacity = Math.min(pacing.concurrency, maxPages - visited.size);
+      const capacity = Math.min(options.concurrency ?? CRAWL_CONCURRENCY, maxPages - visited.size);
       // Group limits count the pages picked for this batch too: with a wide batch, counting only pages
       // already read would let one batch fill up with attorney bios.
       const picked = new Map<number, number>();
@@ -246,6 +287,10 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
         groupCounts.set(pagePriority(item.url), (groupCounts.get(pagePriority(item.url)) ?? 0) + 1);
       }
       await Promise.all(batch.map(async item => {
+        // Taken in batch order before anything is awaited, so which page starts first never depends on timing.
+        const wait = pace(delayMs);
+        // Only the deadline or the caller ends the wait early, and that ends the crawl: the page is not a failure.
+        if (wait > 0 && await sleep(wait, false, { signal }).catch(() => true)) return;
         let page: import('playwright').Page | undefined;
         try {
           page = await context.newPage();
@@ -253,6 +298,12 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
           const status = response?.status() ?? null;
           if (!response || status === null || status >= 400) {
             fail(item, { url: item.url, code: status !== null && [401, 403, 429].includes(status) ? 'ACCESS_BLOCKED' : 'HTTP_ERROR', status });
+            return;
+          }
+          // Only the first hop of a redirect passes the request handler. A chain that still ended off the site
+          // (a www host that redirects again) is not the firm's page, whatever it shows.
+          if (!onSite(page.url())) {
+            fail(item, { url: item.url, code: 'OFF_SITE_REDIRECT', status, detail: URL.canParse(page.url()) ? new URL(page.url()).hostname : undefined });
             return;
           }
           if (!HTML.test(response.headers()['content-type'] ?? '')) {

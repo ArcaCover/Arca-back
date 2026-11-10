@@ -12,7 +12,9 @@ const http = (status: number | null) => status === null ? 'no answer' : `HTTP ${
 function behindEmptyPage(crawl: CrawlResult): string {
   const pages = new Set(pageIssues(crawl).map(issue => issue.url));
   const requests = (crawl.issues ?? []).filter(issue => issue.scope === 'request' && !pages.has(issue.url));
-  const excluded = requests.filter(issue => issue.code === 'ROBOTS_DISALLOWED').length, failed = requests.length - excluded;
+  const excluded = requests.filter(issue => issue.code === 'ROBOTS_DISALLOWED').length;
+  // A frame sent off the site was stopped by the crawler, not lost to a failure.
+  const failed = requests.filter(issue => issue.code !== 'ROBOTS_DISALLOWED' && issue.code !== 'OFF_SITE_REDIRECT').length;
   const notes = [...(failed ? [`${failed} of its requests failed`] : []), ...(excluded ? [`${excluded} excluded by robots.txt`] : [])];
   return notes.length ? ` (${notes.join('; ')})` : '';
 }
@@ -33,6 +35,9 @@ function cause(issue: CrawlIssue, crawl: CrawlResult): Cause {
         ? error('PROVIDER_ERROR', `The website did not serve its pages (${http(issue.status)})`)
         : error('NO_READABLE_EVIDENCE', `The website has no page to read (HTTP ${issue.status})`);
     case 'NOT_HTML': return error('NO_READABLE_EVIDENCE', 'The website did not return an HTML page');
+    // Another domain is not this firm's website, and nothing says the firm's own site will not come back.
+    case 'OFF_SITE_REDIRECT':
+      return error('NO_READABLE_EVIDENCE', `The website redirects to another domain${issue.detail ? ` (${issue.detail})` : ''}`);
     case 'NO_READABLE_CONTENT':
       return error('NO_READABLE_EVIDENCE', `The website returned a page with no readable text${behindEmptyPage(crawl)}`);
     case 'REQUEST_FAILED': return error('PROVIDER_ERROR', 'The website could not be reached');
@@ -80,6 +85,7 @@ export function crawlNotes(crawl: CrawlResult): string | null {
     ...count(['page excluded by robots.txt', 'pages excluded by robots.txt'], issue => issue.code === 'ROBOTS_DISALLOWED'),
     ...count(['dead link (HTTP 404/410)', 'dead links (HTTP 404/410)'], issue => issue.code === 'HTTP_ERROR' && !leavesCrawlPartial(issue)),
     ...count(['link to non-HTML content', 'links to non-HTML content'], issue => issue.code === 'NOT_HTML'),
+    ...count(['link redirecting to another site', 'links redirecting to another site'], issue => issue.code === 'OFF_SITE_REDIRECT'),
   ];
   return notes.length ? notes.join('; ') : null;
 }
