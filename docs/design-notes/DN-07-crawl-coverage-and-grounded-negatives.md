@@ -109,7 +109,14 @@ crawler, el lector de PDFs, el lector de sitemaps y las herramientas del agente 
 - Las peticiones que una página hace a su propio host (scripts, XHR, fetch) también pasan por robots. Antes
   solo se comprobaban las navegaciones, y un `fetch("/wp-json/…")` salía aunque estuviera excluido.
   Un `iframe` del propio sitio excluido por robots queda anotado igual, con `scope: request`.
-- El destino de una redirección se comprueba antes de entregársela al navegador (ver el límite de abajo).
+- El destino de una redirección se comprueba antes de entregársela al navegador. Cuando la navegación termina, se
+  comprueba además cada salto del propio sitio de la cadena (`redirectedFrom()` hasta la primera petición, más la URL
+  final): si robots excluye alguno, la página termina como `ROBOTS_DISALLOWED` y su contenido no se guarda (ver el
+  límite de abajo).
+- El lector de sitemaps sigue las redirecciones él mismo, salto a salto y como mucho 5. Cada salto tiene que quedarse en
+  el host de la firma y estar permitido por el `robots.txt` de su origen antes de pedirlo; si no, ese sitemap se salta.
+  Antes seguía las redirecciones sin mirar ni robots ni el host, y `/sitemap.xml` → `/private/sitemap.xml` con
+  `Disallow: /private/` se leía y sus enlaces se usaban.
 - **`Crawl-delay` se respeta como separación entre inicios de página, no leyendo una página cada vez.** Si el
   grupo de `ArcaBot` (o `*`) lo declara, dos páginas del sitio nunca empiezan más cerca que esa pausa, pero
   las que ya empezaron siguen cargando a la vez (hasta 6). La pausa tiene un tope de `(plazo / 4) / páginas`
@@ -157,7 +164,7 @@ por el código. Es el único sitio donde se decide. No hay códigos nuevos en el
 | Causa | Estado y código | Clase |
 |---|---|---|
 | robots.txt excluye el sitio | `error` / `ACCESS_BLOCKED` | DEFINITIVE |
-| Las páginas responden 401 o 403, o una página de desafío | `error` / `ACCESS_BLOCKED` | DEFINITIVE |
+| Las páginas responden 401 o 403, o una página de desafío (con cualquier estado: 200, 403, 429 o 503) | `error` / `ACCESS_BLOCKED` | DEFINITIVE |
 | La portada responde otro 4xx (404 y 410 incluidos), no es HTML o no tiene texto | `error` / `NO_READABLE_EVIDENCE` | TRANSIENT |
 | La portada redirige a otro dominio (un cambio de marca, por ejemplo) | `error` / `NO_READABLE_EVIDENCE` | TRANSIENT |
 | Plazo o abort | `timeout` / `DEADLINE_REACHED` | TRANSIENT |
@@ -167,12 +174,19 @@ Antes, un robots que excluye el sitio, un robots inalcanzable, un error de red y
 `NO_READABLE_EVIDENCE` ("No readable website evidence"). Si hay una sola causa transitoria, el resultado es
 TRANSIENT: no se marca una firma como ilegible mientras otro scan pueda leerla.
 
+El desafío se reconoce antes de mirar el estado, por su texto ("Just a moment", "Checking your browser"…) o por la
+cabecera `cf-mitigated: challenge`. Cloudflare sirve el suyo con 403, 429 o 503, y antes un desafío con 503 salía
+como `HTTP_ERROR`, se reintentaba y el scan terminaba FAILED en cada intento. Ahora es `ACCESS_BLOCKED` con
+`detail: 'challenge page'`, sin reintentos. Un 503 o un 429 sin desafío siguen siendo transitorios.
+
 Solo es DEFINITIVE la negativa del sitio, es decir, `ACCESS_BLOCKED`. Una portada sin texto no lo es: es
 también lo que deja un script que falló una vez (un 503 del propio bundle, un CDN que no resuelve DNS) o un
 contenido que aún no había llegado cuando se leyó la página, y después no se pueden distinguir. Cuando
 hubo peticiones fallidas o excluidas por robots detrás de esa página, el `reason` lo dice:
 `The website returned a page with no readable text (1 of its requests failed; 2 excluded by robots.txt)`.
-Una portada 404/410 o que no es HTML también queda fuera, porque la decisión D3 no las incluye. Meterlas
+Lo mismo vale para una página vacía dentro de un crawl que sí leyó otras: el website queda `partial` con
+`PROVIDER_ERROR`, transitorio, y la caché de scans lo repara pasado el cooldown en vez de fijarlo 7 días (DN-12
+§4.2). Una portada 404/410 o que no es HTML también queda fuera, porque la decisión D3 no las incluye. Meterlas
 exigiría decidirlo antes y darles un código distinto del de la página vacía, porque la clase se lee solo del código.
 
 Qué hace cada clase con el scan está en DN-12 §3: DEFINITIVE termina PARTIAL con el resultado de alto riesgo
@@ -190,9 +204,13 @@ Calendly se pedía tres veces, dejaba el crawl `partial` y descargaba el `robots
 - Si la cadena acaba fuera del sitio tras un salto que el manejador no vio (`www` que redirige otra vez), la
   página tampoco se guarda: mismo `OFF_SITE_REDIRECT`.
 
-**Límite conocido, sin resolver aquí.** Ese segundo salto sí llega a pedirse (Chromium lo sigue solo), aunque
-su contenido ya no se guarda. Tampoco pasan por `network.ts` las redirecciones de subrecursos (scripts, XHR)
-ni los saltos posteriores al primero, que tampoco pasan por robots. Seguir las redirecciones desde el backend
-lo cerraría, pero hoy las cookies que un sitio fija al redirigir solo las conserva el navegador, y sin ellas
+**Límite conocido, sin resolver aquí.** Los saltos posteriores al primero no pasan por el manejador de peticiones:
+Chromium los sigue con su propia red, fuera de `network.ts` (sin la IP fijada) y sin preguntar a robots antes de
+pedirlos. Desde el 2026-11-10 **el contenido de esos saltos nunca se guarda** si acaban fuera del sitio o en una URL
+que robots excluye: el crawler revisa la cadena entera al terminar la navegación (arriba). Pero Chromium **sí llega a
+pedir** ese salto una vez, y el test de la cadena `/private` → `www/private` → `/private/` lo comprueba así. Tampoco
+pasan por `network.ts` ni por robots las redirecciones de subrecursos (scripts, XHR). Seguir las redirecciones desde
+el backend lo cerraría (resolver la cadena en el manejador y entregar al navegador una sola redirección a la URL final
+ya comprobada), pero hoy las cookies que un sitio fija al redirigir solo las conserva el navegador, y sin ellas
 algunos sitios entrarían en bucle. Queda pendiente de decisión. Una firma cuya portada redirige a otro dominio
 termina FAILED (TRANSIENT) en vez de leer la portada del dominio nuevo.

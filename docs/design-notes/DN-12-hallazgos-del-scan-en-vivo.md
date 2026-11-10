@@ -98,10 +98,20 @@ y el flag. El compuesto es 0 × 0,3 + Capa 2 × 0,7, así que llega como mucho a
 pantalla lee hoy `decision` ni `overrides`. Que el visitante vea que su web no se pudo leer depende del aviso
 del front (§8).
 
-**PDF de Capa 1.** Cuando el resultado lleva el flag, `report/quick-scan.ts` pone una frase en lugar del
-aviso genérico de fuentes incompletas: "The firm's website could not be read, so everything that could not be
-verified counts as unknown and the firm sits in the highest-risk group until the assessment is completed."
-No nombra decisión ni precio. La frase que dice que no hay decisión de suscripción sigue debajo.
+**PDF de Capa 1.** Cuando el resultado lleva el flag, `report/quick-scan.ts` pone el aviso de `/score` en tercera
+persona en lugar del aviso genérico de fuentes incompletas. Con tier `CRITICAL` (en la práctica, siempre con este
+flag): "We could not read the firm's website during the scan. What we could not verify counts as unknown, which
+places the firm in the highest-risk group for now. Answers to the assessment also count, and because the website
+could not be read, the case will need a manual review." Con otro tier, la misma frase sin el grupo: "...What we
+could not verify counts as unknown. Answers to the assessment also count, ...". No nombra decisión ni precio. La
+frase que dice que no hay decisión de suscripción sigue debajo.
+
+**Regla del texto (revisión del 2026-11-10, igual en los dos repos).** El grupo de riesgo sigue al score, también al
+compuesto de Capa 2: unas respuestas buenas pueden sacar al despacho de `CRITICAL` y unas flojas no. Por eso ningún
+texto promete que completar el assessment lo saque del grupo, ni que el grupo se mantenga "whatever your answers
+show". Lo único que se mantiene diga lo que diga el cuestionario es la revisión manual (el override
+`REFERRAL_SENIOR`). Antes el PDF decía "until the assessment is completed" y el de Capa 2 "stays in the
+highest-risk group ... whatever the answers show"; las dos cosas eran falsas para alguna combinación de respuestas.
 
 **Mock y debug.**
 
@@ -127,8 +137,8 @@ toda la ventana de 7 días (D5, §4.2).
 completo y `failed.arca.example` FAILED, todo validado con los esquemas estrictos de 0.4.0),
 `mock-scenarios.test.ts`, `debug-mode.test.ts`, `debug-sources.test.ts` y `report.test.ts`.
 
-**Pendiente en el front.** La lista de dominios mock, el texto de la pantalla FAILED (ya no es "la web nos
-bloqueó") y el aviso de web ilegible en `/score` y en `/assessment/results`.
+**Front.** Hecho: la lista de dominios mock, el texto de la pantalla FAILED (ya no es "la web nos bloqueó") y el
+aviso de web ilegible en `/score` y en `/assessment/results` (§8).
 
 ## 4. Mismo despacho, mismo score (F5, D5)
 
@@ -160,9 +170,9 @@ resultado guardado: el código lo elige quien construye el estado según la caus
 | Estado guardado | Clase | Por qué |
 |---|---|---|
 | `ok` | — | Se leyó entero |
-| `partial` sin código | ESTRUCTURAL | Se leyó hasta donde el sitio deja: una página responde 401/403 o un desafío, viene vacía o da otro 4xx. El crawler no reintenta esas páginas y un segundo scan tampoco las leería |
+| `partial` sin código | ESTRUCTURAL | Se leyó hasta donde el sitio deja: una página responde 401/403 o un desafío (con cualquier estado) o da otro 4xx. El crawler no reintenta esas páginas y un segundo scan tampoco las leería |
 | `partial` + `DEADLINE_REACHED` | TRANSITORIA | El plazo cortó el crawl |
-| `partial` + `PROVIDER_ERROR` | TRANSITORIA | Una página propia falló por algo pasajero y agotó sus reintentos (error de red, 5xx, 429, robots inalcanzable para esa página) |
+| `partial` + `PROVIDER_ERROR` | TRANSITORIA | Una página propia falló por algo pasajero y agotó sus reintentos (error de red, 5xx, 429, robots inalcanzable para esa página), o vino sin texto legible |
 | `error` + `ACCESS_BLOCKED` | ESTRUCTURAL | El resultado `WEBSITE_UNAVAILABLE` (D4) |
 | Cualquier otro `error` o `timeout` | TRANSITORIA | En la práctica el scan terminó FAILED y no está en la caché |
 
@@ -187,6 +197,11 @@ La clase del resultado es la peor de las tres fuentes: **una sola causa transito
 | PARTIAL, todo estructural | 202 y el resultado guardado llega por polling con `cached: true`, **toda la ventana** |
 | PARTIAL con alguna causa transitoria | Igual durante `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` (1 hora) desde que terminó; después se ejecuta de nuevo, y esa ejecución pasa a ser la respuesta |
 | FAILED, o nada | Se ejecuta |
+
+**Página vacía. [mía]** Una página propia sin texto legible (`NO_READABLE_CONTENT`) es TRANSITORIA tanto si es todo
+el sitio (§3.2, `NO_READABLE_EVIDENCE`) como si el crawl leyó otras páginas: es lo que deja un script que falló una
+vez, y las dos situaciones no pueden decir cosas distintas. Hasta la revisión del 2026-11-10 la segunda quedaba sin
+código, ESTRUCTURAL, y se fijaba 7 días sin reparación. Ahora lleva `PROVIDER_ERROR` y se repara una vez por cooldown.
 
 Para que la caché pueda distinguir, el website `partial` ahora lleva código (`partialCrawlCode`, en
 `website-outcome.ts`). Son valores que el enum del contrato 0.4.0 ya tenía y el front no lee el código de
@@ -314,6 +329,17 @@ devuelven el mismo `preScore` a los 6 días; un PARTIAL transitorio se re-ejecut
 - **Variación del modelo en origen** (semilla, votos): cuesta tokens y no se pudo medir sin llamar a OpenAI.
 - **Reglas que dependen de la fecha** (experiencia, antigüedad de una sanción, edad de la firma): usan la
   fecha del scan por diseño (DN-01). Dentro de la ventana no se nota porque se sirve el resultado guardado.
+
+Límites conocidos que la revisión del 2026-11-10 dejó como están:
+
+- **Plantilla cortada y fijada 7 días.** Un run del Bar cortado por su límite de cargo, cuyo coste leyó 0 al terminar,
+  deja un scan que usa la plantilla como completa; con D5 ese resultado es la respuesta de toda la ventana, no de
+  una hora. La liquidación solo saca la consulta de la caché de Apify, no el scan (§5.1).
+- **Filas `partial` antiguas sin código.** Se sirven como ESTRUCTURALES toda su ventana, aunque alguna fuera un plazo
+  cortado (§4.2, "Resultados guardados antes de este cambio"); desaparecen solas 7 días después del despliegue.
+- **Un sitio que siempre llega al plazo** nunca tiene lectura completa: cada reparación horaria puede volver a pagar
+  la extracción y sustituir una lectura parcial más rica por otra más pobre, porque solo se prefiere la completa
+  (§4.3).
 
 ## 5. Control de coste (F6)
 
@@ -611,7 +637,7 @@ los del assessment.
 
 | Caso | Respuesta |
 |---|---|
-| Assessment `COMPLETED` | `200 application/pdf`, `Cache-Control: no-store`, `Content-Disposition: attachment; filename="arca-assessment-<dominio>-<aaaa-mm-dd>.pdf"` (fecha de finalización, en UTC) |
+| Assessment `COMPLETED` | `200 application/pdf`, `Cache-Control: no-store`, `Content-Disposition: attachment; filename="arca-assessment-<dominio>-<aaaa-mm-dd>.pdf"` (día de finalización en `America/New_York`) |
 | Sin token, token inválido, de otro scan o de otro email | `401 unauthorized` |
 | Assessment que no existe | `404 not_found` |
 | Sin completar | `409 incomplete` |
@@ -655,15 +681,22 @@ el aviso de la pantalla. El pie solo dice de dónde sale el informe y las versio
 ("Each point gain is an estimate on its own, not a promised outcome.") no es un aviso de demo: explica que las
 ganancias no se suman, y es la misma de la pantalla. **[mía]**
 
-**Web ilegible.** Con el flag `WEBSITE_UNAVAILABLE` hay una frase, con las dos redacciones de la pantalla:
+**Web ilegible.** Con el flag `WEBSITE_UNAVAILABLE` hay una frase, la del aviso de `/assessment/results` en tercera
+persona:
 
 | Tier del resultado | Frase |
 |---|---|
-| `CRITICAL` | "The firm's website could not be read during the scan. Until it can be read, this result stays in the highest-risk group and needs a manual review, whatever the answers show." |
-| Cualquier otro | "The firm's website could not be read during the scan. Until it can be read, this result needs a manual review, whatever the answers show." |
+| `CRITICAL` | "We could not read the firm's website during the scan. This outlook is in the highest-risk group, and because the website could not be read, it needs a manual review whatever the answers show. This is not a coverage decision or a price." |
+| Cualquier otro | "We could not read the firm's website during the scan. Until it can be read, this outlook needs a manual review, whatever the answers show. This is not a coverage decision or a price." |
 
 Así la frase no contradice el tier que hay justo encima (el límite conocido de §3.3: con buenas respuestas el
-compuesto llega a 70). No nombra la decisión ni un precio.
+compuesto llega a 70), y lo que se mantiene "whatever the answers show" es solo la revisión manual, nunca el grupo
+(regla de §3.3). No nombra la decisión ni un precio.
+
+**Score, fechas y respuestas.** El score combinado se imprime redondeado a un entero entre 0 y 100, como el
+indicador de la pantalla (antes salía 52.15 donde la pantalla dice 52). Las fechas de los dos PDF y sus nombres de
+fichero usan el día de `America/New_York`, no el de UTC: un scan acabado una noche en Miami salía con la fecha del
+día siguiente. Una respuesta numérica de 1 dice "1 hour per lawyer / year".
 
 **Aspecto.** `apps/api/src/report/layout.ts` reúne lo que comparten los dos informes: el escapado, la paleta,
 el formato de fecha y el CSS base. El HTML del informe de Capa 1 sale idéntico byte a byte al de antes
@@ -689,13 +722,18 @@ que la pantalla ya mostraba tras recortar la frase. El significado del paso no c
 
 - **Solo durante la sesión.** La descarga pide el token del scan y el assessment vence a las 24 horas. La
   webapp no guarda ese token, así que desde ella no se puede descargar.
-- **Un Chromium por petición, sin límite.** Es la segunda ruta que lo hace: duplica la superficie del riesgo 12
-  de DN-08. No se añadió tope de concurrencia.
+- **Un Chromium por informe, con tope.** Desde el 2026-11-10 los dos informes comparten un semáforo en el proceso
+  (`limitRenders`, en `report/pdf.ts`): como mucho 2 renders a la vez, y los demás esperan su turno por orden. Cada
+  petición tiene 12 s en total, espera incluida (por debajo de los 15 s del front); pasado ese plazo el render se
+  aborta (se cierra su Chromium), su hueco pasa al siguiente y la ruta responde `503 report_unavailable`. El informe
+  de Capa 1 también responde 503 cuando el render falla (antes, 500). Sigue sin haber límite por token o IP: un
+  token puede llenar la cola, aunque ya no abrir más de dos Chromium. Es el riesgo 12 de DN-08, acotado.
 - **No es el Full Assessment Report del roadmap.** Usa el banco y la fórmula demo, y lo dice. El informe
   definitivo sigue en la fase 5 de DN-07.
 - **El texto vive en dos sitios.** Las frases del informe están en el back y las de la pantalla en el front,
   copiadas a mano. Pueden divergir.
-- **"1 hours per lawyer / year".** La unidad viene del banco y se imprime tal cual.
+- **"1 hours per lawyer / year".** Resuelto el 2026-11-10: con 1, la primera palabra de la unidad va en singular
+  (`numberLabel`, en `layer2.ts`), en el plan de acción y en las respuestas del PDF.
 
 ### 6.5 Tests
 
@@ -708,7 +746,9 @@ que la pantalla ya mostraba tras recortar la frase. El significado del paso no c
   también con el informe del assessment.
 - `apps/api/tests/integration/debug-mode.test.ts`: el fallo de informe inyectado en la ruta nueva.
 - `apps/api/tests/integration/flow.test.ts`: la lista de rutas del OpenAPI.
-- `packages/scoring/tests/layer2.test.ts`: el texto de cada paso del plan.
+- `packages/scoring/tests/layer2.test.ts`: el texto de cada paso del plan y el singular de la unidad.
+- `apps/api/tests/unit/pdf-limit.test.ts`: el tope de 2, la espera por orden, el plazo que cuenta la espera, el
+  render colgado que se aborta y cede su hueco, y el 503 del informe de Capa 1. Renderer inyectado.
 
 ## 7. Webapp simulada en live-debug (F2, D7)
 
@@ -825,8 +865,10 @@ lo usan los tests.
 Todo en `Arca-front`; su `CLAUDE.md` y `docs/copy-deck.md` llevan el detalle y los textos exactos.
 
 - **`/score`.** Un solo aviso de evidencia, en frases, sin flags de máquina. Con `WEBSITE_UNAVAILABLE` dice que
-  la web no se pudo leer, que eso pone al despacho en el grupo de mayor riesgo hasta completar el assessment y
-  que no es una decisión de cobertura; el assessment pasa a ser la acción principal. El PDF es un botón con
+  la web no se pudo leer, que lo no verificado cuenta como desconocido y eso pone al despacho en el grupo de mayor
+  riesgo "for now" (solo si el tier es CRITICAL), que las respuestas del assessment también cuentan, que el caso
+  necesitará una revisión manual y que no es una decisión de cobertura; el assessment pasa a ser la acción
+  principal. Ya no dice "until you complete the assessment" (regla de §3.3). El PDF es un botón con
   etiqueta, "Download report (PDF)", junto al dominio.
 - **Scan FAILED.** El texto ya no culpa a la web: algo falló de nuestro lado o una fuente no respondió, y se
   pide otro intento una sola vez.
@@ -835,8 +877,11 @@ Todo en `Arca-front`; su `CLAUDE.md` y `docs/copy-deck.md` llevan el detalle y l
 - **`/assessment/results`.** Botón "Download report (PDF)" sobre la ruta de §6. Con `WEBSITE_UNAVAILABLE`, un
   aviso que solo nombra el grupo de mayor riesgo si el tier es CRITICAL: el back calcula el tier de Capa 2 con
   el compuesto, y unas buenas respuestas pueden sacarlo de ahí, así que la frase no contradice la insignia
-  **[mía]**.
-- La banda de debug y el panel State no cambian.
+  **[mía]**. Lo que se mantiene "whatever your answers show" es la revisión manual, no el grupo, y las dos formas
+  acaban en "This is not a coverage decision or a price." El PDF de §6.2 dice lo mismo en tercera persona.
+- El panel State no cambia. La banda de `live-debug` cambia solo su texto, a "LIVE DEBUG · real scans · simulated
+  accounts & billing": con D7 la webapp de ese modo es simulada y la banda no puede decir "real database". Es la
+  única excepción a D8, y es corta para que quepa en una línea en un móvil. DN-09 §11 cita el mismo texto.
 
 ## 9. Lo que no cambia
 
@@ -878,4 +923,28 @@ Notas:
 
 - El puerto 8080 lo ocupaba otro proceso local ajeno a ARCA. La pila mock corrió con el mismo
   `scripts/stack.mjs` y `PORT=8081`, y los smokes con `ARCA_API_URL=http://localhost:8081`.
-- Queda a la vista "Next step: 1 hours per lawyer / year." en el plan de acción (§6.4).
+- Quedaba a la vista "Next step: 1 hours per lawyer / year." en el plan de acción; resuelto el 2026-11-10 (§6.4).
+
+## 11. Segunda revisión (2026-11-10)
+
+Arreglos del back tras la revisión final de la rama. Todos con tests nuevos que fallan sin el arreglo.
+
+| Qué | Dónde | Detalle |
+|---|---|---|
+| Robots en los saltos posteriores de una redirección | `crawler.ts` | La cadena entera se comprueba al terminar la navegación; el contenido de un salto excluido no se guarda (DN-07 §6, con su límite) |
+| Robots y host en las redirecciones de un sitemap | `sitemap-reader.ts` | Salto a salto, como mucho 5; uno que no pasa salta ese sitemap |
+| Desafío servido con 403, 429 o 503 | `crawler.ts`, `website-outcome.ts` | Negativa (`ACCESS_BLOCKED`, DEFINITIVE) sin reintentos (DN-07 §6) |
+| Página vacía en un crawl `partial` | `website-outcome.ts` | TRANSITORIA, como cuando es todo el sitio (§4.2) |
+| Aviso de web ilegible en los dos PDF | `report/` | El grupo sigue al score; solo la revisión manual se mantiene (§3.3, §6.2) |
+| Tope de renders PDF | `report/pdf.ts`, `app.ts` | 2 a la vez, 12 s por petición, 503 al agotarse (§6.4) |
+| Score, fechas, dominio y directorios en los PDF | `report/` | Entero como la pantalla, día de `America/New_York`, el dominio una vez, "not searched" para un directorio omitido (§6.2) |
+| "1 hours" | `packages/scoring/src/layer2.ts` | `numberLabel` (§6.4) |
+| Orden canónico antes del cruce de directorios | `packages/scoring/tests/determinism.test.ts` | Test que falla si se quita el orden de `evaluateLayer1Evidence` |
+| `ScanRepository.latestRaw` | repositorios | Eliminado: nadie lo llamaba |
+
+Verificación: back `npm run typecheck` sin errores; `npm test` 1244 de 1244 en 69 ficheros, y en una segunda pasada
+1243 de 1244 con el flake conocido de `infra/aws/lib/arca-demo-stack.test.ts`, que solo pasa 7 de 7. Sin red: los
+tests del crawler usan transportes inyectados y servidores en loopback, y los del PDF un renderer inyectado.
+
+Lo que no cambió, a propósito: los límites de §4.6 (plantilla cortada, filas antiguas sin código, sitio que siempre
+llega al plazo).

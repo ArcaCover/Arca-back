@@ -56,12 +56,12 @@ stored result. Nothing is scored again and no provider is called.
 
 | Case | Answer |
 |---|---|
-| Completed assessment | `200 application/pdf`, `Cache-Control: no-store`, `Content-Disposition: attachment; filename="arca-assessment-<domain>-<yyyy-mm-dd>.pdf"` (the completion date, UTC) |
+| Completed assessment | `200 application/pdf`, `Cache-Control: no-store`, `Content-Disposition: attachment; filename="arca-assessment-<domain>-<yyyy-mm-dd>.pdf"` (the completion day in `America/New_York`, the day the report prints) |
 | Missing or invalid token, another scan's token, another email | `401 unauthorized` |
 | Unknown assessment | `404 not_found` |
 | Not completed yet | `409 incomplete` |
 | The 24-hour session ended | `410 expired` |
-| No renderer configured, the renderer failed, or an injected debug report fault | `503 report_unavailable` |
+| No renderer configured, the renderer failed or ran out of time, or an injected debug report fault | `503 report_unavailable` |
 
 The report states the firm and domain, the completion date, the combined score and tier, the
 Layer 1 and Layer 2 parts, the six areas with their weights, the action plan, the answers as they
@@ -69,14 +69,20 @@ were asked (marking follow-ups that are context only), and the bank and scoring 
 exactly one demo disclosure: "Demo assessment. The questions and the scoring are provisional, so
 these results are illustrative. This is not an insurance offer, a price or an underwriting decision."
 It never prints the decision, the overrides, the raw flags, the requester's email or a price. When
-the result carries `WEBSITE_UNAVAILABLE` it adds one sentence saying that the website could not be
-read and that the result needs a manual review; it names the highest-risk group only when the tier
-is `CRITICAL`, so the sentence cannot contradict the tier printed above it (DN-12 section 6).
+the result carries `WEBSITE_UNAVAILABLE` it adds the results screen's notice in the third person: the
+website could not be read, the outlook needs a manual review whatever the answers show, and this is
+not a coverage decision or a price. It names the highest-risk group only when the tier is `CRITICAL`,
+so the sentence cannot contradict the tier printed above it, and it never says the group itself holds
+whatever the answers are: the tier follows the combined score (DN-12 sections 3.3 and 6.2). The
+combined score is printed as a whole number, as the results screen's gauge shows it, and the dates
+are the day in `America/New_York`.
 
 CORS exposes `Content-Disposition` for every route, so the browser can read the filename. In the
 debug modes the scenario axis `http.report: unavailable` applies to this route as it does to the
-scan report. Each request launches its own Chromium and there is no rate limit, as for the scan
-report.
+scan report. Each render launches its own Chromium. Both reports share an in-process cap of two
+renders at once; further requests wait in order, and each request has 12 seconds in all, waiting
+included. Past that the render is aborted and the route answers `503 report_unavailable`. There is
+still no rate limit per token or address (DN-12 section 6.4).
 
 Action plan items carry only their own step (`Next step: <option>.`). The caveat that each gain is a
 provisional estimate on its own is said once by the screen and once by the report, not on every item.

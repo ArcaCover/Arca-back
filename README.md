@@ -277,7 +277,9 @@ Usar `SOURCE_MODE=mock`, `STORAGE_BACKEND=memory` y `ASSESSMENT_PLANNER=rules` p
 servicios externos. El modo memory pierde los datos al reiniciar el proceso; el adaptador Supabase
 usa una migración nueva con CAS y transacciones para persistencia durable.
 
-Las cinco rutas nuevas se documentan en Swagger y en
+Las seis rutas nuevas se documentan en Swagger y en
 [Layer 2: operación, persistencia y límites](docs/LAYER2_ASSESSMENT.md). Usan el mismo Bearer del scan,
 con una ventana de 24 horas, creación/completado idempotentes y registro de invalidaciones cuando
-una pregunta deja de ser visible. El informe PDF y los enlaces de reanudación quedan fuera de esta entrega.
+una pregunta deja de ser visible. Un assessment completado tiene su informe PDF
+(`GET /assessment/:assessmentId/report.pdf`, ver la sección "Assessment report" de
+[LAYER2_ASSESSMENT.md](docs/LAYER2_ASSESSMENT.md)). Los enlaces de reanudación quedan fuera de esta entrega.

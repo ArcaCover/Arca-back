@@ -198,7 +198,7 @@ Una franja fija arriba, sobre todo lo demás. Se mantiene dentro de la paleta de
 | Modo | Aspecto | Texto |
 |---|---|---|
 | `mock` | `oro` con rayas diagonales `marino` (patrón que no aparece en ningún otro sitio de la UI) | **MOCK** · no real APIs · in-memory data |
-| `live-debug` | `rojo` sólido con texto blanco (el rojo ya está reservado para alertas) | **LIVE DEBUG** · real APIs & real database |
+| `live-debug` | `rojo` sólido con texto blanco (el rojo ya está reservado para alertas) | **LIVE DEBUG** · real scans · simulated accounts & billing (desde DN-12 §7: los scans son reales y la webapp es simulada) |
 | Desalineado | `marino` sólido con texto `oro` e icono de alerta | **MODE MISMATCH** · front=`mock`, back=`live-debug` (o "back unreachable / production") |
 | Comprobando | `bruma` liso con texto `marino`, sin rayas ni icono: no pertenece a ningún modo | Checking the back's mode · front=`mock` |
 
@@ -385,7 +385,7 @@ O por separado: `npm run dev:live-debug` en Arca-back y `npm run dev:live-debug`
 
 1. **La franja de arriba del front:**
    - `MOCK · no real APIs · in-memory data` (oro a rayas): los dos en mock;
-   - `LIVE DEBUG · real APIs & real database` (rojo): los dos en live-debug;
+   - `LIVE DEBUG · real scans · simulated accounts & billing` (rojo): los dos en live-debug;
    - `MODE MISMATCH · front=<f>, back=<b>` o `MODE MISMATCH · front=<f>, back unreachable or production` (marino): no coinciden, el back no responde o está en producción;
    - mientras pregunta al back por primera vez dice `Checking the back's mode · front=<f>` sobre bruma liso, porque nunca afirma un modo que el back no confirmó;
    - si al final lleva `· next scan injects: …`, hay un escenario armado para el próximo scan;

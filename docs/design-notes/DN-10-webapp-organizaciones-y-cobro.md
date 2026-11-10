@@ -183,8 +183,8 @@ Los endpoints están probados con tests. Hay además una prueba de concepto en `
 | `GET /plans` | pública | Planes activos |
 | `POST /orgs/:id/deletion-request` | `org.request_deletion` | Pasa a `deletion_requested` |
 | `/admin/*` | `platform_admin` | Cimientos del panel de ARCA |
-| `POST /__debug/auth/login` | solo mock | Login simulado (§4.1) |
-| `POST /__debug/billing/pay` | solo mock | Pago simulado de una sesión del checkout simulado (§4.4) |
+| `POST /__debug/auth/login` | mock y live-debug (DN-12 §7) | Login simulado (§4.1) |
+| `POST /__debug/billing/pay` | mock y live-debug (DN-12 §7) | Pago simulado de una sesión del checkout simulado (§4.4) |
 
 **Reclamar el análisis [mía].** Va en dos pasos, para que sobreviva al magic link (que puede abrirse en otra pestaña o dispositivo) sin guardar el token del scan fuera de `sessionStorage`:
 1. En los resultados, `POST /claims { scanToken }`, con el token del scan en el cuerpo, devuelve un `claimId` aleatorio de un solo uso, válido 24 h. El back guarda su hash, el `scan_id` y el email del scan. Como el token no va en una cabecera, `allowHeaders` de CORS sigue siendo exactamente `Content-Type,Authorization`.
@@ -231,7 +231,7 @@ En `mock` no hace falta ninguna de las claves. Todas siguen las reglas de DN-09:
   - `/app/members`: lista, invitar, cambiar rol y quitar.
   - `/app/settings`: datos de la organización y "Solicitar eliminación".
   - `/app/invite/[token]`.
-  - `/app/billing/mock-checkout`: la página que hace de Stripe en `mock`, con el botón del pago simulado. Fuera de `mock` responde **404** (componente de servidor con `notFound()`) y **no está en el bundle de producción**: el componente del pago se carga con `next/dynamic` dentro de la guarda literal, así que el build de producción no emite su chunk.
+  - `/app/billing/mock-checkout`: la página que hace de Stripe en `mock` y en `live-debug` (DN-12 §7), con el botón del pago simulado. En producción responde **404** (componente de servidor con `notFound()`) y **no está en el bundle de producción**: el componente del pago se carga con `next/dynamic` dentro de la guarda literal, así que el build de producción no emite su chunk.
   - `/app/admin`: prueba de concepto del panel de ARCA, solo para admins de plataforma: precios de los planes y cola de solicitudes de borrado.
 - **En `/assessment/results`:** un CTA "Save your results and activate your account". Nació **solo en `mock`** (guarda literal `process.env.NEXT_PUBLIC_ARCA_MODE === "mock"`, DN-09) hasta que lleguen los adaptadores reales de Auth y Stripe. Con D7 (DN-12 §7) pasa a ofrecerse también en `live-debug`, etiquetado como simulado; ese cambio es del front. En producción no se pinta. Al pulsarlo cambia el token del scan por un reclamo (`POST /claims`, con el token en el cuerpo) y aplica las reglas de §4.7: el análisis se añade a la organización activa solo si el email de la sesión coincide con el del reclamo (sin distinguir mayúsculas), el rol tiene `analysis.create` y la organización tiene acceso pagado; si no, va a `/app/signup` con el reclamo, y un **402** lleva a `/app/billing`.
 - **Sin diseño:** componentes simples con los tokens de la marca. Lo que un rol no puede hacer se oculta, en todos los modos, y **el back es el que niega** (DN-11 D3). En mock, el interruptor "Show forbidden actions" del panel de debug lo vuelve a mostrar (controles, ítems de la barra y pantallas), para que la demo enseñe el 403 del back. Esto reemplaza la regla anterior, que dejaba los botones activos en los modos de debug. **[Jesús]**
