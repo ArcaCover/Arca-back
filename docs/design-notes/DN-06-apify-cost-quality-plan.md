@@ -7,8 +7,9 @@ Fecha: 14 de septiembre de 2026. Estado: implementación y primer E2E terminados
 > **se registra y no se limita**. Esa decisión sigue vigente en producción. Lo que cambia el 2026-11-09 es que
 > `live-debug` trae un techo propio, activo por defecto: `APIFY_SPEND_CEILING_USD` (USD 2 sobre las últimas
 > 24 horas del ledger), que rechaza un run antes de arrancarlo y, mientras hay techo, vuelve a enviar
-> `maxTotalChargeUsd` con lo que queda. Producción no lo tiene si su entorno no lo fija. El diseño, lo que
-> cuenta cada fila del ledger y sus límites están en el [DN-12](DN-12-hallazgos-del-scan-en-vivo.md), §5.
+> `maxTotalChargeUsd`, igual a la reserva del run (USD 1 por defecto, como la §8). Producción no lo tiene
+> si su entorno no lo fija. El diseño, lo que cuenta cada fila del ledger y sus límites están en el
+> [DN-12](DN-12-hallazgos-del-scan-en-vivo.md), §5.
 
 ## 1. Decisión recomendada
 

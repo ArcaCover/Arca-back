@@ -357,7 +357,9 @@ Cómo cuenta cada fila de `apify_runs` (`committedUsd`, en `apify-client.ts`):
 | Liquidada (`accounting_complete`) | Lo que Apify cobró (`cost_usd`) |
 | Arrancada y sin liquidar (en vuelo o terminada) | Su reserva entera (`reserved_usd`, `APIFY_EXPECTED_COST_USD_PER_RUN`, 1 USD), o el coste ya leído si es mayor |
 | Reservada y a punto de arrancar | Su reserva, hasta que caduca |
-| Nunca arrancada (rechazada por el techo o por el límite de uso, caducada) | 0 |
+| Arranque sin respuesta (`START_UNCERTAIN`: la petición salió y la respuesta se perdió) | Su reserva, durante toda la ventana de 24 horas |
+| Nunca arrancada (rechazada por el límite de uso o por Apify con un error HTTP, caducada) | 0 |
+| Rechazada por el techo | No se lee |
 
 La regla es: `comprometido por las demás filas + reserva de este run > techo` significa rechazo.
 
@@ -365,8 +367,9 @@ La regla es: `comprometido por las demás filas + reserva de este run > techo` s
   consulta cacheada es una fila del ledger: se cuenta una vez, la sirva quien la sirva.
 - **La suma es del ledger, no de la memoria del proceso.** Incluye lo que arrancó este proceso, uno anterior
   (el back se reinicia con cada cambio de código) y cualquier otro que escriba en la misma base.
-- **Sin migración.** Es un `select` de ocho columnas sobre `apify_runs`, sin `items`, solo cuando un run
-  va a arrancar y solo si hay techo. Producción sin techo no hace esa lectura.
+- **Sin migración.** Es un `select` de ocho columnas sobre `apify_runs`, sin `items` y sin las filas que el
+  techo rechazó, solo cuando un run va a arrancar y solo si hay techo. Producción sin techo no hace esa
+  lectura.
 - **Con `0` no arranca ningún run** y se sirve solo lo cacheado. Sirve para una sesión de `live-debug`
   que no debe gastar nada en Apify.
 
@@ -382,11 +385,22 @@ se intenta, las cacheadas se responden gratis y las demás se rechazan sin petic
 [apify] Apify spend ceiling reached: USD 2.00 held by the ledger over the last 24 hours, the ceiling is USD 2.00 and a run reserves USD 1.00 (APIFY_SPEND_CEILING_USD, APIFY_EXPECTED_COST_USD_PER_RUN). No new run starts; cached queries are still served.
 ```
 
-**Límite de cargo por run.** Con techo, cada run arranca con `maxTotalChargeUsd` igual a lo que al techo le
-queda en ese momento. Va en la URL del arranque, no en el input: **el input guardado y el fingerprint de la
-consulta son los mismos con o sin límite**, así que los runs cacheados antes de este cambio siguen valiendo
-(hay un test que lo fija). Es lo que acota la búsqueda por firma: su input no se tocó y sigue pidiendo
-1.000.000 de abogados, pero el run no puede cobrar más de lo que queda.
+**Límite de cargo por run.** Con techo, cada run arranca con `maxTotalChargeUsd` igual a **su reserva**
+(`APIFY_EXPECTED_COST_USD_PER_RUN`, USD 1 por defecto, en centavos enteros). Va en la URL del arranque, no en
+el input: **el input guardado y el fingerprint de la consulta son los mismos con o sin límite**, así que los
+runs cacheados antes de este cambio siguen valiendo (hay un test que lo fija). Es lo que acota la búsqueda
+por firma: su input no se tocó y sigue pidiendo 1.000.000 de abogados, pero el run no puede cobrar más de
+su reserva.
+
+Por qué la reserva y no lo que al techo le queda (la primera versión enviaba eso). Cada run sin liquidar
+cuenta su reserva, así que varios runs admitidos a la vez recibían cada uno casi todo el techo como límite:
+C, C − r, C − 2r… La revisión lo midió con 30 búsquedas por firma simultáneas sobre el cliente real y un
+transporte falso: con techo 2 y reserva 1 los límites sumaban USD 3; con techo 5 y reserva 0,5 (la
+configuración que esta nota recomendaba para una firma con plantilla) sumaban USD 27,50, más que los USD 20
+de crédito; con techo 20 y reserva 1, USD 210. Con la reserva como límite, **los límites de los runs que
+este proceso tiene sin liquidar nunca suman más que el techo**, con cualquier configuración; un test lo fija
+con 2/1, 5/0,5, 20/1 y 2/0,3. Mientras no se liquida, un run de este proceso cuenta además, como mínimo, el
+límite con que arrancó (solo difiere de la reserva si esta es menor de un centavo).
 
 Un run que gasta todo su límite pudo parar antes de tener todas las filas. Sus filas se conservan como
 evidencia parcial para ese scan (el directorio queda `partial`, causa transitoria) y **la consulta no se
@@ -397,16 +411,24 @@ leído al terminar puede ser 0.
 liquidar (dos de espera más el siguiente pase de `reconcileCosts`, que corre cada minuto mientras el back
 siga encendido).
 
-| Configuración | Runs nuevos que caben hasta que se liquiden |
-|---|---|
-| Por defecto (`2` y reserva `1`) | 2. Es el scan de Jesús (una búsqueda por firma en el Bar) o una firma de un abogado (Bar y Avvo) |
-| `APIFY_SPEND_CEILING_USD=5` | 5 |
-| `APIFY_SPEND_CEILING_USD=5` y `APIFY_EXPECTED_COST_USD_PER_RUN=0.5` | 10: cinco abogados en los dos directorios |
-| `APIFY_SPEND_CEILING_USD=0` | 0: solo caché |
+| Configuración | Runs nuevos que caben hasta que se liquiden | Lo más que puede cobrar cada uno |
+|---|---|---|
+| Por defecto (`2` y reserva `1`) | 2. Es el scan de Jesús (una búsqueda por firma en el Bar) o una firma de un abogado (Bar y Avvo) | USD 1 |
+| `APIFY_SPEND_CEILING_USD=5` | 5 | USD 1 |
+| `APIFY_SPEND_CEILING_USD=5` y `APIFY_EXPECTED_COST_USD_PER_RUN=0.5` | 10: cinco abogados en los dos directorios | USD 0,50 |
+| `APIFY_SPEND_CEILING_USD=5` y `APIFY_EXPECTED_COST_USD_PER_RUN=2.5` | 2: una búsqueda por firma grande y poco más | USD 2,50 |
+| `APIFY_SPEND_CEILING_USD=0` | 0: solo caché | — |
 
 Una vez liquidados cuentan por lo que costaron de verdad. Lo observado hasta hoy son dos datos: USD 0,045
 por un run del Bar con 1 resultado y USD 0,38475 por uno de Avvo con 10. El techo por defecto es estrecho a
 propósito: para una firma con plantilla hay que subirlo a mano y sabiendo cuánto se va a gastar.
+
+**Cómo elegir.** La reserva es a la vez lo que cada run aparta del techo y lo más que puede cobrar. Bajarla
+deja caber más runs, pero cada uno puede cobrar menos: con `0.5`, una búsqueda dirigida del Bar que devuelva
+sus 25 resultados detallados (unos USD 0,04 por resultado, extrapolando del único dato) puede quedarse corta,
+y una búsqueda por firma se corta hacia los 11 abogados. Subirla deja llegar más lejos a la búsqueda por
+firma a cambio de menos runs a la vez. Un run cortado no se cachea y su directorio queda `partial` por causa
+transitoria (arriba). En ninguna fila los límites en vuelo suman más que el techo.
 
 En PowerShell, para una sesión:
 
@@ -427,6 +449,9 @@ npm run stack -- live-debug
   parecería un presupuesto. El error dice qué variable cambiar.
 - **Si el ledger no se puede leer, el run no arranca** (`PROVIDER_ERROR`, sin cooldown para la consulta). Un
   techo que deja pasar cuando no puede sumar no es un techo.
+- **El límite de cada run es su reserva**, no lo que al techo le queda: es lo único que mantiene la suma de
+  los límites en vuelo por debajo del techo sin parar la concurrencia. Contar cada run por su límite y darle
+  lo que queda dejaría un solo run a la vez y rechazaría el segundo directorio de una firma de un abogado.
 - **Producción no lo usa.** La decisión del 2026-09-21 sigue vigente allí. Quien fije
   `APIFY_SPEND_CEILING_USD` en producción obtiene el techo y también el límite por run, con el riesgo de
   plantillas cortadas que se describe abajo.
@@ -441,18 +466,24 @@ npm run stack -- live-debug
   también cuenta contra el techo de `live-debug`. Es conservador, pero puede rechazar todo un día con tráfico
   real. La salida es subir el techo o usar una base separada (DN-09 §11.7).
 - **La comprobación se hace de una en una dentro del proceso, no entre procesos.** Dos back sobre el mismo
-  ledger que arranquen un run en el mismo instante pueden admitir uno de más cada uno.
-- **Dos runs que arrancan juntos pueden sumar más límite que techo.** El límite del segundo descuenta la
-  reserva del primero, no su límite. El exceso máximo es el techo menos una reserva (USD 1 con los valores
-  por defecto) y solo se da si los dos son búsquedas por firma, las únicas que pueden pasar de su reserva.
-- **Una plantilla cortada por el límite.** Solo afecta a la búsqueda por firma de una firma con muchos
-  abogados (con USD 2, del orden de 40, extrapolando del único run del Bar medido). Si el coste al terminar
-  leyó 0, el corte no se ve
-  hasta la liquidación: ese scan usó el dataset como completo y su resultado queda en la caché de scans.
-  La consulta sí deja de reutilizarse en cuanto se liquida.
+  ledger que arranquen un run en el mismo instante pueden admitir uno de más cada uno: el exceso es de una
+  reserva por proceso, no más, porque cada run arrancado con techo lleva su reserva como límite.
+- **Un run arrancado sin techo no lleva límite.** Si producción comparte el ledger, sus runs sin liquidar
+  cuentan su reserva pero pueden cobrar más; la cuenta lo corrige al liquidarse.
+- **Una plantilla cortada por el límite.** Afecta a la búsqueda por firma de una firma con muchos abogados
+  (con la reserva por defecto de USD 1, del orden de 20, extrapolando del único run del Bar medido) y, con
+  una reserva baja, a una búsqueda dirigida con muchos resultados (ver "Cómo elegir"). Si el coste al
+  terminar leyó 0, el corte no se ve hasta la liquidación: ese scan usó el dataset como completo y su
+  resultado queda en la caché de scans. La consulta sí deja de reutilizarse en cuanto se liquida.
 - **El límite con que arrancó cada run vive en memoria.** Tras un reinicio, la segunda comprobación (al
   liquidar) no existe para los runs anteriores.
-- **Más de 1.000 runs en 24 horas** no se pueden sumar con una lectura: el run se rechaza.
+- **Un arranque sin respuesta cuenta su reserva 24 horas.** Si la petición de arranque salió y la respuesta
+  se perdió (red, plazo del scan), no hay id de run que liquidar: puede que Apify no arrancara nada, o que
+  arrancara un run que cobra hasta su límite. Se cuenta lo segundo durante toda la ventana, también si otro
+  scan viene a retomarlo. Es conservador. Un error HTTP de Apify, en cambio, prueba que no arrancó y cuenta 0.
+- **Más de 1.000 runs en 24 horas** no se pueden sumar con una lectura: el run se rechaza. Los rechazos del
+  techo no cuentan para ese límite (la lectura los deja fuera), así que una plantilla larga rechazada scan
+  tras scan no llena la ventana. Las filas de producción sobre una base compartida sí cuentan.
 
 ### 5.2 Tope de peticiones a OpenAI por scan
 
@@ -537,8 +568,12 @@ Todos con clientes inyectados: ninguno toca Apify ni OpenAI.
   registra una vez; de seis runs simultáneos arrancan exactamente los dos que caben; las consultas cacheadas
   se sirven y no cuentan de nuevo; la reserva se mantiene hasta liquidar; cuenta el gasto de otro proceso y
   no el de hace más de 24 horas; `0` no arranca nada; sin techo no hay lectura ni `maxTotalChargeUsd`; el
-  límite no cambia input ni fingerprint; la búsqueda por firma sigue pidiendo 1.000.000 y lleva límite; un
-  run que agotó su límite no se cachea; el directorio informa causa transitoria sin parar la cola.
+  límite es la reserva y no cambia input ni fingerprint; la búsqueda por firma sigue pidiendo 1.000.000 y
+  lleva límite; 30 búsquedas por firma simultáneas nunca reciben más límite que el techo (2/1, 5/0,5, 20/1 y
+  2/0,3); un arranque sin respuesta sigue contando pasada su caducidad, también si otro scan lo retoma, y uno
+  que Apify rechazó no cuenta; mil rechazos del techo no llenan la ventana; un run que agotó su límite no se
+  cachea; el directorio informa causa transitoria sin parar la cola. `supabase-repository.test.ts` fija que
+  la lectura deja fuera los rechazos.
 - `apps/api/tests/unit/env.test.ts`, "spend guards": producción sin valor, `live-debug` con 2 y 30, valor
   explícito, línea vacía, valores inválidos.
 - `apps/api/tests/unit/agentic-evidence-provider.test.ts`, "request cap per scan".

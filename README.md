@@ -156,8 +156,9 @@ entorno no las fija.
   las últimas 24 horas, lo haya arrancado quien lo haya arrancado. Un run sin liquidar cuenta su reserva
   entera. Si un run nuevo no cabe, se rechaza antes de enviar nada a Apify, el directorio informa
   `PROVIDER_ERROR` (causa transitoria) y el scan queda PARTIAL. Las consultas cacheadas se siguen
-  sirviendo. `0` no arranca ningún run. Con techo, cada run lleva además `maxTotalChargeUsd` con lo que
-  queda; va en la URL, así que ni el input ni el fingerprint cambian.
+  sirviendo. `0` no arranca ningún run. Con techo, cada run lleva además `maxTotalChargeUsd` igual a su
+  reserva, así que los límites de los runs en vuelo nunca suman más que el techo; va en la URL, así que ni
+  el input ni el fingerprint cambian. Para que una búsqueda por firma pueda gastar más, se sube la reserva.
 - `OPENAI_MAX_REQUESTS_PER_SCAN` (`live-debug`: 30): máximo de chat completions de la extracción del
   website de un scan. Si se pasa, la fuente falla por causa transitoria y el scan termina FAILED.
 
