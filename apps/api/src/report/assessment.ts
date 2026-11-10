@@ -1,8 +1,8 @@
 import type { AnswerValue, AssessmentResult, RenderedQuestion } from '@arca/contracts';
 import { visibleQuestions } from '@arca/questions';
-import { WEBSITE_UNAVAILABLE } from '@arca/scoring';
+import { WEBSITE_UNAVAILABLE, numberLabel } from '@arca/scoring';
 import type { AssessmentPlan, AssessmentRecord } from '../assessment/repository.js';
-import { BASE_STYLE, COLORS, escape, longDate } from './layout.js';
+import { BASE_STYLE, COLORS, escape, isoDay, longDate } from './layout.js';
 
 // The Assessment Report: what /assessment/results shows, plus the answers behind it. It is built from the stored
 // record alone (the frozen bank, the questions exactly as they were rendered, the answers and the result), so it
@@ -17,16 +17,25 @@ export const isCompleted = (record: AssessmentRecord): record is CompletedAssess
 export const DEMO_DISCLOSURE = 'The questions and the scoring are provisional, so these results are illustrative. ' +
   'This is not an insurance offer, a price or an underwriting decision.';
 
-// Shown when the result carries the WEBSITE_UNAVAILABLE flag (DN-12). The risk group is named only when the tier
-// agrees, as /assessment/results does, so the sentence cannot contradict the tier printed above it.
+// Shown when the result carries the WEBSITE_UNAVAILABLE flag: the notice of /assessment/results in the third person
+// (DN-12 §6.2). The tier follows the composite score, so better answers can move the outlook out of the highest-risk
+// group: the group is named only when the tier printed above is CRITICAL, and only the manual review holds whatever
+// the answers show.
 export function websiteUnreadNote(tier: AssessmentResult['tier']) {
-  return "The firm's website could not be read during the scan. Until it can be read, this result " +
-    `${tier === 'CRITICAL' ? 'stays in the highest-risk group and ' : ''}needs a manual review, whatever the answers show.`;
+  return ["We could not read the firm's website during the scan.",
+    tier === 'CRITICAL'
+      ? 'This outlook is in the highest-risk group, and because the website could not be read, it needs a manual review whatever the answers show.'
+      : 'Until it can be read, this outlook needs a manual review, whatever the answers show.',
+    'This is not a coverage decision or a price.'].join(' ');
 }
 
+// The completion day in Florida, the same day the report prints (layout.ts).
 export function assessmentReportFilename(record: CompletedAssessment) {
-  return `arca-assessment-${record.layer1_snapshot.domain}-${record.result.completedAt.slice(0, 10)}.pdf`;
+  return `arca-assessment-${record.layer1_snapshot.domain}-${isoDay(record.result.completedAt)}.pdf`;
 }
+
+/** The combined score as the results screen's gauge shows it: a whole number from 0 to 100. */
+export const displayedScore = (score: number) => Math.min(100, Math.max(0, Math.round(score)));
 
 function answerText(question: RenderedQuestion, answer: AnswerValue | undefined) {
   if (!answer) return 'No answer';
@@ -37,7 +46,7 @@ function answerText(question: RenderedQuestion, answer: AnswerValue | undefined)
     return question.scale ? `${answer.value} on a scale from ${question.scale.min} (${question.scale.minLabel}) ` +
       `to ${question.scale.max} (${question.scale.maxLabel})` : String(answer.value);
   }
-  return question.number ? `${answer.value} ${question.number.unit}` : String(answer.value);
+  return question.number ? numberLabel(answer.value, question.number.unit) : String(answer.value);
 }
 
 export function renderAssessmentHtml(record: CompletedAssessment) {
@@ -76,7 +85,7 @@ export function renderAssessmentHtml(record: CompletedAssessment) {
   <p class="disclosure"><strong>Demo assessment.</strong> ${escape(DEMO_DISCLOSURE)}</p>
 
   <section class="score">
-    <div class="total">${scored ? result.compositeScore : '—'}<small> / 100</small></div>
+    <div class="total">${result.compositeScore !== null ? displayedScore(result.compositeScore) : '—'}<small> / 100</small></div>
     <div><div class="tier">${scored ? escape(result.tier) : 'NOT SCORED'}</div>
       <div class="tier-line">${scored ? "Combined from the public evidence and the firm's answers"
         : 'The quick scan did not support a combined score. The questionnaire score is shown below.'}</div></div>

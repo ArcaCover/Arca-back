@@ -7,6 +7,7 @@ import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import { InProcessPipeline } from '../../src/pipeline/in-process-pipeline.js';
 import { mockSources } from '../../src/pipeline/mock-sources.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
+import { isoDay } from '../../src/report/layout.js';
 
 // DN-12: a website that refuses to be read no longer fails the scan. The whole path runs through the HTTP app as the
 // front drives it, on the mock domains, and every response is parsed with the published schemas, which are strict.
@@ -72,7 +73,7 @@ describe('a firm whose website refuses to be read', () => {
     const report = await request(`/scan/${started.scanId}/report.pdf`);
     expect(report.status).toBe(200);
     expect(report.headers.get('Content-Type')).toBe('application/pdf');
-    expect(s.renderReport.mock.calls[0]![0]).toMatch(/website could not be read, so everything that could not be verified counts as unknown/);
+    expect(s.renderReport.mock.calls[0]![0]).toMatch(/What we could not verify counts as unknown, which places the firm in the highest-risk group for now\./);
 
     const startedAssessment = await request(`/scan/${started.scanId}/assessment`, 'POST');
     expect(startedAssessment.status).toBe(202);
@@ -101,10 +102,10 @@ describe('a firm whose website refuses to be read', () => {
     const assessmentReport = await request(`/assessment/${assessmentId}/report.pdf`);
     expect(assessmentReport.status).toBe(200);
     expect(assessmentReport.headers.get('Content-Disposition')).toBe(
-      `attachment; filename="arca-assessment-blocked.arca.example-${assessment.completedAt.slice(0, 10)}.pdf"`);
+      `attachment; filename="arca-assessment-blocked.arca.example-${isoDay(assessment.completedAt)}.pdf"`);
     const assessmentHtml = s.renderReport.mock.calls[1]![0];
     expect(assessmentHtml).toContain('<h1>blocked.arca.example</h1>');
-    expect(assessmentHtml).toMatch(/website could not be read during the scan\. Until it can be read, this result needs a manual review/);
+    expect(assessmentHtml).toMatch(/website during the scan\. Until it can be read, this outlook needs a manual review, whatever the answers show\. This is not a coverage decision or a price\./);
     expect(assessmentHtml).not.toMatch(/REFERRAL|referral|declin|premium|\$|approved|eligible/);
   });
 

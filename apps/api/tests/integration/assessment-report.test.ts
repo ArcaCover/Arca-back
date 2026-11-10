@@ -136,15 +136,15 @@ describe('GET /assessment/:assessmentId/report.pdf', () => {
     await flagged.complete(id);
     expect((await flagged.report(id)).status).toBe(200);
     const html = flagged.renderReport.mock.calls[0]![0];
-    expect(count(html, /website could not be read/g)).toBe(1);
-    expect(html).toContain('<ul class="notes"><li>The firm&#39;s website could not be read during the scan. Until it can be read, this result ' +
-      'needs a manual review, whatever the answers show.</li></ul>');
+    expect(count(html, /website during the scan/g)).toBe(1);
+    expect(html).toContain('<ul class="notes"><li>We could not read the firm&#39;s website during the scan. Until it can be read, this outlook ' +
+      'needs a manual review, whatever the answers show. This is not a coverage decision or a price.</li></ul>');
 
     const clean = await setup();
     const cleanId = await clean.start();
     await clean.complete(cleanId);
     await clean.report(cleanId);
-    expect(clean.renderReport.mock.calls[0]![0]).not.toMatch(/website could not be read|manual review/);
+    expect(clean.renderReport.mock.calls[0]![0]).not.toMatch(/could not read|manual review/);
   });
 
   it('answers 503 when no renderer is configured or the renderer fails, never a storage error', async () => {
@@ -205,7 +205,8 @@ describe('Assessment Report content', () => {
     expect(html).toContain('<h1>Smith Law</h1>');
     expect(html).toContain('smithlaw.com<br>Assessment completed November 9, 2026');
     expect(result.compositeScore).not.toBeNull();
-    expect(html).toContain(`<div class="total">${result.compositeScore}<small> / 100</small></div>`);
+    // Printed as the results screen's gauge shows it: a whole number.
+    expect(html).toContain(`<div class="total">${Math.round(result.compositeScore!)}<small> / 100</small></div>`);
     expect(html).toContain(`<div class="tier">${result.tier}</div>`);
     expect(html).toContain(`Public evidence · Layer 1</div><div class="part-score">82<small> / 100</small>`);
     expect(html).toContain(`The firm&#39;s answers · Layer 2</div><div class="part-score">${result.layer2Score}<small> / 100</small>`);
@@ -272,7 +273,11 @@ describe('Assessment Report content', () => {
     expect(html).toContain(`<p class="disclosure"><strong>Demo assessment.</strong> ${DEMO_DISCLOSURE}</p>`);
     expect(DEMO_DISCLOSURE).toBe('The questions and the scoring are provisional, so these results are illustrative. ' +
       'This is not an insurance offer, a price or an underwriting decision.');
-    const seen = text(html);
+    // The website notice ends as the screen's does, "not a coverage decision or a price"; the rest of the page says
+    // nothing about price or coverage beyond the one disclosure.
+    const notice = websiteUnreadNote(restricted.result.tier).replaceAll("'", '&#39;');
+    expect(text(html)).toContain(notice);
+    const seen = text(html).replace(notice, '');
     for (const once of [/Demo assessment/g, /provisional/gi, /illustrative/gi, /insurance offer/gi, /underwriting decision/gi, /\bprice\b/gi]) {
       expect(count(seen, once)).toBe(1);
     }
@@ -299,12 +304,17 @@ describe('Assessment Report content', () => {
   });
 
   it('names the highest-risk group in the website sentence only when the tier agrees', async () => {
-    expect(websiteUnreadNote('CRITICAL')).toBe("The firm's website could not be read during the scan. Until it can be read, this result " +
-      'stays in the highest-risk group and needs a manual review, whatever the answers show.');
+    // The results screen's notice in the third person (DN-12 §6.2). The group is the score's; only the manual review
+    // holds whatever the answers show.
+    expect(websiteUnreadNote('CRITICAL')).toBe("We could not read the firm's website during the scan. This outlook is in the " +
+      'highest-risk group, and because the website could not be read, it needs a manual review whatever the answers show. ' +
+      'This is not a coverage decision or a price.');
     for (const tier of ['FORTRESS', 'FORTIFIED', 'GUARDED', 'EXPOSED', 'UNKNOWN'] as const) {
-      expect(websiteUnreadNote(tier)).toBe("The firm's website could not be read during the scan. Until it can be read, this result " +
-        'needs a manual review, whatever the answers show.');
+      expect(websiteUnreadNote(tier)).toBe("We could not read the firm's website during the scan. Until it can be read, this outlook " +
+        'needs a manual review, whatever the answers show. This is not a coverage decision or a price.');
     }
+    // Never that the group itself holds whatever the answers show.
+    expect(websiteUnreadNote('CRITICAL')).not.toMatch(/stays in the highest-risk group/);
     // Nothing public and the weakest answers: the tier is CRITICAL, and the page says so once.
     const weakest: Record<string, AnswerValue> = { 'D1.1': { kind: 'option', optionId: 'none' }, 'D1.2': { kind: 'option', optionId: 'no' },
       'D2.1': { kind: 'options', optionIds: ['none'] }, 'D3.1': { kind: 'scale', value: 0 }, 'D3.2': { kind: 'option', optionId: 'none' },
@@ -313,7 +323,7 @@ describe('Assessment Report content', () => {
       result.preScore.flags = ['WEBSITE_UNAVAILABLE']; } }, weakest);
     expect(record.result.tier).toBe('CRITICAL');
     const html = renderAssessmentHtml(record);
-    expect(count(html, /stays in the highest-risk group and needs a manual review/g)).toBe(1);
+    expect(count(html, /This outlook is in the highest-risk group/g)).toBe(1);
   });
 
   it('falls back to the domain when the scan found no firm name, and never lets stored text become markup', async () => {
@@ -338,5 +348,32 @@ describe('Assessment Report content', () => {
 
   it('names the file after the domain and the completion date', async () => {
     expect(assessmentReportFilename(await completed())).toBe('arca-assessment-smithlaw.com-2026-11-09.pdf');
+  });
+
+  it('dates the report and its file by the day in Florida, not in UTC', async () => {
+    // Completed at 10:30 p.m. in Miami on November 9, which is already November 10 in UTC.
+    const record = await completed();
+    record.result.completedAt = '2026-11-10T03:30:00.000Z';
+    record.attested_at = '2026-11-10T03:29:00.000Z';
+    expect(assessmentReportFilename(record)).toBe('arca-assessment-smithlaw.com-2026-11-09.pdf');
+    const html = renderAssessmentHtml(record);
+    expect(html).toContain('Assessment completed November 9, 2026');
+    expect(html).toContain('Attested as true by the firm on November 9, 2026.');
+  });
+
+  it('prints the combined score as the screen shows it, not with its decimals', async () => {
+    const record = await completed();
+    for (const [stored, shown] of [[52.15, 52], [52.5, 53], [0.4, 0], [99.99, 100]] as const) {
+      record.result.compositeScore = stored;
+      expect(renderAssessmentHtml(record)).toContain(`<div class="total">${shown}<small> / 100</small></div>`);
+    }
+  });
+
+  it('says one hour, not one hours, in an answer', async () => {
+    const record = await completed();
+    const training = record.rendered.find(question => question.number)!;
+    record.answers[training.id] = { kind: 'number', value: 1 };
+    expect(renderAssessmentHtml(record)).toContain('1 hour per lawyer / year');
+    expect(renderAssessmentHtml(record)).not.toContain('1 hours');
   });
 });

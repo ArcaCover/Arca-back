@@ -24,6 +24,13 @@ function domainResults(bank:QuestionBank,answers:Answers): AssessmentResult['dom
       status:fixed.length >= domain.minQuestions && fixed.every(q=>validateAnswer(q,answers[q.id])) ? 'KNOWN' : 'PARTIAL'};
   });
 }
+/**
+ * A count and its unit as a sentence reads them. The bank names a unit in the plural ('hours per lawyer / year'), so
+ * one of it drops the plural ending of the unit's first word: '1 hour per lawyer / year'.
+ */
+export function numberLabel(value:number,unit:string): string {
+  return `${value} ${value===1 ? unit.replace(/^([A-Za-z]+)s(?![A-Za-z])/,'$1') : unit}`;
+}
 function betterAnswers(q:Question,answer:AnswerValue): Array<{answer:AnswerValue;label:string}> {
   if (q.options && answer.kind==='option') return q.options.map(o=>({answer:{kind:'option' as const,optionId:o.id},label:o.label}));
   if (q.options && answer.kind==='options') {
@@ -34,7 +41,10 @@ function betterAnswers(q:Question,answer:AnswerValue): Array<{answer:AnswerValue
     return candidates.filter(c=>validateAnswer(q,c.answer));
   }
   if (q.scale) return q.scale.points.map((_,i)=>({answer:{kind:'scale' as const,value:q.scale!.min+i*q.scale!.step},label:`Review level ${q.scale!.min+i*q.scale!.step} of ${q.scale!.max}`}));
-  if (q.number) return q.number.bands.map((_,i)=>({answer:{kind:'number' as const,value:i===0?q.number!.min:q.number!.bands[i-1]!.upTo+1},label:`${i===0?q.number!.min:q.number!.bands[i-1]!.upTo+1} ${q.number!.unit}`}));
+  if (q.number) return q.number.bands.map((_,i)=>{
+    const value=i===0?q.number!.min:q.number!.bands[i-1]!.upTo+1;
+    return {answer:{kind:'number' as const,value},label:numberLabel(value,q.number!.unit)};
+  });
   return [];
 }
 export function scoreAssessment({assessmentId,layer1,bank,answers,completedAt}: {

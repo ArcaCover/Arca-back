@@ -176,7 +176,13 @@ export function createApp(deps: AppDeps) {
       return c.json({ error: 'report_unavailable', message: 'The report exists once the scan has a result' }, 409);
     }
     if (!deps.renderReport) return c.json({ error: 'report_unavailable', message: 'Report rendering is not configured' }, 503);
-    const pdf = await deps.renderReport(renderQuickScanHtml(scan.result, scan.status));
+    // A render that fails or runs out of time (the renderer's concurrency cap and deadline) is the report being
+    // unavailable for now, as on the assessment report: 503, not an unexpected server error.
+    const pdf = await deps.renderReport(renderQuickScanHtml(scan.result, scan.status)).catch((error: unknown) => {
+      console.error('[api] report rendering failed', scan.scan_id, error instanceof Error ? error.message : 'Unknown error');
+      return null;
+    });
+    if (!pdf) return c.json({ error: 'report_unavailable', message: 'The report could not be prepared; try again' }, 503);
     return c.body(pdf, 200, { 'Content-Type': 'application/pdf', 'Cache-Control': 'no-store',
       'Content-Disposition': `attachment; filename="${reportFilename(scan.result)}"` });
   });

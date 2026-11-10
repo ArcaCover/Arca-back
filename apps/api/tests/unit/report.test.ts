@@ -4,7 +4,7 @@ import { createApp } from '../../src/http/app.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import { issueSessionToken } from '../../src/auth/session-token.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
-import { renderQuickScanHtml, reportFilename } from '../../src/report/quick-scan.js';
+import { renderQuickScanHtml, reportFilename, websiteUnreadNote } from '../../src/report/quick-scan.js';
 import { InProcessPipeline } from '../../src/pipeline/in-process-pipeline.js';
 import { mockSources } from '../../src/pipeline/mock-sources.js';
 import { fixtureResult } from '../../../../packages/contracts/tests/fixture.js';
@@ -40,18 +40,28 @@ describe('Quick Scan Report content', () => {
       .run({ scanId: 'sc_blocked', canonicalDomain: 'blocked.arca.example', email: 'owner@blocked.arca.example' });
     expect(status).toBe('PARTIAL');
     const html = renderQuickScanHtml(result, 'PARTIAL');
-    const notes = [...html.matchAll(/<li>([^<]*)<\/li>/g)].map(match => match[1]).filter(text => /website could not be read/.test(text!));
-    expect(notes).toEqual(['The firm&#39;s website could not be read, so everything that could not be verified counts as unknown ' +
-      'and the firm sits in the highest-risk group until the assessment is completed.']);
+    const notes = [...html.matchAll(/<li>([^<]*)<\/li>/g)].map(match => match[1]).filter(text => /could not read/.test(text!));
+    // The /score notice in the third person: the group is the score's, "for now"; only the manual review holds.
+    expect(notes).toEqual(['We could not read the firm&#39;s website during the scan. What we could not verify counts as unknown, ' +
+      'which places the firm in the highest-risk group for now. Answers to the assessment also count, and because the website ' +
+      'could not be read, the case will need a manual review.']);
+    expect(html).not.toMatch(/until the assessment|whatever/);
     // The cause stands in for the generic notice, and the report still says no decision was made.
     expect(html).not.toMatch(/did not answer in full/i);
     expect(html).toMatch(/not enough public evidence yet for an underwriting decision/i);
     expect(html).toMatch(/not an offer of insurance, a quote or an underwriting decision/i);
     // The firm name falls back to the domain, the one thing known about a site that was not read.
     expect(html).toContain('<h1>blocked.arca.example</h1>');
+    // ...and the line under it does not print the domain a second time.
+    expect(html.match(/blocked\.arca\.example/g)).toHaveLength(2);
+    expect(html).toContain('<div class="meta">Scanned ');
     expect(html).toMatch(/>0<small> \/ 100/);
     expect(html).toContain('CRITICAL');
     expect(html).toContain('Firm website: unavailable');
+    // The directories were never asked: they were skipped, not unavailable.
+    expect(html).toContain('Florida Bar: not searched, because the firm could not be identified from its website');
+    expect(html).toContain('Avvo: not searched, because the firm could not be identified from its website');
+    expect(html).not.toMatch(/(Florida Bar|Avvo): unavailable/);
     // Nothing in the report names the restriction, a premium or a coverage outcome.
     expect(html).not.toMatch(/REFERRAL|referral|declin|premium|\$|approved|eligible|coverage/);
   });
@@ -66,6 +76,30 @@ describe('Quick Scan Report content', () => {
 
   it('names the file after the domain and the scan date', () => {
     expect(reportFilename(fixtureResult())).toBe('arca-quick-scan-smithlaw.com-2026-09-11.pdf');
+  });
+
+  it('dates the report and its file by the day in Florida, not in UTC', () => {
+    // 10:30 p.m. in Miami on November 9 is already November 10 in UTC.
+    const evening = fixtureResult();
+    evening.meta.completedAt = '2026-11-10T03:30:00.000Z';
+    expect(reportFilename(evening)).toBe('arca-quick-scan-smithlaw.com-2026-11-09.pdf');
+    expect(renderQuickScanHtml(evening, 'COMPLETED')).toContain('Scanned November 9, 2026');
+    expect(renderQuickScanHtml(evening, 'COMPLETED')).toMatch(/observed on November 9, 2026/);
+  });
+
+  it('names the highest-risk group only for a CRITICAL tier, and never promises the group will change or hold', () => {
+    expect(websiteUnreadNote('CRITICAL')).toContain('which places the firm in the highest-risk group for now.');
+    for (const tier of ['FORTRESS', 'FORTIFIED', 'GUARDED', 'EXPOSED', 'UNKNOWN'] as const) {
+      expect(websiteUnreadNote(tier)).toBe("We could not read the firm's website during the scan. What we could not verify counts as unknown. " +
+        'Answers to the assessment also count, and because the website could not be read, the case will need a manual review.');
+    }
+    for (const tier of ['CRITICAL', 'GUARDED'] as const) expect(websiteUnreadNote(tier)).not.toMatch(/until|whatever|complet/i);
+  });
+
+  it('prints the domain under a firm name the scan found', () => {
+    const html = renderQuickScanHtml(fixtureResult(), 'COMPLETED');
+    expect(html).toContain('<h1>Smith Law</h1>');
+    expect(html).toMatch(/<div class="meta">smithlaw\.com( · [^<]+)?<br>Scanned/);
   });
 });
 

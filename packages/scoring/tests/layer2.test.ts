@@ -1,7 +1,7 @@
 import { describe,it,expect } from 'vitest';
 import { fixtureResult } from '../../contracts/tests/fixture.js';
 import { DEMO_BANK, type Answers } from '@arca/questions';
-import { questionPoints, scoreAssessment } from '../src/layer2.js';
+import { numberLabel, questionPoints, scoreAssessment } from '../src/layer2.js';
 const answers:Answers={
   'D1.1':{kind:'option',optionId:'written_shared'},'D1.2':{kind:'option',optionId:'yes'},
   'D2.1':{kind:'options',optionIds:['legal_enterprise','enterprise_general']},
@@ -60,10 +60,18 @@ describe('demo Layer2 deterministic scoring',()=>{
     expect(Object.fromEntries(result.actionPlan.map(a=>[a.id,a.detail]))).toEqual({
       'improve:D1.1':'Next step: We have informal guidance.',
       'improve:D3.2':'Next step: We check a sample of citations.',
-      'improve:D5.1':'Next step: 1 hours per lawyer / year.',
+      // One of a unit is singular; the bank names the unit in the plural.
+      'improve:D5.1':'Next step: 1 hour per lawyer / year.',
     });
     // The screen and the PDF say once that the model is provisional and promises nothing (DN-12 §6).
     for(const action of result.actionPlan) expect(action.detail).not.toMatch(/illustrative|estimate|promise|pricing|coverage|demo/i);
+  });
+  it('names one of a unit in the singular and every other count in the plural',()=>{
+    expect(numberLabel(1,'hours per lawyer / year')).toBe('1 hour per lawyer / year');
+    expect(numberLabel(0,'hours per lawyer / year')).toBe('0 hours per lawyer / year');
+    expect(numberLabel(12,'hours per lawyer / year')).toBe('12 hours per lawyer / year');
+    expect(numberLabel(1,'lawyers')).toBe('1 lawyer');
+    expect(numberLabel(1,'staff')).toBe('1 staff');
   });
   it('is stable for the same versioned snapshot',()=>expect(scoreAssessment(structuredClone(input))).toEqual(scoreAssessment(input)));
 });

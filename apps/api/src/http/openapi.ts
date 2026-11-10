@@ -88,7 +88,7 @@ export function buildOpenApiDocument() {
       401: { description: 'Missing or invalid session', content: json(error) },
       404: { description: 'Scan not found', content: json(error) },
       409: { description: 'The scan is still running or failed, so there is no report (report_unavailable)', content: json(error) },
-      503: { description: 'Report rendering is not configured on this server', content: json(error) } } });
+      503: { description: 'The report could not be rendered in time, or rendering is not configured on this server (report_unavailable)', content: json(error) } } });
   const assessmentErrors = {
     401: { description: 'Missing, invalid, expired, or wrong-scan capability token', content: json(AssessmentError) },
     404: { description: 'Assessment not found', content: json(AssessmentError) },

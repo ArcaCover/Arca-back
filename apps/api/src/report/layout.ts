@@ -8,8 +8,19 @@ export const escape = (value: string) => value.replace(/[&<>"']/g, char =>
 // the score back are marked in dark gold, as /assessment/results does.
 export const COLORS = { marino: '#1C2C5B', cielo: '#6CABDD', oro: '#FFC659', oroOscuro: '#D4A12A', bruma: '#E4F4F7' };
 
+/**
+ * Dates are the firm's day, not the server's: ARCA serves Florida firms, and in UTC a scan finished on a Florida
+ * evening carried tomorrow's date. Florida's peninsula keeps Eastern time (the panhandle's Central-time counties are
+ * an hour behind and may still read the next day after 11 p.m.).
+ */
+export const REPORT_TIME_ZONE = 'America/New_York';
+
 export const longDate = (iso: string) =>
-  new Date(iso).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
+  new Date(iso).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: REPORT_TIME_ZONE });
+
+/** The same day as `longDate`, as yyyy-mm-dd, for the file names. */
+export const isoDay = (iso: string) => new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit',
+  timeZone: REPORT_TIME_ZONE }).format(new Date(iso));
 
 export const BASE_STYLE = `
   @page { size: A4; margin: 12mm 14mm 11mm; }

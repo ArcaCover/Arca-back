@@ -1,6 +1,6 @@
 import { adaptScore, type Layer1Result } from '@arca/contracts';
 import { WEBSITE_UNAVAILABLE } from '@arca/scoring';
-import { BASE_STYLE, COLORS, escape, longDate } from './layout.js';
+import { BASE_STYLE, COLORS, escape, isoDay, longDate } from './layout.js';
 
 // The Quick Scan Report: the /score screen on one A4 page. Every sentence comes from adaptScore
 // and signalsToCards, the same code the screen renders, so the PDF can never say more than the
@@ -15,9 +15,16 @@ const TIER_LINES: Record<string, string> = {
   UNKNOWN: 'Not enough public evidence to place the firm in a tier',
 };
 
-// Shown when the result carries the WEBSITE_UNAVAILABLE flag (DN-12).
-export const WEBSITE_UNREAD_NOTE = "The firm's website could not be read, so everything that could not be verified counts as unknown " +
-  'and the firm sits in the highest-risk group until the assessment is completed.';
+// Shown when the result carries the WEBSITE_UNAVAILABLE flag, in the words of the /score notice, in the third person
+// (DN-12 §3.3). The risk group follows the score, the Layer 2 composite included, so the group is named only when the
+// tier printed above is CRITICAL (in practice always, for this flag) and is never promised to change or to hold. Only
+// the manual review holds, whatever the answers are.
+export function websiteUnreadNote(tier: Layer1Result['preScore']['tier']) {
+  return ["We could not read the firm's website during the scan.",
+    tier === 'CRITICAL' ? 'What we could not verify counts as unknown, which places the firm in the highest-risk group for now.'
+      : 'What we could not verify counts as unknown.',
+    'Answers to the assessment also count, and because the website could not be read, the case will need a manual review.'].join(' ');
+}
 
 const SOURCE_NAMES: Record<string, string> = { website: 'Firm website', bar: 'Florida Bar', avvo: 'Avvo' };
 
@@ -25,12 +32,16 @@ function sourceLine(name: string, source: Layer1Result['sources'][keyof Layer1Re
   const searched = source.attorneysSearched ?? null;
   const found = source.attorneysFound ?? null;
   const coverage = searched && found !== null ? `, ${found} of ${searched} attorneys matched` : '';
-  const state = source.status === 'ok' ? 'complete' : source.status === 'partial' ? 'partial' : 'unavailable';
+  // A directory that was skipped was never asked, so it was not unavailable: say why it was not searched, as /score does.
+  const state = source.status === 'ok' ? 'complete' : source.status === 'partial' ? 'partial'
+    : source.status === 'skipped' ? (source.code === 'INSUFFICIENT_IDENTITY'
+      ? 'not searched, because the firm could not be identified from its website' : 'not searched') : 'unavailable';
   return `${SOURCE_NAMES[name] ?? name}: ${state}${coverage}`;
 }
 
+// The scan day in Florida, where the firms are (layout.ts): the same day the report prints.
 export function reportFilename(result: Layer1Result) {
-  return `arca-quick-scan-${result.domain}-${result.meta.completedAt.slice(0, 10)}.pdf`;
+  return `arca-quick-scan-${result.domain}-${isoDay(result.meta.completedAt)}.pdf`;
 }
 
 export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 'PARTIAL') {
@@ -38,6 +49,8 @@ export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 
   const date = longDate(result.meta.completedAt);
   const place = [view.firm.city, view.firm.state].filter(Boolean).join(', ');
   const facts = [place, view.firm.practice, view.firm.attorneys ? `${view.firm.attorneys} attorneys` : null].filter(Boolean) as string[];
+  // When the firm name fell back to the domain, the title already is the domain: the line under it does not repeat it.
+  const details = [...(view.firm.name === result.domain ? [] : [result.domain]), ...facts];
   const helping = view.signals.filter(signal => signal.positive);
   const holding = view.signals.filter(signal => !signal.positive);
   const list = (items: typeof helping, mark: string) => items.length
@@ -47,7 +60,7 @@ export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 
   // the score, never a decision or a price.
   const websiteUnread = result.preScore.flags.includes(WEBSITE_UNAVAILABLE);
   const notes = [
-    websiteUnread ? WEBSITE_UNREAD_NOTE
+    websiteUnread ? websiteUnreadNote(result.preScore.tier)
       : view.incomplete ? 'Some sources did not answer in full, so this score rests on partial evidence.' : null,
     view.decisionWithheld ? 'There is not enough public evidence yet for an underwriting decision.' : null,
   ].filter(Boolean) as string[];
@@ -58,7 +71,7 @@ export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 
 <body>
   <header><span class="brand">Arca</span><span class="kind">Quick Scan Report</span></header>
   <h1>${escape(view.firm.name ?? result.domain)}</h1>
-  <div class="meta">${escape([result.domain, ...facts].join(' · '))}<br>Scanned ${escape(date)}</div>
+  <div class="meta">${details.length ? `${escape(details.join(' · '))}<br>` : ''}Scanned ${escape(date)}</div>
 
   <section class="score">
     <div class="total">${view.score === null ? '—' : view.score}<small> / 100</small></div>
