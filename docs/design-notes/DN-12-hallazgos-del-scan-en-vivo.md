@@ -1,8 +1,8 @@
 # DN-12 · Hallazgos del scan en vivo
 
 - **Fecha:** 2026-11-09
-- **Estado:** en implementación. Cada arreglo tiene su sección (§3 a §8) y la amplía la tarea que lo hace.
-  Hoy están hechos §3, §4, §5, §6 y §7 (back).
+- **Estado:** hecho en las dos ramas, sin publicar. Cada arreglo tiene su sección (§3 a §8); la verificación
+  conjunta en mock está en §10.
 - **Repos:** `Arca-back` y `Arca-front`, rama `fix/live-scan-findings` en ambos
 - **Parte de:** DN-07 de crawl (§6, robots y web ilegible), DN-09 (modos), DN-10 y DN-11 (webapp)
 
@@ -822,7 +822,21 @@ lo usan los tests.
 
 ## 8. Textos de la interfaz (F3, D8)
 
-Pendiente.
+Todo en `Arca-front`; su `CLAUDE.md` y `docs/copy-deck.md` llevan el detalle y los textos exactos.
+
+- **`/score`.** Un solo aviso de evidencia, en frases, sin flags de máquina. Con `WEBSITE_UNAVAILABLE` dice que
+  la web no se pudo leer, que eso pone al despacho en el grupo de mayor riesgo hasta completar el assessment y
+  que no es una decisión de cobertura; el assessment pasa a ser la acción principal. El PDF es un botón con
+  etiqueta, "Download report (PDF)", junto al dominio.
+- **Scan FAILED.** El texto ya no culpa a la web: algo falló de nuestro lado o una fuente no respondió, y se
+  pide otro intento una sola vez.
+- **Capa 2.** Un solo aviso de demo por pantalla, en el armazón (`AssessmentShell`); se quitaron las otras
+  menciones de "demo" y "provisional". La versión del banco y del modelo sale una vez, en pequeño.
+- **`/assessment/results`.** Botón "Download report (PDF)" sobre la ruta de §6. Con `WEBSITE_UNAVAILABLE`, un
+  aviso que solo nombra el grupo de mayor riesgo si el tier es CRITICAL: el back calcula el tier de Capa 2 con
+  el compuesto, y unas buenas respuestas pueden sacarlo de ahí, así que la frase no contradice la insignia
+  **[mía]**.
+- La banda de debug y el panel State no cambian.
 
 ## 9. Lo que no cambia
 
@@ -830,3 +844,38 @@ Pendiente.
 - La identidad: el dominio sigue sin convertirse en nombre de firma (DN-04).
 - Producción: nada de mock ni de debug llega a ella (DN-09), y su gasto de Apify sigue sin techo (§5).
 - El input de las consultas a Apify y su fingerprint: los runs ya cacheados siguen valiendo (§5.1).
+
+## 10. Verificación (2026-11-09)
+
+Back en `a56826d`, front en `572d0cb`, las dos en `fix/live-scan-findings`. Solo mock: ninguna llamada a
+OpenAI, Apify, Supabase ni a webs reales.
+
+| Comprobación | Resultado |
+|---|---|
+| Back `npm run typecheck` | Sin errores |
+| Back `npm test` | 1217 de 1218. Falló por tiempo `infra/aws/lib/arca-demo-stack.test.ts` (flake conocido bajo carga); solo pasa 7 de 7 |
+| Front `npm run typecheck` y `npm run lint` | Sin errores; los 6 avisos de react-hooks conocidos |
+| Front `npm test`, dos veces | 930 de 930 en 47 ficheros, las dos veces |
+| Front `npm run build` (producción) | `[check-no-debug] 0 debug leak(s)`. En `.next/static`, 0 ficheros con cadenas de debug, de la webapp simulada, de la semilla o "Keep these results"; "Download report (PDF)" está en 2 (control) |
+| Contrato | Las respuestas de la API mock para `robust`, `minimal`, `partial`, `sanctioned`, `failed` y `blocked` (scan, poll y, salvo `failed`, el assessment de principio a fin) pasan los esquemas de `@arca/contracts` 0.4.0 instalado en el front: 37 de 37 |
+| Smokes del front | `assessment` sin errores de página; `modes` 4 de 4; `webapp` 5 de 5; `roles` 6 de 6 |
+| Recorrido en Chromium a 1280×900 | 6 de 6, abajo |
+
+Recorrido:
+
+- `robust.arca.example`: `/score` 82, FORTRESS. El botón del PDF cabe en la primera pantalla (y 361 a 403) y
+  baja un fichero que empieza por `%PDF`. Assessment completo, un solo aviso de demo en los resultados, el PDF
+  de Capa 2 baja bien, y "Keep these results" lleva al registro, al pago simulado y a `/app` con el análisis.
+- `blocked.arca.example`: termina PARTIAL y llega a `/score` (no a la pantalla de fallo) con 0, CRITICAL,
+  confianza baja, el override `WEBSITE_UNAVAILABLE` → `REFERRAL_SENIOR` y el aviso de web ilegible. El
+  assessment es la acción principal, dentro de la primera pantalla. Resultados: 52, GUARDED, un solo aviso de
+  demo y el aviso de web en su forma sin "highest-risk group", porque el tier no es CRITICAL (§8). El resto,
+  como en `robust`.
+- `failed.arca.example`: termina FAILED con el texto de "try again" y sin culpar a la web.
+- El mismo dominio escaneado dos veces da el mismo score (82 y 82; 0 y 0).
+
+Notas:
+
+- El puerto 8080 lo ocupaba otro proceso local ajeno a ARCA. La pila mock corrió con el mismo
+  `scripts/stack.mjs` y `PORT=8081`, y los smokes con `ARCA_API_URL=http://localhost:8081`.
+- Queda a la vista "Next step: 1 hours per lawyer / year." en el plan de acción (§6.4).
