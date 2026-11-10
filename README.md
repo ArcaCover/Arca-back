@@ -141,12 +141,28 @@ La caché vive en PostgreSQL/Supabase usando `scans`; no requiere Redis ni archi
 está respaldada por un índice parcial sobre dominio y fecha para scans reutilizables no cacheados.
 Los límites en memoria son 10 solicitudes por IP/hora y 3 por email/hora.
 
-El gasto de Apify se **registra pero no se limita**. El ledger (`apify_runs`, `scan_apify_runs`,
-`cost_usd`, `reserved_usd`, `accounting_complete`, `charged_to_scan`) queda intacto y atribuye el
-coste por scan; `APIFY_EXPECTED_COST_USD_PER_RUN` es la cifra provisional que se reserva mientras un
-run está en vuelo, antes de que Apify reporte el coste real. No hay tope por run, por scan ni por día,
-y tampoco `maxTotalChargeUsd` del lado del proveedor: lo único que acota un run individual es
+En producción el gasto de Apify se **registra pero no se limita**. El ledger (`apify_runs`, `scan_apify_runs`,
+`cost_usd`, `reserved_usd`, `accounting_complete`, `charged_to_scan`) atribuye el coste por scan;
+`APIFY_EXPECTED_COST_USD_PER_RUN` es la cifra provisional que se reserva por cada run hasta que Apify
+liquida su coste real, minutos después de que termine. Sin techo no hay tope por run, por scan ni por
+día, y tampoco `maxTotalChargeUsd` del lado del proveedor: lo único que acota un run individual es
 `APIFY_RUN_TIMEOUT_SECS`.
+
+**Guardas de gasto (DN-12 §5).** Activas por defecto solo en `live-debug`; producción no las tiene si su
+entorno no las fija.
+
+- `APIFY_SPEND_CEILING_USD` (`live-debug`: 2): techo en USD sobre lo que el ledger tiene comprometido en
+  las últimas 24 horas, lo haya arrancado quien lo haya arrancado. Un run sin liquidar cuenta su reserva
+  entera. Si un run nuevo no cabe, se rechaza antes de enviar nada a Apify, el directorio informa
+  `PROVIDER_ERROR` (causa transitoria) y el scan queda PARTIAL. Las consultas cacheadas se siguen
+  sirviendo. `0` no arranca ningún run. Con techo, cada run lleva además `maxTotalChargeUsd` con lo que
+  queda; va en la URL, así que ni el input ni el fingerprint cambian.
+- `OPENAI_MAX_REQUESTS_PER_SCAN` (`live-debug`: 30): máximo de chat completions de la extracción del
+  website de un scan. Si se pasa, la fuente falla por causa transitoria y el scan termina FAILED.
+
+Cada ejecución del pipeline deja una línea `[scan-cost] {...}` en el log, en todos los modos: runs de
+Apify arrancados, rechazados y servidos de caché, USD informados y reservados, peticiones y tokens de
+OpenAI. Nombra el scan solo por su id.
 
 ## Reglas
 

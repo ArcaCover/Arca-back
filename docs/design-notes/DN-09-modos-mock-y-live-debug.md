@@ -369,7 +369,7 @@ O por separado: `npm run dev:live-debug` en Arca-back y `npm run dev:live-debug`
 
 - Por separado vale lo mismo que en la §11.2: si el `.env.local` del front apunta a otra API, pon antes `$env:NEXT_PUBLIC_API_URL = 'http://localhost:8080'` en la terminal del front. Si no, el front habla con esa otra API y la franja dice MODE MISMATCH.
 - El back no arranca si `SOURCE_MODE` y `STORAGE_BACKEND` no resuelven a `live` y `supabase`, y el error explica el conflicto. Con el `.env.local` de Jesús resuelven bien.
-- Línea de arranque: `[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only)`.
+- Línea de arranque: `[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only) spend guards: Apify ceiling USD 2 per 24 h, OpenAI cap 30 requests per scan`. Desde el 2026-11-09 nombra los dos guardas de gasto de este modo (DN-12 §5): si no aparecen, no están activos.
 - Al arrancar recupera los scans y assessments interrumpidos contra la base compartida, igual que hoy `npm run dev`.
 - Un scan **sin** escenario es un scan real: escribe en Supabase y gasta crédito.
 - Un scan **con** escenario vive en memoria (§5.5). Aun así, sus fuentes en `default` (que el panel llama "real") llaman a las APIs reales.

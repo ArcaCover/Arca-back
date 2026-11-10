@@ -2,7 +2,7 @@
 
 - **Fecha:** 2026-11-09
 - **Estado:** en implementación. Cada arreglo tiene su sección (§3 a §8) y la amplía la tarea que lo hace.
-  Hoy están hechos §3 y §4 (back).
+  Hoy están hechos §3, §4 y §5 (back).
 - **Repos:** `Arca-back` y `Arca-front`, rama `fix/live-scan-findings` en ambos
 - **Parte de:** DN-07 de crawl (§6, robots y web ilegible), DN-09 (modos), DN-10 y DN-11 (webapp)
 
@@ -317,7 +317,246 @@ devuelven el mismo `preScore` a los 6 días; un PARTIAL transitorio se re-ejecut
 
 ## 5. Control de coste (F6)
 
-Pendiente.
+Hecho en el back. Son tres piezas: un techo de gasto de Apify (§5.1), un tope de peticiones a OpenAI por
+scan (§5.2) y una línea de log con el coste de cada scan (§5.4). Las dos primeras están **activas por
+defecto solo en `live-debug`**. Producción no cambia si su entorno no las fija.
+
+**Decisión. [mía]** El 2026-09-21 se decidió que el gasto de Apify se registra y no se limita (DN-06). Eso
+sigue así en producción. `live-debug` es el modo que paga proveedores reales desde la máquina de quien
+desarrolla, con USD 20 de crédito de pruebas, y desde hoy trae sus propios guardas.
+
+| Variable | Producción | `live-debug` | `mock` |
+|---|---|---|---|
+| `APIFY_SPEND_CEILING_USD` | sin valor: sin techo | `2` si no se fija otra cosa | no aplica: no construye cliente de Apify |
+| `OPENAI_MAX_REQUESTS_PER_SCAN` | sin valor: sin tope | `30` si no se fija otra cosa | no aplica: no llama a ningún modelo |
+
+Un valor explícito gana en cualquier modo. Una línea vacía en el `.env` cuenta como "sin valor", nunca
+como 0. La línea de arranque de `live-debug` dice qué está activo:
+
+```
+[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only) spend guards: Apify ceiling USD 2 per 24 h, OpenAI cap 30 requests per scan
+```
+
+### 5.1 Techo de gasto de Apify
+
+**Qué pasaba.** Desde el 2026-09-21 el gasto de Apify se registra en el ledger pero nada lo limita (DN-06;
+DN-08, "Riesgos y decisiones pendientes", punto 2). Un scan lanza un run por abogado y por directorio (2N runs), y cuando la web da nombre de
+firma pero ningún abogado lanza una sola búsqueda por firma en el Bar que pide hasta 1.000.000 de
+abogados. Ese run era el único capaz de gastar por sí solo los USD 20 de crédito de pruebas.
+
+**Ahora.** Antes de arrancar un run, `ApifyClient` suma lo que el ledger tiene comprometido en las últimas
+24 horas y lo rechaza si su reserva ya no cabe bajo el techo. El rechazo ocurre **antes de enviar ninguna
+petición a Apify**.
+
+Cómo cuenta cada fila de `apify_runs` (`committedUsd`, en `apify-client.ts`):
+
+| Fila | Cuenta |
+|---|---|
+| Liquidada (`accounting_complete`) | Lo que Apify cobró (`cost_usd`) |
+| Arrancada y sin liquidar (en vuelo o terminada) | Su reserva entera (`reserved_usd`, `APIFY_EXPECTED_COST_USD_PER_RUN`, 1 USD), o el coste ya leído si es mayor |
+| Reservada y a punto de arrancar | Su reserva, hasta que caduca |
+| Nunca arrancada (rechazada por el techo o por el límite de uso, caducada) | 0 |
+
+La regla es: `comprometido por las demás filas + reserva de este run > techo` significa rechazo.
+
+- **Las consultas cacheadas no cuentan de nuevo y se siguen sirviendo**, también con el techo agotado. Una
+  consulta cacheada es una fila del ledger: se cuenta una vez, la sirva quien la sirva.
+- **La suma es del ledger, no de la memoria del proceso.** Incluye lo que arrancó este proceso, uno anterior
+  (el back se reinicia con cada cambio de código) y cualquier otro que escriba en la misma base.
+- **Sin migración.** Es un `select` de ocho columnas sobre `apify_runs`, sin `items`, solo cuando un run
+  va a arrancar y solo si hay techo. Producción sin techo no hace esa lectura.
+- **Con `0` no arranca ningún run** y se sirve solo lo cacheado. Sirve para una sesión de `live-debug`
+  que no debe gastar nada en Apify.
+
+**Qué ve el scan.** El directorio termina con `PROVIDER_ERROR` y el motivo `Apify spend ceiling reached;
+lookups it had no room for were not started`. Es una causa transitoria en la tabla de §4.2, así que el scan
+queda PARTIAL, no se concluye nada sobre la firma (ni flag ni override) y la caché lo repara pasado el
+cooldown. A diferencia del límite de uso de Apify, el techo **no para la cola** del directorio: cada búsqueda
+se intenta, las cacheadas se responden gratis y las demás se rechazan sin petición.
+
+**Qué dice el log**, como mucho una vez por minuto:
+
+```
+[apify] Apify spend ceiling reached: USD 2.00 held by the ledger over the last 24 hours, the ceiling is USD 2.00 and a run reserves USD 1.00 (APIFY_SPEND_CEILING_USD, APIFY_EXPECTED_COST_USD_PER_RUN). No new run starts; cached queries are still served.
+```
+
+**Límite de cargo por run.** Con techo, cada run arranca con `maxTotalChargeUsd` igual a lo que al techo le
+queda en ese momento. Va en la URL del arranque, no en el input: **el input guardado y el fingerprint de la
+consulta son los mismos con o sin límite**, así que los runs cacheados antes de este cambio siguen valiendo
+(hay un test que lo fija). Es lo que acota la búsqueda por firma: su input no se tocó y sigue pidiendo
+1.000.000 de abogados, pero el run no puede cobrar más de lo que queda.
+
+Un run que gasta todo su límite pudo parar antes de tener todas las filas. Sus filas se conservan como
+evidencia parcial para ese scan (el directorio queda `partial`, causa transitoria) y **la consulta no se
+cachea**. Se comprueba dos veces: al terminar el run y otra vez cuando se liquida su coste, porque el coste
+leído al terminar puede ser 0.
+
+**Cuántos runs caben.** Cada run sin liquidar cuenta su reserva entera, y Apify tarda unos tres minutos en
+liquidar (dos de espera más el siguiente pase de `reconcileCosts`, que corre cada minuto mientras el back
+siga encendido).
+
+| Configuración | Runs nuevos que caben hasta que se liquiden |
+|---|---|
+| Por defecto (`2` y reserva `1`) | 2. Es el scan de Jesús (una búsqueda por firma en el Bar) o una firma de un abogado (Bar y Avvo) |
+| `APIFY_SPEND_CEILING_USD=5` | 5 |
+| `APIFY_SPEND_CEILING_USD=5` y `APIFY_EXPECTED_COST_USD_PER_RUN=0.5` | 10: cinco abogados en los dos directorios |
+| `APIFY_SPEND_CEILING_USD=0` | 0: solo caché |
+
+Una vez liquidados cuentan por lo que costaron de verdad. Lo observado hasta hoy son dos datos: USD 0,045
+por un run del Bar con 1 resultado y USD 0,38475 por uno de Avvo con 10. El techo por defecto es estrecho a
+propósito: para una firma con plantilla hay que subirlo a mano y sabiendo cuánto se va a gastar.
+
+En PowerShell, para una sesión:
+
+```powershell
+$env:APIFY_SPEND_CEILING_USD='5'; $env:APIFY_EXPECTED_COST_USD_PER_RUN='0.5'
+npm run stack -- live-debug
+```
+
+**Decisiones. [mía]**
+
+- **La reserva entera hasta liquidar**, no el coste leído al terminar el run. Ese coste llega tarde y lee de
+  menos: un run del Bar lee 0 al terminar (el de Jesús leyó 0 y se liquidó en USD 0,045), y un scan en vivo
+  de septiembre leyó ocho veces menos de lo cobrado. Con el coste provisional, un scan de 25 abogados habría
+  pasado entero bajo un techo de 2.
+- **Ventana de 24 horas sobre el ledger**, no un contador en memoria: el back se reinicia con cada cambio y
+  un contador en memoria volvería a cero.
+- **Un techo menor que la reserva de un run no arranca el back** (salvo `0`): ningún run cabría nunca y
+  parecería un presupuesto. El error dice qué variable cambiar.
+- **Si el ledger no se puede leer, el run no arranca** (`PROVIDER_ERROR`, sin cooldown para la consulta). Un
+  techo que deja pasar cuando no puede sumar no es un techo.
+- **Producción no lo usa.** La decisión del 2026-09-21 sigue vigente allí. Quien fije
+  `APIFY_SPEND_CEILING_USD` en producción obtiene el techo y también el límite por run, con el riesgo de
+  plantillas cortadas que se describe abajo.
+
+**Límites conocidos.**
+
+- **No se pudo comprobar que los dos actores respeten `maxTotalChargeUsd`**: habría hecho falta un run de
+  pago. El código anterior al 2026-09-21 ya lo enviaba en cada arranque, con USD 1 por run. El freno
+  duro sigue siendo el límite de uso de la cuenta, que se fija en la consola de Apify; el back ya trata ese
+  corte como causa transitoria.
+- **Si `live-debug` y producción comparten base de datos**, el gasto de producción de las últimas 24 horas
+  también cuenta contra el techo de `live-debug`. Es conservador, pero puede rechazar todo un día con tráfico
+  real. La salida es subir el techo o usar una base separada (DN-09 §11.7).
+- **La comprobación se hace de una en una dentro del proceso, no entre procesos.** Dos back sobre el mismo
+  ledger que arranquen un run en el mismo instante pueden admitir uno de más cada uno.
+- **Dos runs que arrancan juntos pueden sumar más límite que techo.** El límite del segundo descuenta la
+  reserva del primero, no su límite. El exceso máximo es el techo menos una reserva (USD 1 con los valores
+  por defecto) y solo se da si los dos son búsquedas por firma, las únicas que pueden pasar de su reserva.
+- **Una plantilla cortada por el límite.** Solo afecta a la búsqueda por firma de una firma con muchos
+  abogados (con USD 2, del orden de 40, extrapolando del único run del Bar medido). Si el coste al terminar
+  leyó 0, el corte no se ve
+  hasta la liquidación: ese scan usó el dataset como completo y su resultado queda en la caché de scans.
+  La consulta sí deja de reutilizarse en cuanto se liquida.
+- **El límite con que arrancó cada run vive en memoria.** Tras un reinicio, la segunda comprobación (al
+  liquidar) no existe para los runs anteriores.
+- **Más de 1.000 runs en 24 horas** no se pueden sumar con una lectura: el run se rechaza.
+
+### 5.2 Tope de peticiones a OpenAI por scan
+
+**Qué pasaba.** La extracción agéntica está acotada en rondas (3), no en llamadas: cada fase puede añadir
+una reparación y hasta tres intentos ante un 5xx. La mayor extracción grabada (25 abogados) hizo 12
+llamadas; reparando todas sus fases habrían sido 26.
+
+**Ahora.** `AgenticEvidenceProvider` cuenta las chat completions de cada extracción, reintentos y
+reparaciones incluidos, y con `OPENAI_MAX_REQUESTS_PER_SCAN` se niega a enviar la que pasa del tope. La
+cuenta es por scan: el proveedor es un objeto compartido y dos scans simultáneos no se la reparten.
+
+| Qué | Resultado |
+|---|---|
+| Dentro del tope | Nada cambia |
+| Pasa del tope | La extracción falla con `OpenAI request cap reached: one scan may make 30 chat completions`. Ninguna petición más sale |
+| Website source | `error` / `PROVIDER_ERROR`, motivo `Website evidence extraction unavailable`: transitoria (§3.2) |
+| Scan | FAILED, "try again": sin web no hay identidad y los directorios se omiten. No se concluye nada sobre la firma |
+| Evidencia guardada | `diagnostics.error` con el mensaje del tope; el API no lo devuelve |
+| Log | `[openai] request cap reached: ...`, una vez por extracción |
+
+- **No forma parte de la versión de extracción.** El tope cambia cuándo para una extracción, no lo que dice
+  una que terminó: los análisis guardados se siguen reutilizando igual (§4.3). Hay un test que lo fija.
+- **30 por defecto en `live-debug`. [mía]** Es más del doble de lo esperado (entre 5 y 13 según el tamaño de
+  la firma; la única medida real son esas 12) y está por encima de las 26 del peor caso. Corta un bucle, no
+  un scan normal.
+- **Fuera.** Los tokens no se limitan, solo se cuentan (§5.4). El planner de Capa 2 (`ASSESSMENT_PLANNER=agent`,
+  como mucho 2 llamadas por assessment) y el proveedor `openai` de una pasada (1 llamada) no lo necesitan.
+
+### 5.3 Qué hacer antes de un scan real
+
+1. Fijar el límite de uso de la cuenta en la consola de Apify. Es el único freno que también cubre scripts,
+   producción y errores fuera de este código. **Lo hace Jesús**; desde aquí no se puede.
+2. Arrancar `live-debug` y leer la línea de arranque: debe nombrar los dos guardas.
+3. Para no gastar nada en Apify, `APIFY_SPEND_CEILING_USD=0`. Para una firma con plantilla, subir el techo
+   con la tabla de §5.1.
+4. Dejar el back encendido al menos tres minutos después del scan, para que el coste se liquide y el techo
+   cuente lo real en vez de la reserva.
+
+### 5.4 Línea de coste por scan
+
+Cada ejecución del pipeline deja **una** línea en el log, termine como termine:
+
+```
+[scan-cost] {"scanId":"sc_cost1","status":"COMPLETED","durationMs":0,"apify":{"started":4,"refused":0,"resumed":0,"chargedUsd":0.1,"reservedUsd":4,"cachedUsd":0},"openai":{"requests":7,"inputTokens":7000,"outputTokens":1400},"cacheHits":{"apifyRuns":0,"websiteAnalysis":false}}
+```
+
+Esa es la línea del test de integración, con grabaciones escritas a mano y el reloj fijo: no son cifras de
+un scan real.
+
+| Campo | Qué es |
+|---|---|
+| `scanId`, `status`, `durationMs` | El scan, cómo terminó (`FAILED` también si el pipeline lanzó una excepción) y cuánto duró |
+| `apify.started` | Runs que este scan arrancó: los que cuestan |
+| `apify.refused` | Búsquedas que el techo rechazó |
+| `apify.resumed` | Runs de otro scan que este retomó |
+| `apify.chargedUsd` | Lo que Apify había informado al terminar esos runs. **Es un suelo**: los cargos se liquidan minutos después |
+| `apify.reservedUsd` | Lo que el ledger reserva por esos runs hasta que se liquiden. Es lo que cuenta contra el techo |
+| `apify.cachedUsd` | Lo que costaron en su día las respuestas servidas de la caché. Este scan no pagó nada por ellas |
+| `openai.requests` | Chat completions pedidas por la extracción del website |
+| `openai.inputTokens`, `outputTokens` | Suma de lo que informó cada respuesta; `null` si ninguna lo informó |
+| `cacheHits.apifyRuns` | Consultas de directorio servidas de la caché |
+| `cacheHits.websiteAnalysis` | `true` si se reutilizó el análisis guardado (§4.3) y el modelo no leyó el sitio |
+
+- **Sin email, sin dominio y sin claves.** El scan se nombra solo por su id, como en los demás logs.
+- **Una por ejecución del pipeline.** Un scan servido de la caché de scans no ejecuta el pipeline y no deja
+  línea. Dos peticiones del mismo dominio que comparten una ejecución dejan una, con el id de la primera.
+- **En todos los modos**, también en producción y en mock (donde todo vale 0).
+- **Una fuente cortada por el plazo** se cuenta hasta el momento de escribir la línea.
+- **No incluye dólares de OpenAI**: el precio por token no está en el código y no se inventa.
+
+**Cómo llega la cuenta.** Las fuentes hablan con sus proveedores a través de las interfaces del contrato,
+que no tienen sitio para un contador (D6), y una fuente cortada por el plazo no devuelve nada. Por eso el
+contador (`ScanMeter`, en `scan-cost.ts`) viaja en el contexto asíncrono del scan (`AsyncLocalStorage`): el
+cliente de Apify y el del modelo le informan si existe, y fuera de un scan (un script, la liquidación de
+costes) no hay ninguno.
+
+### 5.5 Tests
+
+Todos con clientes inyectados: ninguno toca Apify ni OpenAI.
+
+- `apps/api/tests/unit/sources.test.ts`, "Apify spend ceiling": el rechazo ocurre antes de la petición y se
+  registra una vez; de seis runs simultáneos arrancan exactamente los dos que caben; las consultas cacheadas
+  se sirven y no cuentan de nuevo; la reserva se mantiene hasta liquidar; cuenta el gasto de otro proceso y
+  no el de hace más de 24 horas; `0` no arranca nada; sin techo no hay lectura ni `maxTotalChargeUsd`; el
+  límite no cambia input ni fingerprint; la búsqueda por firma sigue pidiendo 1.000.000 y lleva límite; un
+  run que agotó su límite no se cachea; el directorio informa causa transitoria sin parar la cola.
+- `apps/api/tests/unit/env.test.ts`, "spend guards": producción sin valor, `live-debug` con 2 y 30, valor
+  explícito, línea vacía, valores inválidos.
+- `apps/api/tests/unit/agentic-evidence-provider.test.ts`, "request cap per scan".
+- `apps/api/tests/unit/scan-cost.test.ts` y `apps/api/tests/integration/scan-cost.test.ts`: la forma de la
+  línea sobre el pipeline real con las grabaciones de §4.5, un segundo scan servido de las cachés, dos
+  scans simultáneos sin mezclar cuentas, un scan con el techo alcanzado, un pipeline que lanza, y ninguna
+  línea para un scan servido de la caché.
+- `compose.test.ts` (el techo y el tope llegan a los clientes; producción los construye sin ellos),
+  `supabase-repository.test.ts` (la consulta exacta de la lectura nueva) y `debug-isolation.test.ts` (el
+  ledger sigue siendo durable).
+
+### 5.6 Lo que queda fuera
+
+- **Acotar el input de la búsqueda por firma** (`maxLawyers`): cambia el fingerprint y pierde el run que
+  Jesús ya pagó. Además un tope ahí tendría que salir como `TRUNCATED`, no como plantilla completa (DN-02, DN-06).
+- **Techo por scan.** El techo es por ventana de 24 horas. Un scan solo no puede pasar de él.
+- **Límite de tokens o de dólares de OpenAI.** Se cuentan peticiones y tokens; el límite de gasto de OpenAI
+  se fija en su panel.
+- **Guardar el límite de cada run en el ledger**, para que la comprobación al liquidar sobreviva a un
+  reinicio: necesita una columna y una migración sobre la base compartida.
 
 ## 6. PDF de Capa 2 y botón de exportar (F1, D8)
 
@@ -336,4 +575,5 @@ Pendiente.
 
 - El contrato publicado: `@arca/contracts` sigue en 0.4.0, sin campos ni valores nuevos (D6).
 - La identidad: el dominio sigue sin convertirse en nombre de firma (DN-04).
-- Producción: nada de mock ni de debug llega a ella (DN-09).
+- Producción: nada de mock ni de debug llega a ella (DN-09), y su gasto de Apify sigue sin techo (§5).
+- El input de las consultas a Apify y su fingerprint: los runs ya cacheados siguen valiendo (§5.1).
