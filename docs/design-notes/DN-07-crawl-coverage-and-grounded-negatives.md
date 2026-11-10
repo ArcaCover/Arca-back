@@ -110,9 +110,17 @@ crawler, el lector de PDFs, el lector de sitemaps y las herramientas del agente 
   solo se comprobaban las navegaciones, y un `fetch("/wp-json/…")` salía aunque estuviera excluido.
   Un `iframe` del propio sitio excluido por robots queda anotado igual, con `scope: request`.
 - El destino de una redirección se comprueba antes de entregársela al navegador. Cuando la navegación termina, se
-  comprueba además cada salto del propio sitio de la cadena (`redirectedFrom()` hasta la primera petición, más la URL
-  final): si robots excluye alguno, la página termina como `ROBOTS_DISALLOWED` y su contenido no se guarda (ver el
-  límite de abajo).
+  comprueba además cada salto de la cadena (`redirectedFrom()` hasta la primera petición, más la URL actual): si
+  alguno sale del sitio, la página termina como `OFF_SITE_REDIRECT`; si robots excluye alguno del sitio, como
+  `ROBOTS_DISALLOWED`. En los dos casos su contenido no se guarda (ver el límite de abajo). La comprobación va antes de
+  mirar el estado, así que una cadena que sale a otro host termina como `OFF_SITE_REDIRECT` aunque el último salto
+  responda 503 con un desafío: el desafío es de otro host, no la negativa de la firma.
+- La página puede navegar sola después de cargar (un `meta refresh`, un `location.href` en un script) mientras el
+  crawler espera a que la red se calme. Por eso el crawler apunta todas las respuestas de navegación del marco
+  principal (`page.on('response')`) y, después de leer el contenido, vuelve a revisar la cadena de cada una y la URL
+  actual. Si alguna sale del sitio o pasa por una URL excluida, la página termina igual que arriba y lo leído se
+  descarta. Antes de la segunda revisión, un `meta refresh` a `/private` → `www/private` → `/private/` con
+  `Disallow: /private/` se guardaba como página de la firma, y uno que acababa en otro host también.
 - El lector de sitemaps sigue las redirecciones él mismo, salto a salto y como mucho 5. Cada salto tiene que quedarse en
   el host de la firma y estar permitido por el `robots.txt` de su origen antes de pedirlo; si no, ese sitemap se salta.
   Antes seguía las redirecciones sin mirar ni robots ni el host, y `/sitemap.xml` → `/private/sitemap.xml` con
@@ -177,7 +185,9 @@ TRANSIENT: no se marca una firma como ilegible mientras otro scan pueda leerla.
 El desafío se reconoce antes de mirar el estado, por su texto ("Just a moment", "Checking your browser"…) o por la
 cabecera `cf-mitigated: challenge`. Cloudflare sirve el suyo con 403, 429 o 503, y antes un desafío con 503 salía
 como `HTTP_ERROR`, se reintentaba y el scan terminaba FAILED en cada intento. Ahora es `ACCESS_BLOCKED` con
-`detail: 'challenge page'`, sin reintentos. Un 503 o un 429 sin desafío siguen siendo transitorios.
+`detail: 'challenge page'`, sin reintentos. Un 503 o un 429 sin desafío siguen siendo transitorios. Solo cuenta el
+desafío del propio sitio: la cadena de redirecciones se revisa antes (arriba), y una que acaba en el desafío de otro
+host es `OFF_SITE_REDIRECT`, transitoria.
 
 Solo es DEFINITIVE la negativa del sitio, es decir, `ACCESS_BLOCKED`. Una portada sin texto no lo es: es
 también lo que deja un script que falló una vez (un 503 del propio bundle, un CDN que no resuelve DNS) o un
@@ -201,14 +211,18 @@ Calendly se pedía tres veces, dejaba el crawl `partial` y descargaba el `robots
 - Si una navegación redirige fuera del sitio (otro host, otro puerto u otro esquema), el manejador corta la
   redirección antes de entregarla al navegador y la página termina como `OFF_SITE_REDIRECT`, con el host de
   destino en `detail`. Es una respuesta del sitio: sin reintentos, sin `partial`, sin pedir nada al otro host.
-- Si la cadena acaba fuera del sitio tras un salto que el manejador no vio (`www` que redirige otra vez), la
-  página tampoco se guarda: mismo `OFF_SITE_REDIRECT`.
+- Si la cadena pasa fuera del sitio tras un salto que el manejador no vio (`www` que redirige otra vez), la
+  página tampoco se guarda: mismo `OFF_SITE_REDIRECT`. Vale también para una navegación que la página empieza sola
+  después de cargar (`meta refresh` o script).
 
 **Límite conocido, sin resolver aquí.** Los saltos posteriores al primero no pasan por el manejador de peticiones:
 Chromium los sigue con su propia red, fuera de `network.ts` (sin la IP fijada) y sin preguntar a robots antes de
-pedirlos. Desde el 2026-11-10 **el contenido de esos saltos nunca se guarda** si acaban fuera del sitio o en una URL
-que robots excluye: el crawler revisa la cadena entera al terminar la navegación (arriba). Pero Chromium **sí llega a
-pedir** ese salto una vez, y el test de la cadena `/private` → `www/private` → `/private/` lo comprueba así. Tampoco
+pedirlos. Desde el 2026-11-10 **el contenido de esos saltos no se guarda** si salen del sitio o pasan por una URL que
+robots excluye: el crawler revisa la cadena de cada navegación del marco principal antes de mirar el estado y otra vez
+después de leer el contenido, también la de una navegación que la página empezó sola (arriba). Una navegación que
+empiece después de esa lectura ya no cambia lo que se guardó. Pero Chromium **sí llega a pedir** ese salto una vez,
+y los tests de la cadena `/private` → `www/private` → `/private/` (directa, por `meta refresh` y por script) lo
+comprueban así. Tampoco
 pasan por `network.ts` ni por robots las redirecciones de subrecursos (scripts, XHR). Seguir las redirecciones desde
 el backend lo cerraría (resolver la cadena en el manejador y entregar al navegador una sola redirección a la URL final
 ya comprobada), pero hoy las cookies que un sitio fija al redirigir solo las conserva el navegador, y sin ellas

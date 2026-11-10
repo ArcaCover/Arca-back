@@ -931,13 +931,13 @@ Arreglos del back tras la revisión final de la rama. Todos con tests nuevos que
 
 | Qué | Dónde | Detalle |
 |---|---|---|
-| Robots en los saltos posteriores de una redirección | `crawler.ts` | La cadena entera se comprueba al terminar la navegación; el contenido de un salto excluido no se guarda (DN-07 §6, con su límite) |
+| Robots en los saltos posteriores de una redirección | `crawler.ts` | La cadena de cada navegación del marco principal se comprueba antes de mirar el estado y otra vez después de leer el contenido, también la de un `meta refresh` o un script que navega solo; el contenido de un salto excluido o de otro host no se guarda (DN-07 §6, con su límite) |
 | Robots y host en las redirecciones de un sitemap | `sitemap-reader.ts` | Salto a salto, como mucho 5; uno que no pasa salta ese sitemap |
-| Desafío servido con 403, 429 o 503 | `crawler.ts`, `website-outcome.ts` | Negativa (`ACCESS_BLOCKED`, DEFINITIVE) sin reintentos (DN-07 §6) |
+| Desafío servido con 403, 429 o 503 | `crawler.ts`, `website-outcome.ts` | Negativa (`ACCESS_BLOCKED`, DEFINITIVE) sin reintentos, solo si es del propio sitio: una cadena que acaba en el desafío de otro host es `OFF_SITE_REDIRECT`, transitoria (DN-07 §6) |
 | Página vacía en un crawl `partial` | `website-outcome.ts` | TRANSITORIA, como cuando es todo el sitio (§4.2) |
 | Aviso de web ilegible en los dos PDF | `report/` | El grupo sigue al score; solo la revisión manual se mantiene (§3.3, §6.2) |
 | Tope de renders PDF | `report/pdf.ts`, `app.ts` | 2 a la vez, 12 s por petición, 503 al agotarse (§6.4) |
-| Score, fechas, dominio y directorios en los PDF | `report/` | Entero como la pantalla, día de `America/New_York`, el dominio una vez, "not searched" para un directorio omitido (§6.2) |
+| Score, fechas, dominio y directorios en los PDF | `report/` | Entero como la pantalla, día de `America/New_York`, el dominio una vez, y un directorio omitido dice "not searched; we could not look the firm up there", como `/score` ("We could not look your firm up on Avvo."). No dice que la firma no se pudo identificar: `INSUFFICIENT_IDENTITY` también sale con la firma identificada y sin ciudad verificada, la forma del scan del 2026-11-06 (§6.2) |
 | "1 hours" | `packages/scoring/src/layer2.ts` | `numberLabel` (§6.4) |
 | Orden canónico antes del cruce de directorios | `packages/scoring/tests/determinism.test.ts` | Test que falla si se quita el orden de `evaluateLayer1Evidence` |
 | `ScanRepository.latestRaw` | repositorios | Eliminado: nadie lo llamaba |
@@ -945,6 +945,13 @@ Arreglos del back tras la revisión final de la rama. Todos con tests nuevos que
 Verificación: back `npm run typecheck` sin errores; `npm test` 1244 de 1244 en 69 ficheros, y en una segunda pasada
 1243 de 1244 con el flake conocido de `infra/aws/lib/arca-demo-stack.test.ts`, que solo pasa 7 de 7. Sin red: los
 tests del crawler usan transportes inyectados y servidores en loopback, y los del PDF un renderer inyectado.
+
+Tras la revisión de estos arreglos se corrigieron tres cosas más, cada una con su test visto fallar antes: la
+navegación que la página empieza sola después de cargar (`meta refresh` o script) saltaba la comprobación de la
+cadena y guardaba el contenido de un salto excluido o de otro host; el desafío de otro host al final de una cadena
+contaba como negativa de la firma (DEFINITIVE, 7 días fijado), y el PDF del Quick Scan decía que la firma no se pudo
+identificar cuando el directorio solo se omitió por falta de ciudad. Con ellos, `npm test` da 1248 de 1249; el único
+fallo es el mismo flake de `arca-demo-stack.test.ts`, que solo pasa 7 de 7.
 
 Lo que no cambió, a propósito: los límites de §4.6 (plantilla cortada, filas antiguas sin código, sitio que siempre
 llega al plazo).
