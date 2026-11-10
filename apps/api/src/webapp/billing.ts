@@ -17,7 +17,7 @@ export interface BillingProvider {
 
 const id = (prefix: string) => `${prefix}_mock_${randomUUID().replaceAll('-', '')}`;
 
-/** Stripe stand-in for mock (DN-09): nothing leaves the process, and a checkout is paid through the debug route. */
+/** Stripe stand-in for the debug modes (DN-09): nothing leaves the process, and a checkout is paid through the debug route. */
 export class MockBillingProvider implements BillingProvider {
   /** Organizations whose subscription was canceled, for the tests. */
   readonly canceled: string[] = [];
@@ -33,7 +33,7 @@ export class MockBillingProvider implements BillingProvider {
     this.sessions.set(sessionId, { orgId: input.orgId, plan: structuredClone(input.plan), paid: false });
     return { sessionId, url: `${this.appBaseUrl}/app/billing/mock-checkout?session=${encodeURIComponent(sessionId)}` };
   }
-  // There is no portal in mock: the billing page is where the customer would land again.
+  // The stand-in has no portal: the billing page is where the customer would land again.
   async createPortal(_input: { orgId: string; returnUrl: string }) { return { url: `${this.appBaseUrl}/app/billing` }; }
   async cancel(orgId: string) { this.canceled.push(orgId); }
 

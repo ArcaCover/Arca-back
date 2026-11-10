@@ -31,7 +31,7 @@ export type AppDeps = {
   renderReport?: (html: string) => Promise<Uint8Array<ArrayBuffer>>;
   /** Debug modes only. Without it there is no /__debug route, the scenario header is never read and CORS refuses it. */
   debug?: DebugTools;
-  /** The private webapp (DN-10). Only mock builds it for now; without it every webapp route answers 501. */
+  /** The private webapp (DN-10). Only the debug modes build one, simulated in memory; without it, as in production, every webapp route answers 501. */
   webapp?: { service: WebappService; auth: AppAuth };
 };
 export function createApp(deps: AppDeps) {

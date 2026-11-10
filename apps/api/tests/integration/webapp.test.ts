@@ -1,12 +1,13 @@
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { ActionItemView, ActionPlanResponse, ActivityPage, AdminAuditPage, AdminMetricsView, AdminOrgDetailView, AdminOrgView, AnalysisView,
-  AssessmentView, ClaimResponse, DeletionRequestView, InvitationView, MeResponse, MemberView, OrgView, PlanView, PollResponse, ROLES, ScanResponse,
-  StartedAssessmentResponse, UrlResponse, type AnswerValue, type RenderedQuestion, type Role } from '@arca/contracts';
-import { DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, DebugSeedResponse, type DebugModeResponse,
-  type DebugScenarioInput } from '@arca/contracts/debug';
+  AssessmentView, ClaimResponse, DeletionRequestView, InvitationView, Layer1Result, MeResponse, MemberView, OrgView, PlanView, PollResponse, ROLES,
+  ScanResponse, StartedAssessmentResponse, UrlResponse, type AnswerValue, type RenderedQuestion, type Role } from '@arca/contracts';
+import { DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, DebugModeResponse, DebugSeedResponse, type DebugScenarioInput } from '@arca/contracts/debug';
 import { InMemoryAssessmentRepository } from '../../src/assessment/repository.js';
 import { AssessmentService } from '../../src/assessment/service.js';
+import { issueSessionToken } from '../../src/auth/session-token.js';
 import { compose } from '../../src/compose.js';
 import { loadEnv } from '../../src/config/env.js';
 import { RoutingAssessmentRepository, RoutingScanRepository } from '../../src/debug/isolation.js';
@@ -17,6 +18,7 @@ import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
 import { InProcessPipeline } from '../../src/pipeline/in-process-pipeline.js';
 import { mockSources } from '../../src/pipeline/mock-sources.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
+import type { ScanRecord } from '../../src/repositories/types.js';
 import { MockAppAuth } from '../../src/webapp/auth.js';
 import { MockBillingProvider } from '../../src/webapp/billing.js';
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
@@ -64,7 +66,7 @@ async function scan(app: App, email = OWNER, scenario?: DebugScenarioInput) {
 }
 
 /** The assessment of the funnel, answered with the first valid answer of each question, as mock-offline.test.ts does. */
-async function completeAssessment(app: App, started: Awaited<ReturnType<typeof scan>>) {
+async function completeAssessment(app: App, started: { scanId: string; sessionToken: string }) {
   const auth = { Authorization: `Bearer ${started.sessionToken}`, 'Content-Type': 'application/json' };
   const created = await app.request(`/scan/${started.scanId}/assessment`, { method: 'POST', headers: auth });
   expect(created.status).toBe(202);
@@ -84,10 +86,8 @@ async function completeAssessment(app: App, started: Awaited<ReturnType<typeof s
   expect(completed.status).toBe(200);
 }
 
-/** The app exactly as `npm run dev:mock` builds it, plus the calls the webapp makes. Every webapp answer is no-store. */
-async function mockApp() {
-  const composed = await compose(loadEnv({ ARCA_MODE: 'mock', SESSION_TOKEN_SECRET: secret, CORS_ALLOWED_ORIGINS: origin }));
-  const { app } = composed;
+/** The calls of the webapp that start no scan, so they are safe against any composition. Every webapp answer is no-store. */
+function webappCalls(app: App) {
   async function call(method: string, path: string, options: { token?: string; body?: unknown; debug?: boolean } = {}): Promise<Reply> {
     const response = await app.request(path, { method, body: options.body === undefined ? undefined : JSON.stringify(options.body),
       headers: { ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
@@ -101,14 +101,6 @@ async function mockApp() {
     expect(reply.status).toBe(200);
     return LoginResponse.parse(reply.body);
   }
-  /** With `assessed`, the assessment is completed before the claim, which gives the organization its action plan. */
-  async function claim(email = OWNER, options: { assessed?: boolean } = {}) {
-    const started = await scan(app, email);
-    if (options.assessed) await completeAssessment(app, started);
-    const reply = await call('POST', '/claims', { body: { scanToken: started.sessionToken } });
-    expect(reply.status).toBe(201);
-    return ClaimResponse.parse(reply.body).claimId;
-  }
   async function createOrg(token: string, claimId: string, name = 'Smith & Co') {
     const reply = await call('POST', '/orgs', { token, body: { name, claimId } });
     expect(reply.status).toBe(201);
@@ -120,6 +112,27 @@ async function mockApp() {
     const sessionId = new URL(UrlResponse.parse(checkout.body).url).searchParams.get('session')!;
     expect(await call('POST', '/__debug/billing/pay', { debug: true, body: { sessionId } })).toEqual({ status: 200, body: { ok: true } });
     return sessionId;
+  }
+  async function actionPlan(token: string, orgId: string) {
+    const reply = await call('GET', `/orgs/${orgId}/actions`, { token });
+    expect(reply.status).toBe(200);
+    return ActionPlanResponse.parse(reply.body);
+  }
+  return { call, login, createOrg, pay, actionPlan };
+}
+
+/** The app exactly as `npm run dev:mock` builds it, plus the calls the webapp makes. */
+async function mockApp() {
+  const composed = await compose(loadEnv({ ARCA_MODE: 'mock', SESSION_TOKEN_SECRET: secret, CORS_ALLOWED_ORIGINS: origin }));
+  const { app } = composed;
+  const { call, login, createOrg, pay, actionPlan } = webappCalls(app);
+  /** With `assessed`, the assessment is completed before the claim, which gives the organization its action plan. */
+  async function claim(email = OWNER, options: { assessed?: boolean } = {}) {
+    const started = await scan(app, email);
+    if (options.assessed) await completeAssessment(app, started);
+    const reply = await call('POST', '/claims', { body: { scanToken: started.sessionToken } });
+    expect(reply.status).toBe(201);
+    return ClaimResponse.parse(reply.body).claimId;
   }
   async function invite(token: string, orgId: string, email: string, role: Exclude<Role, 'owner'>) {
     const reply = await call('POST', `/orgs/${orgId}/invitations`, { token, body: { email, role } });
@@ -142,11 +155,6 @@ async function mockApp() {
     const org = await createOrg(owner.token, await claim(email, { assessed: options.assessed }));
     if (options.paid ?? true) await pay(owner.token, org.id);
     return { owner, org };
-  }
-  async function actionPlan(token: string, orgId: string) {
-    const reply = await call('GET', `/orgs/${orgId}/actions`, { token });
-    expect(reply.status).toBe(200);
-    return ActionPlanResponse.parse(reply.body);
   }
   async function createAction(token: string, orgId: string, title = 'Name an AI lead') {
     const reply = await call('POST', `/orgs/${orgId}/actions`, { token, body: { title } });
@@ -1000,70 +1008,210 @@ describe('production wiring', () => {
   });
 });
 
-describe('live-debug has no mock login', () => {
+// DN-12 §7 (D7): live-debug keeps its scans and assessments real and runs the accounts, organizations and billing in memory,
+// behind the same simulated login and payment as mock. The demo seed stays in mock.
+describe('live-debug: real scans, a simulated webapp held in memory', () => {
+  const liveDebugEnv = { ARCA_MODE: 'live-debug', SOURCE_MODE: 'live', STORAGE_BACKEND: 'supabase', SUPABASE_URL: 'https://x.supabase.co',
+    SUPABASE_SECRET_KEY: 'sb_secret_x', OPENAI_API_KEY: 'sk-x', APIFY_API_TOKEN: 'apify_x', SESSION_TOKEN_SECRET: secret,
+    CORS_ALLOWED_ORIGINS: origin };
   const description: DebugModeResponse = { mode: 'live-debug', sourceMode: 'live', storageBackend: 'supabase', websiteEvidenceProvider: 'agentic',
     assessmentPlanner: 'rules', signalLlmModel: 'fixture-model', inUse: { openai: true, apify: true, supabase: true } };
-  function liveDebug() {
-    const scans = new RoutingScanRepository(new InMemoryRepository(), new InMemoryRepository());
-    const assessments = new RoutingAssessmentRepository(new InMemoryAssessmentRepository(), new InMemoryAssessmentRepository(), scans);
-    return { scans, assessments, options: { mode: 'live-debug' as const, describe: description, sources: mockSources(), scans, assessments,
-      pipelineTimeoutMs: 600_000 } };
+  const debugPost = (app: App, path: string, body: unknown = { email: OWNER, sessionId: 'cs_x' }) => app.request(path, { method: 'POST',
+    body: JSON.stringify(body), headers: { 'Content-Type': 'application/json', [DEBUG_REQUEST_HEADER]: '1' } });
+
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  /** The repository itself, with the name of every method called on it. */
+  function recorded<T extends object>(target: T) {
+    const calls: string[] = [];
+    const spied = new Proxy(target, { get(inner, property) {
+      const value: unknown = Reflect.get(inner, property, inner);
+      if (typeof value !== 'function') return value;
+      return (...args: unknown[]) => { calls.push(String(property)); return (value as (...a: unknown[]) => unknown).apply(inner, args); };
+    } });
+    return { spied, calls };
   }
 
-  it('answers 404 on /__debug/auth/login, /__debug/billing/pay and /__debug/seed', async () => {
-    const { scans, assessments, options } = liveDebug();
-    const { app } = createApp({ repository: scans, assessmentRepository: assessments, debug: createDebugTools(options),
-      pipeline: new InProcessPipeline({ ...mockSources(), repository: scans, timeoutMs: 600_000 }),
-      domainResolver: new PublicDomainResolver(async () => {}), sessionSecret: secret, corsOrigins: [origin], clientIp: () => '127.0.0.1' });
-    expect((await app.request('/__debug/mode')).status).toBe(200);
-    for (const path of ['/__debug/auth/login', '/__debug/billing/pay', '/__debug/seed']) {
-      const response = await app.request(path, { method: 'POST', body: JSON.stringify({ email: OWNER, sessionId: 'cs_x' }),
-        headers: { 'Content-Type': 'application/json', [DEBUG_REQUEST_HEADER]: '1' } });
-      expect(response.status).toBe(404);
+  /**
+   * The app exactly as `npm run dev:live-debug` builds it, except that repositories of this test stand in for Supabase and the
+   * network refuses every request. No scan is ever started here: the real sources would read a real site.
+   */
+  async function liveDebugApp() {
+    const network = vi.fn(async () => { throw new Error('A live-debug webapp test must not reach the network'); });
+    vi.stubGlobal('fetch', network);
+    const scans = recorded(new InMemoryRepository()), assessments = recorded(new InMemoryAssessmentRepository());
+    const composed = await compose(loadEnv(liveDebugEnv), { scans: scans.spied, assessments: assessments.spied });
+    /** A finished scan as a real run left it in storage, and the session token its visitor holds. */
+    async function storedScan(email = OWNER, scanId = `sc_${randomUUID().replaceAll('-', '')}`) {
+      const outcome = await new InProcessPipeline({ ...mockSources(), repository: new InMemoryRepository(), timeoutMs: 600_000 })
+        .run({ scanId, canonicalDomain: DOMAIN, email });
+      const at = new Date().toISOString();
+      const record: ScanRecord = { id: randomUUID(), scan_id: scanId, email, canonical_domain: DOMAIN,
+        domain_resolution: { status: 'RESOLVED', canonicalDomain: DOMAIN, source: 'request', reason: null }, status: outcome.status,
+        result: Layer1Result.parse({ ...outcome.result, scanId, domain: DOMAIN, email }), created_at: at, completed_at: at, duration_ms: 10,
+        cached: false };
+      await composed.repository.create(record);
+      return { scanId, sessionToken: await issueSessionToken(scanId, email, secret) };
     }
-    expect((await app.request('/me')).status).toBe(501);
+    /** Forgets what was called so far, so a test can look at one stretch of its walk. */
+    const forgetCalls = () => { scans.calls.length = 0; assessments.calls.length = 0; };
+    return { ...composed, ...webappCalls(composed.app), network, scans, assessments, storedScan, forgetCalls };
+  }
+
+  it('walks from the simulated login to the listed analysis, and the webapp only ever reads the stored scan and assessment', async () => {
+    const s = await liveDebugApp();
+    expect(DebugModeResponse.parse((await s.call('GET', '/__debug/mode')).body)).toMatchObject({ mode: 'live-debug', sourceMode: 'live',
+      storageBackend: 'supabase' });
+    // The anonymous funnel wrote these two; from here on storage is only watched.
+    const started = await s.storedScan();
+    await completeAssessment(s.app, started);
+    expect(s.scans.calls).toContain('create');
+    expect(s.assessments.calls).toContain('commit');
+    s.forgetCalls();
+
+    // 1. The simulated login, then the claim and the organization.
+    const owner = await s.login(OWNER);
+    const claimed = await s.call('POST', '/claims', { body: { scanToken: started.sessionToken } });
+    expect(claimed.status).toBe(201);
+    const org = await s.createOrg(owner.token, ClaimResponse.parse(claimed.body).claimId);
+    expect(org).toMatchObject({ domain: DOMAIN, billingStatus: 'pending_payment', role: 'owner', paidAccess: false });
+    expect(MeResponse.parse((await s.call('GET', '/me', { token: owner.token })).body).organizations).toEqual([org]);
+
+    // 2. Locked until paid.
+    expect(await s.call('GET', `/orgs/${org.id}/analyses`, { token: owner.token })).toEqual(failure(402, 'payment_required'));
+
+    // 3. The simulated payment, then the real scan with its assessment.
+    const sessionId = await s.pay(owner.token, org.id);
+    expect(await s.call('POST', '/__debug/billing/pay', { debug: true, body: { sessionId } })).toEqual(failure(409, 'conflict'));
+    const analyses = await s.call('GET', `/orgs/${org.id}/analyses`, { token: owner.token });
+    expect(analyses.status).toBe(200);
+    const [analysis, ...rest] = z.array(AnalysisView).parse(analyses.body);
+    expect(rest).toEqual([]);
+    expect(analysis).toMatchObject({ scanId: started.scanId, domain: DOMAIN, scanStatus: 'COMPLETED' });
+    expect(analysis!.layer1.preScore.total).toBe(82);
+    expect(analysis!.assessment).not.toBeNull();
+    expect((await s.actionPlan(owner.token, org.id)).source).toMatchObject({ scanId: started.scanId, domain: DOMAIN });
+
+    // The claim, the organization, the payment and the plan wrote nothing where the scans live.
+    expect([...new Set(s.scans.calls)]).toEqual(['get']);
+    expect([...new Set(s.assessments.calls)]).toEqual(['getByScan']);
+    // A scan is claimed once, and that rule lives in the webapp's memory too.
+    expect(await s.call('POST', '/claims', { body: { scanToken: started.sessionToken } })).toEqual(failure(409, 'conflict'));
+    expect(s.network).not.toHaveBeenCalled();
   });
 
-  it('hands its debug routes no scan runner, so none that skips the limiter is built there', () => {
-    const { scans, assessments, options } = liveDebug();
-    const debug = createDebugTools(options);
-    expect(debug.seeds).toBe(false);
-    const routes = vi.spyOn(debug, 'routes');
-    createApp({ repository: scans, assessmentRepository: assessments, debug,
+  it('has no demo seed: it would scan a real site past the limiter and write to the shared database', async () => {
+    const s = await liveDebugApp();
+    expect((await debugPost(s.app, '/__debug/seed')).status).toBe(404);
+    expect(MeResponse.parse((await s.call('GET', '/me', { token: (await s.login(OWNER)).token })).body).organizations).toEqual([]);
+    expect(s.network).not.toHaveBeenCalled();
+  });
+
+  it('guards the simulated login and payment as mock does: X-Arca-Debug: 1 and a valid body', async () => {
+    const s = await liveDebugApp();
+    for (const path of ['/__debug/auth/login', '/__debug/billing/pay']) {
+      const response = await s.app.request(path, { method: 'POST', body: JSON.stringify({ email: OWNER, sessionId: 'cs_x' }),
+        headers: { 'Content-Type': 'application/json' } });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'invalid_request', message: expect.stringContaining(DEBUG_REQUEST_HEADER) });
+    }
+    expect(await s.call('POST', '/__debug/auth/login', { debug: true, body: { email: 'not-an-email' } })).toEqual(failure(400, 'invalid_request'));
+    expect(await s.call('POST', '/__debug/billing/pay', { debug: true, body: { sessionId: 'cs_mock_unknown' } })).toEqual(failure(409, 'conflict'));
+    // Without a token the webapp is there and asks for one; it is no longer a 501.
+    expect(await s.call('GET', '/me')).toEqual(failure(401, 'unauthorized'));
+    expect(await s.call('GET', '/me', { token: 'not-a-token' })).toEqual(failure(401, 'unauthorized'));
+  });
+
+  it('a reset forgets the simulated webapp and never touches storage, so the same scan can be claimed again', async () => {
+    const s = await liveDebugApp();
+    const started = await s.storedScan();
+    const owner = await s.login(OWNER);
+    const claimOf = async () => s.call('POST', '/claims', { body: { scanToken: started.sessionToken } });
+    const org = await s.createOrg(owner.token, ClaimResponse.parse((await claimOf()).body).claimId);
+    await s.pay(owner.token, org.id);
+    expect(await claimOf()).toEqual(failure(409, 'conflict'));
+    s.forgetCalls();
+
+    expect(await s.call('POST', '/__debug/reset', { debug: true })).toEqual({ status: 200, body: { ok: true } });
+    expect(s.scans.calls).toEqual([]);
+    expect(s.assessments.calls).toEqual([]);
+    // The token still verifies, since its key comes from the session secret, but its organization is gone.
+    expect(await s.call('GET', `/orgs/${org.id}`, { token: owner.token })).toEqual(failure(404, 'not_found'));
+    expect(MeResponse.parse((await s.call('GET', '/me', { token: owner.token })).body).organizations).toEqual([]);
+    // The scan is where it was, and free to join a new organization.
+    expect((await s.app.request(`/scan/${started.scanId}`, { headers: { Authorization: `Bearer ${started.sessionToken}` } })).status).toBe(200);
+    const again = await claimOf();
+    expect(again.status).toBe(201);
+    expect((await s.createOrg(owner.token, ClaimResponse.parse(again.body).claimId, 'Second time')).id).not.toBe(org.id);
+    expect(s.network).not.toHaveBeenCalled();
+  });
+
+  it('never lets a scan with an injected fault, which lives in memory only, join an organization', async () => {
+    const s = await liveDebugApp();
+    const scanId = `sc_${randomUUID().replaceAll('-', '')}`;
+    // What POST /scan does for a scenario header (DN-09 5.5), without starting the scan.
+    (s.repository as RoutingScanRepository).isolate(scanId);
+    const injected = await s.storedScan(OWNER, scanId);
+    expect(s.scans.calls).not.toContain('create');
+    expect(await s.call('POST', '/claims', { body: { scanToken: injected.sessionToken } })).toEqual(failure(409, 'conflict'));
+  });
+
+  it('on the real Supabase repositories, the login, the account, the plans and a reset send nothing to Supabase', async () => {
+    // Stands in for Supabase, which compose reaches once at start to fail the scans a restart interrupted.
+    const supabase = vi.fn(async (..._request: Parameters<typeof fetch>) => new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', supabase);
+    const { app } = await compose(loadEnv(liveDebugEnv));
+    const s = webappCalls(app);
+    const owner = await s.login(OWNER);
+    expect(MeResponse.parse((await s.call('GET', '/me', { token: owner.token })).body)).toEqual({ user: { id: owner.user.userId, email: OWNER },
+      organizations: [], platformAdmin: false });
+    expect((await s.call('GET', '/plans')).status).toBe(200);
+    expect((await debugPost(app, '/__debug/seed')).status).toBe(404);
+    expect(await s.call('POST', '/__debug/reset', { debug: true })).toEqual({ status: 200, body: { ok: true } });
+    expect(supabase.mock.calls.map(([input, init]) => `${init?.method} ${String(input).split('?')[0]}`))
+      .toEqual(['PATCH https://x.supabase.co/rest/v1/scans']);
+  });
+
+  /** The debug tools and the app built by hand, the way compose builds them in live-debug. */
+  function handBuilt() {
+    const scans = new RoutingScanRepository(new InMemoryRepository(), new InMemoryRepository());
+    const assessments = new RoutingAssessmentRepository(new InMemoryAssessmentRepository(), new InMemoryAssessmentRepository(), scans);
+    const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
+    const billing = new MockBillingProvider(origin);
+    const auth = new MockAppAuth(secret);
+    const service = new WebappService({ repository, scans, assessments, billing, sessionSecret: secret, appBaseUrl: origin });
+    const debug = createDebugTools({ mode: 'live-debug', describe: description, sources: mockSources(), scans, assessments,
+      pipelineTimeoutMs: 600_000, webapp: { auth, billing, service, repository } });
+    const build = () => createApp({ repository: scans, assessmentRepository: assessments, debug, webapp: { service, auth },
       pipeline: new InProcessPipeline({ ...mockSources(), repository: scans, timeoutMs: 600_000 }),
       domainResolver: new PublicDomainResolver(async () => {}), sessionSecret: secret, corsOrigins: [origin], clientIp: () => '127.0.0.1' });
+    return { assessments, debug, build };
+  }
+
+  it('hands its debug routes no scan runner, so none that skips the limiter is built there', async () => {
+    const { assessments, debug, build } = handBuilt();
+    expect(debug.seeds).toBe(false);
+    const routes = vi.spyOn(debug, 'routes');
+    const { app } = build();
     expect(routes).toHaveBeenCalledTimes(1);
     expect(routes.mock.calls[0]![0]).toEqual({ limiter: expect.any(ScanLimiter), sessionSecret: secret, seed: undefined });
     // Nor would the routes take one.
     expect(() => debug.routes({ limiter: new ScanLimiter(), sessionSecret: secret,
       seed: { runScan: vi.fn(), assessments: new AssessmentService({ repository: assessments }) } })).toThrow('only in mock');
+    expect((await debugPost(app, '/__debug/auth/login', { email: OWNER })).status).toBe(200);
+    expect((await debugPost(app, '/__debug/seed')).status).toBe(404);
   });
 
-  it('nor does compose build one: the webapp answers 501 there', async () => {
-    // Stands in for Supabase, which compose reaches once at start to fail the scans a restart interrupted.
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
-    try {
-      const { app } = await compose(loadEnv({ ARCA_MODE: 'live-debug', SOURCE_MODE: 'live', STORAGE_BACKEND: 'supabase',
-        SUPABASE_URL: 'https://x.supabase.co', SUPABASE_SECRET_KEY: 'sb_secret_x', OPENAI_API_KEY: 'sk-x', APIFY_API_TOKEN: 'apify_x',
-        SESSION_TOKEN_SECRET: secret, CORS_ALLOWED_ORIGINS: origin }));
-      expect((await app.request('/__debug/mode')).status).toBe(200);
-      const login = await app.request('/__debug/auth/login', { method: 'POST', body: JSON.stringify({ email: OWNER }),
-        headers: { 'Content-Type': 'application/json', [DEBUG_REQUEST_HEADER]: '1' } });
-      expect(login.status).toBe(404);
-      expect((await app.request('/__debug/seed', { method: 'POST', headers: { [DEBUG_REQUEST_HEADER]: '1' } })).status).toBe(404);
-      const me = await app.request('/me', { headers: { Authorization: 'Bearer x' } });
-      expect(me.status).toBe(501);
-      expect(await me.json()).toEqual({ error: 'not_configured', message: expect.any(String) });
-    } finally {
-      vi.unstubAllGlobals();
-    }
-  });
-
-  it('refuses to build the mock login outside mock', () => {
-    const { scans, assessments, options } = liveDebug();
-    const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
-    const billing = new MockBillingProvider(origin);
-    const service = new WebappService({ repository, scans, assessments, billing, sessionSecret: secret, appBaseUrl: origin });
-    expect(() => createDebugTools({ ...options, webapp: { auth: new MockAppAuth(secret), billing, service, repository } })).toThrow('mock');
+  it('without the simulated webapp pieces there is no login or payment route, and the webapp answers 501', async () => {
+    const scans = new RoutingScanRepository(new InMemoryRepository(), new InMemoryRepository());
+    const assessments = new RoutingAssessmentRepository(new InMemoryAssessmentRepository(), new InMemoryAssessmentRepository(), scans);
+    const debug = createDebugTools({ mode: 'live-debug', describe: description, sources: mockSources(), scans, assessments,
+      pipelineTimeoutMs: 600_000 });
+    const { app } = createApp({ repository: scans, assessmentRepository: assessments, debug,
+      pipeline: new InProcessPipeline({ ...mockSources(), repository: scans, timeoutMs: 600_000 }),
+      domainResolver: new PublicDomainResolver(async () => {}), sessionSecret: secret, corsOrigins: [origin], clientIp: () => '127.0.0.1' });
+    expect((await app.request('/__debug/mode')).status).toBe(200);
+    for (const path of ['/__debug/auth/login', '/__debug/billing/pay', '/__debug/seed']) expect((await debugPost(app, path)).status).toBe(404);
+    expect((await app.request('/me')).status).toBe(501);
   });
 });
