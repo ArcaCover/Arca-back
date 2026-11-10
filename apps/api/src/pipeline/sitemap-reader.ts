@@ -1,5 +1,5 @@
 import { fetchPublicText } from './network.js';
-import { fetchRobotsText, robotsPolicy, type RobotsCache, type RobotsFetch } from './robots.js';
+import { createRobotsCache, fetchRobotsText, robotsPolicy, type RobotsCache, type RobotsFetch } from './robots.js';
 import { classifyLink } from './evidence-corpus.js';
 import { pagePriority } from './crawler.js';
 
@@ -15,11 +15,16 @@ export const sitemapTransport: SitemapTransport = { text: fetchPublicText, robot
 export async function readSitemap(domain: string, signal: AbortSignal, transport: SitemapTransport = sitemapTransport,
   robots?: RobotsCache): Promise<{ links: Array<{ url: string; kind: 'page' | 'document' }>; detail: string | null }> {
   const origin = `https://${domain}`, base = `${origin}/`;
+  const options = { fetchText: transport.robots, cache: robots ?? createRobotsCache() };
+  // A sitemap on the www host is fetched from there, so the rules of that origin are the ones that apply to it.
+  const fetchable = async (url: string) => (await robotsPolicy(new URL(url).origin, signal, options)).allows(url);
   try {
-    const rules = await robotsPolicy(origin, signal, { fetchText: transport.robots, cache: robots });
+    const rules = await robotsPolicy(origin, signal, options);
     if (rules.state === 'unreachable') return { links: [], detail: 'ROBOTS_UNAVAILABLE' };
-    const queue = [...new Set([...rules.sitemaps(), `${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`, `${origin}/wp-sitemap.xml`])]
-      .filter(url => host(url) === domain && rules.allows(url));
+    const queue: string[] = [];
+    for (const url of new Set([...rules.sitemaps(), `${origin}/sitemap.xml`, `${origin}/sitemap_index.xml`, `${origin}/wp-sitemap.xml`])) {
+      if (host(url) === domain && await fetchable(url)) queue.push(url);
+    }
     const seen = new Set<string>(), links = new Map<string, 'page' | 'document'>();
     let indexChildren = 0;
     while (queue.length && seen.size < 20 && links.size < MAX_SITEMAP_URLS) {
@@ -31,7 +36,7 @@ export async function readSitemap(domain: string, signal: AbortSignal, transport
       if (response.status !== 200) continue;
       const isIndex = /<sitemapindex\b/i.test(response.text);
       for (const loc of locations(response.text)) {
-        if (isIndex) { if (indexChildren < 10 && host(loc) === domain && rules.allows(loc)) { queue.push(loc); indexChildren++; } continue; }
+        if (isIndex) { if (indexChildren < 10 && host(loc) === domain && await fetchable(loc)) { queue.push(loc); indexChildren++; } continue; }
         const target = classifyLink(loc, base);
         if (target && rules.allows(target.url)) links.set(target.url, target.kind);
       }

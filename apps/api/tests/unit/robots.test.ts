@@ -116,6 +116,12 @@ describe('robots.txt fetch outcomes (RFC 9309)', () => {
     expect(policy.allows('https://firm.com/private')).toBe(false);
     expect(policy.allows('https://firm.com/about')).toBe(true);
   });
+
+  it('reads an oversized body with no line end before the cap as no rules, like an HTML page served as robots.txt', async () => {
+    const policy = await rules(`<html><body>${'<div>Smith Law</div>'.repeat(ROBOTS_MAX_BYTES / 10)}</body></html>`);
+    expect(policy.state).toBe('rules');
+    expect(policy.allows('https://firm.com/about')).toBe(true);
+  });
 });
 
 describe('response body limits', () => {

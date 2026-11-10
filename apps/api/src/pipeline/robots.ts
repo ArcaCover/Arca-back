@@ -54,7 +54,9 @@ function clip(text: string): string {
   const bytes = Buffer.from(text, 'utf8');
   if (bytes.byteLength <= ROBOTS_MAX_BYTES) return text;
   // The cut can land in the middle of a rule, and half a path is a different rule: drop the broken last line.
-  // A line ends with LF, CRLF or a lone CR (RFC 9309 2.2).
+  // A line ends with LF, CRLF or a lone CR (RFC 9309 2.2). With no line end at all before the cap nothing is left,
+  // which reads as no rules: half a megabyte on one line is not a robots.txt (a minified HTML page served with
+  // 200 is what that looks like), and the parser would find no group in it either.
   const kept = bytes.subarray(0, ROBOTS_MAX_BYTES);
   return kept.subarray(0, Math.max(kept.lastIndexOf(0x0a), kept.lastIndexOf(0x0d)) + 1).toString('utf8');
 }

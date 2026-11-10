@@ -37,6 +37,28 @@ describe('sitemap reader', () => {
     expect(text).not.toHaveBeenCalled();
   });
 
+  it('checks a sitemap on the www host against the rules of the www origin', async () => {
+    const index = '<sitemapindex><sitemap><loc>https://www.firm.com/private-sitemap.xml</loc></sitemap>'
+      + '<sitemap><loc>https://www.firm.com/page-sitemap.xml</loc></sitemap></sitemapindex>';
+    const text = vi.fn(async (url: string) => {
+      if (url === 'https://firm.com/sitemap_index.xml') return { status: 200, text: index };
+      if (url === 'https://www.firm.com/page-sitemap.xml') return { status: 200, text: sitemap };
+      return { status: 404, text: '' };
+    });
+    // The bare domain publishes no rules; the www host, where the sitemaps live, excludes one of them.
+    const robots = vi.fn(async (url: string) => url === 'https://www.firm.com/robots.txt'
+      ? { status: 200, text: 'User-agent: *\nDisallow: /private-sitemap.xml\nDisallow: /wp-sitemap.xml' } : { status: 404, text: '' });
+    const declared = 'User-agent: *\nSitemap: https://www.firm.com/wp-sitemap.xml';
+    robots.mockImplementationOnce(async () => ({ status: 200, text: declared }));
+    const result = await readSitemap('firm.com', new AbortController().signal, { text, robots });
+    expect(result.links).toHaveLength(2);
+    expect(text.mock.calls.map(call => call[0])).not.toContain('https://www.firm.com/private-sitemap.xml');
+    expect(text.mock.calls.map(call => call[0])).not.toContain('https://www.firm.com/wp-sitemap.xml');
+    expect(text.mock.calls.map(call => call[0])).toContain('https://www.firm.com/page-sitemap.xml');
+    // Each origin's rules once.
+    expect(robots.mock.calls.map(call => call[0])).toEqual(['https://firm.com/robots.txt', 'https://www.firm.com/robots.txt']);
+  });
+
   it('reuses the robots.txt the scan already fetched', async () => {
     const robots = vi.fn(async () => ({ status: 404, text: '' }));
     const text = async () => ({ status: 200, text: sitemap });
