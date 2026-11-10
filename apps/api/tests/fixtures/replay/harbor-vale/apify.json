@@ -1,0 +1,56 @@
+[
+  {
+    "actor": "scrapers_lat/florida-bar-lawyers-scraper",
+    "input": { "lastNames": ["Harbor"], "firstName": "Daniel", "maxLawyers": 25, "withDetails": true, "withLeadScore": false,
+      "withProfileSummary": false, "eligibleOnly": false, "includeDeceased": true },
+    "run": { "id": "run-bar-daniel-harbor", "status": "SUCCEEDED", "defaultDatasetId": "ds-bar-daniel-harbor",
+      "usageTotalUsd": 0.02, "buildId": "build-bar-1", "buildNumber": "1.4.2" },
+    "items": [
+      { "name": "Daniel Harbor", "status": "Member in Good Standing", "firm": "Harbor Vale Law", "barNumber": "900202",
+        "admittedDate": "05/12/2015", "physicalCity": "Miami", "county": "Miami-Dade", "disciplineHistory10Year": "None",
+        "pendingDisciplineCases": "No active regulatory investigation", "practiceAreas": ["Family Law"],
+        "officePhone": "(305) 555-0142", "mailStreet": "200 Bay Street", "profileUrl": "https://bar.example/profile/900202" },
+      { "name": "Daniel Harbor", "status": "Member in Good Standing", "firm": "Gulf Coast Title Company", "barNumber": "900909",
+        "admittedDate": "02/03/1998", "physicalCity": "Naples", "county": "Collier", "disciplineHistory10Year": "None",
+        "pendingDisciplineCases": "No active regulatory investigation", "practiceAreas": ["Real Estate"],
+        "officePhone": "(239) 555-0177", "mailStreet": "14 Shell Road", "profileUrl": "https://bar.example/profile/900909" }
+    ]
+  },
+  {
+    "actor": "scrapers_lat/florida-bar-lawyers-scraper",
+    "input": { "lastNames": ["Vale"], "firstName": "Maria", "maxLawyers": 25, "withDetails": true, "withLeadScore": false,
+      "withProfileSummary": false, "eligibleOnly": false, "includeDeceased": true },
+    "run": { "id": "run-bar-maria-vale", "status": "SUCCEEDED", "defaultDatasetId": "ds-bar-maria-vale",
+      "usageTotalUsd": 0.02, "buildId": "build-bar-1", "buildNumber": "1.4.2" },
+    "items": [
+      { "name": "Maria Vale", "status": "Member in Good Standing", "firm": "Harbor Vale Law", "barNumber": "900101",
+        "admittedDate": "09/24/2008", "physicalCity": "Miami", "county": "Miami-Dade", "disciplineHistory10Year": "None",
+        "pendingDisciplineCases": "No active regulatory investigation", "practiceAreas": ["Immigration"],
+        "officePhone": "(305) 555-0142", "mailStreet": "200 Bay Street", "profileUrl": "https://bar.example/profile/900101" }
+    ]
+  },
+  {
+    "actor": "scrapers_lat/avvo-lawyers-scraper",
+    "input": { "searchQueries": ["Daniel Harbor"], "cities": ["Miami, FL"], "withDetails": true, "maxLawyers": 10 },
+    "run": { "id": "run-avvo-daniel-harbor", "status": "SUCCEEDED", "defaultDatasetId": "ds-avvo-daniel-harbor",
+      "usageTotalUsd": 0.03, "buildId": "build-avvo-1", "buildNumber": "0.9.7" },
+    "items": [
+      { "name": "Daniel Harbor", "city": "Miami", "firmName": "Harbor Vale Law", "disciplined": false, "avvoRating": 8.4,
+        "avvoRatingLevel": "Excellent", "practiceAreas": ["Family"], "reviewsCount": 9, "reviewsRating": 4.6, "awardsCount": 0,
+        "phone": "(305) 555-0142", "addressStreet": "200 Bay Street", "yearsLicensed": 11, "licensedSince": "2015",
+        "profileUrl": "https://avvo.example/attorneys/daniel-harbor" }
+    ]
+  },
+  {
+    "actor": "scrapers_lat/avvo-lawyers-scraper",
+    "input": { "searchQueries": ["Maria Vale"], "cities": ["Miami, FL"], "withDetails": true, "maxLawyers": 10 },
+    "run": { "id": "run-avvo-maria-vale", "status": "SUCCEEDED", "defaultDatasetId": "ds-avvo-maria-vale",
+      "usageTotalUsd": 0.03, "buildId": "build-avvo-1", "buildNumber": "0.9.7" },
+    "items": [
+      { "name": "Maria Vale", "city": "Miami", "firmName": "Harbor Vale Law", "disciplined": false, "avvoRating": 9.2,
+        "avvoRatingLevel": "Superb", "practiceAreas": ["Immigration"], "reviewsCount": 18, "reviewsRating": 4.8, "awardsCount": 2,
+        "topAward": "Clients' Choice Award 2025", "phone": "(305) 555-0142", "addressStreet": "200 Bay Street",
+        "yearsLicensed": 18, "licensedSince": "2008", "profileUrl": "https://avvo.example/attorneys/maria-vale" }
+    ]
+  }
+]

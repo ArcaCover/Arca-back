@@ -1,0 +1,774 @@
+{
+ "0587c7944f0d406eda499a9548a79109f4c78ae59b77113dd29a6f8be24847c1": {
+  "phase": "review",
+  "response": {
+   "verdicts": [
+    {
+     "claimId": "firm-name",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-1bb368a86cf10c69-6a08f26efa841dce",
+       "quote": "Harbor Vale Law is a law firm in Miami, Florida"
+      }
+     ]
+    },
+    {
+     "claimId": "city",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-1bb368a86cf10c69-6a08f26efa841dce",
+       "quote": "Harbor Vale Law is a law firm in Miami, Florida"
+      }
+     ]
+    },
+    {
+     "claimId": "address",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-f94cc97e37ce266c-801aca0229d76fb0",
+       "quote": "Harbor Vale Law, 200 Bay Street, Miami, FL 33131"
+      }
+     ]
+    },
+    {
+     "claimId": "phone",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-1bb368a86cf10c69-6a08f26efa841dce",
+       "quote": "Call us at (305) 555-0142"
+      }
+     ]
+    },
+    {
+     "claimId": "offices",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-9aad2c9f0f30ff27-2a79fb8ad5634ba9",
+       "quote": "The firm has one office in Miami"
+      }
+     ]
+    },
+    {
+     "claimId": "established",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-1bb368a86cf10c69-6a08f26efa841dce",
+       "quote": "Founded in 2009"
+      }
+     ]
+    },
+    {
+     "claimId": "practice-areas",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-1bb368a86cf10c69-6a08f26efa841dce",
+       "quote": "we handle immigration, family law and personal injury matters"
+      }
+     ]
+    },
+    {
+     "claimId": "ai-policy",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "Harbor Vale Law has a written policy for artificial intelligence"
+      }
+     ]
+    },
+    {
+     "claimId": "ai-services",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "Our attorneys use CoCounsel for legal research"
+      }
+     ]
+    },
+    {
+     "claimId": "ai-disclosure",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "We tell clients when AI tools assist with their matter"
+      }
+     ]
+    },
+    {
+     "claimId": "privacy",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-0dcbd74787bc9a49-274aca3d7fc21436",
+       "quote": "Harbor Vale Law protects client data"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "253f123820dc7f8c5a54a3b984920ecbcdd26ccb6015ea5be5d5ecc8ff1c987d": {
+  "phase": "classify-pages",
+  "response": {
+   "pages": [
+    {
+     "id": "C1",
+     "type": "other"
+    },
+    {
+     "id": "C2",
+     "type": "other"
+    },
+    {
+     "id": "C3",
+     "type": "team"
+    },
+    {
+     "id": "C4",
+     "type": "privacy"
+    },
+    {
+     "id": "C5",
+     "type": "about"
+    },
+    {
+     "id": "C6",
+     "type": "contact"
+    },
+    {
+     "id": "C7",
+     "type": "profile"
+    },
+    {
+     "id": "C8",
+     "type": "profile"
+    }
+   ]
+  }
+ },
+ "4df93da131ae51758541c3a4460519aac0feace215492f6b8bf7c24eab1b57a6": {
+  "phase": "review",
+  "response": {
+   "verdicts": [
+    {
+     "claimId": "roster-daniel-harbor:1",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-2a4ca97a01681b49-ccb515806452a1a3",
+       "quote": "Daniel Harbor, Associate Attorney"
+      }
+     ]
+    },
+    {
+     "claimId": "roster-maria-vale:1",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-2a4ca97a01681b49-ccb515806452a1a3",
+       "quote": "Maria Vale, Managing Partner"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "6034499e1847052ba385faf9dc884ecea00bea040142020f35b181616fa5bcd4": {
+  "phase": "extract-round",
+  "response": {
+   "action": {
+    "type": "finish",
+    "reason": "Every page that could settle a field was read."
+   },
+   "claims": [
+    {
+     "id": "firm-name",
+     "field": "firm_name",
+     "value": "Harbor Vale Law",
+     "explanation": "The site operator names itself.",
+     "citations": [
+      {
+       "segmentId": "D-3ada98a2864f3486-8aab95d5f9075d4c",
+       "quote": "Harbor Vale Law is a law firm in Miami, Florida"
+      }
+     ]
+    },
+    {
+     "id": "city",
+     "field": "city",
+     "value": "Miami",
+     "explanation": "The home page states where the firm is.",
+     "citations": [
+      {
+       "segmentId": "D-3ada98a2864f3486-8aab95d5f9075d4c",
+       "quote": "Harbor Vale Law is a law firm in Miami, Florida"
+      }
+     ]
+    },
+    {
+     "id": "address",
+     "field": "address_street",
+     "value": "200 Bay Street",
+     "explanation": "The contact page gives the office address.",
+     "citations": [
+      {
+       "segmentId": "D-f94cc97e37ce266c-801aca0229d76fb0",
+       "quote": "Harbor Vale Law, 200 Bay Street, Miami, FL 33131"
+      }
+     ]
+    },
+    {
+     "id": "phone",
+     "field": "phone",
+     "value": "(305) 555-0142",
+     "explanation": "The home page gives the firm phone.",
+     "citations": [
+      {
+       "segmentId": "D-3ada98a2864f3486-8aab95d5f9075d4c",
+       "quote": "Call us at (305) 555-0142"
+      }
+     ]
+    },
+    {
+     "id": "offices",
+     "field": "office_count",
+     "value": 1,
+     "explanation": "The about page states the number of offices.",
+     "citations": [
+      {
+       "segmentId": "D-9aad2c9f0f30ff27-2a79fb8ad5634ba9",
+       "quote": "The firm has one office in Miami"
+      }
+     ]
+    },
+    {
+     "id": "established",
+     "field": "firm_established_year",
+     "value": 2009,
+     "explanation": "The home page states the founding year.",
+     "citations": [
+      {
+       "segmentId": "D-3ada98a2864f3486-8aab95d5f9075d4c",
+       "quote": "Founded in 2009"
+      }
+     ]
+    },
+    {
+     "id": "practice-areas",
+     "field": "practice_areas",
+     "value": [
+      "Immigration",
+      "Family Law"
+     ],
+     "explanation": "The home page lists the matters the firm handles.",
+     "citations": [
+      {
+       "segmentId": "D-3ada98a2864f3486-8aab95d5f9075d4c",
+       "quote": "we handle immigration and family law matters"
+      }
+     ]
+    },
+    {
+     "id": "ai-policy",
+     "field": "ai_policy",
+     "value": {
+      "found": true,
+      "depth": "basic"
+     },
+     "explanation": "The firm states it has a written AI policy.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "Harbor Vale Law has a written policy for artificial intelligence"
+      }
+     ]
+    },
+    {
+     "id": "ai-services",
+     "field": "ai_in_services",
+     "value": {
+      "found": true,
+      "tools_mentioned": [
+       "CoCounsel"
+      ],
+      "integration_depth": "supplementary"
+     },
+     "explanation": "The firm states its attorneys use a named AI tool for research.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "Our attorneys use CoCounsel for legal research"
+      }
+     ]
+    },
+    {
+     "id": "ai-disclosure",
+     "field": "ai_disclosure",
+     "value": {
+      "found": true
+     },
+     "explanation": "The firm tells clients when AI assists.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "We tell clients when AI tools assist with their matter"
+      }
+     ]
+    },
+    {
+     "id": "privacy",
+     "field": "privacy_policy",
+     "value": {
+      "found": true,
+      "mentions_client_data": true
+     },
+     "explanation": "The privacy policy covers client data.",
+     "citations": [
+      {
+       "segmentId": "D-0dcbd74787bc9a49-274aca3d7fc21436",
+       "quote": "Harbor Vale Law protects client data"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "7459c33d7e6af9e9e7f98ae4c63d2a383a0b30635a30cd954fcc0a6c5468b50a": {
+  "phase": "extract-round",
+  "response": {
+   "action": {
+    "type": "finish",
+    "reason": "Every page that could settle a field was read."
+   },
+   "claims": [
+    {
+     "id": "firm-name",
+     "field": "firm_name",
+     "value": "Harbor Vale Law",
+     "explanation": "The site operator names itself.",
+     "citations": [
+      {
+       "segmentId": "D-1bb368a86cf10c69-6a08f26efa841dce",
+       "quote": "Harbor Vale Law is a law firm in Miami, Florida"
+      }
+     ]
+    },
+    {
+     "id": "city",
+     "field": "city",
+     "value": "Miami",
+     "explanation": "The home page states where the firm is.",
+     "citations": [
+      {
+       "segmentId": "D-1bb368a86cf10c69-6a08f26efa841dce",
+       "quote": "Harbor Vale Law is a law firm in Miami, Florida"
+      }
+     ]
+    },
+    {
+     "id": "address",
+     "field": "address_street",
+     "value": "200 Bay Street",
+     "explanation": "The contact page gives the office address.",
+     "citations": [
+      {
+       "segmentId": "D-f94cc97e37ce266c-801aca0229d76fb0",
+       "quote": "Harbor Vale Law, 200 Bay Street, Miami, FL 33131"
+      }
+     ]
+    },
+    {
+     "id": "phone",
+     "field": "phone",
+     "value": "(305) 555-0142",
+     "explanation": "The home page gives the firm phone.",
+     "citations": [
+      {
+       "segmentId": "D-1bb368a86cf10c69-6a08f26efa841dce",
+       "quote": "Call us at (305) 555-0142"
+      }
+     ]
+    },
+    {
+     "id": "offices",
+     "field": "office_count",
+     "value": 1,
+     "explanation": "The about page states the number of offices.",
+     "citations": [
+      {
+       "segmentId": "D-9aad2c9f0f30ff27-2a79fb8ad5634ba9",
+       "quote": "The firm has one office in Miami"
+      }
+     ]
+    },
+    {
+     "id": "established",
+     "field": "firm_established_year",
+     "value": 2009,
+     "explanation": "The home page states the founding year.",
+     "citations": [
+      {
+       "segmentId": "D-1bb368a86cf10c69-6a08f26efa841dce",
+       "quote": "Founded in 2009"
+      }
+     ]
+    },
+    {
+     "id": "practice-areas",
+     "field": "practice_areas",
+     "value": [
+      "Immigration",
+      "Family Law",
+      "Personal Injury"
+     ],
+     "explanation": "The home page lists the matters the firm handles.",
+     "citations": [
+      {
+       "segmentId": "D-1bb368a86cf10c69-6a08f26efa841dce",
+       "quote": "we handle immigration, family law and personal injury matters"
+      }
+     ]
+    },
+    {
+     "id": "ai-policy",
+     "field": "ai_policy",
+     "value": {
+      "found": true,
+      "depth": "basic"
+     },
+     "explanation": "The firm states it has a written AI policy.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "Harbor Vale Law has a written policy for artificial intelligence"
+      }
+     ]
+    },
+    {
+     "id": "ai-services",
+     "field": "ai_in_services",
+     "value": {
+      "found": true,
+      "tools_mentioned": [
+       "CoCounsel"
+      ],
+      "integration_depth": "supplementary"
+     },
+     "explanation": "The firm states its attorneys use a named AI tool for research.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "Our attorneys use CoCounsel for legal research"
+      }
+     ]
+    },
+    {
+     "id": "ai-disclosure",
+     "field": "ai_disclosure",
+     "value": {
+      "found": true
+     },
+     "explanation": "The firm tells clients when AI assists.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "We tell clients when AI tools assist with their matter"
+      }
+     ]
+    },
+    {
+     "id": "privacy",
+     "field": "privacy_policy",
+     "value": {
+      "found": true,
+      "mentions_client_data": true
+     },
+     "explanation": "The privacy policy covers client data.",
+     "citations": [
+      {
+       "segmentId": "D-0dcbd74787bc9a49-274aca3d7fc21436",
+       "quote": "Harbor Vale Law protects client data"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "85c64c457f4b5e71008941a6ff86d036315d3ffdf08ac7f65ac44a4fc749947f": {
+  "phase": "review",
+  "response": {
+   "verdicts": [
+    {
+     "claimId": "firm-name",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-3ada98a2864f3486-8aab95d5f9075d4c",
+       "quote": "Harbor Vale Law is a law firm in Miami, Florida"
+      }
+     ]
+    },
+    {
+     "claimId": "city",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-3ada98a2864f3486-8aab95d5f9075d4c",
+       "quote": "Harbor Vale Law is a law firm in Miami, Florida"
+      }
+     ]
+    },
+    {
+     "claimId": "address",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-f94cc97e37ce266c-801aca0229d76fb0",
+       "quote": "Harbor Vale Law, 200 Bay Street, Miami, FL 33131"
+      }
+     ]
+    },
+    {
+     "claimId": "phone",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-3ada98a2864f3486-8aab95d5f9075d4c",
+       "quote": "Call us at (305) 555-0142"
+      }
+     ]
+    },
+    {
+     "claimId": "offices",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-9aad2c9f0f30ff27-2a79fb8ad5634ba9",
+       "quote": "The firm has one office in Miami"
+      }
+     ]
+    },
+    {
+     "claimId": "established",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-3ada98a2864f3486-8aab95d5f9075d4c",
+       "quote": "Founded in 2009"
+      }
+     ]
+    },
+    {
+     "claimId": "practice-areas",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-3ada98a2864f3486-8aab95d5f9075d4c",
+       "quote": "we handle immigration and family law matters"
+      }
+     ]
+    },
+    {
+     "claimId": "ai-policy",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "Harbor Vale Law has a written policy for artificial intelligence"
+      }
+     ]
+    },
+    {
+     "claimId": "ai-services",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "Our attorneys use CoCounsel for legal research"
+      }
+     ]
+    },
+    {
+     "claimId": "ai-disclosure",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-8faff8745994930b-878b97e0a0bf50a4",
+       "quote": "We tell clients when AI tools assist with their matter"
+      }
+     ]
+    },
+    {
+     "claimId": "privacy",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-0dcbd74787bc9a49-274aca3d7fc21436",
+       "quote": "Harbor Vale Law protects client data"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "9897070b07bdd8b1eab5c543e36242ef86e8313eef0ad3dca976ab9fce4e46ad": {
+  "phase": "extract-roster",
+  "response": {
+   "action": {
+    "type": "finish",
+    "reason": "The team page was read in full."
+   },
+   "claims": [
+    {
+     "id": "roster-daniel-harbor",
+     "field": "attorneys",
+     "value": [
+      {
+       "full_name": "Daniel Harbor",
+       "title": "Associate Attorney",
+       "role": "attorney",
+       "affiliation": "current"
+      }
+     ],
+     "explanation": "Listed on the team page with a legal role.",
+     "citations": [
+      {
+       "segmentId": "D-2a4ca97a01681b49-ccb515806452a1a3",
+       "quote": "Daniel Harbor, Associate Attorney"
+      }
+     ]
+    },
+    {
+     "id": "roster-maria-vale",
+     "field": "attorneys",
+     "value": [
+      {
+       "full_name": "Maria Vale",
+       "title": "Managing Partner",
+       "role": "attorney",
+       "affiliation": "current"
+      }
+     ],
+     "explanation": "Listed on the team page with a legal role.",
+     "citations": [
+      {
+       "segmentId": "D-2a4ca97a01681b49-ccb515806452a1a3",
+       "quote": "Maria Vale, Managing Partner"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "b868dabdf67c8dde9ad62133e3a69592e27d0999daebee4246c887a53a370800": {
+  "phase": "review",
+  "response": {
+   "verdicts": [
+    {
+     "claimId": "roster-daniel-harbor:1",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-2a4ca97a01681b49-ccb515806452a1a3",
+       "quote": "Daniel Harbor, Associate Attorney"
+      }
+     ]
+    },
+    {
+     "claimId": "roster-maria-vale:1",
+     "verdict": "supported",
+     "reason": "The quoted sentence says this about the firm.",
+     "citations": [
+      {
+       "segmentId": "D-2a4ca97a01681b49-ccb515806452a1a3",
+       "quote": "Maria Vale, Managing Partner"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "bdfe36386b6b3b4b518316654609b307914df81d76d305468145ca754233bc62": {
+  "phase": "extract-roster",
+  "response": {
+   "action": {
+    "type": "finish",
+    "reason": "The team page was read in full."
+   },
+   "claims": [
+    {
+     "id": "roster-daniel-harbor",
+     "field": "attorneys",
+     "value": [
+      {
+       "full_name": "Daniel Harbor",
+       "title": "Associate Attorney",
+       "role": "attorney",
+       "affiliation": "current"
+      }
+     ],
+     "explanation": "Listed on the team page with a legal role.",
+     "citations": [
+      {
+       "segmentId": "D-2a4ca97a01681b49-ccb515806452a1a3",
+       "quote": "Daniel Harbor, Associate Attorney"
+      }
+     ]
+    },
+    {
+     "id": "roster-maria-vale",
+     "field": "attorneys",
+     "value": [
+      {
+       "full_name": "Maria Vale",
+       "title": "Managing Partner",
+       "role": "attorney",
+       "affiliation": "current"
+      }
+     ],
+     "explanation": "Listed on the team page with a legal role.",
+     "citations": [
+      {
+       "segmentId": "D-2a4ca97a01681b49-ccb515806452a1a3",
+       "quote": "Maria Vale, Managing Partner"
+      }
+     ]
+    }
+   ]
+  }
+ }
+}
