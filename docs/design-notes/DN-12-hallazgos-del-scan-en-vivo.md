@@ -2,7 +2,7 @@
 
 - **Fecha:** 2026-11-09
 - **Estado:** en implementación. Cada arreglo tiene su sección (§3 a §8) y la amplía la tarea que lo hace.
-  Hoy están hechos §3, §4 y §5 (back).
+  Hoy están hechos §3, §4, §5 y §6 (back).
 - **Repos:** `Arca-back` y `Arca-front`, rama `fix/live-scan-findings` en ambos
 - **Parte de:** DN-07 de crawl (§6, robots y web ilegible), DN-09 (modos), DN-10 y DN-11 (webapp)
 
@@ -560,8 +560,118 @@ Todos con clientes inyectados: ninguno toca Apify ni OpenAI.
 
 ## 6. PDF de Capa 2 y botón de exportar (F1, D8)
 
-Pendiente. Ruta fijada: `GET /assessment/:assessmentId/report.pdf`, con el Bearer de la sesión del scan y
-`Content-Disposition` `arca-assessment-<dominio>-<aaaa-mm-dd>.pdf`.
+Hecho en el back. El botón es del front y ya llama a esta ruta desde `/assessment/results`.
+
+**Antes.** La Capa 2 no tenía PDF: ni ruta, ni función en el cliente, ni botón. Fue un recorte deliberado del
+prototipo y DN-07 lo dejaba para una fase posterior. Además, cada paso del plan de acción traía pegada la misma
+frase de aviso, que en pantalla se leía hasta ocho veces.
+
+### 6.1 La ruta
+
+`GET /assessment/:assessmentId/report.pdf`, con el Bearer de la sesión del scan como el resto de rutas del
+assessment: el middleware de `/assessment/:assessmentId/*` exige que el scan y el email del token coincidan con
+los del assessment.
+
+| Caso | Respuesta |
+|---|---|
+| Assessment `COMPLETED` | `200 application/pdf`, `Cache-Control: no-store`, `Content-Disposition: attachment; filename="arca-assessment-<dominio>-<aaaa-mm-dd>.pdf"` (fecha de finalización, en UTC) |
+| Sin token, token inválido, de otro scan o de otro email | `401 unauthorized` |
+| Assessment que no existe | `404 not_found` |
+| Sin completar | `409 incomplete` |
+| Sesión de 24 horas vencida | `410 expired` |
+| Sin renderer, Chromium falla o hay un fallo de debug inyectado | `503 report_unavailable` |
+
+- **CORS.** `exposeHeaders` ya incluía `Content-Disposition` para todas las rutas. Un test lo comprueba en esta.
+- **Contrato (D6).** Es una ruta binaria: no cambia nada en `@arca/contracts`. `report_unavailable` no está en
+  `AssessmentError`, que solo documenta; el OpenAPI describe el 503 con el esquema genérico de error, como en Capa 1.
+  El front ya conocía todos los códigos.
+- **Fallo del renderer.** Si Chromium falla, la ruta responde 503 ella misma. Si lo dejara pasar, el manejador de
+  errores del assessment diría "Unable to save or load the assessment", que no es lo que ocurrió. **[mía]**
+- **Fallo de debug.** El eje `http.report: unavailable` se aplica también a esta ruta, por el scan del
+  assessment y antes de mirar si está completo, igual que en el informe del scan. No hubo que tocar
+  `@arca/contracts/debug`: `app.ts` pasa `debug.reportFault` a las rutas del assessment, y sin `debug`
+  (producción) no pasa nada.
+
+### 6.2 De dónde sale y qué lleva
+
+Solo del registro guardado. No se recalcula nada y no se llama a ningún proveedor.
+
+| Dato del informe | Origen en el registro |
+|---|---|
+| Nombre de la firma (o el dominio, si el scan no encontró nombre) y dominio | `layer1_snapshot` |
+| Fecha, score combinado, tier, partes de Capa 1 y Capa 2, las seis áreas, plan de acción, versiones | `result` |
+| Qué preguntas se imprimen y en qué orden | `bank_snapshot`, `plan` y `answers`: las que quedaron visibles, en el orden del cuestionario |
+| El texto de cada pregunta y de cada opción | `rendered`, tal como se mostró |
+| La respuesta y la fecha de la declaración de veracidad | `answers`, `attested_at` |
+
+Una pregunta que se mostró, se respondió y luego quedó oculta al cambiar la respuesta de su pregunta padre sigue
+en `rendered`, pero no se imprime: no es una respuesta del resultado. Las preguntas de seguimiento llevan la
+marca "context only, not scored".
+
+**Lo que no lleva.** `decision`, los overrides, los flags de máquina, el email, la evidencia de terceros, un
+precio, ni los pesos 30/70 de la fórmula demo. Si el score combinado es nulo, pone una raya, "NOT SCORED" y
+"Not scored" en la parte de Capa 1, nunca `UNKNOWN`.
+
+**Un solo aviso (D8).** Arriba, bajo el nombre: "Demo assessment. The questions and the scoring are provisional,
+so these results are illustrative. This is not an insurance offer, a price or an underwriting decision." Sigue
+el aviso de la pantalla. El pie solo dice de dónde sale el informe y las versiones. La frase del plan de acción
+("Each point gain is an estimate on its own, not a promised outcome.") no es un aviso de demo: explica que las
+ganancias no se suman, y es la misma de la pantalla. **[mía]**
+
+**Web ilegible.** Con el flag `WEBSITE_UNAVAILABLE` hay una frase, con las dos redacciones de la pantalla:
+
+| Tier del resultado | Frase |
+|---|---|
+| `CRITICAL` | "The firm's website could not be read during the scan. Until it can be read, this result stays in the highest-risk group and needs a manual review, whatever the answers show." |
+| Cualquier otro | "The firm's website could not be read during the scan. Until it can be read, this result needs a manual review, whatever the answers show." |
+
+Así la frase no contradice el tier que hay justo encima (el límite conocido de §3.3: con buenas respuestas el
+compuesto llega a 70). No nombra la decisión ni un precio.
+
+**Aspecto.** `apps/api/src/report/layout.ts` reúne lo que comparten los dos informes: el escapado, la paleta,
+el formato de fecha y el CSS base. El HTML del informe de Capa 1 sale idéntico byte a byte al de antes
+(comprobado con el fixture, `robust.arca.example` y `blocked.arca.example`). En el de Capa 2 ninguna fila se
+parte entre páginas.
+
+Medido en local con Chromium real sobre `robust.arca.example` y `blocked.arca.example`: dos páginas A4, unos
+73 KB y entre 0,7 y 0,8 s por informe.
+
+### 6.3 El plan de acción sin la frase repetida
+
+`packages/scoring/src/layer2.ts` generaba cada paso así: "Illustrative next step: X. This estimate is
+independent of other steps and is not a pricing or coverage promise." Ahora genera "Next step: X.", que es lo
+que la pantalla ya mostraba tras recortar la frase. El significado del paso no cambia.
+
+- `LAYER2_SCORING_VERSION` no cambia: la puntuación es la misma, solo cambia un texto. **[mía]**
+- Los resultados ya guardados conservan el texto antiguo, porque son inmutables. La pantalla lo recorta
+  (`nextStep` en el front) y el PDF lo imprime tal cual. Solo afecta a las sesiones de 24 horas abiertas en el
+  momento del despliegue.
+- El plan de acción de la webapp (DN-10) muestra `detail` sin tocar, así que también pierde la frase.
+
+### 6.4 Límites conocidos
+
+- **Solo durante la sesión.** La descarga pide el token del scan y el assessment vence a las 24 horas. La
+  webapp no guarda ese token, así que desde ella no se puede descargar.
+- **Un Chromium por petición, sin límite.** Es la segunda ruta que lo hace: duplica la superficie del riesgo 12
+  de DN-08. No se añadió tope de concurrencia.
+- **No es el Full Assessment Report del roadmap.** Usa el banco y la fórmula demo, y lo dice. El informe
+  definitivo sigue en la fase 5 de DN-07.
+- **El texto vive en dos sitios.** Las frases del informe están en el back y las de la pantalla en el front,
+  copiadas a mano. Pueden divergir.
+- **"1 hours per lawyer / year".** La unidad viene del banco y se imprime tal cual.
+
+### 6.5 Tests
+
+- `apps/api/tests/integration/assessment-report.test.ts`: la ruta (descarga y cabeceras, token ausente, mal
+  formado, de otro email y de otro scan, assessment inexistente, sin completar, sesión vencida, sin renderer,
+  renderer que falla, OpenAPI) y el contenido (firma, fecha, score y partes, áreas, plan de acción, respuestas
+  en orden y sin las ocultas, un solo aviso, sin precio ni decisión ni email, score nulo, las dos frases de la
+  web, escapado y nombre del fichero). El renderer va inyectado: no se lanza Chromium.
+- `apps/api/tests/integration/unreadable-website.test.ts`: `blocked.arca.example` de principio a fin, ahora
+  también con el informe del assessment.
+- `apps/api/tests/integration/debug-mode.test.ts`: el fallo de informe inyectado en la ruta nueva.
+- `apps/api/tests/integration/flow.test.ts`: la lista de rutas del OpenAPI.
+- `packages/scoring/tests/layer2.test.ts`: el texto de cada paso del plan.
 
 ## 7. Webapp simulada en live-debug (F2, D7)
 
