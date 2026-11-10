@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { loadEnv } from '../../src/config/env.js';
+import { LIVE_DEBUG_APIFY_SPEND_CEILING_USD, LIVE_DEBUG_OPENAI_MAX_REQUESTS_PER_SCAN, loadEnv } from '../../src/config/env.js';
 import { listenHostname } from '../../src/config/mode.js';
 import { WEBSITE_SIGNAL_REUSE_MAX_AGE_MS } from '../../src/pipeline/website-source.js';
 
@@ -102,6 +102,48 @@ describe('independent source and storage configuration', () => {
     expect(loadEnv({ ...mock, SCAN_PARTIAL_REPAIR_COOLDOWN_MS: '0' }).SCAN_PARTIAL_REPAIR_COOLDOWN_MS).toBe(0);
     expect(() => loadEnv({ ...mock, SCAN_CACHE_TTL_MS: '3600000', SCAN_PARTIAL_REPAIR_COOLDOWN_MS: '7200000' }))
       .toThrow('SCAN_PARTIAL_REPAIR_COOLDOWN_MS');
+  });
+});
+describe('spend guards', () => {
+  // DN-12 §5: production records spend and caps nothing unless its environment says so; live-debug guards itself.
+  const production = { ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test', OPENAI_API_KEY: 'sk-test' };
+  const liveDebug = { ...base, ...database, ARCA_MODE: 'live-debug', SOURCE_MODE: 'live', STORAGE_BACKEND: 'supabase',
+    APIFY_API_TOKEN: 'test', OPENAI_API_KEY: 'sk-test' };
+  it('leaves production without a spend ceiling and without a request cap', () => {
+    expect(loadEnv(production)).toMatchObject({ mode: 'production', apifySpendCeilingUsd: null, openAiMaxRequestsPerScan: null });
+    expect(loadEnv(production).APIFY_SPEND_CEILING_USD).toBeUndefined();
+    expect(loadEnv(production).OPENAI_MAX_REQUESTS_PER_SCAN).toBeUndefined();
+    // Mock builds no paid client, so it has nothing to guard.
+    expect(loadEnv({ ...base, ARCA_MODE: 'mock' })).toMatchObject({ apifySpendCeilingUsd: null, openAiMaxRequestsPerScan: null });
+  });
+  it('turns both guards on in live-debug by default', () => {
+    expect(LIVE_DEBUG_APIFY_SPEND_CEILING_USD).toBe(2);
+    expect(LIVE_DEBUG_OPENAI_MAX_REQUESTS_PER_SCAN).toBe(30);
+    expect(loadEnv(liveDebug)).toMatchObject({ mode: 'live-debug', apifySpendCeilingUsd: 2, openAiMaxRequestsPerScan: 30 });
+  });
+  it('takes an explicit value in any mode', () => {
+    expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '7.5', OPENAI_MAX_REQUESTS_PER_SCAN: '12' }))
+      .toMatchObject({ apifySpendCeilingUsd: 7.5, openAiMaxRequestsPerScan: 12 });
+    expect(loadEnv({ ...production, APIFY_SPEND_CEILING_USD: '50', OPENAI_MAX_REQUESTS_PER_SCAN: '40' }))
+      .toMatchObject({ apifySpendCeilingUsd: 50, openAiMaxRequestsPerScan: 40 });
+    // 0 is a ceiling too: no new run, cached queries only.
+    expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0' }).apifySpendCeilingUsd).toBe(0);
+  });
+  it('reads an empty value as not set, never as a ceiling of 0', () => {
+    for (const blank of ['', '  ']) {
+      expect(loadEnv({ ...production, APIFY_SPEND_CEILING_USD: blank, OPENAI_MAX_REQUESTS_PER_SCAN: blank }))
+        .toMatchObject({ apifySpendCeilingUsd: null, openAiMaxRequestsPerScan: null });
+      expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: blank, OPENAI_MAX_REQUESTS_PER_SCAN: blank }))
+        .toMatchObject({ apifySpendCeilingUsd: 2, openAiMaxRequestsPerScan: 30 });
+    }
+  });
+  it('refuses values that are not a ceiling or a cap', () => {
+    for (const value of ['-1', 'two', 'Infinity']) expect(() => loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: value }), value).toThrow();
+    for (const value of ['0', '-3', '2.5', 'many']) expect(() => loadEnv({ ...liveDebug, OPENAI_MAX_REQUESTS_PER_SCAN: value }), value).toThrow();
+    // A ceiling no run fits under would refuse everything while looking like a budget.
+    expect(() => loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.5' })).toThrow('APIFY_SPEND_CEILING_USD is below APIFY_EXPECTED_COST_USD_PER_RUN');
+    expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.5', APIFY_EXPECTED_COST_USD_PER_RUN: '0.25' }).apifySpendCeilingUsd).toBe(0.5);
+    expect(() => loadEnv({ ...liveDebug, APIFY_EXPECTED_COST_USD_PER_RUN: '3' })).toThrow('APIFY_SPEND_CEILING_USD');
   });
 });
 describe('ARCA_MODE', () => {

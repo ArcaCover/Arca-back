@@ -2,7 +2,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
 import { ACTIVE_APIFY_STATUSES, RAW_MARKER } from './types.js';
 import type { ScanRepository, ScanRecord, RawRecord, RawReference, ReserveApifyRun, ApifyRunReservation, ApifyRunRecord,
-  ApifyRunUpdate } from './types.js';
+  ApifyRunUpdate, ApifySpendRecord } from './types.js';
 
 export class SupabaseRepository implements ScanRepository {
   constructor(private readonly client: SupabaseClient) {}
@@ -83,6 +83,14 @@ export class SupabaseRepository implements ScanRepository {
     const { data, error } = await this.client.from('apify_runs').update({ ...update, updated_at: new Date().toISOString() })
       .eq('id', id).select('id').single();
     if (error || !data) throw new Error('Unable to update Apify run', { cause: error });
+  }
+  async recentApifyRuns(since: string, limit: number): Promise<ApifySpendRecord[]> {
+    // Never `*`: `items` holds whole datasets.
+    const { data, error } = await this.client.from('apify_runs')
+      .select('id,run_id,status,cost_usd,reserved_usd,accounting_complete,created_at,expires_at')
+      .gte('created_at', since).order('created_at', { ascending: false }).limit(limit);
+    if (error) throw new Error('Unable to read recent Apify runs', { cause: error });
+    return (data ?? []) as ApifySpendRecord[];
   }
 }
 export function createStorageClient(url: string, key: string) {

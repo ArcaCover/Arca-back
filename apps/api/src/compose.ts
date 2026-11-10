@@ -63,12 +63,15 @@ export async function compose(env: ReturnType<typeof loadEnv>): Promise<{ app: H
   const websiteEvidenceProvider = evidence === 'mock' ? null : evidence === 'openai'
     ? new OpenAIEvidenceProvider(env.OPENAI_API_KEY!) : evidence === 'rules'
       ? new RuleBasedEvidenceProvider() : new AgenticEvidenceProvider(env.OPENAI_API_KEY!, env.SIGNAL_LLM_MODEL, undefined,
-        undefined, openAiEndpoint(env.SIGNAL_LLM_REASONING_EFFORT));
+        undefined, openAiEndpoint(env.SIGNAL_LLM_REASONING_EFFORT),
+        env.openAiMaxRequestsPerScan === null ? {} : { maxRequests: env.openAiMaxRequestsPerScan });
   const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY, {
     store: repository, build: env.APIFY_ACTOR_BUILD, expectedCostUsdPerRun: env.APIFY_EXPECTED_COST_USD_PER_RUN,
     cacheTtlMs: env.APIFY_QUERY_CACHE_TTL_MS, activeTtlMs: env.APIFY_ACTIVE_RUN_TTL_MS,
     runTimeoutSecs: env.APIFY_RUN_TIMEOUT_SECS,
     maxCachedItems: env.APIFY_MAX_CACHED_ITEMS,
+    // Null in production unless its environment sets one: spend is recorded there, not capped (DN-12 §5).
+    spendCeilingUsd: env.apifySpendCeilingUsd,
   }) : null;
   const sources = env.sourceMode === 'mock' ? mockSources() : {
     website: new WebsiteExtractionSource(repository, websiteEvidenceProvider!, undefined,
@@ -106,8 +109,12 @@ export async function compose(env: ReturnType<typeof loadEnv>): Promise<{ app: H
     scanCacheTtlMs: env.SCAN_CACHE_TTL_MS, partialRepairCooldownMs: env.SCAN_PARTIAL_REPAIR_COOLDOWN_MS,
     clientIp: request => clientIps.get(request) ?? 'unknown' });
   // `overridden` also lists defaults mock replaced, so it says what changed, not what was set.
+  // The spend guards are named only where they act: on a client this process built.
+  const guards = [...(apify && env.apifySpendCeilingUsd !== null ? [`Apify ceiling USD ${env.apifySpendCeilingUsd} per 24 h`] : []),
+    ...(evidence === 'agentic' && env.openAiMaxRequestsPerScan !== null ? [`OpenAI cap ${env.openAiMaxRequestsPerScan} requests per scan`] : [])];
   const banner = `[api] MODE=${mode} sources=${env.sourceMode} storage=${env.storageBackend}`
     + (mode === 'production' ? '' : ` (debug routes on ${listenHostname(mode)} only)`)
+    + (guards.length ? ` spend guards: ${guards.join(', ')}` : '')
     + (env.overridden.length ? ` overrides: ${env.overridden.join(', ')}` : '');
   return { app, drain, recoverAssessments, repository, apify, banner, clientIps };
 }

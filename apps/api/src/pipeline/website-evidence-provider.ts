@@ -2,6 +2,7 @@ import OpenAI from 'openai';
 import { zodResponseFormat } from 'openai/helpers/zod';
 import { WebsiteData, unknownWebsite } from '@arca/contracts';
 import type { CrawlResult } from './crawler.js';
+import { scanMeter } from './scan-cost.js';
 
 /** Adapter contract upstream from Layer 1. Implementations turn website content into structured evidence. */
 export interface EvidenceProvider<Input, Evidence> {
@@ -43,9 +44,11 @@ export class OpenAIEvidenceProvider implements WebsiteEvidenceProvider {
   async extract(input: CrawlResult, signal: AbortSignal): Promise<WebsiteData> {
     const corpus = input.pages.map(page => `URL: ${page.url}\n${page.text}`).join('\n\n');
     if (corpus.length > 300_000) throw new Error('Website corpus exceeds analysis budget');
+    scanMeter()?.openAiRequested();
     const response = await this.client.chat.completions.parse({ model: OPENAI_EVIDENCE_MODEL, temperature: 0,
       messages: [{ role: 'system', content: WEBSITE_PROMPT }, { role: 'user', content: corpus }],
       response_format: zodResponseFormat(OpenAIWebsiteData, 'website_signals') }, { signal });
+    scanMeter()?.openAiAnswered(response);
     return WebsiteData.parse(response.choices[0]?.message.parsed);
   }
 }

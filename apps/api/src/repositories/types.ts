@@ -22,11 +22,15 @@ export type ApifyRunRecord = {
   accounting_complete: boolean; partial: boolean; created_at: string; updated_at: string;
   expires_at: string; last_error: string | null;
 };
+/** What the spend ceiling reads of a ledger row: enough to tell what the run cost, or may still cost. */
+export type ApifySpendRecord = Pick<ApifyRunRecord, 'id' | 'run_id' | 'status' | 'cost_usd' | 'reserved_usd' |
+  'accounting_complete' | 'created_at' | 'expires_at'>;
 export type ApifyRunReservation = { decision: 'start' | 'reuse' | 'resume' | 'failed';
   record: ApifyRunRecord | null; chargedToScan: boolean };
 export type ReserveApifyRun = {
   scanId?: string; queryFingerprint: string; actor: string; build: string; input: Record<string, unknown>;
-  // Provisional cost booked against the run while it is in flight. Accounting, not a cap.
+  // Provisional cost booked against the run until its charges settle. Accounting: the cap, when there is one,
+  // is the Apify client's spend ceiling, which adds these up.
   expectedCostUsd: number; expiresAt: string;
 };
 export type ApifyRunUpdate = Partial<Pick<ApifyRunRecord, 'run_id' | 'dataset_id' | 'build_id' | 'build_number' | 'status' | 'items' |
@@ -52,4 +56,6 @@ export interface ScanRepository {
   /** Finished runs whose charges are not booked yet: started (a run id exists) and no longer active. */
   pendingApifyAccounting(limit: number): Promise<ApifyRunRecord[]>;
   updateApifyRun(id: string, update: ApifyRunUpdate): Promise<void>;
+  /** Ledger rows created since `since`, newest first, at most `limit`, without their datasets. The spend ceiling adds them up. */
+  recentApifyRuns(since: string, limit: number): Promise<ApifySpendRecord[]>;
 }

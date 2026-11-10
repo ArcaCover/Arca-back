@@ -100,4 +100,20 @@ describe('Supabase Data API adapter', () => {
       expiresAt: '2026-09-14T23:00:00.000Z' }))
       .resolves.toEqual({ decision: 'start', record: null, chargedToScan: true });
   });
+  it('reads the recent ledger rows for the spend ceiling without their datasets', async () => {
+    const row = { id: 'ledger-1', run_id: 'run-1', status: 'SUCCEEDED', cost_usd: 0.045, reserved_usd: 1, accounting_complete: true,
+      created_at: '2026-11-09T11:00:00+00:00', expires_at: '2026-11-16T11:00:00+00:00' };
+    const { repository } = setup(url => {
+      expect(url.pathname).toBe('/rest/v1/apify_runs');
+      const select = url.searchParams.get('select')!;
+      expect(select.split(',').sort()).toEqual(['accounting_complete', 'cost_usd', 'created_at', 'expires_at', 'id', 'reserved_usd', 'run_id', 'status']);
+      // `items` and `input_json` hold whole datasets and queries: the sum needs neither.
+      expect(select).not.toContain('items');
+      expect(Object.fromEntries(url.searchParams)).toMatchObject({ created_at: 'gte.2026-11-08T12:00:00.000Z', order: 'created_at.desc', limit: '1000' });
+      return Response.json([row]);
+    });
+    expect(await repository.recentApifyRuns('2026-11-08T12:00:00.000Z', 1000)).toEqual([row]);
+    const failing = setup(() => Response.json({ code: '57014', message: 'canceling statement due to statement timeout' }, { status: 500 }));
+    await expect(failing.repository.recentApifyRuns('2026-11-08T12:00:00.000Z', 1000)).rejects.toThrow('Unable to read recent Apify runs');
+  });
 });

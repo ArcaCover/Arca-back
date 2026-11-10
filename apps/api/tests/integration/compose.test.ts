@@ -107,8 +107,27 @@ describe('compose', () => {
     // What scripts/with-mode.mjs sets for mock: nothing left to override.
     expect((await compose(loadEnv({ ...base, ...live, ARCA_MODE: 'mock', SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' }))).banner)
       .toBe('[api] MODE=mock sources=mock storage=memory (debug routes on 127.0.0.1 only)');
+    // live-debug pays real providers, so its line also says what guards the spend (DN-12 §5).
     expect((await compose(loadEnv({ ...base, ...live, ARCA_MODE: 'live-debug' }))).banner)
-      .toBe('[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only)');
+      .toBe('[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only) '
+        + 'spend guards: Apify ceiling USD 2 per 24 h, OpenAI cap 30 requests per scan');
+    // A guard is named only where it acts: the rules provider calls no model.
+    expect((await compose(loadEnv({ ...base, ...live, ARCA_MODE: 'live-debug', WEBSITE_EVIDENCE_PROVIDER: 'rules', APIFY_SPEND_CEILING_USD: '5' }))).banner)
+      .toBe('[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only) spend guards: Apify ceiling USD 5 per 24 h');
+  });
+
+  // DN-12 §5: the ceiling and the cap reach the clients compose builds, and production builds them without either.
+  it.each([
+    { name: 'production', env: {}, ceiling: null, cap: undefined },
+    { name: 'live-debug', env: { ARCA_MODE: 'live-debug' }, ceiling: 2, cap: 30 },
+    { name: 'production with both set', env: { APIFY_SPEND_CEILING_USD: '25', OPENAI_MAX_REQUESTS_PER_SCAN: '40' }, ceiling: 25, cap: 40 },
+  ])('$name builds its paid clients with spend ceiling $ceiling and request cap $cap', async ({ env, ceiling, cap }) => {
+    const composed = await compose(loadEnv({ ...base, ...live, ...env }));
+    // Private on purpose; read here only to check the wiring.
+    expect((composed.apify as unknown as { options: { spendCeilingUsd: number | null } }).options.spendCeilingUsd).toBe(ceiling);
+    const website = (appDeps().pipeline as unknown as { deps: { website: { provider: { options: { maxRequests?: number } } } } }).deps.website;
+    expect(website.provider.options.maxRequests).toBe(cap);
+    if (ceiling === null) expect(composed.banner).not.toContain('spend guards');
   });
 
   // DN-09 4 and 7: the panel's 'Back mode' row must say what this process built, never which keys merely sit in the file.

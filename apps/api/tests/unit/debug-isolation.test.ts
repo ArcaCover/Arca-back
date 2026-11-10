@@ -20,7 +20,8 @@ function durableScans() {
     cached: vi.fn(async () => null), saveRaw: vi.fn(async () => {}), latestRaw: vi.fn(async () => null),
     findRaw: vi.fn(async () => []), rawOf: vi.fn(async () => null),
     recoverInterrupted: vi.fn(async () => {}), reserveApifyRun: vi.fn(async () => ({ decision: 'failed' as const, record: null, chargedToScan: false })),
-    getApifyRun: vi.fn(async () => null), pendingApifyAccounting: vi.fn(async () => []), updateApifyRun: vi.fn(async () => {}) };
+    getApifyRun: vi.fn(async () => null), pendingApifyAccounting: vi.fn(async () => []), updateApifyRun: vi.fn(async () => {}),
+    recentApifyRuns: vi.fn(async () => []) };
 }
 function setup() {
   const durable = durableScans();
@@ -107,6 +108,9 @@ describe('scan repository routing', () => {
     await repository.getApifyRun('run_1');
     await repository.pendingApifyAccounting(5);
     await repository.updateApifyRun('run_1', { status: 'SUCCEEDED' });
+    // The spend ceiling adds up real spend, so it reads the durable ledger too.
+    await repository.recentApifyRuns('2026-10-22T13:00:00.000Z', 1000);
+    expect(durable.recentApifyRuns).toHaveBeenCalledWith('2026-10-22T13:00:00.000Z', 1000);
     expect(durable.reserveApifyRun).toHaveBeenCalledWith(request);
     expect(durable.getApifyRun).toHaveBeenCalledWith('run_1');
     expect(durable.pendingApifyAccounting).toHaveBeenCalledWith(5);

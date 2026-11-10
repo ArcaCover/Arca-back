@@ -36,6 +36,7 @@ export class RoutingScanRepository implements ScanRepository {
   getApifyRun(id: string) { return this.durable.getApifyRun(id); }
   pendingApifyAccounting(limit: number) { return this.durable.pendingApifyAccounting(limit); }
   updateApifyRun(id: string, update: ApifyRunUpdate) { return this.durable.updateApifyRun(id, update); }
+  recentApifyRuns(since: string, limit: number) { return this.durable.recentApifyRuns(since, limit); }
 }
 
 /**

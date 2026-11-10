@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { DEFAULT_SIGNAL_LLM_MODEL } from '../pipeline/llm-endpoint.js';
 import { ARCA_MODES } from './mode.js';
+/** What live-debug guards its spend with unless the environment says otherwise (DN-12 §5). Production has neither. */
+export const LIVE_DEBUG_APIFY_SPEND_CEILING_USD = 2;
+export const LIVE_DEBUG_OPENAI_MAX_REQUESTS_PER_SCAN = 30;
+// An empty line in an env file means "not set", never zero: a ceiling of 0 starts no run at all.
+const blankAsUnset = (value: unknown) => typeof value === 'string' && value.trim() === '' ? undefined : value;
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
@@ -36,9 +41,17 @@ const EnvSchema = z.object({
   // directory run takes 1 GB: 16 lets Bar and Avvo each run 8 lookups at once, half the account.
   MAX_APIFY_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(16),
   APIFY_ACTOR_BUILD: z.string().min(1).default('latest'),
-  // Provisional figure the ledger reserves while a run is in flight, before Apify reports
-  // the real cost. Accounting only: spend is recorded, never capped.
+  // Provisional figure the ledger reserves for a run until Apify reports what it really cost.
+  // Accounting only unless a spend ceiling is set, which counts it for every run not settled yet.
   APIFY_EXPECTED_COST_USD_PER_RUN: z.coerce.number().positive().default(1),
+  // USD of Apify runs the ledger may hold over its last 24 hours before a new run is refused (DN-12 §5).
+  // Unset means no ceiling: production records spend and never caps it. live-debug defaults to 2.
+  // 0 starts no run at all and still serves the queries already cached.
+  APIFY_SPEND_CEILING_USD: z.preprocess(blankAsUnset, z.coerce.number().finite().nonnegative().optional()),
+  // Chat completions the website extraction of one scan may request. Unset means no cap (production);
+  // live-debug defaults to 30. The largest recorded extraction (25 attorneys) made 12; it would have made
+  // 26 had every one of its phases needed a repair.
+  OPENAI_MAX_REQUESTS_PER_SCAN: z.preprocess(blankAsUnset, z.coerce.number().int().min(1).optional()),
   // Kept in step with SCAN_CACHE_TTL_MS. If this expires first, repairing a partial scan
   // re-pays the directory runs it was meant to reuse.
   APIFY_QUERY_CACHE_TTL_MS: z.coerce.number().int().positive().default(604_800_000),
@@ -77,6 +90,14 @@ export function loadEnv(source = process.env) {
   const sourceMode = mode === 'mock' ? 'mock' : inheritedSourceMode;
   const storageBackend = mode === 'mock' ? 'memory' : inheritedStorageBackend;
   const assessmentPlanner = mode === 'mock' ? 'rules' : env.ASSESSMENT_PLANNER;
+  // live-debug is the mode that pays real providers from a developer's machine, so it brings its own guards.
+  // An explicit value wins in every mode; production without one stays uncapped.
+  const apifySpendCeilingUsd = env.APIFY_SPEND_CEILING_USD ?? (mode === 'live-debug' ? LIVE_DEBUG_APIFY_SPEND_CEILING_USD : null);
+  const openAiMaxRequestsPerScan = env.OPENAI_MAX_REQUESTS_PER_SCAN
+    ?? (mode === 'live-debug' ? LIVE_DEBUG_OPENAI_MAX_REQUESTS_PER_SCAN : null);
+  if (apifySpendCeilingUsd !== null && apifySpendCeilingUsd > 0 && apifySpendCeilingUsd < env.APIFY_EXPECTED_COST_USD_PER_RUN) {
+    throw new Error('APIFY_SPEND_CEILING_USD is below APIFY_EXPECTED_COST_USD_PER_RUN, so no run could ever start; use 0 to serve cached queries only');
+  }
   const overridden = [['SOURCE_MODE', inheritedSourceMode, sourceMode], ['STORAGE_BACKEND', inheritedStorageBackend, storageBackend], ['ASSESSMENT_PLANNER', env.ASSESSMENT_PLANNER, assessmentPlanner]]
     .filter(([, was, now]) => was !== now).map(([name, was, now]) => `${name}=${was}→${now}`);
   const supabaseKey = env.SUPABASE_SECRET_KEY?.trim() || env.SUPABASE_SERVICE_ROLE_KEY?.trim();
@@ -101,5 +122,6 @@ export function loadEnv(source = process.env) {
   if (env.APIFY_ACTIVE_RUN_TTL_MS < (env.APIFY_RUN_TIMEOUT_SECS + 60) * 1000) {
     throw new Error('APIFY_ACTIVE_RUN_TTL_MS must exceed the remote run timeout by at least 60 seconds');
   }
-  return { ...env, ASSESSMENT_PLANNER: assessmentPlanner, mode, overridden, sourceMode, storageBackend, supabaseKey, corsOrigins };
+  return { ...env, ASSESSMENT_PLANNER: assessmentPlanner, mode, overridden, sourceMode, storageBackend, supabaseKey, corsOrigins,
+    apifySpendCeilingUsd, openAiMaxRequestsPerScan };
 }

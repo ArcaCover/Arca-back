@@ -5,6 +5,7 @@ import { classifyUnreadableWebsite, evaluateLayer1Evidence } from '@arca/scoring
 import { normalizeDomain } from './domain-resolution.js';
 import { buildFirmIdentity } from './firm-identity.js';
 import type { ScanRepository } from '../repositories/types.js';
+import { ScanMeter, meterScan, scanCostLine } from './scan-cost.js';
 
 export class InProcessPipeline implements Layer1Pipeline {
   constructor(private readonly deps: {
@@ -15,6 +16,20 @@ export class InProcessPipeline implements Layer1Pipeline {
     if (!input.canonicalDomain || normalizeDomain(input.canonicalDomain) !== input.canonicalDomain) {
       throw new Error('A normalized canonical domain is required before assessment');
     }
+    const now = this.deps.now ?? Date.now, start = now(), meter = new ScanMeter();
+    // A run that throws is stored FAILED by its caller, and what it spent before that is spent all the same.
+    let status: PipelineResult['status'] = 'FAILED';
+    try {
+      const outcome = await meterScan(meter, () => this.execute(input));
+      status = outcome.status;
+      return outcome;
+    } finally {
+      // One line per pipeline run, whichever way it ended (DN-12 §5.4). A scan served from the cache runs no
+      // pipeline and leaves none. A source the deadline cut off is counted up to this moment.
+      console.log(scanCostLine({ scanId: input.scanId, status, durationMs: Math.max(0, now() - start) }, meter.cost()));
+    }
+  }
+  private async execute(input: { scanId: string; canonicalDomain: string; email: string }): Promise<PipelineResult> {
     const now = this.deps.now ?? Date.now, start = now();
     const controller = new AbortController();
     const budget = this.deps.timeoutMs ?? 55_000;

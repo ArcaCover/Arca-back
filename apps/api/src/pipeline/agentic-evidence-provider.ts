@@ -15,6 +15,7 @@ import { PAGE_CLASSIFICATION_PROMPT, PAGE_TYPE_VOTES, PageClassification, acquis
   serializeCandidates, type PageCandidate, type PageType } from './page-types.js';
 import type { WebsiteEvidenceProvider } from './website-evidence-provider.js';
 import { DEFAULT_SIGNAL_LLM_MODEL, openAiEndpoint, type LlmEndpoint } from './llm-endpoint.js';
+import { scanMeter } from './scan-cost.js';
 
 export const EXTRACTION_VERSION = 'agentic-signals-v5';
 export const MAX_AGENT_ROUNDS = 3;
@@ -123,6 +124,16 @@ export class ExtractionFailure extends Error {
     this.name = 'ExtractionFailure';
   }
 }
+/**
+ * The extraction asked for more chat completions than one scan may make (DN-12 §5.2). Not an ExtractionFailure on
+ * its way out of `complete`: the page-type votes forgive those, and nothing may carry on past the cap.
+ */
+export class RequestCapReached extends Error {
+  constructor(readonly maxRequests: number) {
+    super(`OpenAI request cap reached: one scan may make ${maxRequests} chat completions`);
+    this.name = 'RequestCapReached';
+  }
+}
 export type ExtractionDiagnostics = { model: string; version: string; corpus: EvidenceCorpus; attempts: Attempt[];
   extraction: unknown; review: unknown; grounding: GroundingReport; toolCalls: ToolCall[]; rounds: number; stopReason: StopReason;
   pageTypes: Array<{ url: string; type: PageType }>; derived: { team: TeamPageDerivation; website: WebsiteDerivation } };
@@ -172,9 +183,16 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
   readonly id: string;
   readonly version: string;
   private readonly client: CompletionClient;
+  // Chat completions requested so far by each extraction in flight, keyed by its list of attempts: the provider
+  // is one object shared by every scan, and that list is the one thing an extraction hands to all of its calls.
+  private readonly requested = new WeakMap<Attempt[], number>();
+  /**
+   * `maxRequests` caps the chat completions of one extraction, retries and repairs included. Without it there is
+   * no cap. It is not part of the version: it changes when an extraction stops, never what one that finished says.
+   */
   constructor(apiKey: string, readonly model = DEFAULT_SIGNAL_LLM_MODEL, client?: CompletionClient,
     private readonly access: SiteAccess = createSiteAccess(), private readonly endpoint: LlmEndpoint = openAiEndpoint(),
-    private readonly options: { planPages?: boolean } = {}) {
+    private readonly options: { planPages?: boolean; maxRequests?: number } = {}) {
     this.id = 'openai-agentic';
     // Stored website analyses are reused only while this matches.
     this.version = extractionVersion(endpoint, model, options);
@@ -188,8 +206,19 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
     for (let attempt = 1; ; attempt++) {
       const started = Date.now();
       const label = attempt === 1 ? phase : `${phase}-attempt-${attempt}`;
+      // Counted before it is sent: the page-type votes and the roster run side by side with other calls.
+      const requests = (this.requested.get(attempts) ?? 0) + 1;
+      const { maxRequests } = this.options;
+      if (maxRequests !== undefined && requests > maxRequests) {
+        if (requests === maxRequests + 1) console.error(`[openai] request cap reached: the website extraction asked for more than ${maxRequests} chat completions in one scan (OPENAI_MAX_REQUESTS_PER_SCAN); it stops and the website source fails`);
+        this.requested.set(attempts, requests);
+        throw new RequestCapReached(maxRequests);
+      }
+      this.requested.set(attempts, requests);
+      scanMeter()?.openAiRequested();
       try {
         const response = await this.client.chat.completions.create(request, { signal });
+        scanMeter()?.openAiAnswered(response);
         // Record the attempt before validating it: truncated or malformed answers are the ones worth auditing.
         const record: Attempt = { phase: label, request, response, rawContent: '', durationMs: Date.now() - started };
         attempts.push(record);

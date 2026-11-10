@@ -19,6 +19,9 @@ export const AVVO_TARGETED_MAX_LAWYERS = 10;
 export const DIRECTORY_LOOKUPS_IN_FLIGHT = 8;
 // The reason of a directory stopped by the usage limit. The debug sources fabricate the same status, so it is shared.
 export const APIFY_QUOTA_REASON = 'Apify usage limit reached for the current billing cycle; lookups after it were not started';
+// The reason of a directory whose lookups our own spend ceiling refused (DN-12 §5.1). A passing cause, like the usage
+// limit: the code stays PROVIDER_ERROR, so the scan cache repairs the result and nothing is concluded about the firm.
+export const APIFY_SPEND_CEILING_REASON = 'Apify spend ceiling reached; lookups it had no room for were not started';
 const record = z.record(z.unknown());
 const text = (value: unknown): string | null => typeof value === 'string' && value.trim() ? value.trim() : null;
 const availableText = (value: unknown): string | null => {
@@ -161,7 +164,7 @@ export class ApifyDirectorySource implements DirectorySource {
     const providerRuns: NonNullable<SourceStatus['providerRuns']> = [];
     let failed = 0, successfulQueries = 0, candidatesReceived = 0, recordsValid = 0, truncations = 0;
     // Lookups that threw (the provider refused or vanished), as opposed to answers in the wrong shape.
-    let providerFailures = 0, quotaReached = false;
+    let providerFailures = 0, quotaReached = false, ceilingRefusals = 0;
     let cursor = 0;
     const worker = async () => {
       while (cursor < targets.length) {
@@ -219,10 +222,15 @@ export class ApifyDirectorySource implements DirectorySource {
           failed++; providerFailures++;
           const quota = error instanceof ApifyClientError && error.code === 'PROVIDER_QUOTA_EXCEEDED';
           if (quota) quotaReached = true;
+          // Unlike the usage limit, the ceiling does not stop the queue: a lookup already in the query cache
+          // costs nothing and is still answered, and one the ceiling has no room for is refused before any request.
+          const ceiling = error instanceof ApifyClientError && error.code === 'SPEND_CEILING_REACHED';
+          if (ceiling) ceilingRefusals++;
           if (error instanceof ApifyClientError && error.metadata) {
             const { ledgerId: _ledgerId, ...publicMetadata } = error.metadata; providerRuns.push(publicMetadata);
           }
-          rawResults.push({ target, items: null, error: signal.aborted ? 'timeout' : quota ? 'provider_quota_exceeded' : 'source_error' });
+          rawResults.push({ target, items: null, error: signal.aborted ? 'timeout' : quota ? 'provider_quota_exceeded'
+            : ceiling ? 'spend_ceiling_reached' : 'source_error' });
           if (!fallback) matches.push({ searchedName: target, attorney: null, ambiguous: false, matchConfidence: 'no_match' });
         }
       }
@@ -240,7 +248,7 @@ export class ApifyDirectorySource implements DirectorySource {
     const costPerAcceptedAttorneyUsd = costUsd !== null && found > 0 ? costUsd / found : null;
     // TRUNCATED means a full result page was the only problem, so scoring may clear it once the
     // accepted attorneys are independently confirmed. Any other failure keeps its own code.
-    const code = signal.aborted ? 'DEADLINE_REACHED' : quotaReached ? 'PROVIDER_ERROR' :
+    const code = signal.aborted ? 'DEADLINE_REACHED' : quotaReached || ceilingRefusals ? 'PROVIDER_ERROR' :
       truncations > 0 && failed === truncations ? 'TRUNCATED' :
       !successful ? 'PROVIDER_ERROR' : failed > providerFailures ? 'PROVIDER_CONTRACT_ERROR' : failed ? 'PROVIDER_ERROR'
         : found ? undefined : 'NO_MATCH';
@@ -252,7 +260,7 @@ export class ApifyDirectorySource implements DirectorySource {
         candidatesReceived, recordsValid, providerRuns, costUsd, accountingComplete,
         cachedRuns: providerRuns.filter(run => run.cached).length, resumedRuns: providerRuns.filter(run => run.resumed).length,
         costPerAcceptedAttorneyUsd, ...(code ? { code } : {}),
-        reason: quotaReached ? APIFY_QUOTA_REASON :
+        reason: quotaReached ? APIFY_QUOTA_REASON : ceilingRefusals ? APIFY_SPEND_CEILING_REASON :
           failed ? 'One or more targeted lookups were incomplete; raw responses retained' :
           found ? null : 'Provider completed successfully with no accepted identity match' } };
   }

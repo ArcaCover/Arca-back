@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { ScanRepository, ScanRecord, RawRecord, ApifyRunRecord, ReserveApifyRun, ApifyRunReservation,
-  ApifyRunUpdate } from './types.js';
+  ApifyRunUpdate, ApifySpendRecord } from './types.js';
 import { RAW_MARKER } from './types.js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
 import { ACTIVE_APIFY_STATUSES } from './types.js';
@@ -71,7 +71,7 @@ export class InMemoryRepository implements ScanRepository {
     if (existing && existing.expires_at > now) {
       attach(existing.id, false); return { decision: 'failed', record: structuredClone(existing), chargedToScan: false };
     }
-    // Spend is recorded, never capped: the ledger below is the whole point, the gate is gone.
+    // The ledger records spend and refuses nothing. A spend ceiling, where one is set, is the Apify client's.
     const record: ApifyRunRecord = { id: randomUUID(), query_fingerprint: request.queryFingerprint,
       actor: request.actor, build: request.build, build_id: null, build_number: null,
       input_json: structuredClone(request.input), run_id: null,
@@ -89,5 +89,11 @@ export class InMemoryRepository implements ScanRepository {
   async updateApifyRun(id: string, update: ApifyRunUpdate) {
     const record = this.apifyRuns.get(id); if (!record) throw new Error('Apify run not found');
     Object.assign(record, structuredClone(update), { updated_at: new Date().toISOString() });
+  }
+  async recentApifyRuns(since: string, limit: number): Promise<ApifySpendRecord[]> {
+    return [...this.apifyRuns.values()].filter(run => run.created_at >= since)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit)
+      .map(({ id, run_id, status, cost_usd, reserved_usd, accounting_complete, created_at, expires_at }) =>
+        ({ id, run_id, status, cost_usd, reserved_usd, accounting_complete, created_at, expires_at }));
   }
 }

@@ -7,6 +7,7 @@ import { crawlNotes, partialCrawlCode, unreadableWebsite } from './website-outco
 import type { ScanRepository } from '../repositories/types.js';
 import { OpenAIEvidenceProvider, type WebsiteEvidenceProvider } from './website-evidence-provider.js';
 import type OpenAI from 'openai';
+import { scanMeter } from './scan-cost.js';
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 type Crawl = (domain: string, signal: AbortSignal, robots: RobotsCache) => Promise<CrawlResult>;
@@ -82,6 +83,7 @@ export class WebsiteExtractionSource implements WebsiteSource {
     const kept = fuller && fuller.reuse.pages >= crawl.pages.length ? fuller : null;
     const found = kept ?? await lookup('key', key);
     let analysis: WebsiteData | null = found?.analysis ?? null;
+    if (found) scanMeter()?.websiteAnalysisReused();
     let diagnostics: unknown = null;
     if (!analysis) {
       try {
