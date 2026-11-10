@@ -104,20 +104,22 @@ crawler, el lector de PDFs, el lector de sitemaps y las herramientas del agente 
   El corte busca el último fin de línea de cualquier tipo (LF, CRLF o CR solo).
 - Hay una caché por scan y por origen (`RobotsCache`). La crea `WebsiteExtractionSource` y la comparten el
   crawl y todas las lecturas del agente, así que `robots.txt` se descarga una vez por origen y scan. Antes
-  se descargaba de nuevo en cada página pedida por el agente. `www` y el dominio desnudo son orígenes distintos.
+  se descargaba de nuevo en cada página pedida por el agente. `www` y el dominio desnudo son orígenes distintos:
+  un sitemap alojado en `www` se comprueba con las reglas de `www`, no con las del dominio desnudo.
 - Las peticiones que una página hace a su propio host (scripts, XHR, fetch) también pasan por robots. Antes
   solo se comprobaban las navegaciones, y un `fetch("/wp-json/…")` salía aunque estuviera excluido.
   Un `iframe` del propio sitio excluido por robots queda anotado igual, con `scope: request`.
 - El destino de una redirección se comprueba antes de entregársela al navegador (ver el límite de abajo).
-- **`Crawl-delay` se respeta de forma acotada.** Si el grupo de `ArcaBot` (o `*`) lo declara, el crawl lee
-  una página cada vez y espera esa pausa entre el inicio de una página y el de la siguiente. La pausa tiene
-  un tope de `plazo / páginas` (1,5 s con 30 s y 20 páginas), para que la espera sola no pueda agotar el
-  plazo. Consecuencia medida con páginas de fixture sin latencia: con una pausa declarada de 1,5 s o más,
-  20 páginas tardan 29,6 s de los 30 s. Un sitio real con esa pausa y 20 páginas alcanzables termina por
-  tanto en el plazo: website `partial` con `Crawl deadline reached`, y cuántas páginas entran depende del
-  tiempo de carga. La causa es estructural, pero el plazo se lee como transitorio. **Pendiente de decisión
-  del founder** antes de aplicar D5 (reparación cada hora). Las lecturas del agente (`site-access.ts`) son
-  un crawl de una página por llamada y no esperan la pausa entre una llamada y la siguiente.
+- **`Crawl-delay` se respeta como separación entre inicios de página, no leyendo una página cada vez.** Si el
+  grupo de `ArcaBot` (o `*`) lo declara, dos páginas del sitio nunca empiezan más cerca que esa pausa, pero
+  las que ya empezaron siguen cargando a la vez (hasta 6). La pausa tiene un tope de `(plazo / 4) / páginas`
+  (375 ms con 30 s y 20 páginas), y lo que la separación añade a todo el crawl, reintentos incluidos, no pasa
+  de `plazo / 4` (7,5 s): agotado ese presupuesto, nadie espera más (`createPacer`). La versión anterior (una
+  página cada vez, tope de 1,5 s) agotaba el plazo en cualquier sitio real: con 700 ms por página y
+  `Crawl-delay: 10` leía 19 páginas en 30 s y salía `partial`; ahora lee las 20 en 12,8 s (sin `Crawl-delay`,
+  7,8 s). Así el `Crawl-delay` no decide cuántas páginas entran ni deja el website `partial` por el plazo.
+  El precio: a un sitio que pide 10 s le damos 375 ms. Las lecturas del agente (`site-access.ts`) son un
+  crawl de una página por llamada y no esperan la pausa entre una llamada y la siguiente.
 - Los enlaces que robots excluye no gastan el presupuesto de 20 páginas. Se resuelven antes de elegir cada
   tanda, porque no cuestan ninguna petición. Antes, 19 enlaces excluidos dejaban el crawl en la portada y el
   website salía `ok`. Un 404/410 o un fichero sí cuentan: hubo que pedirlos para saberlo.
@@ -131,6 +133,7 @@ página del crawl), `request` (una petición del navegador, de cualquier host) o
 | Enlace excluido por robots (`ROBOTS_DISALLOWED`) | No |
 | Enlace muerto, HTTP 404 o 410 | No |
 | Enlace a algo que no es HTML (`NOT_HTML`: un feed, un `.docx`, una vCard), con o sin redirección delante | No |
+| Enlace que redirige fuera del sitio (`OFF_SITE_REDIRECT`: `/pay`, `/book` o `/reviews` hacia LawPay, Calendly o Google) | No |
 | Subrecurso fallido, propio o de terceros (`scope: request`) | No |
 | Página del propio sitio que falla tras sus reintentos (red, 5xx, 429) | Sí |
 | Página con 401/403, página de desafío o sin texto legible | Sí |
@@ -156,6 +159,7 @@ por el código. Es el único sitio donde se decide. No hay códigos nuevos en el
 | robots.txt excluye el sitio | `error` / `ACCESS_BLOCKED` | DEFINITIVE |
 | Las páginas responden 401 o 403, o una página de desafío | `error` / `ACCESS_BLOCKED` | DEFINITIVE |
 | La portada responde otro 4xx (404 y 410 incluidos), no es HTML o no tiene texto | `error` / `NO_READABLE_EVIDENCE` | TRANSIENT |
+| La portada redirige a otro dominio (un cambio de marca, por ejemplo) | `error` / `NO_READABLE_EVIDENCE` | TRANSIENT |
 | Plazo o abort | `timeout` / `DEADLINE_REACHED` | TRANSIENT |
 | robots.txt inalcanzable, 429, 5xx, error de red o causa desconocida | `error` / `PROVIDER_ERROR` | TRANSIENT |
 
@@ -174,8 +178,21 @@ exigiría decidirlo antes y darles un código distinto del de la página vacía,
 Qué hace cada clase con el scan está en DN-12 §3: DEFINITIVE termina PARTIAL con el resultado de alto riesgo
 (flag y override `WEBSITE_UNAVAILABLE`) y TRANSIENT sigue terminando FAILED.
 
-**Límite conocido, sin resolver aquí.** Playwright no pasa por el manejador de peticiones los saltos de
-una redirección HTTP: Chromium los sigue con su propia red. Por eso el destino de una redirección no pasa
-por `network.ts` (anti-SSRF con IP fijada), y los saltos posteriores al primero tampoco pasan por robots.
-Seguir las redirecciones desde el backend lo cerraría, pero hoy las cookies que un sitio fija al redirigir
-solo las conserva el navegador, y sin ellas algunos sitios entrarían en bucle. Queda pendiente de decisión.
+**Redirecciones fuera del sitio.** Playwright no pasa por el manejador de peticiones los saltos de una
+redirección HTTP: Chromium los sigue con su propia red, fuera de `network.ts` (anti-SSRF con IP fijada).
+Antes, un enlace de la firma que redirigía a otro host se seguía igual: el probe de la revisión leyó como
+página de la firma el contenido de `http://127.0.0.1:<puerto>/latest/meta-data`, y un `/book` hacia
+Calendly se pedía tres veces, dejaba el crawl `partial` y descargaba el `robots.txt` de Calendly. Ahora:
+
+- Si una navegación redirige fuera del sitio (otro host, otro puerto u otro esquema), el manejador corta la
+  redirección antes de entregarla al navegador y la página termina como `OFF_SITE_REDIRECT`, con el host de
+  destino en `detail`. Es una respuesta del sitio: sin reintentos, sin `partial`, sin pedir nada al otro host.
+- Si la cadena acaba fuera del sitio tras un salto que el manejador no vio (`www` que redirige otra vez), la
+  página tampoco se guarda: mismo `OFF_SITE_REDIRECT`.
+
+**Límite conocido, sin resolver aquí.** Ese segundo salto sí llega a pedirse (Chromium lo sigue solo), aunque
+su contenido ya no se guarda. Tampoco pasan por `network.ts` las redirecciones de subrecursos (scripts, XHR)
+ni los saltos posteriores al primero, que tampoco pasan por robots. Seguir las redirecciones desde el backend
+lo cerraría, pero hoy las cookies que un sitio fija al redirigir solo las conserva el navegador, y sin ellas
+algunos sitios entrarían en bucle. Queda pendiente de decisión. Una firma cuya portada redirige a otro dominio
+termina FAILED (TRANSIENT) en vez de leer la portada del dominio nuevo.

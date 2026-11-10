@@ -779,8 +779,8 @@ La prioridad es mi criterio (Alta, Media o Baja). La columna "Fuente" indica dó
 | Alta | Gates de DN-05 §12 sin cumplir (20 snapshots, ≥40 casos adversariales, conjunto reservado, 3 corridas, p95 ≤120 s) con `agentic` ya por defecto | DN-05:474-542; DN-05-evaluacion §6.6, §8 |
 | Media | Latencia: no hay medición después de `8659d6b`; la última daba de 338 a 618 s | DN-05-evaluacion §6.10, §8 |
 | Media | Deadline por fase en `InProcessPipeline`, y no descartar el raw al abortar | DN-05 §6; DN-07c:49-51; DN-05-review R05; DN-06:33 |
-| Media | Estado de la fuente según la cobertura real, no según `crawl.partial`. Resuelto en parte el 2026-11-09: un 404, robots o algo que no es HTML ya no dejan PARTIAL | DN-05 §8; DN-05-review R08; DN-07 de crawl, §6 |
-| Media | Causas estructurales que hoy dejan el website `partial` sin un código que las distinga de una transitoria: un `Crawl-delay` de 1,5 s o más (acaba en el plazo del crawl) y una página interior con 401/403, otro 4xx o sin texto. Hay que decidirlo antes de fijar qué `partial` se repara cada hora | DN-07 de crawl, §6 |
+| Media | Estado de la fuente según la cobertura real, no según `crawl.partial`. Resuelto en parte el 2026-11-09: un 404, robots, algo que no es HTML o un enlace que redirige fuera del sitio ya no dejan PARTIAL | DN-05 §8; DN-05-review R08; DN-07 de crawl, §6 |
+| Media | Causas estructurales que hoy dejan el website `partial` sin un código que las distinga de una transitoria: una página interior con 401/403, otro 4xx o sin texto. Hay que decidirlo antes de fijar qué `partial` se repara cada hora. El `Crawl-delay` ya no acaba en el plazo (2026-11-09): separa los inicios de página y añade como mucho 7,5 s | DN-07 de crawl, §6 |
 | Media | Flag "cola agotada" frente a "presupuesto agotado", para poder fijar los negativos de IA | DN-07c:68-71 |
 | Media | Que `agentic` pueda producir W7 `minimal` y W5a `no_team_page` | `derived-signals.ts:47,58` |
 | Baja | `extractionFingerprint` y política de caché (hash frágil, solo el último raw) | DN-05 §9; `website-source.ts:24-36` |
