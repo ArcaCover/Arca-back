@@ -110,15 +110,19 @@ crawler, el lector de PDFs, el lector de sitemaps y las herramientas del agente 
   solo se comprobaban las navegaciones, y un `fetch("/wp-json/…")` salía aunque estuviera excluido.
   Un `iframe` del propio sitio excluido por robots queda anotado igual, con `scope: request`.
 - El destino de una redirección se comprueba antes de entregársela al navegador. Cuando la navegación termina, se
-  comprueba además cada salto de la cadena (`redirectedFrom()` hasta la primera petición, más la URL actual): si
-  alguno sale del sitio, la página termina como `OFF_SITE_REDIRECT`; si robots excluye alguno del sitio, como
-  `ROBOTS_DISALLOWED`. En los dos casos su contenido no se guarda (ver el límite de abajo). La comprobación va antes de
+  comprueba además cada salto de la cadena (`redirectedFrom()` hasta la primera petición): si alguno sale del sitio,
+  la página termina como `OFF_SITE_REDIRECT`; si robots excluye alguno del sitio, como `ROBOTS_DISALLOWED`. La URL
+  actual de la página solo entra en la comprobación de host, no en la de robots: un script puede reescribir la
+  dirección en el mismo documento (`history.replaceState`, `pushState`) sin pedir nada a la red, y robots.txt no
+  tiene nada que decir de una petición que no existe. Antes de este arreglo, un `replaceState` a `/?lang=en` con
+  `Disallow: /*?` descartaba una portada leída desde una URL permitida, y el sitio podía acabar como ilegible
+  (`WEBSITE_UNAVAILABLE`) sin serlo. En los dos casos su contenido no se guarda (ver el límite de abajo). La comprobación va antes de
   mirar el estado, así que una cadena que sale a otro host termina como `OFF_SITE_REDIRECT` aunque el último salto
   responda 503 con un desafío: el desafío es de otro host, no la negativa de la firma.
 - La página puede navegar sola después de cargar (un `meta refresh`, un `location.href` en un script) mientras el
   crawler espera a que la red se calme. Por eso el crawler apunta todas las respuestas de navegación del marco
-  principal (`page.on('response')`) y, después de leer el contenido, vuelve a revisar la cadena de cada una y la URL
-  actual. Si alguna sale del sitio o pasa por una URL excluida, la página termina igual que arriba y lo leído se
+  principal (`page.on('response')`) y, después de leer el contenido, vuelve a revisar la cadena de cada una (y la URL
+  actual, solo contra el host). Si alguna sale del sitio o pasa por una URL excluida, la página termina igual que arriba y lo leído se
   descarta. Antes de la segunda revisión, un `meta refresh` a `/private` → `www/private` → `/private/` con
   `Disallow: /private/` se guardaba como página de la firma, y uno que acababa en otro host también.
 - El lector de sitemaps sigue las redirecciones él mismo, salto a salto y como mucho 5. Cada salto tiene que quedarse en

@@ -953,5 +953,14 @@ contaba como negativa de la firma (DEFINITIVE, 7 días fijado), y el PDF del Qui
 identificar cuando el directorio solo se omitió por falta de ciudad. Con ellos, `npm test` da 1248 de 1249; el único
 fallo es el mismo flake de `arca-demo-stack.test.ts`, que solo pasa 7 de 7.
 
+Una tercera pasada de revisión encontró una regresión de esos arreglos, ya corregida con su test: la URL actual de
+la página se comparaba con robots.txt, así que un script que reescribe la dirección en el mismo documento
+(`history.replaceState` o `pushState`, sin petición de red) hacia una URL excluida descartaba una página leída desde
+una URL permitida, y una web legible podía acabar con `WEBSITE_UNAVAILABLE`. Ahora robots solo se pregunta por los
+saltos que se pidieron a la red, y la URL actual solo entra en la comprobación de host (DN-07 §6). En la misma pasada:
+`numberLabel` ya no recorta palabras que solo acaban en "ss" ("1 busines days"), y el tope de renders PDF resuelve
+la petición antes de pasar el turno y trata un renderer que lanza antes de devolver la promesa como uno que rechaza.
+Con ellos, `npm test` da 1252 de 1252.
+
 Lo que no cambió, a propósito: los límites de §4.6 (plantilla cortada, filas antiguas sin código, sitio que siempre
 llega al plazo).
