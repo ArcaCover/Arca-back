@@ -357,6 +357,25 @@ describe('debug wiring', () => {
     expect(s.renderReport).not.toHaveBeenCalled();
   });
 
+  it("report fault answers 503 for the scan's assessment report too, and a clean scan's report is untouched", async () => {
+    const s = debugSetup();
+    const report = async (scenario?: DebugScenarioInput) => {
+      const { started } = await s.finish(scenario);
+      const created = await s.app.request(`/scan/${started.scanId}/assessment`, { method: 'POST', headers: s.auth(started) });
+      const { assessmentId } = StartedAssessmentResponse.parse(await created.json());
+      await s.drain();
+      return s.app.request(`/assessment/${assessmentId}/report.pdf`, { headers: s.auth(started) });
+    };
+    const injected = await report({ http: { report: 'unavailable' } });
+    expect(injected.status).toBe(503);
+    expect(await injected.json()).toEqual({ error: 'report_unavailable', message: 'Injected report failure' });
+    // Without the fault the same request reaches the ordinary answer for an assessment that is not completed.
+    const clean = await report();
+    expect(clean.status).toBe(409);
+    expect(await clean.json()).toMatchObject({ error: 'incomplete' });
+    expect(s.renderReport).not.toHaveBeenCalled();
+  });
+
   it('planner timeout falls back to rules', async () => {
     // A working agent is wired, so a rules plan can only come from the injected stall.
     const agent: PlanningAgent = { model: 'fixture-agent', plan: async input => rulesPlan(input.bank, input.layer1, input.evidence) };

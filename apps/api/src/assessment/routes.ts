@@ -5,8 +5,14 @@ import { verifySessionToken } from '../auth/session-token.js';
 import type { ScanRepository } from '../repositories/types.js';
 import type { AssessmentRepository } from './repository.js';
 import { AssessmentFailure, type AssessmentService } from './service.js';
+import { assessmentReportFilename, isCompleted, renderAssessmentHtml } from '../report/assessment.js';
 
-export function assessmentRoutes(deps: { scans: ScanRepository; repository: AssessmentRepository; service: AssessmentService; sessionSecret: string }) {
+export function assessmentRoutes(deps: { scans: ScanRepository; repository: AssessmentRepository; service: AssessmentService; sessionSecret: string;
+  /** Turns the report's HTML into a PDF. Without it the report endpoint answers 503. */
+  renderReport?: (html: string) => Promise<Uint8Array<ArrayBuffer>>;
+  /** Debug modes only: whether the scan was started with an injected report failure. */
+  reportFault?: (scanId: string) => boolean;
+}) {
   const app = new Hono();
   app.use('*', async (c, next) => { c.header('Cache-Control', 'no-store'); await next(); });
   app.use('/assessment/*', bodyLimit({ maxSize: 16_384,
@@ -68,5 +74,20 @@ export function assessmentRoutes(deps: { scans: ScanRepository; repository: Asse
     return c.json(await deps.service.complete(c.req.param('assessmentId')));
   });
   app.get('/assessment/:assessmentId/result', async c => c.json(await deps.service.result(c.req.param('assessmentId'))));
+  app.get('/assessment/:assessmentId/report.pdf', async c => {
+    const record = await deps.service.get(c.req.param('assessmentId'));
+    if (deps.reportFault?.(record.scan_id)) return c.json({ error: 'report_unavailable', message: 'Injected report failure' }, 503);
+    if (!isCompleted(record)) throw new AssessmentFailure('incomplete', 'Complete the assessment before requesting its report');
+    if (!deps.renderReport) return c.json({ error: 'report_unavailable', message: 'Report rendering is not configured' }, 503);
+    const html = renderAssessmentHtml(record);
+    // Answered here: this sub-app's error handler would blame saving or loading the assessment, which worked.
+    const pdf = await deps.renderReport(html).catch((error: unknown) => {
+      console.error('[assessment] report rendering failed', record.id, error instanceof Error ? error.message : 'Unknown error');
+      return null;
+    });
+    if (!pdf) return c.json({ error: 'report_unavailable', message: 'The report could not be prepared; try again' }, 503);
+    return c.body(pdf, 200, { 'Content-Type': 'application/pdf', 'Cache-Control': 'no-store',
+      'Content-Disposition': `attachment; filename="${assessmentReportFilename(record)}"` });
+  });
   return app;
 }

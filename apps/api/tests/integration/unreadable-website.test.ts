@@ -95,6 +95,17 @@ describe('a firm whose website refuses to be read', () => {
     expect(assessment.compositeScore).toBeLessThanOrEqual(70);
     expect(assessment.flags).toEqual(expect.arrayContaining(['WEBSITE_UNAVAILABLE', 'INSUFFICIENT_EVIDENCE', 'COMMERCIAL_DECISION_BLOCKED']));
     expect(AssessmentResult.parse(await (await request(`/assessment/${assessmentId}/result`)).json())).toEqual(assessment);
+
+    // The assessment report says it too. The answers lifted the tier out of CRITICAL, so the sentence names no risk group.
+    expect(assessment.tier).not.toBe('CRITICAL');
+    const assessmentReport = await request(`/assessment/${assessmentId}/report.pdf`);
+    expect(assessmentReport.status).toBe(200);
+    expect(assessmentReport.headers.get('Content-Disposition')).toBe(
+      `attachment; filename="arca-assessment-blocked.arca.example-${assessment.completedAt.slice(0, 10)}.pdf"`);
+    const assessmentHtml = s.renderReport.mock.calls[1]![0];
+    expect(assessmentHtml).toContain('<h1>blocked.arca.example</h1>');
+    expect(assessmentHtml).toMatch(/website could not be read during the scan\. Until it can be read, this result needs a manual review/);
+    expect(assessmentHtml).not.toMatch(/REFERRAL|referral|declin|premium|\$|approved|eligible/);
   });
 
   it('serves the same marked result to the next requester inside the repair cooldown', async () => {

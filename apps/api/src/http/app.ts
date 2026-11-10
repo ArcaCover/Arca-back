@@ -198,7 +198,8 @@ export function createApp(deps: AppDeps) {
   const assessments = new AssessmentService({ repository: assessmentRepository, now, agent: deps.assessmentAgent,
     agentFor: debug ? scanId => debug.assessmentAgentFor(scanId) : undefined,
     planningTimeoutMs: deps.assessmentPlanningTimeoutMs, maxWritesPerMinute: deps.assessmentMaxWritesPerMinute });
-  app.route('/', assessmentRoutes({ scans: deps.repository, repository: assessmentRepository, service: assessments, sessionSecret: deps.sessionSecret }));
+  app.route('/', assessmentRoutes({ scans: deps.repository, repository: assessmentRepository, service: assessments, sessionSecret: deps.sessionSecret,
+    renderReport: deps.renderReport, reportFault: debug ? scanId => debug.reportFault(scanId) : undefined }));
   app.route('/', deps.webapp ? webappRoutes(deps.webapp) : notConfiguredWebapp());
   if (debug) {
     // The mock demo seed (DN-11 §4.6) runs this very scan, past the limiter, to its end, then the assessment through this service.

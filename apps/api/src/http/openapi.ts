@@ -121,6 +121,13 @@ export function buildOpenApiDocument() {
   registry.registerPath({ method: 'get', path: '/assessment/{assessmentId}/result', summary: 'Read the saved completed assessment result',
     security: [{ sessionToken: [] }], request: { params: assessmentParams },
     responses: { ...assessmentErrors, 200: { description: 'Immutable assessment result', content: json(AssessmentResult) } } });
+  registry.registerPath({ method: 'get', path: '/assessment/{assessmentId}/report.pdf', summary: 'Download the Assessment Report',
+    description: 'PDF of a COMPLETED assessment, built only from its stored record: the firm and domain, the completion date, the combined score and tier with its Layer 1 and Layer 2 parts, the six areas, the action plan, the answers as they were asked, and the bank and scoring versions. It carries one demo disclosure and no price, coverage promise or decision. Content-Disposition names the file arca-assessment-<domain>-<yyyy-mm-dd>.pdf. Like every assessment read, it works only during the 24-hour session.',
+    security: [{ sessionToken: [] }], request: { params: assessmentParams },
+    responses: { ...assessmentErrors,
+      200: { description: 'The report', content: { 'application/pdf': { schema: { type: 'string', format: 'binary' } } } },
+      409: { description: 'The assessment is not completed yet, so there is no report (incomplete)', content: json(AssessmentError) },
+      503: { description: 'The report could not be rendered, or rendering is not configured on this server (report_unavailable)', content: json(error) } } });
   return new OpenApiGeneratorV31(registry.definitions).generateDocument({ openapi: '3.1.0',
     info: { title: 'ARCA Layer 1 + Layer 2 API', version: '2.0.0', description: 'Domain evidence scoring. Unknown fields remain null while unavailable scoring rules contribute zero points. Tier and decision are separate.' } });
 }
