@@ -43,7 +43,8 @@ los atajos del assessment.
 Los modos (`ARCA_MODE` aquí y `NEXT_PUBLIC_ARCA_MODE` en el front) son `mock`, `live-debug` y `production`.
 Si faltan, el modo es `production`. Los dos `.env.example` arrancan en `mock`, que no necesita ninguna
 credencial ni hace llamadas pagadas. Datos y caché viven en memoria y desaparecen al reiniciar. `live-debug`
-usa las APIs reales y Supabase, y necesita sus claves. Comandos, comprobaciones y reglas de seguridad:
+usa las APIs reales y Supabase, y necesita sus claves; su webapp (cuentas, organizaciones y cobro) es
+simulada y vive en memoria, como en `mock` (DN-12 §7). Comandos, comprobaciones y reglas de seguridad:
 [DN-09](docs/design-notes/DN-09-modos-mock-y-live-debug.md), §11 y §12.
 
 Cada repo también tiene `npm run dev:mock` y `npm run dev:live-debug` para arrancarlo por separado. Sin

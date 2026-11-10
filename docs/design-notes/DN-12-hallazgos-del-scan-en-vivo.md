@@ -2,7 +2,7 @@
 
 - **Fecha:** 2026-11-09
 - **Estado:** en implementación. Cada arreglo tiene su sección (§3 a §8) y la amplía la tarea que lo hace.
-  Hoy están hechos §3, §4, §5 y §6 (back).
+  Hoy están hechos §3, §4, §5, §6 y §7 (back).
 - **Repos:** `Arca-back` y `Arca-front`, rama `fix/live-scan-findings` en ambos
 - **Parte de:** DN-07 de crawl (§6, robots y web ilegible), DN-09 (modos), DN-10 y DN-11 (webapp)
 
@@ -334,8 +334,10 @@ Un valor explícito gana en cualquier modo. Una línea vacía en el `.env` cuent
 como 0. La línea de arranque de `live-debug` dice qué está activo:
 
 ```
-[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only) spend guards: Apify ceiling USD 2 per 24 h, OpenAI cap 30 requests per scan
+[api] MODE=live-debug sources=live storage=supabase webapp=simulated-in-memory (debug routes on 127.0.0.1 only) spend guards: Apify ceiling USD 2 per 24 h, OpenAI cap 30 requests per scan
 ```
+
+(`webapp=simulated-in-memory` es de §7.)
 
 ### 5.1 Techo de gasto de Apify
 
@@ -675,7 +677,113 @@ que la pantalla ya mostraba tras recortar la frase. El significado del paso no c
 
 ## 7. Webapp simulada en live-debug (F2, D7)
 
-Pendiente.
+Hecho en el back. Las pantallas, el botón de registro y las etiquetas de "simulado" son del front.
+
+**Antes.** La webapp privada (cuentas, organizaciones y cobro: DN-10 y DN-11) solo se construía en `mock`. En
+`live-debug` todas sus rutas respondían 501 y `/__debug/auth/login` y `/__debug/billing/pay` no existían. Era
+una decisión de DN-10 §10 **[mía]**: que nunca pareciera que funcionaba contra servicios que no existen. El
+efecto fue que, tras un scan real, el embudo terminaba sin salida y nada lo explicaba (F2).
+
+**Ahora (D7, [Jesús]).** `live-debug` construye las mismas piezas que `mock`: `InMemoryWebappRepository`,
+`MockAppAuth` y `MockBillingProvider`. Lo que cambia es de dónde lee:
+
+| | `production` | `live-debug` | `mock` |
+|---|---|---|---|
+| Scans y assessments | Supabase | Supabase (reales) | memoria |
+| Cuentas, organizaciones, miembros, planes, cobro | no hay: 501 | **memoria, simulados** | memoria, simulados |
+| `POST /__debug/auth/login` | no existe (404) | sí | sí |
+| `POST /__debug/billing/pay` | no existe (404) | sí | sí |
+| `POST /__debug/seed` (DN-11 §4.6) | no existe (404) | **no existe (404)** | sí |
+
+Sigue sin haber repositorio de Supabase para la webapp, verificador de Supabase Auth ni Stripe. Eso es el
+trabajo de DN-10 §10 y no cambia: en producción no hay registro.
+
+### 7.1 Un reclamo no escribe nada en Supabase
+
+`WebappService` solo **lee** de los repositorios de scans y assessments: `scans.get` y
+`assessments.getByScan`. Que un scan esté reclamado se guarda en el repositorio de la webapp
+(`org_analyses`), que aquí es memoria. La tabla `scans` no tiene ninguna marca de reclamado.
+
+Un test lo fija con repositorios espía en el lugar de Supabase: durante login, reclamo, organización, pago,
+lista de análisis y plan de acción, las únicas llamadas son `get` y `getByScan`. Otro test, con el
+`SupabaseRepository` de verdad y un `fetch` falso, comprueba que el login, `/me`, `/plans` y un reset no
+mandan ninguna petición a Supabase.
+
+### 7.2 Guardas
+
+Las mismas que en `mock`, sin ninguna nueva:
+
+- **Modo.** Las rutas `/__debug/*` solo se registran cuando `compose` construye las herramientas de debug, y
+  eso no ocurre en producción. La webapp simulada depende de los repositorios de enrutado, que producción
+  tampoco construye. `ARCA_DEPLOYMENT` impide arrancar un modo de debug en un despliegue (DN-09 §4).
+- **Loopback.** El servidor de los modos de debug escucha solo en `127.0.0.1` (DN-09 §5.1). Es una guarda del
+  socket, no de cada petición.
+- **Cabecera.** Login, pago y reset piden `X-Arca-Debug: 1`. Sin ella responden **400**, igual que en mock: así
+  la petición deja de ser "simple" para CORS y solo pasan los orígenes permitidos. El 404 es para las rutas que
+  no existen en ese modo.
+- **Semilla solo en mock.** La semilla lanza un scan que se salta el limitador. En `live-debug` leería una web
+  real, gastaría crédito y escribiría en la base compartida. `DebugTools.seeds` es verdadero solo en mock con la
+  webapp, `createApp` solo construye ese ejecutor cuando lo es, y `routes()` rechaza recibirlo en otro caso.
+- **Scan inyectado.** Un scan con fallo inyectado vive en memoria (DN-09 §5.5) y sigue sin poder reclamarse: 409.
+
+### 7.3 Reset
+
+`POST /__debug/reset` en `live-debug` vacía el limitador, como antes, y ahora también **la memoria de la
+webapp**. No toca Supabase ni los scans inyectados que alguien esté mirando. **[mía]**
+
+Motivo: la regla de "un scan se reclama una sola vez" vive en esa memoria. Sin el reset, repetir el recorrido
+de registro con el mismo scan real exigiría reiniciar el back o pagar otro scan.
+
+### 7.4 Lo que dice el propio back
+
+- **Línea de arranque.** `storage=supabase` habla de los scans. Cuando la webapp no vive ahí, la línea lo
+  dice: `webapp=simulated-in-memory`. En mock no aparece, porque allí todo es memoria y `storage=memory` ya
+  lo dice. En producción tampoco: no hay webapp.
+- **`GET /__debug/mode` no cambia (D6).** `DebugModeResponse` es un objeto estricto y no tiene campo para la
+  webapp. `storageBackend` e `inUse.supabase` siguen describiendo dónde viven los scans y assessments. No
+  hizo falta un campo nuevo: en los dos modos de debug la webapp es la simulada, así que `mode` ya lo
+  determina. Si algún día un modo de debug usa la webapp real, hará falta un campo (por ejemplo
+  `webapp: 'simulated' | 'real'`) y una versión nueva del contrato.
+- **Comentarios y mensajes** que decían "solo en mock" para el login y el pago dicen ahora "modos de debug".
+
+### 7.5 Límites conocidos
+
+- **Se pierde al reiniciar.** Organizaciones, miembros, invitaciones, precios cambiados y admins de plataforma
+  viven en el proceso. El back corre con `tsx watch`: guardar un fichero lo reinicia y lo borra todo. El
+  navegador conserva su token, que sigue siendo válido (su clave sale de `SESSION_TOKEN_SECRET`), y verá una
+  cuenta sin organización. El mismo scan se puede volver a reclamar.
+- **Hace falta el token del scan.** El reclamo pide el token de sesión del scan, que dura 24 horas y vive en la
+  pestaña que hizo el scan. Un scan antiguo no se puede reclamar sin él.
+- **Admin de plataforma.** El login simulado acepta `platformAdmin: true` también en `live-debug`. Ese panel
+  solo ve organizaciones de la memoria, que nacen de un reclamo hecho con el token de un scan. No abre ninguna
+  lectura nueva sobre los leads de Supabase.
+- **El checkout simulado** devuelve una URL bajo `APP_BASE_URL`. Si ese valor no apunta al front local, el
+  navegador sale a otro sitio.
+- **El webhook** `POST /billing/webhook` sigue respondiendo 501 en todos los modos.
+
+### 7.6 Tests
+
+`apps/api/tests/integration/webapp.test.ts`:
+
+- "production wiring": sin cambios. Producción responde 501 en las 22 rutas, no tiene login, pago ni semilla
+  (404) y su CORS sigue exacto.
+- "live-debug: real scans, a simulated webapp held in memory": la app compuesta en `live-debug` con
+  repositorios en memoria en el lugar de Supabase y un `fetch` que falla si alguien lo llama. Ningún test
+  lanza un scan: el scan se deja guardado como lo dejaría una ejecución real.
+  - login → reclamo → organización → 402 → pago simulado → el análisis aparece, con su assessment y su plan;
+    las únicas llamadas a los repositorios son lecturas (§7.1);
+  - la semilla responde 404;
+  - login y pago sin la cabecera responden 400, y `/me` sin token 401 (ya no 501);
+  - el reset olvida la webapp, no llama a los repositorios y deja reclamar el mismo scan otra vez;
+  - un scan aislado en memoria no se puede reclamar (409);
+  - con el `SupabaseRepository` real, la única petición a Supabase es la de arranque;
+  - las herramientas de debug no reciben el ejecutor de la semilla ni lo aceptan.
+
+`apps/api/tests/integration/compose.test.ts`: producción no pasa `webapp` a `createApp`; los dos modos de
+debug pasan la simulada y las herramientas de debug comparten ese mismo servicio; la línea de arranque.
+
+`compose` acepta un segundo argumento opcional, `storage`, que sustituye a los repositorios durables. Solo
+lo usan los tests.
 
 ## 8. Textos de la interfaz (F3, D8)
 
