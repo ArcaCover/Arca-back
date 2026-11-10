@@ -11,7 +11,7 @@ describe('why a stored source is degraded (DN-12 §4.2)', () => {
     ['read in full', { status: 'ok' }, 'NONE'],
     ['read as far as the site allows, or stored before the code existed', { status: 'partial' }, 'STRUCTURAL'],
     ['a crawl cut by the deadline', { status: 'partial', code: 'DEADLINE_REACHED' }, 'TRANSIENT'],
-    ['a page that failed for a passing reason', { status: 'partial', code: 'PROVIDER_ERROR' }, 'TRANSIENT'],
+    ['a page that failed for a passing reason or came back empty', { status: 'partial', code: 'PROVIDER_ERROR' }, 'TRANSIENT'],
     ['the site refuses to be read (WEBSITE_UNAVAILABLE)', { status: 'error', code: 'ACCESS_BLOCKED' }, 'STRUCTURAL'],
     ['no page had readable text', { status: 'error', code: 'NO_READABLE_EVIDENCE' }, 'TRANSIENT'],
     ['the site or the extraction failed', { status: 'error', code: 'PROVIDER_ERROR' }, 'TRANSIENT'],

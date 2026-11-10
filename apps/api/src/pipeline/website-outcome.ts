@@ -1,6 +1,6 @@
 import type { SourceStatus } from '@arca/contracts';
 import { classifyUnreadableWebsite, type UnreadableWebsite } from '@arca/scoring';
-import { leavesCrawlPartial, shouldRetryPage, type CrawlIssue, type CrawlResult } from './crawler.js';
+import { isChallenge, leavesCrawlPartial, shouldRetryPage, type CrawlIssue, type CrawlResult } from './crawler.js';
 
 type Cause = { status: 'error' | 'timeout'; code: NonNullable<SourceStatus['code']>; reason: string };
 export type UnreadableOutcome = Cause & { classification: UnreadableWebsite };
@@ -27,6 +27,8 @@ function cause(issue: CrawlIssue, crawl: CrawlResult): Cause {
     case 'ROBOTS_UNAVAILABLE':
       return error('PROVIDER_ERROR', `robots.txt could not be retrieved (${http(issue.status)}), so the website was not read`);
     case 'ACCESS_BLOCKED':
+      // A challenge is the site's refusal whatever status carries it, a 429 included.
+      if (isChallenge(issue)) return error('ACCESS_BLOCKED', 'The website answered with a bot challenge page');
       if (issue.status === 429) return error('PROVIDER_ERROR', 'The website is rate limiting requests (HTTP 429)');
       return error('ACCESS_BLOCKED', issue.status === 401 || issue.status === 403
         ? `The website refused automated access (HTTP ${issue.status})` : 'The website answered with a bot challenge page');
@@ -47,7 +49,8 @@ function cause(issue: CrawlIssue, crawl: CrawlResult): Cause {
 /**
  * Why a crawl read no page at all, as the website source reports it: the cause picks the code and the reason,
  * and the code alone says whether the outcome is definitive or transient (`classifyUnreadableWebsite`).
- * Only a refusal is definitive: robots.txt excluding the site, or its pages answering 401/403 or a challenge page.
+ * Only a refusal is definitive: robots.txt excluding the site, or its pages answering 401/403 or a challenge page
+ * (whatever status carries the challenge).
  * One passing failure is enough to call the whole outcome transient, and so is a page that came back missing or
  * empty: a firm is never branded unreadable while a second scan could still read it.
  */
@@ -62,13 +65,16 @@ export function unreadableWebsite(crawl: CrawlResult): UnreadableOutcome {
 
 /**
  * Why a crawl that read pages is still partial, as the code its source reports. The scan cache reads it: a crawl
- * the deadline cut, or one with a page that failed for a passing reason (the kind the crawler itself retries, or
- * robots.txt unreachable), is worth another scan. No code means every missing page is the site's own answer
- * (a page that refuses or stays empty), which a second scan would get again.
+ * the deadline cut, or one with a page that failed for a passing reason (the kind the crawler itself retries,
+ * robots.txt unreachable, or a page that came back empty), is worth another scan. An empty page is transient here
+ * for the same reason as in a crawl that read nothing (`unreadableWebsite`): it is what a script that failed to load
+ * once leaves behind. No code means every missing page is the site's own answer (a page that refuses: 401/403, a
+ * challenge, another 4xx), which a second scan would get again.
  */
 export function partialCrawlCode(crawl: CrawlResult): 'DEADLINE_REACHED' | 'PROVIDER_ERROR' | undefined {
   if (crawl.aborted) return 'DEADLINE_REACHED';
-  const passing = (issue: CrawlIssue) => issue.code === 'ROBOTS_UNAVAILABLE' || shouldRetryPage(issue, 0, false);
+  const passing = (issue: CrawlIssue) => issue.code === 'ROBOTS_UNAVAILABLE' || issue.code === 'NO_READABLE_CONTENT' ||
+    shouldRetryPage(issue, 0, false);
   return pageIssues(crawl).some(issue => leavesCrawlPartial(issue) && passing(issue)) ? 'PROVIDER_ERROR' : undefined;
 }
 

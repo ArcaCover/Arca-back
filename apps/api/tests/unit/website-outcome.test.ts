@@ -1,13 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { SourceStatus } from '@arca/contracts';
 import { classifyUnreadableWebsite } from '@arca/scoring';
-import type { CrawlIssue, CrawlResult } from '../../src/pipeline/crawler.js';
+import { CHALLENGE_PAGE, MAX_PAGE_ATTEMPTS, shouldRetryPage, type CrawlIssue, type CrawlResult } from '../../src/pipeline/crawler.js';
 import { crawlNotes, partialCrawlCode, unreadableWebsite } from '../../src/pipeline/website-outcome.js';
+import { websiteDegradation } from '../../src/http/scan-cache.js';
 
 const home = 'https://firm.com/';
 const page = (code: CrawlIssue['code'], status: number | null = null, url = home): CrawlIssue => ({ url, code, status, scope: 'page' });
 const request = (code: CrawlIssue['code'], status: number | null, url: string): CrawlIssue => ({ url, code, status, scope: 'request' });
 const unread = (issues: CrawlIssue[], aborted = false): CrawlResult => ({ pages: [], partial: true, issues, aborted });
+const challenge = (status: number, url = home): CrawlIssue => ({ ...page('ACCESS_BLOCKED', status, url), detail: CHALLENGE_PAGE });
 
 describe('why a website could not be read', () => {
   // Every way a crawl can end without a page, with the code and the class the source must report for it.
@@ -16,6 +18,10 @@ describe('why a website could not be read', () => {
     ['the pages answer 401', unread([page('ACCESS_BLOCKED', 401)]), 'DEFINITIVE', 'error', 'ACCESS_BLOCKED', /HTTP 401/],
     ['the pages answer 403', unread([page('ACCESS_BLOCKED', 403)]), 'DEFINITIVE', 'error', 'ACCESS_BLOCKED', /HTTP 403/],
     ['a challenge page', unread([page('ACCESS_BLOCKED', 200)]), 'DEFINITIVE', 'error', 'ACCESS_BLOCKED', /challenge page/],
+    // A challenge is a refusal whatever status carries it: the rate-limit and server-error rows below do not apply.
+    ['a challenge page served with 503', unread([challenge(503)]), 'DEFINITIVE', 'error', 'ACCESS_BLOCKED', /challenge page/],
+    ['a challenge page served with 429', unread([challenge(429)]), 'DEFINITIVE', 'error', 'ACCESS_BLOCKED', /challenge page/],
+    ['a challenge page served with 403', unread([challenge(403)]), 'DEFINITIVE', 'error', 'ACCESS_BLOCKED', /challenge page/],
     // Not on the definitive list: none of these is the site refusing to be read, and an empty page is what a
     // script that failed to load once leaves behind.
     ['the home page does not exist', unread([page('HTTP_ERROR', 404)]), 'TRANSIENT', 'error', 'NO_READABLE_EVIDENCE', /HTTP 404/],
@@ -131,16 +137,33 @@ describe('why a crawl that read pages is partial', () => {
     ['a page answering 429', read([page('ACCESS_BLOCKED', 429, about)]), 'PROVIDER_ERROR'],
     ['robots.txt unreachable for a page', read([page('ROBOTS_UNAVAILABLE', 503, about)]), 'PROVIDER_ERROR'],
     ['a passing failure next to an answer of the site', read([page('ACCESS_BLOCKED', 403, about), page('HTTP_ERROR', 502, 'https://firm.com/team')]), 'PROVIDER_ERROR'],
+    // An empty page means what it means in a crawl that read nothing: what a script that failed to load once leaves
+    // behind. Transient in both, so the result is repaired after the cooldown instead of pinned for the window.
+    ['a page with no text', read([page('NO_READABLE_CONTENT', 200, about)]), 'PROVIDER_ERROR'],
+    ['a page with no text next to an answer of the site', read([page('ACCESS_BLOCKED', 403, about),
+      page('NO_READABLE_CONTENT', 200, 'https://firm.com/team')]), 'PROVIDER_ERROR'],
     // The site's own answer about a page: the crawler does not retry these, and neither does a second scan.
     ['a page answering 403', read([page('ACCESS_BLOCKED', 403, about)]), undefined],
     ['a page answering 401', read([page('ACCESS_BLOCKED', 401, about)]), undefined],
     ['a challenge page', read([page('ACCESS_BLOCKED', 200, about)]), undefined],
-    ['a page with no text', read([page('NO_READABLE_CONTENT', 200, about)]), undefined],
+    ['a challenge page served with 429', read([challenge(429, about)]), undefined],
+    ['a challenge page served with 503', read([challenge(503, about)]), undefined],
     ['a page answering 400', read([page('HTTP_ERROR', 400, about)]), undefined],
     ['a partial crawl with no cause on record', read([]), undefined],
   ];
   it.each(causes)('%s', (_name, crawl, code) => {
     expect(partialCrawlCode(crawl)).toBe(code);
+  });
+
+  it('reads an empty page the same in a crawl that read nothing and in one that read other pages', () => {
+    const empty = page('NO_READABLE_CONTENT', 200, about);
+    expect(unreadableWebsite(unread([empty])).classification).toBe('TRANSIENT');
+    expect(websiteDegradation({ status: 'partial', code: partialCrawlCode(read([empty])) })).toBe('TRANSIENT');
+  });
+
+  it('never retries a challenge page within the crawl, whatever its status', () => {
+    for (const status of [200, 403, 429, 503]) expect(shouldRetryPage(challenge(status), 0, false, MAX_PAGE_ATTEMPTS)).toBe(false);
+    expect(shouldRetryPage(page('ACCESS_BLOCKED', 429), 0, false, MAX_PAGE_ATTEMPTS)).toBe(true);
   });
 
   it('ignores what does not leave a crawl partial, and requests that are not pages', () => {

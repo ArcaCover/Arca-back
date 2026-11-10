@@ -31,9 +31,11 @@ it('downloads robots.txt once for every tool call of a scan', async () => {
   const access = createSiteAccess({
     robots,
     response: async (raw: string) => new URL(raw).pathname.endsWith('.pdf')
-      ? { status: 200, headers: { 'content-type': 'application/pdf' }, body: pdf } : await transport.response(raw),
+      ? { status: 200, headers: { 'content-type': 'application/pdf' }, body: pdf }
+      : new URL(raw).pathname.endsWith('.xml') ? { status: 200, headers: { 'content-type': 'application/xml' },
+        body: Buffer.from('<urlset><url><loc>https://fixture.example/team</loc></url><url><loc>https://fixture.example/private/x</loc></url></urlset>') }
+        : await transport.response(raw),
     extract: async () => ({ totalPages: 1, text: ['Privacy policy'] }),
-    text: async () => ({ status: 200, text: '<urlset><url><loc>https://fixture.example/team</loc></url><url><loc>https://fixture.example/private/x</loc></url></urlset>' }),
   }).withRobots!(createRobotsCache());
   const signal = new AbortController().signal;
   const pages = await access.fetchPages(['https://fixture.example/about', 'https://fixture.example/team', 'https://fixture.example/private/memo'], signal);

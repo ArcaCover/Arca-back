@@ -7,7 +7,7 @@ import { ApifyClient, ApifyClientError, committedUsd } from '../../src/pipeline/
 import { directoryDegradation } from '../../src/http/scan-cache.js';
 import { RagWebsiteSource, WebsiteExtractionSource } from '../../src/pipeline/website-source.js';
 import { RuleBasedEvidenceProvider } from '../../src/pipeline/website-evidence-provider.js';
-import type { CrawlIssue, CrawlResult } from '../../src/pipeline/crawler.js';
+import { CHALLENGE_PAGE, type CrawlIssue, type CrawlResult } from '../../src/pipeline/crawler.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import type OpenAI from 'openai';
 
@@ -998,7 +998,7 @@ describe('website signal reuse', () => {
     const s = setup();
     await s.scan();
     for (let index = 0; index < 5; index++) { s.advance(DAY); await s.scan(); }
-    const find = vi.spyOn(s.repository, 'findRaw'), read = vi.spyOn(s.repository, 'rawOf'), latest = vi.spyOn(s.repository, 'latestRaw');
+    const find = vi.spyOn(s.repository, 'findRaw'), read = vi.spyOn(s.repository, 'rawOf');
     await s.scan();
     expect(find).toHaveBeenCalledTimes(1);
     expect(find.mock.calls[0]).toEqual(['firm.com', 'website', expect.stringMatching(/^wsk1-[0-9a-f]{64}$/), expect.any(String), 3]);
@@ -1009,7 +1009,6 @@ describe('website signal reuse', () => {
     await s.scan({ pages: [page('/', 'Another firm entirely.')], partial: false });
     expect(find).toHaveBeenCalledTimes(2);
     expect(read).toHaveBeenCalledTimes(1);
-    expect(latest).not.toHaveBeenCalled();
   });
 
   it('caps the age of a reused analysis from the day it was extracted, however often it was reused', async () => {
@@ -1092,7 +1091,9 @@ describe('website signal reuse', () => {
     expect(await status({ aborted: true })).toMatchObject({ status: 'partial', code: 'DEADLINE_REACHED' });
     expect(await status({ issues: [issue('HTTP_ERROR', 503)] })).toMatchObject({ status: 'partial', code: 'PROVIDER_ERROR' });
     expect(await status({ issues: [issue('ACCESS_BLOCKED', 403)] })).not.toHaveProperty('code');
-    expect(await status({ issues: [issue('NO_READABLE_CONTENT', 200)] })).not.toHaveProperty('code');
+    // An empty page is transient here as it is when it is the whole site: a script that failed to load once.
+    expect(await status({ issues: [issue('NO_READABLE_CONTENT', 200)] })).toMatchObject({ status: 'partial', code: 'PROVIDER_ERROR' });
+    expect(await status({ issues: [{ ...issue('ACCESS_BLOCKED', 429), detail: CHALLENGE_PAGE }] })).not.toHaveProperty('code');
     expect((await s.scan({ pages: site(), partial: false, issues: [issue('HTTP_ERROR', 404)] })).result.status).not.toHaveProperty('code');
   });
 });

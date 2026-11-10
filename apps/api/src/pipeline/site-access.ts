@@ -1,7 +1,7 @@
 import { crawlWebsite, type CrawledPage, type CrawlTransport } from './crawler.js';
 import { documentTransport, readDocument, type DocumentTransport } from './document-reader.js';
 import type { RobotsCache } from './robots.js';
-import { readSitemap as readSitemapUrls, sitemapTransport, type SitemapTransport } from './sitemap-reader.js';
+import { readSitemap as readSitemapUrls, sitemapTransport } from './sitemap-reader.js';
 
 export type ToolName = 'fetch_pages' | 'read_document' | 'read_sitemap' | 'find_in_site';
 export type ToolCall = { round: number; tool: ToolName; target: string; status: 'read' | 'failed' | 'skipped'; detail: string | null };
@@ -15,7 +15,8 @@ export interface SiteAccess {
   /** The same tools reading through one scan's robots cache, so every tool call shares one robots.txt download per origin. */
   withRobots?(robots: RobotsCache): SiteAccess;
 }
-export type SiteTransport = CrawlTransport & Partial<Pick<DocumentTransport, 'extract'> & Pick<SitemapTransport, 'text'>>;
+/** The crawler's transport serves every reader: one request per call, so each reader checks every redirect hop itself. */
+export type SiteTransport = CrawlTransport & Partial<Pick<DocumentTransport, 'extract'>>;
 
 // No cache by default: this object outlives a scan, and a robots answer must not.
 export function createSiteAccess(transport?: SiteTransport, robots?: RobotsCache): SiteAccess {

@@ -291,6 +291,62 @@ it('does not keep a page whose redirect chain ended off the site after a hop the
   }
 }, 30_000);
 
+it('does not keep a page whose redirect chain ends on a path robots.txt excludes, after hops the handler never saw', async () => {
+  // The usual WordPress chain: a slashless link goes to www, and www adds the trailing slash. Only the last URL is
+  // excluded, and the browser follows that hop with its own network, out of the request handler's sight.
+  const served: string[] = [];
+  const www = await loopback((request, response) => {
+    served.push(request.url ?? '');
+    if (request.url === '/private') response.writeHead(301, { location: '/private/' }).end();
+    else response.writeHead(200, { 'content-type': 'text/html' }).end('<body>SECRET PRIVATE PAGE</body>');
+  });
+  try {
+    const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+      robots: async () => ({ status: 200, text: 'User-agent: *\nDisallow: /private/' }),
+      response: async raw => path(raw) === '/' ? html('Smith Law<a href="/private">Private</a>')
+        : { status: 301, headers: { location: `http://www.fixture.example${path(raw)}` }, body: Buffer.alloc(0) },
+    }, { hostResolverRules: www.hostResolverRules });
+    expect(result.pages.map(page => path(page.url))).toEqual(['/']);
+    expect(result.pages.some(page => page.text.includes('SECRET'))).toBe(false);
+    // The site's answer about the link, as for a link robots.txt excludes outright: not a failure, not partial.
+    expect(listed(result)).toEqual(['page ROBOTS_DISALLOWED null fixture.example/private']);
+    expect(result.partial).toBe(false);
+    // The known limit (DN-07 §6): the browser still fetched the excluded URL once. Only its content is dropped.
+    expect(served).toEqual(['/private', '/private/']);
+  } finally {
+    await www.close();
+  }
+}, 30_000);
+
+it('takes a challenge page for a refusal whatever status carries it, and asks for it once', async () => {
+  const challenge = 'Just a moment...<p>Checking your browser before accessing fixture.example.</p>';
+  const cases: Array<[number, Record<string, string>, string]> = [
+    [503, {}, challenge], [429, {}, challenge], [403, {}, challenge],
+    // Cloudflare marks its own challenge with a header, whatever the page says.
+    [503, { 'cf-mitigated': 'challenge' }, '<div id="challenge-form"></div>'],
+  ];
+  for (const [status, headers, body] of cases) {
+    let asked = 0;
+    const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+      robots: async () => ({ status: 404, text: '' }),
+      response: async () => { asked++; return { status, headers: { 'content-type': 'text/html', ...headers }, body: Buffer.from(`<body>${body}</body>`) }; },
+    });
+    expect(result.pages).toEqual([]);
+    expect([status, asked]).toEqual([status, 1]);
+    expect(result.issues?.find(issue => issue.scope === 'page')).toMatchObject({ code: 'ACCESS_BLOCKED', status, detail: 'challenge page' });
+    expect(unreadableWebsite(result)).toMatchObject({ classification: 'DEFINITIVE', status: 'error', code: 'ACCESS_BLOCKED' });
+  }
+  // A 503 without a challenge stays a passing failure of the site, retried and transient.
+  let asked = 0;
+  const busy = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async () => ({ status: 404, text: '' }),
+    response: async () => { asked++; return html('Service temporarily unavailable', 503); },
+  });
+  expect(asked).toBe(MAX_PAGE_ATTEMPTS);
+  expect(listed(busy)).toEqual(['page HTTP_ERROR 503 fixture.example/', 'request HTTP_ERROR 503 fixture.example/']);
+  expect(unreadableWebsite(busy)).toMatchObject({ classification: 'TRANSIENT', code: 'PROVIDER_ERROR' });
+}, 90_000);
+
 it('does not spend the page budget on links robots.txt excludes', async () => {
   // Excluded links sort before the readable pages here. They cost no request, so they must not take their place.
   const excluded = Array.from({ length: 5 }, (_, index) => `<a href="/category/c${index}">Category</a>`).join('');

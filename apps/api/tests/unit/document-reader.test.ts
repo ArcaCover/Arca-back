@@ -55,7 +55,7 @@ describe('document reader', () => {
     const cache = createRobotsCache();
     const first = await readDocument('https://firm.com/a.pdf', new AbortController().signal, transport({ robots }), cache);
     const second = await readDocument('https://firm.com/private/b.pdf', new AbortController().signal, transport({ robots }), cache);
-    await readSitemap('firm.com', new AbortController().signal, { text: async () => ({ status: 404, text: '' }), robots }, cache);
+    await readSitemap('firm.com', new AbortController().signal, { response: async () => ({ status: 404, headers: {}, body: Buffer.alloc(0) }), robots }, cache);
     expect(first.page).not.toBeNull();
     expect(second).toEqual({ page: null, detail: 'ROBOTS_DISALLOWED' });
     expect(robots).toHaveBeenCalledTimes(1);

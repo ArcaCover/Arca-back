@@ -14,7 +14,7 @@ type Cause = Pick<SourceStatus, 'status' | 'code'>;
 type Code = NonNullable<SourceStatus['code']>;
 
 // The cause table (DN-12 §4.2). A status is read by its code, which whoever built the status picked by cause.
-/** A website that was read in part: the crawl deadline cut it, or a page failed for a passing reason. */
+/** A website that was read in part: the crawl deadline cut it, or a page failed for a passing reason or came back empty. */
 const PASSING_WEBSITE_CODES: ReadonlySet<Code> = new Set(['DEADLINE_REACHED', 'PROVIDER_ERROR']);
 /**
  * A directory gap a second lookup would repeat: nothing to look up (the website shows no attorney or city), nobody
@@ -24,7 +24,7 @@ const STRUCTURAL_DIRECTORY_CODES: ReadonlySet<Code> = new Set(['INSUFFICIENT_IDE
 
 export function websiteDegradation(status: Cause): Degradation {
   if (status.status === 'ok') return 'NONE';
-  // A partial website without a code was read as far as the site allows (a page that refuses or stays empty). A
+  // A partial website without a code was read as far as the site allows (a page that refuses to be read). A
   // result stored before the code existed looks the same: it cannot say what cut it, and it is served as it stands.
   if (status.status === 'partial') return status.code !== undefined && PASSING_WEBSITE_CODES.has(status.code) ? 'TRANSIENT' : 'STRUCTURAL';
   // No page at all: only the site's refusal (the WEBSITE_UNAVAILABLE outcome) is an answer about the firm.

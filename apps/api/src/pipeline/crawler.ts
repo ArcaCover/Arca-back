@@ -22,6 +22,14 @@ export type CrawlTransport = { response: typeof fetchPublicResponse; robots: Rob
 /** Attempts allowed per page, the first one included. */
 export const MAX_PAGE_ATTEMPTS = 3;
 /**
+ * The `detail` of an `ACCESS_BLOCKED` page that answered with a bot challenge. A challenge is the site refusing to be
+ * read whatever status carries it (Cloudflare serves its own with 403, 429 or 503), so it is told apart from a plain
+ * 429 or 5xx, which are passing. Issues stored before this marker existed carry a challenge only with a status below 400.
+ */
+export const CHALLENGE_PAGE = 'challenge page';
+export const isChallenge = (issue: Pick<CrawlIssue, 'code' | 'detail'>) => issue.code === 'ACCESS_BLOCKED' && issue.detail === CHALLENGE_PAGE;
+const CHALLENGE_TEXT = /^(checking your browser|just a moment|access denied|verify you are human)/i;
+/**
  * A page is worth another attempt only while the crawl is alive and the failure could plausibly
  * differ next time. Robots rules, missing pages and unreadable content are decided, so retrying
  * them only spends the crawl deadline that a recoverable page still needs.
@@ -31,7 +39,7 @@ export function shouldRetryPage(issue: CrawlIssue, attempt: number, aborted: boo
   if (aborted || attempt + 1 >= max) return false;
   if (issue.code === 'REQUEST_FAILED') return true;
   if (issue.code === 'HTTP_ERROR') return issue.status === null || issue.status >= 500;
-  if (issue.code === 'ACCESS_BLOCKED') return issue.status === 429;
+  if (issue.code === 'ACCESS_BLOCKED') return issue.status === 429 && !isChallenge(issue);
   return false;
 }
 /**
@@ -296,8 +304,17 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
           page = await context.newPage();
           const response = await page.goto(item.url, { timeout: 8000, waitUntil: 'domcontentloaded' });
           const status = response?.status() ?? null;
+          // The page as the reader sees it: no menus, footers or scripts.
+          const visibleText = async (target: import('playwright').Page) => {
+            await target.locator('nav, footer, script, style, noscript, template, [aria-hidden="true"]').evaluateAll(elements => elements.forEach(element => element.remove()));
+            return (await target.locator('body').innerText({ timeout: 1000 })).trim();
+          };
           if (!response || status === null || status >= 400) {
-            fail(item, { url: item.url, code: status !== null && [401, 403, 429].includes(status) ? 'ACCESS_BLOCKED' : 'HTTP_ERROR', status });
+            // Checked before the status: a challenge is a refusal whatever status carries it, never a 503 to retry.
+            const challenge = !!response && (status === 403 || status === 429 || (status ?? 0) >= 500) &&
+              (response.headers()['cf-mitigated'] === 'challenge' || CHALLENGE_TEXT.test(await visibleText(page).catch(() => '')));
+            fail(item, challenge ? { url: item.url, code: 'ACCESS_BLOCKED', status, detail: CHALLENGE_PAGE }
+              : { url: item.url, code: status !== null && [401, 403, 429].includes(status) ? 'ACCESS_BLOCKED' : 'HTTP_ERROR', status });
             return;
           }
           // Only the first hop of a redirect passes the request handler. A chain that still ended off the site
@@ -306,6 +323,15 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
             fail(item, { url: item.url, code: 'OFF_SITE_REDIRECT', status, detail: URL.canParse(page.url()) ? new URL(page.url()).hostname : undefined });
             return;
           }
+          // The same reason applies to robots.txt: the browser followed the later hops by itself, so each one is
+          // checked here, and a page that ended on a URL the site excludes is not kept, whatever it shows. The browser
+          // has already fetched it; this only keeps its content out of the evidence (DN-07 §6, known limit).
+          const hops: string[] = [];
+          for (let hop: import('playwright').Request | null = response.request(); hop; hop = hop.redirectedFrom()) hops.push(hop.url());
+          for (const hop of [...new Set([...hops.reverse(), page.url()])].filter(onSite)) {
+            const policy = await robotsFor(hop);
+            if (!policy.allows(hop)) { fail(item, { url: item.url, ...robotsIssue(policy) }); return; }
+          }
           if (!HTML.test(response.headers()['content-type'] ?? '')) {
             fail(item, { url: item.url, code: 'NOT_HTML', status });
             return;
@@ -313,14 +339,14 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
           await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => {});
           const html = await page.content();
           const links = await page.locator('a[href]').evaluateAll(anchors => anchors.map(a => a.getAttribute('href') ?? ''));
-          await page.locator('nav, footer, script, style, noscript, template, [aria-hidden="true"]').evaluateAll(elements => elements.forEach(element => element.remove()));
-          const text = (await page.locator('body').innerText({ timeout: 1000 })).trim();
-          const challenge = /^(checking your browser|just a moment|access denied|verify you are human)/i.test(text);
+          const text = await visibleText(page);
+          const challenge = CHALLENGE_TEXT.test(text);
           if (!text || challenge) {
             // An empty shell whose script redirect was stopped for a known reason ends for that reason.
             const known = challenge ? undefined : decided.get(page);
             fail(item, known ? { url: item.url, ...known }
-              : { url: item.url, code: challenge ? 'ACCESS_BLOCKED' : 'NO_READABLE_CONTENT', status });
+              : challenge ? { url: item.url, code: 'ACCESS_BLOCKED', status, detail: CHALLENGE_PAGE }
+                : { url: item.url, code: 'NO_READABLE_CONTENT', status });
             return;
           }
           // Store under the canonical (www-stripped) identity, not the raw post-navigation url: a
