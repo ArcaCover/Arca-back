@@ -76,7 +76,37 @@ describe('asynchronous scan API', () => {
     clock += 200000;
     expect(await repository.cached('firm.com', new Date(clock - 86400000).toISOString())).toBeNull();
   });
-  it('repairs a partial cache entry instead of returning stale partial evidence', async () => {
+  it('serves a partial stored before the cause codes when nothing passing is recorded in it', async () => {
+    // The shape of the live scan of 2026-11-06 (DN-12 §4): website partial with data and no code, Avvo skipped for
+    // identity, Bar ok. A day old, far past the repair cooldown, it is still the answer of record.
+    const repository = new InMemoryRepository();
+    const now = Date.now();
+    const oldTime = new Date(now - 86300000).toISOString();
+    const original = fixtureResult('sc_partial', 'original@firm.com');
+    original.meta.completedAt = oldTime;
+    original.sources = { website: { status: 'partial', dataStatus: 'PRESENT', durationMs: 73456, pagesCrawled: 19 },
+      bar: { status: 'ok', dataStatus: 'PRESENT', durationMs: 10 },
+      avvo: { status: 'skipped', dataStatus: 'UNKNOWN', durationMs: 0, code: 'INSUFFICIENT_IDENTITY',
+        reason: 'A firm-wide search needs a verified city; a nationwide search is not run' } };
+    await repository.create({ id: randomUUID(), scan_id: 'sc_partial', canonical_domain: 'firm.com', email: 'original@firm.com',
+      domain_resolution: { status: 'RESOLVED', canonicalDomain: 'firm.com', source: 'request', reason: null },
+      status: 'PARTIAL', result: original, created_at: oldTime, completed_at: oldTime, duration_ms: 10, cached: false });
+    const run = vi.fn();
+    const { app, drain } = createApp({ domainResolver, repository, pipeline: { run }, sessionSecret: secret,
+      corsOrigins: [], clientIp: () => '127.0.0.1', now: () => now });
+    const response = await app.request(post('second@gmail.com'));
+    expect(response.status).toBe(202);
+    const body = ScanResponse.parse(await response.json());
+    await drain();
+    expect(run).not.toHaveBeenCalled();
+    const poll = PollResponse.parse(await (await app.request(`/scan/${body.scanId}`,
+      { headers: { Authorization: `Bearer ${body.sessionToken}` } })).json());
+    expect(poll).toMatchObject({ status: 'PARTIAL', cached: true });
+    expect(poll.status === 'PARTIAL' && poll.result.preScore).toEqual(original.preScore);
+    expect(JSON.stringify(poll)).not.toContain('original@firm.com');
+  });
+  it('repairs a partial cache entry with a passing failure once its cooldown has ended', async () => {
+    // Every source of the fixture ended in an error nobody named, which a second scan could clear.
     const repository = new InMemoryRepository();
     const now = Date.now();
     const oldTime = new Date(now - 86300000).toISOString();
@@ -99,7 +129,7 @@ describe('asynchronous scan API', () => {
     expect(repository.scans.get(body.scanId)?.cached).toBe(false);
   });
   it('serves a partial scan repaired within the cooldown without running the pipeline again', async () => {
-    // A source that is down for good would otherwise re-run the pipeline on every request for
+    // A source that keeps failing would otherwise re-run the pipeline on every request for
     // the whole cache window. One repair per cooldown still retries it, without making each
     // visitor wait for the same failure.
     const repository = new InMemoryRepository();

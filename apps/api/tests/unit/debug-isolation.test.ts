@@ -18,6 +18,7 @@ const raw = (scanId: string): RawRecord => ({ scan_id: scanId, source: 'website'
 function durableScans() {
   return { create: vi.fn(async () => {}), get: vi.fn(async () => null), complete: vi.fn(async () => {}),
     cached: vi.fn(async () => null), saveRaw: vi.fn(async () => {}), latestRaw: vi.fn(async () => null),
+    findRaw: vi.fn(async () => []), rawOf: vi.fn(async () => null),
     recoverInterrupted: vi.fn(async () => {}), reserveApifyRun: vi.fn(async () => ({ decision: 'failed' as const, record: null, chargedToScan: false })),
     getApifyRun: vi.fn(async () => null), pendingApifyAccounting: vi.fn(async () => []), updateApifyRun: vi.fn(async () => {}) };
 }
@@ -79,6 +80,14 @@ describe('scan repository routing', () => {
     expect(await repository.latestRaw('firm.com', 'website')).toBeNull();
     expect(durable.cached).toHaveBeenCalledWith('firm.com', '2026-01-01T00:00:00.000Z');
     expect(durable.latestRaw).toHaveBeenCalledWith('firm.com', 'website');
+    // The analysis an injected scan stored is never the one a clean scan reuses.
+    const marker = `wsk1-${'ab'.repeat(32)}`;
+    await repository.saveRaw({ ...raw('sc_i'), raw_content: JSON.stringify({ reuse: { key: marker } }) });
+    expect(await overlay.findRaw('firm.com', 'website', marker, '2026-01-01T00:00:00.000Z', 3)).toHaveLength(1);
+    expect(await repository.findRaw('firm.com', 'website', marker, '2026-01-01T00:00:00.000Z', 3)).toEqual([]);
+    expect(await repository.rawOf('sc_i', 'website')).toBeNull();
+    expect(durable.findRaw).toHaveBeenCalledWith('firm.com', 'website', marker, '2026-01-01T00:00:00.000Z', 3);
+    expect(durable.rawOf).toHaveBeenCalledWith('sc_i', 'website');
   });
 
   it('recovering interrupted scans covers both repositories', async () => {

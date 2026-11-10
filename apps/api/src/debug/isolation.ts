@@ -22,6 +22,11 @@ export class RoutingScanRepository implements ScanRepository {
   // A clean scan must never be served from, or analysed against, a scan with an injected fault: these read durable storage only.
   cached(domain: string, since: string) { return this.durable.cached(domain, since); }
   latestRaw(domain: string, source: SourceName) { return this.durable.latestRaw(domain, source); }
+  findRaw(domain: string, source: SourceName, marker: string, since: string, limit: number) {
+    return this.durable.findRaw(domain, source, marker, since, limit);
+  }
+  // Only ever asked for a record `findRaw` listed, which is a durable one.
+  rawOf(scanId: string, source: SourceName) { return this.durable.rawOf(scanId, source); }
   async recoverInterrupted(before: string) {
     await this.durable.recoverInterrupted(before);
     await this.overlay.recoverInterrupted(before);

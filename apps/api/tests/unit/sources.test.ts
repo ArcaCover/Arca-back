@@ -6,7 +6,7 @@ import { ApifyDirectorySource, AVVO_ACTOR, BAR_ACTOR, AVVO_TECHNICAL_MAX_LAWYERS
 import { ApifyClient, ApifyClientError } from '../../src/pipeline/apify-client.js';
 import { RagWebsiteSource, WebsiteExtractionSource } from '../../src/pipeline/website-source.js';
 import { RuleBasedEvidenceProvider } from '../../src/pipeline/website-evidence-provider.js';
-import type { CrawlResult } from '../../src/pipeline/crawler.js';
+import type { CrawlIssue, CrawlResult } from '../../src/pipeline/crawler.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import type OpenAI from 'openai';
 
@@ -443,17 +443,6 @@ describe('Apify cost reconciliation', () => {
 });
 describe('website extraction', () => {
   const pages = [{ url: 'https://firm.com/', html: '<body>Firm</body>', text: 'Firm' }];
-  it('reuses validated analysis only after checking the newly crawled content hash', async () => {
-    const repository = new InMemoryRepository();
-    const parse = vi.fn(async () => ({ choices: [{ message: { parsed: unknownWebsite() } }] }));
-    const client = { chat: { completions: { parse } } } as unknown as OpenAI;
-    const source = new RagWebsiteSource('test', repository, async () => ({ pages, partial: false }), client);
-    const first = await source.run('firm.com', new AbortController().signal);
-    vi.spyOn(repository, 'latestRaw').mockResolvedValue({ scan_id: 'scan', source: 'website', raw_content: first.rawContent!, content_hash: 'hash', fetched_at: new Date().toISOString() });
-    const second = await source.run('firm.com', new AbortController().signal);
-    expect(parse).toHaveBeenCalledTimes(1);
-    expect(second.data).toEqual(first.data);
-  });
   it('retains raw website evidence when model analysis fails', async () => {
     const parse = vi.fn(async () => { throw new Error('unavailable'); });
     const source = new RagWebsiteSource('test', new InMemoryRepository(), async () => ({ pages, partial: true }), { chat: { completions: { parse } } } as unknown as OpenAI);
@@ -568,5 +557,219 @@ describe('website extraction', () => {
     expect(stored.diagnostics).toMatchObject({ error: 'Model call exceeded the per-call token limit' });
     // The public reason stays generic: provider internals do not belong in an API response.
     expect(result.status.reason).toBe('Website evidence extraction unavailable');
+  });
+});
+
+// DN-12 §4.3. Each scan here is stored the way the pipeline stores it: a scan row, then the source's raw record.
+describe('website signal reuse', () => {
+  const DAY = 86_400_000, T0 = Date.parse('2026-11-01T10:00:00.000Z');
+  const signal = () => new AbortController().signal;
+  const page = (path: string, text: string, noise = '') => ({ url: `https://firm.com${path}`, text,
+    html: `<html><head><title>Smith Law</title>${noise}</head><body>${noise}<p>${text}</p><a href="/team">Our team</a></body></html>` });
+  const site = (noise = '') => [page('/', 'Smith Law, Miami.', noise), page('/team', 'Jane Smith, Partner.', noise)];
+  const analysis = (firm: string) => ({ ...unknownWebsite(), firm_name: firm });
+  function setup(options: { reuseMaxAgeMs?: number } = {}) {
+    const repository = new InMemoryRepository();
+    let clock = T0, crawl: CrawlResult = { pages: site(), partial: false }, scans = 0, version = '1';
+    const extract = vi.fn(async (input: CrawlResult) => analysis(`Smith Law read from ${input.pages.length} pages`));
+    const source = () => new WebsiteExtractionSource(repository, { id: 'fixture', version, extract }, async () => crawl,
+      { now: () => clock, reuseMaxAgeMs: options.reuseMaxAgeMs });
+    async function scan(next?: CrawlResult) {
+      if (next) crawl = next;
+      const scanId = `sc_${++scans}`, at = new Date(clock).toISOString();
+      await repository.create({ id: scanId, scan_id: scanId, email: 'owner@firm.com', canonical_domain: 'firm.com',
+        domain_resolution: { status: 'RESOLVED', canonicalDomain: 'firm.com', source: 'request', reason: null },
+        status: 'RUNNING', result: null, created_at: at, completed_at: null, duration_ms: null, cached: false });
+      const result = await source().run('firm.com', signal());
+      if (result.rawContent !== null) await repository.saveRaw({ scan_id: scanId, source: 'website', raw_content: result.rawContent,
+        content_hash: 'a'.repeat(64), fetched_at: at });
+      return { scanId, result, stored: result.rawContent === null ? null : JSON.parse(result.rawContent) };
+    }
+    return { repository, extract, scan, advance: (ms: number) => { clock += ms; }, setVersion: (value: string) => { version = value; } };
+  }
+
+  it('reuses the analysis when the site reads the same, whatever changed in its HTML', async () => {
+    const s = setup();
+    const first = await s.scan();
+    s.advance(8 * DAY);
+    const noise = `<script nonce="${'9f'.repeat(8)}">window.__t=1762683000</script><!-- rendered 2026-11-09T10:10:00Z -->`;
+    const second = await s.scan({ pages: site(noise).reverse(), partial: false });
+    expect(s.extract).toHaveBeenCalledTimes(1);
+    expect(second.result.data).toEqual(first.result.data);
+    expect(second.result.status).toMatchObject({ status: 'ok', dataStatus: 'PRESENT', pagesCrawled: 2 });
+    // The reused record says whose analysis it holds and how old it is.
+    expect(second.stored.reuse).toMatchObject({ key: first.stored.reuse.key, from: 'sc_1', analyzedAt: '2026-11-01T10:00:00.000Z' });
+    expect(first.stored.reuse).toMatchObject({ from: null, pages: 2 });
+  });
+
+  it('extracts again when a page reads differently', async () => {
+    const s = setup();
+    await s.scan();
+    await s.scan({ pages: [page('/', 'Smith Law, Miami.'), page('/team', 'Jane Smith, Partner. John Doe, Associate.')], partial: false });
+    expect(s.extract).toHaveBeenCalledTimes(2);
+    // A title, a description or a link the corpus shows the model counts as much as the text.
+    const titled = site();
+    titled[0]!.html = titled[0]!.html.replace('<title>Smith Law</title>', '<title>Smith &amp; Doe Law</title>');
+    await s.scan({ pages: titled, partial: false });
+    expect(s.extract).toHaveBeenCalledTimes(3);
+    const linked = site();
+    linked[1]!.html = linked[1]!.html.replace('</body>', '<a href="/privacy">Privacy</a></body>');
+    await s.scan({ pages: linked, partial: false });
+    expect(s.extract).toHaveBeenCalledTimes(4);
+  });
+
+  it('extracts again under another provider version', async () => {
+    const s = setup();
+    await s.scan();
+    s.setVersion('2');
+    await s.scan();
+    expect(s.extract).toHaveBeenCalledTimes(2);
+    await s.scan();
+    expect(s.extract).toHaveBeenCalledTimes(2);
+  });
+
+  it('looks past a newer record that holds no analysis', async () => {
+    const s = setup();
+    const first = await s.scan();
+    s.advance(DAY);
+    s.extract.mockRejectedValueOnce(new Error('Model unavailable'));
+    const failed = await s.scan({ pages: [page('/', 'Smith Law, Miami. Now in Tampa too.')], partial: false });
+    expect(failed.result.status).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR' });
+    expect(failed.stored).not.toHaveProperty('reuse');
+    s.advance(DAY);
+    const third = await s.scan({ pages: site(), partial: false });
+    expect(s.extract).toHaveBeenCalledTimes(2);
+    expect(third.result.data).toEqual(first.result.data);
+  });
+
+  it('skips a stored record it cannot trust and reads the next one', async () => {
+    const s = setup();
+    const first = await s.scan();
+    s.advance(DAY);
+    const copy = await s.scan();
+    // The newer record is damaged in storage: it still carries the key, but no analysis that parses.
+    const broken = s.repository.raw.find(record => record.scan_id === copy.scanId)!;
+    broken.raw_content = JSON.stringify({ ...copy.stored, analysis: { firm_name: 7 } });
+    s.advance(DAY);
+    const third = await s.scan();
+    expect(s.extract).toHaveBeenCalledTimes(1);
+    expect(third.result.data).toEqual(first.result.data);
+  });
+
+  it('never fails the source because the lookup failed', async () => {
+    const s = setup();
+    await s.scan();
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(s.repository, 'findRaw').mockRejectedValueOnce(new Error('The storage request timed out'));
+    const searched = await s.scan();
+    expect(searched.result.status).toMatchObject({ status: 'ok', dataStatus: 'PRESENT' });
+    vi.spyOn(s.repository, 'rawOf').mockRejectedValueOnce(new Error('The storage request timed out'));
+    const read = await s.scan();
+    expect(read.result.status).toMatchObject({ status: 'ok', dataStatus: 'PRESENT' });
+    expect(s.extract).toHaveBeenCalledTimes(3);
+    expect(errors).toHaveBeenCalledTimes(2);
+    errors.mockRestore();
+  });
+
+  it('keeps its reads small: ids first, then one record on a hit and none on a miss', async () => {
+    const s = setup();
+    await s.scan();
+    for (let index = 0; index < 5; index++) { s.advance(DAY); await s.scan(); }
+    const find = vi.spyOn(s.repository, 'findRaw'), read = vi.spyOn(s.repository, 'rawOf'), latest = vi.spyOn(s.repository, 'latestRaw');
+    await s.scan();
+    expect(find).toHaveBeenCalledTimes(1);
+    expect(find.mock.calls[0]).toEqual(['firm.com', 'website', expect.stringMatching(/^wsk1-[0-9a-f]{64}$/), expect.any(String), 3]);
+    const listed = await find.mock.results[0]!.value;
+    expect(listed).toHaveLength(3);
+    expect(listed[0]).not.toHaveProperty('raw_content');
+    expect(read).toHaveBeenCalledTimes(1);
+    await s.scan({ pages: [page('/', 'Another firm entirely.')], partial: false });
+    expect(find).toHaveBeenCalledTimes(2);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(latest).not.toHaveBeenCalled();
+  });
+
+  it('caps the age of a reused analysis from the day it was extracted, however often it was reused', async () => {
+    const s = setup({ reuseMaxAgeMs: 30 * DAY });
+    await s.scan();
+    for (let week = 0; week < 4; week++) { s.advance(7 * DAY); await s.scan(); }
+    // Day 28: four reuses, each stored a week after the last. None of them made the analysis younger.
+    expect(s.extract).toHaveBeenCalledTimes(1);
+    s.advance(7 * DAY);
+    const expired = await s.scan();
+    expect(s.extract).toHaveBeenCalledTimes(2);
+    expect(expired.stored.reuse).toMatchObject({ from: null, analyzedAt: new Date(T0 + 35 * DAY).toISOString() });
+  });
+
+  it('extracts on every scan when the reuse age is 0', async () => {
+    const s = setup({ reuseMaxAgeMs: 0 });
+    const find = vi.spyOn(s.repository, 'findRaw');
+    await s.scan(); await s.scan();
+    expect(s.extract).toHaveBeenCalledTimes(2);
+    expect(find).not.toHaveBeenCalled();
+  });
+
+  describe('a crawl that was cut short', () => {
+    const cut = (pages = [site()[0]!]): CrawlResult => ({ pages, partial: true, aborted: true, issues: [] });
+    it('keeps the analysis of the complete reading instead of a thinner one', async () => {
+      const s = setup();
+      const complete = await s.scan();
+      s.advance(2 * DAY);
+      const short = await s.scan(cut());
+      expect(s.extract).toHaveBeenCalledTimes(1);
+      expect(short.result.data).toEqual(complete.result.data);
+      // The status still describes this crawl, and says where the signals came from.
+      expect(short.result.status).toMatchObject({ status: 'partial', code: 'DEADLINE_REACHED', pagesCrawled: 1,
+        reason: 'Crawl deadline reached; signals kept from the complete reading of 2026-11-01' });
+      expect(short.stored.reuse).toMatchObject({ key: complete.stored.reuse.key, from: 'sc_1', pages: 2 });
+      // The next complete crawl of the same site still finds it, through the record the short crawl stored.
+      s.advance(DAY);
+      expect((await s.scan({ pages: site(), partial: false })).result.data).toEqual(complete.result.data);
+      expect(s.extract).toHaveBeenCalledTimes(1);
+    });
+    it('prefers the complete reading over an older analysis of the same thin evidence', async () => {
+      const s = setup();
+      const thin = await s.scan(cut());
+      expect(thin.stored.reuse).toMatchObject({ full: null, pages: 1 });
+      s.advance(DAY);
+      const complete = await s.scan({ pages: site(), partial: false });
+      s.advance(DAY);
+      const again = await s.scan(cut());
+      expect(s.extract).toHaveBeenCalledTimes(2);
+      expect(again.result.data).toEqual(complete.result.data);
+      expect(again.result.data).not.toEqual(thin.result.data);
+    });
+    it('reuses its own earlier analysis when no complete reading exists', async () => {
+      const s = setup();
+      const first = await s.scan(cut());
+      const second = await s.scan(cut());
+      expect(s.extract).toHaveBeenCalledTimes(1);
+      expect(second.result.data).toEqual(first.result.data);
+    });
+    it('extracts when it read more pages than the stored complete reading', async () => {
+      const s = setup();
+      await s.scan({ pages: [site()[0]!], partial: false });
+      const grown = await s.scan(cut(site()));
+      expect(s.extract).toHaveBeenCalledTimes(2);
+      expect(grown.result.data?.firm_name).toBe('Smith Law read from 2 pages');
+    });
+    it('does not keep a complete reading older than the age cap', async () => {
+      const s = setup({ reuseMaxAgeMs: 30 * DAY });
+      await s.scan();
+      s.advance(31 * DAY);
+      await s.scan(cut());
+      expect(s.extract).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('reports why a partial crawl is partial, so the scan cache can tell a passing failure from an answer of the site', async () => {
+    const s = setup();
+    const issue = (code: CrawlIssue['code'], status: number | null): CrawlIssue => ({ url: 'https://firm.com/about', code, status, scope: 'page' });
+    const status = async (crawl: Partial<CrawlResult>) => (await s.scan({ pages: site(), partial: true, ...crawl })).result.status;
+    expect(await status({ aborted: true })).toMatchObject({ status: 'partial', code: 'DEADLINE_REACHED' });
+    expect(await status({ issues: [issue('HTTP_ERROR', 503)] })).toMatchObject({ status: 'partial', code: 'PROVIDER_ERROR' });
+    expect(await status({ issues: [issue('ACCESS_BLOCKED', 403)] })).not.toHaveProperty('code');
+    expect(await status({ issues: [issue('NO_READABLE_CONTENT', 200)] })).not.toHaveProperty('code');
+    expect((await s.scan({ pages: site(), partial: false, issues: [issue('HTTP_ERROR', 404)] })).result.status).not.toHaveProperty('code');
   });
 });

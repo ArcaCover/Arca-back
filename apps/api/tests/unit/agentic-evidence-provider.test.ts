@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AgenticEvidenceProvider, ExtractionFailure, MAX_TRANSIENT_ATTEMPTS } from '../../src/pipeline/agentic-evidence-provider.js';
+import { AgenticEvidenceProvider, ExtractionFailure, MAX_TRANSIENT_ATTEMPTS, extractionVersion } from '../../src/pipeline/agentic-evidence-provider.js';
 import { openAiEndpoint, type LlmEndpoint } from '../../src/pipeline/llm-endpoint.js';
 import { createRobotsCache } from '../../src/pipeline/robots.js';
 
@@ -352,7 +352,22 @@ describe('Agentic evidence provider', () => {
     expect(create.mock.calls[0]![0]).toMatchObject({ model: 'gpt-6-luna', max_completion_tokens: expect.any(Number) });
     expect(create.mock.calls[0]![0]).not.toHaveProperty('temperature');
     expect(provider.id).toBe('openai-agentic');
-    expect(provider.version).toMatch(/:openai:gpt-6-luna$/);
+    expect(provider.version).toMatch(/^agentic-signals-v5:openai:gpt-6-luna:default:[0-9a-f]{12}$/);
+  });
+
+  it('names in its version everything that changes what the model answers', () => {
+    // Stored analyses are reused only under the same version (DN-12 §4.3), so none of these may go unnoticed.
+    const base = extractionVersion(openAiEndpoint(), 'gpt-6-luna');
+    expect(extractionVersion(openAiEndpoint(), 'gpt-6-luna')).toBe(base);
+    expect(new AgenticEvidenceProvider('key', 'gpt-6-luna', { chat: { completions: { create: vi.fn() } } }).version).toBe(base);
+    expect(extractionVersion(openAiEndpoint(), 'gpt-6-astra')).not.toBe(base);
+    const low = extractionVersion(openAiEndpoint('low'), 'gpt-6-luna');
+    expect(low).toMatch(/^agentic-signals-v5:openai:gpt-6-luna:low:[0-9a-f]{12}$/);
+    expect(low.split(':')[4]).not.toBe(base.split(':')[4]);
+    expect(extractionVersion(openAiEndpoint(), 'gpt-6-luna', { planPages: false })).not.toBe(base);
+    // A prompt edited by one character is another extraction, with no version constant to remember.
+    expect(extractionVersion(openAiEndpoint(), 'gpt-6-luna', {}, ['classify', 'extract', 'roster', 'review']))
+      .not.toBe(extractionVersion(openAiEndpoint(), 'gpt-6-luna', {}, ['classify', 'extract.', 'roster', 'review']));
   });
 
   it('asks OpenAI reasoning models for the configured reasoning effort only', async () => {

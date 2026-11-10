@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { loadEnv } from '../../src/config/env.js';
 import { listenHostname } from '../../src/config/mode.js';
+import { WEBSITE_SIGNAL_REUSE_MAX_AGE_MS } from '../../src/pipeline/website-source.js';
 
 const base = { SESSION_TOKEN_SECRET: 's'.repeat(40), CORS_ALLOWED_ORIGINS: 'http://localhost:3000' };
 const database = { SUPABASE_URL: 'https://fixture.supabase.co', SUPABASE_SECRET_KEY: 'sb_secret_fixture' };
@@ -79,6 +80,21 @@ describe('independent source and storage configuration', () => {
     expect(loadEnv(mock).MAX_APIFY_CONCURRENCY).toBe(16);
     expect(loadEnv({ ...mock, MAX_APIFY_CONCURRENCY: '32' }).MAX_APIFY_CONCURRENCY).toBe(32);
     expect(() => loadEnv({ ...mock, MAX_APIFY_CONCURRENCY: '33' })).toThrow();
+  });
+  it('reuses a stored website analysis for 30 days by default, and never when the age is 0', () => {
+    const mock = { ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' };
+    expect(loadEnv(mock).WEBSITE_SIGNAL_REUSE_MAX_AGE_MS).toBe(WEBSITE_SIGNAL_REUSE_MAX_AGE_MS);
+    expect(loadEnv({ ...mock, WEBSITE_SIGNAL_REUSE_MAX_AGE_MS: '0' }).WEBSITE_SIGNAL_REUSE_MAX_AGE_MS).toBe(0);
+    expect(() => loadEnv({ ...mock, WEBSITE_SIGNAL_REUSE_MAX_AGE_MS: '-1' })).toThrow();
+  });
+  it('loads the values that force a fresh run of a cached firm', () => {
+    // DN-12 §4.4: no header and no contract change, only the environment of one start.
+    const forced = loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory', SCAN_CACHE_TTL_MS: '1',
+      SCAN_PARTIAL_REPAIR_COOLDOWN_MS: '0', WEBSITE_SIGNAL_REUSE_MAX_AGE_MS: '0' });
+    expect(forced).toMatchObject({ SCAN_CACHE_TTL_MS: 1, SCAN_PARTIAL_REPAIR_COOLDOWN_MS: 0, WEBSITE_SIGNAL_REUSE_MAX_AGE_MS: 0 });
+    // The cooldown has to go down with the window: its default alone is refused.
+    expect(() => loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory', SCAN_CACHE_TTL_MS: '1' }))
+      .toThrow('SCAN_PARTIAL_REPAIR_COOLDOWN_MS');
   });
   it('repairs a partial scan at most hourly by default, never less often than the cache window', () => {
     const mock = { ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' };

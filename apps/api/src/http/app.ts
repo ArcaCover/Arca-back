@@ -9,6 +9,7 @@ import { issueSessionToken, verifySessionToken } from '../auth/session-token.js'
 import type { DebugTools } from '../debug/tools.js';
 import type { ScanRepository, ScanRecord } from '../repositories/types.js';
 import { ScanLimiter } from './rate-limit.js';
+import { answersFromCache } from './scan-cache.js';
 import { buildOpenApiDocument } from './openapi.js';
 import { renderQuickScanHtml, reportFilename } from '../report/quick-scan.js';
 import { InMemoryRepository } from '../repositories/in-memory.js';
@@ -95,16 +96,12 @@ export function createApp(deps: AppDeps) {
     const sessionToken = await issueSessionToken(scanId, email, deps.sessionSecret);
     // An injected scan never reads the domain cache, which would show the cached result instead of the fault.
     const cached = scenario ? null : await deps.repository.cached(canonicalDomain, new Date(timestamp - scanCacheTtlMs).toISOString());
-    // Completed scans are returned immediately. Partial scans warm the website and per-query caches,
-    // then run again so only missing or expired external evidence is repaired.
-    // A partial scan is repaired at most once per cooldown. Inside it, the last repair is served
-    // as it stands: a source that is down for good would otherwise re-run the whole pipeline for
-    // every visitor, all cache window long, and make each one wait for the same failure.
-    const recentlyRepaired = cached?.status === 'PARTIAL' && cached.completed_at !== null &&
-      Date.parse(cached.completed_at) > timestamp - partialRepairCooldownMs;
-    const reusable = cached?.result && (cached.status === 'COMPLETED' || recentlyRepaired) ? cached : null;
-    const cachedResult = reusable ? Layer1Result.parse({ ...reusable.result, scanId, domain: canonicalDomain, email,
-      meta: { ...reusable.result!.meta, cached: true } }) : null;
+    // Same firm, same score (DN-12 §4): inside the window the stored result is the answer of record, a PARTIAL
+    // included when a second scan would find the same gaps. Only a PARTIAL with a passing failure runs again, at
+    // most once per cooldown: the website and per-query caches make that run repair just what was missing.
+    const reusable = cached && answersFromCache(cached, timestamp, partialRepairCooldownMs) ? cached : null;
+    const cachedResult = reusable?.result ? Layer1Result.parse({ ...reusable.result, scanId, domain: canonicalDomain, email,
+      meta: { ...reusable.result.meta, cached: true } }) : null;
     if (cachedResult && cachedResult.domain !== canonicalDomain) throw new Error('Cached domain identity mismatch');
     const cachedStatus = reusable?.status === 'PARTIAL' ? 'PARTIAL' as const : 'COMPLETED' as const;
     const scan: ScanRecord = {

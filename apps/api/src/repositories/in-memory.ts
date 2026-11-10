@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ScanRepository, ScanRecord, RawRecord, ApifyRunRecord, ReserveApifyRun, ApifyRunReservation,
   ApifyRunUpdate } from './types.js';
+import { RAW_MARKER } from './types.js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
 import { ACTIVE_APIFY_STATUSES } from './types.js';
 
@@ -32,6 +33,17 @@ export class InMemoryRepository implements ScanRepository {
   async saveRaw(record: RawRecord) { this.raw.push(structuredClone(record)); }
   async latestRaw(domain: string, source: SourceName) {
     return structuredClone(this.raw.filter(r => r.source === source && this.scans.get(r.scan_id)?.canonical_domain === domain)
+      .sort((a, b) => b.fetched_at.localeCompare(a.fetched_at))[0] ?? null);
+  }
+  async findRaw(domain: string, source: SourceName, marker: string, since: string, limit: number) {
+    if (!RAW_MARKER.test(marker)) throw new Error('Invalid raw evidence marker');
+    return this.raw.filter(r => r.source === source && this.scans.get(r.scan_id)?.canonical_domain === domain &&
+      r.fetched_at >= since && r.raw_content.includes(marker))
+      .sort((a, b) => b.fetched_at.localeCompare(a.fetched_at)).slice(0, limit)
+      .map(({ scan_id, source, content_hash, fetched_at }) => ({ scan_id, source, content_hash, fetched_at }));
+  }
+  async rawOf(scanId: string, source: SourceName) {
+    return structuredClone(this.raw.filter(r => r.scan_id === scanId && r.source === source)
       .sort((a, b) => b.fetched_at.localeCompare(a.fetched_at))[0] ?? null);
   }
   async recoverInterrupted(before: string) {

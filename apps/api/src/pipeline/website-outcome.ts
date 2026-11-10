@@ -1,6 +1,6 @@
 import type { SourceStatus } from '@arca/contracts';
 import { classifyUnreadableWebsite, type UnreadableWebsite } from '@arca/scoring';
-import { leavesCrawlPartial, type CrawlIssue, type CrawlResult } from './crawler.js';
+import { leavesCrawlPartial, shouldRetryPage, type CrawlIssue, type CrawlResult } from './crawler.js';
 
 type Cause = { status: 'error' | 'timeout'; code: NonNullable<SourceStatus['code']>; reason: string };
 export type UnreadableOutcome = Cause & { classification: UnreadableWebsite };
@@ -53,6 +53,18 @@ export function unreadableWebsite(crawl: CrawlResult): UnreadableOutcome {
     : causes.find(item => classifyUnreadableWebsite(item) === 'TRANSIENT') ?? causes[0]
       ?? { status: 'error', code: 'PROVIDER_ERROR', reason: 'No page of the website could be read' };
   return { ...chosen, classification: classifyUnreadableWebsite(chosen)! };
+}
+
+/**
+ * Why a crawl that read pages is still partial, as the code its source reports. The scan cache reads it: a crawl
+ * the deadline cut, or one with a page that failed for a passing reason (the kind the crawler itself retries, or
+ * robots.txt unreachable), is worth another scan. No code means every missing page is the site's own answer
+ * (a page that refuses or stays empty), which a second scan would get again.
+ */
+export function partialCrawlCode(crawl: CrawlResult): 'DEADLINE_REACHED' | 'PROVIDER_ERROR' | undefined {
+  if (crawl.aborted) return 'DEADLINE_REACHED';
+  const passing = (issue: CrawlIssue) => issue.code === 'ROBOTS_UNAVAILABLE' || shouldRetryPage(issue, 0, false);
+  return pageIssues(crawl).some(issue => leavesCrawlPartial(issue) && passing(issue)) ? 'PROVIDER_ERROR' : undefined;
 }
 
 /** What the crawl left out of a site it did read, for the source's reason text. Null when it left nothing out. */

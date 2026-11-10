@@ -11,6 +11,9 @@ export type ScanRecord = {
 export type RawRecord = {
   scan_id: string; source: SourceName; raw_content: string; content_hash: string; fetched_at: string;
 };
+export type RawReference = Omit<RawRecord, 'raw_content'>;
+/** What a marker searched in stored content may be made of: nothing a LIKE pattern or a query string reads as syntax. */
+export const RAW_MARKER = /^[a-z0-9-]{8,}$/;
 export type ApifyRunRecord = {
   id: string; query_fingerprint: string; actor: string; build: string; build_id: string | null;
   build_number: string | null; input_json: Record<string, unknown>;
@@ -35,6 +38,14 @@ export interface ScanRepository {
   cached(domain: string, since: string): Promise<ScanRecord | null>;
   saveRaw(record: RawRecord): Promise<void>;
   latestRaw(domain: string, source: SourceName): Promise<RawRecord | null>;
+  /**
+   * Which stored raw records of a domain's source carry `marker` in their content, newest first: fetched since
+   * `since`, at most `limit`. It returns no content, which is megabytes for a website: read one record with `rawOf`.
+   * The marker is lowercase letters, digits and hyphens.
+   */
+  findRaw(domain: string, source: SourceName, marker: string, since: string, limit: number): Promise<RawReference[]>;
+  /** The raw record a scan stored for a source. */
+  rawOf(scanId: string, source: SourceName): Promise<RawRecord | null>;
   recoverInterrupted(before: string): Promise<void>;
   reserveApifyRun(request: ReserveApifyRun): Promise<ApifyRunReservation>;
   getApifyRun(id: string): Promise<ApifyRunRecord | null>;

@@ -30,6 +30,41 @@ describe('Supabase Data API adapter', () => {
     });
     expect(await repository.latestRaw('firm.com', 'website')).toBeNull();
   });
+  it('lets the database search raw evidence for a marker and returns ids, never the content', async () => {
+    const marker = `wsk1-${'ab12'.repeat(16)}`;
+    const { repository, request } = setup(url => {
+      expect(url.pathname).toBe('/rest/v1/scan_raw_data');
+      const select = url.searchParams.get('select')!;
+      expect(select.replaceAll(' ', '')).toBe('scan_id,source,content_hash,fetched_at,scans!inner(canonical_domain)');
+      expect(select).not.toContain('raw_content');
+      expect(Object.fromEntries(url.searchParams)).toMatchObject({ 'scans.canonical_domain': 'eq.firm.com', source: 'eq.website',
+        fetched_at: 'gte.2026-10-10T00:00:00.000Z', raw_content: `like.%${marker}%`, order: 'fetched_at.desc', limit: '3' });
+      return Response.json([{ scan_id: 'sc_new', source: 'website', content_hash: 'a'.repeat(64),
+        fetched_at: '2026-11-08T00:00:00.000Z', scans: { canonical_domain: 'firm.com' } }]);
+    });
+    expect(await repository.findRaw('firm.com', 'website', marker, '2026-10-10T00:00:00.000Z', 3)).toEqual([
+      { scan_id: 'sc_new', source: 'website', content_hash: 'a'.repeat(64), fetched_at: '2026-11-08T00:00:00.000Z' }]);
+    // A marker is a plain token: anything a LIKE pattern or a query string could read as syntax never reaches the database.
+    for (const unsafe of ['wsk1-%', 'wsk1_abcdef', 'wsk1-abc,def', 'WSK1-ABCDEF', 'short']) {
+      await expect(repository.findRaw('firm.com', 'website', unsafe, '2026-10-10T00:00:00.000Z', 3)).rejects.toThrow('Invalid raw evidence marker');
+    }
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+  it('reads the one raw record of a scan and reports a storage error instead of an absent record', async () => {
+    const record = { scan_id: 'sc_new', source: 'website' as const, raw_content: '{"analysis":null}', content_hash: 'a'.repeat(64),
+      fetched_at: '2026-11-08T00:00:00.000Z' };
+    const found = setup(url => {
+      expect(url.pathname).toBe('/rest/v1/scan_raw_data');
+      expect(Object.fromEntries(url.searchParams)).toMatchObject({ scan_id: 'eq.sc_new', source: 'eq.website',
+        order: 'fetched_at.desc', limit: '1' });
+      return Response.json([record]);
+    });
+    expect(await found.repository.rawOf('sc_new', 'website')).toEqual(record);
+    const failing = setup(() => Response.json({ code: '57014', message: 'canceling statement due to statement timeout' }, { status: 500 }));
+    await expect(failing.repository.rawOf('sc_new', 'website')).rejects.toThrow('Unable to read evidence');
+    await expect(failing.repository.findRaw('firm.com', 'website', 'wsk1-abcdef', '2026-10-10T00:00:00.000Z', 3))
+      .rejects.toThrow('Unable to search evidence');
+  });
   it('preserves unknown JSON values in evidence writes', async () => {
     const raw = { scan_id: 'sc_test', source: 'bar' as const, raw_content: '{"discipline":null}', content_hash: 'a'.repeat(64), fetched_at: '2026-09-08T00:00:00.000Z' };
     const { repository } = setup((_url, init) => {

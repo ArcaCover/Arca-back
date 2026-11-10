@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import OpenAI from 'openai';
 import { SignalExtraction, SignalReview, WebsiteData, type Claim, type GroundingReport } from '@arca/contracts';
@@ -95,6 +96,23 @@ from a single segment that contains that person's name and, when shown, the role
 Copy role and affiliation as the exact enums attorney|staff|unclear and current|former|unclear. attorney_count is allowed only
 when the supplied team page is complete and must equal the number of unique current attorneys listed. Always finish.`;
 
+/** Every prompt an extraction sends. */
+const PROMPTS: readonly string[] = [PAGE_CLASSIFICATION_PROMPT, SIGNAL_EXTRACTION_PROMPT, ROSTER_PROMPT, SIGNAL_REVIEW_PROMPT];
+/**
+ * What a stored website analysis is reused under: the workflow version, the endpoint, the model, the reasoning
+ * effort, and a hash of the prompts and request parameters. A prompt edit therefore ends the reuse of older
+ * analyses by itself. EXTRACTION_VERSION is still bumped by hand for a change the hash cannot see (the workflow,
+ * the grounding rules).
+ */
+export function extractionVersion(endpoint: LlmEndpoint, model: string, options: { planPages?: boolean } = {},
+  prompts: readonly string[] = PROMPTS): string {
+  const params = endpoint.requestParams(model);
+  const effort = typeof params.reasoning_effort === 'string' ? params.reasoning_effort : 'default';
+  const profile = createHash('sha256').update(JSON.stringify({ prompts, params, planPages: options.planPages !== false }))
+    .digest('hex').slice(0, 12);
+  return `${EXTRACTION_VERSION}:${endpoint.id}:${model}:${effort}:${profile}`;
+}
+
 type CompletionClient = { chat: { completions: { create(body: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<unknown> } } };
 export type Attempt = { phase: string; request: Record<string, unknown>; response: unknown; rawContent: string;
   durationMs: number; validationIssues?: string };
@@ -158,8 +176,8 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
     private readonly access: SiteAccess = createSiteAccess(), private readonly endpoint: LlmEndpoint = openAiEndpoint(),
     private readonly options: { planPages?: boolean } = {}) {
     this.id = 'openai-agentic';
-    // Keep this format stable: stored website analyses are reused only while it matches.
-    this.version = `${EXTRACTION_VERSION}:${endpoint.id}:${model}`;
+    // Stored website analyses are reused only while this matches.
+    this.version = extractionVersion(endpoint, model, options);
     this.client = client ?? new OpenAI({ apiKey, maxRetries: 0, timeout: 120_000 }) as unknown as CompletionClient;
   }
 

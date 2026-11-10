@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { compareText } from '@arca/scoring';
 import { canonicalUrl, type CrawlResult } from './crawler.js';
 import { MAX_DOCUMENT_CHARS } from './document-reader.js';
 
@@ -53,9 +54,12 @@ function metadata(html: string): Array<{ kind: 'meta' | 'json_ld'; locator: stri
   return found;
 }
 
+/** The lines of a page as the corpus reads them: whitespace collapsed, empty and one-character lines dropped. */
+const readLines = (text: string) => text.split(/\r?\n/).map(value => value.replace(/\s+/g, ' ').trim())
+  .filter(value => value.length >= 2);
+
 function paragraphs(text: string, max = 800): string[] {
-  const result: string[] = [], lines = text.split(/\r?\n/).map(value => value.replace(/\s+/g, ' ').trim())
-    .filter(value => value.length >= 2);
+  const result: string[] = [], lines = readLines(text);
   let block = '';
   for (const line of lines) {
     for (let start = 0; start < line.length; start += max) {
@@ -66,6 +70,32 @@ function paragraphs(text: string, max = 800): string[] {
   }
   if (block) result.push(block);
   return result;
+}
+
+/** The links of a page the backend can read, in document order, with the text the corpus shows for each. */
+function pageLinks(page: CrawlResult['pages'][number]): Array<{ url: string; kind: 'page' | 'document'; label: string }> {
+  const found: Array<{ url: string; kind: 'page' | 'document'; label: string }> = [];
+  for (const match of page.html.matchAll(/<a\b[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    const target = classifyLink(match[1]!, page.url);
+    if (target) found.push({ ...target, label: decode(match[2]!) });
+  }
+  return found;
+}
+
+/**
+ * A hash of what an extraction reads of a crawl, and of nothing else: per page, in URL order, the text as the corpus
+ * splits it, the metadata the corpus lifts from the HTML (title, description, JSON-LD) and the links it offers.
+ * Two crawls of a site with the same fingerprint give the model the same evidence even when their HTML differs
+ * (a nonce, a timestamp in a comment, an injected script). Segment ids cannot say that: they hash the HTML.
+ */
+export function corpusFingerprint(crawl: CrawlResult): string {
+  const pages = [...crawl.pages].sort((a, b) => compareText(a.url, b.url)).map(page => ({
+    url: page.url, kind: page.kind ?? 'page', complete: page.complete !== false,
+    metadata: metadata(page.html).map(item => [item.kind, normalizeForGrounding(item.text)]),
+    text: readLines(page.text).map(normalizeForGrounding),
+    links: pageLinks(page).map(link => [link.url, link.kind, link.label]),
+  }));
+  return createHash('sha256').update(JSON.stringify(pages)).digest('hex');
 }
 
 export function normalizeForGrounding(value: string): string {
@@ -115,11 +145,9 @@ export function buildCorpus(crawl: CrawlResult, budgetChars = 24_000): EvidenceC
     }
     if (!included && candidates.length) omittedUrls.push(page.url);
     if (isDocument) documents.push({ url: page.url, complete: page.complete !== false && !dropped, chars: pageUsed });
-    for (const match of page.html.matchAll(/<a\b[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
-      const target = classifyLink(match[1]!, page.url);
-      if (!target) continue;
+    for (const target of pageLinks(page)) {
       const id = `L-${digest(target.url)}`;
-      if (!links.some(link => link.id === id)) links.push({ id, url: target.url, sourceUrl: page.url, label: decode(match[2]!), kind: target.kind });
+      if (!links.some(link => link.id === id)) links.push({ id, url: target.url, sourceUrl: page.url, label: target.label, kind: target.kind });
     }
   }
   const snapshotId = digest(crawl.pages.map(page => `${page.url}:${digest(page.html)}`).sort().join('|'));

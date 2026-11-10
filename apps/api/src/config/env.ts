@@ -51,9 +51,13 @@ const EnvSchema = z.object({
   // Domain scan cache window. Layer 1 evidence (a published AI policy, bar standing, an
   // Avvo rating) changes in weeks, not hours.
   SCAN_CACHE_TTL_MS: z.coerce.number().int().positive().default(604_800_000),
-  // A PARTIAL scan is re-run to repair its missing evidence at most once per this window;
-  // inside it the last repair is served. 0 repairs on every request.
+  // Only a PARTIAL scan with a passing failure (a deadline, a provider) is run again, at most once per
+  // this window; inside it the last run is served. 0 repairs it on every request. A PARTIAL whose gaps a
+  // second scan would find again is served for the whole cache window (DN-12 §4).
   SCAN_PARTIAL_REPAIR_COOLDOWN_MS: z.coerce.number().int().nonnegative().default(3_600_000),
+  // How old a stored website analysis may be and still stand in for a new extraction of the same
+  // evidence, counted from the day the model produced it: 30 days. 0 extracts on every scan.
+  WEBSITE_SIGNAL_REUSE_MAX_AGE_MS: z.coerce.number().int().nonnegative().default(2_592_000_000),
 });
 export function loadEnv(source = process.env) {
   const env = EnvSchema.parse(source);

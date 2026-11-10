@@ -1,7 +1,7 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
-import { ACTIVE_APIFY_STATUSES } from './types.js';
-import type { ScanRepository, ScanRecord, RawRecord, ReserveApifyRun, ApifyRunReservation, ApifyRunRecord,
+import { ACTIVE_APIFY_STATUSES, RAW_MARKER } from './types.js';
+import type { ScanRepository, ScanRecord, RawRecord, RawReference, ReserveApifyRun, ApifyRunReservation, ApifyRunRecord,
   ApifyRunUpdate } from './types.js';
 
 export class SupabaseRepository implements ScanRepository {
@@ -34,6 +34,23 @@ export class SupabaseRepository implements ScanRepository {
   async latestRaw(domain: string, source: SourceName): Promise<RawRecord | null> {
     const { data, error } = await this.client.from('scan_raw_data').select('*, scans!inner(canonical_domain)')
       .eq('scans.canonical_domain', domain).eq('source', source).order('fetched_at', { ascending: false }).limit(1).maybeSingle();
+    if (error) throw new Error('Unable to read evidence', { cause: error });
+    return data;
+  }
+  // The database searches the content and returns ids only: a website record is megabytes, and the storage
+  // client gives every request five seconds.
+  async findRaw(domain: string, source: SourceName, marker: string, since: string, limit: number): Promise<RawReference[]> {
+    if (!RAW_MARKER.test(marker)) throw new Error('Invalid raw evidence marker');
+    const { data, error } = await this.client.from('scan_raw_data')
+      .select('scan_id, source, content_hash, fetched_at, scans!inner(canonical_domain)')
+      .eq('scans.canonical_domain', domain).eq('source', source).gte('fetched_at', since).like('raw_content', `%${marker}%`)
+      .order('fetched_at', { ascending: false }).limit(limit);
+    if (error) throw new Error('Unable to search evidence', { cause: error });
+    return (data ?? []).map(({ scan_id, source, content_hash, fetched_at }) => ({ scan_id, source, content_hash, fetched_at }));
+  }
+  async rawOf(scanId: string, source: SourceName): Promise<RawRecord | null> {
+    const { data, error } = await this.client.from('scan_raw_data').select('scan_id, source, raw_content, content_hash, fetched_at')
+      .eq('scan_id', scanId).eq('source', source).order('fetched_at', { ascending: false }).limit(1).maybeSingle();
     if (error) throw new Error('Unable to read evidence', { cause: error });
     return data;
   }

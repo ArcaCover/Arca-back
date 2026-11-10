@@ -71,7 +71,8 @@ export async function compose(env: ReturnType<typeof loadEnv>): Promise<{ app: H
     maxCachedItems: env.APIFY_MAX_CACHED_ITEMS,
   }) : null;
   const sources = env.sourceMode === 'mock' ? mockSources() : {
-    website: new WebsiteExtractionSource(repository, websiteEvidenceProvider!),
+    website: new WebsiteExtractionSource(repository, websiteEvidenceProvider!, undefined,
+      { reuseMaxAgeMs: env.WEBSITE_SIGNAL_REUSE_MAX_AGE_MS }),
     bar: new ApifyDirectorySource('bar', apify!, { targetedMaxLawyers: env.APIFY_BAR_TARGETED_MAX_RESULTS }),
     avvo: new ApifyDirectorySource('avvo', apify!, { targetedMaxLawyers: env.APIFY_AVVO_TARGETED_MAX_RESULTS }),
   };

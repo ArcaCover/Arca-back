@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { SourceStatus } from '@arca/contracts';
 import { classifyUnreadableWebsite } from '@arca/scoring';
 import type { CrawlIssue, CrawlResult } from '../../src/pipeline/crawler.js';
-import { crawlNotes, unreadableWebsite } from '../../src/pipeline/website-outcome.js';
+import { crawlNotes, partialCrawlCode, unreadableWebsite } from '../../src/pipeline/website-outcome.js';
 
 const home = 'https://firm.com/';
 const page = (code: CrawlIssue['code'], status: number | null = null, url = home): CrawlIssue => ({ url, code, status, scope: 'page' });
@@ -109,5 +109,39 @@ describe('what a crawl left out of a site it read', () => {
   it('leaves subresources out of the counts', () => {
     expect(crawlNotes(read([{ url: 'https://cdn.example/w.js', code: 'REQUEST_FAILED', status: null, scope: 'request' },
       { url: 'https://firm.com/wp-json/x', code: 'ROBOTS_DISALLOWED', status: null, scope: 'request' }]))).toBeNull();
+  });
+});
+
+describe('why a crawl that read pages is partial', () => {
+  const read = (issues: CrawlIssue[], aborted = false): CrawlResult =>
+    ({ pages: [{ url: home, html: '', text: 'Firm' }], partial: true, issues, aborted });
+  const about = 'https://firm.com/about';
+  // Every page outcome that leaves a crawl partial, with the code the source reports for it (DN-12 §4.2).
+  const causes: Array<[string, CrawlResult, 'DEADLINE_REACHED' | 'PROVIDER_ERROR' | undefined]> = [
+    ['the crawl deadline', read([], true), 'DEADLINE_REACHED'],
+    ['the deadline, whatever else happened', read([page('ACCESS_BLOCKED', 403, about)], true), 'DEADLINE_REACHED'],
+    ['a page that could not be reached', read([page('REQUEST_FAILED', null, about)]), 'PROVIDER_ERROR'],
+    ['a page answering 500', read([page('HTTP_ERROR', 500, about)]), 'PROVIDER_ERROR'],
+    ['a page that did not answer', read([page('HTTP_ERROR', null, about)]), 'PROVIDER_ERROR'],
+    ['a page answering 429', read([page('ACCESS_BLOCKED', 429, about)]), 'PROVIDER_ERROR'],
+    ['robots.txt unreachable for a page', read([page('ROBOTS_UNAVAILABLE', 503, about)]), 'PROVIDER_ERROR'],
+    ['a passing failure next to an answer of the site', read([page('ACCESS_BLOCKED', 403, about), page('HTTP_ERROR', 502, 'https://firm.com/team')]), 'PROVIDER_ERROR'],
+    // The site's own answer about a page: the crawler does not retry these, and neither does a second scan.
+    ['a page answering 403', read([page('ACCESS_BLOCKED', 403, about)]), undefined],
+    ['a page answering 401', read([page('ACCESS_BLOCKED', 401, about)]), undefined],
+    ['a challenge page', read([page('ACCESS_BLOCKED', 200, about)]), undefined],
+    ['a page with no text', read([page('NO_READABLE_CONTENT', 200, about)]), undefined],
+    ['a page answering 400', read([page('HTTP_ERROR', 400, about)]), undefined],
+    ['a partial crawl with no cause on record', read([]), undefined],
+  ];
+  it.each(causes)('%s', (_name, crawl, code) => {
+    expect(partialCrawlCode(crawl)).toBe(code);
+  });
+
+  it('ignores what does not leave a crawl partial, and requests that are not pages', () => {
+    expect(partialCrawlCode(read([page('HTTP_ERROR', 404, about), page('ROBOTS_DISALLOWED', null, 'https://firm.com/wp-admin/'),
+      page('NOT_HTML', 200, 'https://firm.com/feed'), request('REQUEST_FAILED', null, 'https://cdn.example/w.js'),
+      request('HTTP_ERROR', 503, 'https://firm.com/api'),
+      { url: 'https://www.firm.com/robots.txt', code: 'ROBOTS_UNAVAILABLE', status: 503, scope: 'robots' }]))).toBeUndefined();
   });
 });
