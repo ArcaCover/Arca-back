@@ -52,8 +52,18 @@ describe('demo Layer2 deterministic scoring',()=>{
   it('computes bounded independent marginal improvements, not premium promises',()=>{
     const result=scoreAssessment({...input,answers:{...answers,'D1.1':{kind:'option',optionId:'none'}}});
     const action=result.actionPlan.find(a=>a.id==='improve:D1.1')!;
-    expect(action.pointsGain).toBe(1.75);expect(action.detail).toContain('independent');
+    expect(action.pointsGain).toBe(1.75);
     expect(result.actionPlan.every(a=>a.pointsGain>0)).toBe(true);
+  });
+  it('words each action as its own next step, with no caveat repeated on every item',()=>{
+    const result=scoreAssessment({...input,answers:{...answers,'D1.1':{kind:'option',optionId:'none'},'D3.2':{kind:'option',optionId:'none'},'D5.1':{kind:'number',value:0}}});
+    expect(Object.fromEntries(result.actionPlan.map(a=>[a.id,a.detail]))).toEqual({
+      'improve:D1.1':'Next step: We have informal guidance.',
+      'improve:D3.2':'Next step: We check a sample of citations.',
+      'improve:D5.1':'Next step: 1 hours per lawyer / year.',
+    });
+    // The screen and the PDF say once that the model is provisional and promises nothing (DN-12 §6).
+    for(const action of result.actionPlan) expect(action.detail).not.toMatch(/illustrative|estimate|promise|pricing|coverage|demo/i);
   });
   it('is stable for the same versioned snapshot',()=>expect(scoreAssessment(structuredClone(input))).toEqual(scoreAssessment(input)));
 });

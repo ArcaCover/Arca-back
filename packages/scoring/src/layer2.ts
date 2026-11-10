@@ -64,8 +64,8 @@ export function scoreAssessment({assessmentId,layer1,bank,answers,completedAt}: 
       return {...candidate,gain:round((projected.score-current.score)*current.weight/100*DEMO_LAYER2_WEIGHT)};
     }).filter(c=>c.gain>0).sort((a,b)=>a.gain-b.gain||a.label.localeCompare(b.label));
     const next=candidates[0];
-    if(next) actionPlan.push({id:`improve:${q.id}`,domain:q.domain,title:q.text,
-      detail:`Illustrative next step: ${next.label}. This estimate is independent of other steps and is not a pricing or coverage promise.`,pointsGain:next.gain});
+    // Only the step itself. The screen and the report say once that the gains are provisional estimates, each on its own.
+    if(next) actionPlan.push({id:`improve:${q.id}`,domain:q.domain,title:q.text,detail:`Next step: ${next.label}.`,pointsGain:next.gain});
   }
   actionPlan.sort((a,b)=>b.pointsGain-a.pointsGain||a.id.localeCompare(b.id));
   // A questionnaire cannot erase a known disciplinary restriction or fill missing public
