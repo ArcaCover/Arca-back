@@ -313,7 +313,8 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
           const response = await current.goto(item.url, { timeout: 8000, waitUntil: 'domcontentloaded' });
           const status = response?.status() ?? null;
           // Only the first hop of each navigation passes the request handler; the browser follows the later ones by
-          // itself. So every hop of every navigation of the page, and the URL it is on now, are checked here. A chain
+          // itself. So every hop of every navigation of the page is checked here, and the URL it is on now joins the
+          // host check (not robots: a same-document address change fetches nothing). A chain
           // that reached another host is not the firm's page, and one that passed a URL robots.txt excludes is not kept,
           // whatever it shows. The browser has already fetched them; this keeps their content out of the evidence
           // (DN-07 §6, known limit). Run before the status (another host's challenge is not the firm refusing) and
@@ -326,10 +327,13 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
               hops.push(...chain.reverse());
             }
             // Only web addresses: an error page the browser shows for a stopped navigation is not a hop.
-            const web = [...new Set([...hops, current.url()])].filter(url => /^https?:/i.test(url));
-            const away = web.find(url => !onSite(url));
+            const fetched = [...new Set(hops)].filter(url => /^https?:/i.test(url));
+            // The address bar joins the host check only. A script can rewrite it in place (history.replaceState or
+            // pushState) without fetching anything, so robots.txt has nothing to say about it: asking would drop a page
+            // read from an allowed URL and could call a readable website unreadable.
+            const away = [...fetched, current.url()].filter(url => /^https?:/i.test(url)).find(url => !onSite(url));
             if (away) return { code: 'OFF_SITE_REDIRECT', status, detail: URL.canParse(away) ? new URL(away).hostname : undefined };
-            for (const hop of web) {
+            for (const hop of fetched) {
               const policy = await robotsFor(hop);
               if (!policy.allows(hop)) return robotsIssue(policy);
             }

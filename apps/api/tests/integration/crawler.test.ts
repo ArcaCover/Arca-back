@@ -350,6 +350,24 @@ for (const [label, trigger] of [
   }, 30_000);
 }
 
+for (const [label, rewrite] of [
+  ['history.replaceState', 'history.replaceState(null, "", "/?lang=en")'],
+  ['history.pushState', 'history.pushState(null, "", "/?lang=en")'],
+] as const) {
+  it(`keeps a page whose script rewrites the address with ${label} to a URL robots.txt excludes`, async () => {
+    // A same-document address change fetches nothing, so robots.txt has nothing to say about it: the page was read
+    // from an allowed URL. Dropping it would call a readable firm website unreadable (WEBSITE_UNAVAILABLE).
+    const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+      robots: async () => ({ status: 200, text: 'User-agent: *\nDisallow: /*?' }),
+      response: async () => html(`Smith Law, P.A. <script>${rewrite}</script>`),
+    }, { seedOnly: true });
+    expect(result.pages.map(page => page.text)).toEqual(['Smith Law, P.A.']);
+    // A page was read, so the source never asks unreadableWebsite (it only explains a crawl with no page).
+    expect(result.issues ?? []).toEqual([]);
+    expect(result.partial).toBe(false);
+  }, 30_000);
+}
+
 it('does not keep another host\'s page that a meta refresh reached through hops the handler never saw', async () => {
   const served: string[] = [];
   const server = createServer((request, response) => {
