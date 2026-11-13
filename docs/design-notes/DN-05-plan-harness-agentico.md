@@ -8,7 +8,7 @@
 > una búsqueda de IA fija ya no dependen del modelo: el backend los hace siempre, en ese orden y antes de la
 > primera ronda, sin ninguna llamada al modelo. El modelo sigue pudiendo pedir herramientas en las rondas. Un
 > nombre de abogado citado solo desde noticias o comunicados ya no se toma como roster. Detalle en
-> [DN-12](DN-12-hallazgos-del-scan-en-vivo.md) §12.2 y §12.3.
+> [DN-12](DN-12-hallazgos-del-scan-en-vivo.md) §13.2 y §13.3.
 
 **Objetivo:** que el agente de extracción pueda conseguir la evidencia que le falta (PDFs, sitemap, pasajes
 recortados del corpus) sin perder la garantía de que toda señal aceptada tiene sustento literal y
