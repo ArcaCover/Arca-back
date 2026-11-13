@@ -163,6 +163,20 @@ describe('sitemap index of a large firm (hklaw.com, 2026-11-13)', () => {
     expect(order.indexOf('https://www.firm.com/en/sitemap/professionals')).toBeLessThan(order.indexOf('https://www.firm.com/en/sitemap/news'));
   });
 
+  it('skips a child file the transport refuses as too large and reads the others', async () => {
+    // Live 2026-11-13: hklaw.com's insights sitemap is 1.4 MB, over MAX_SITEMAP_BYTES; the transport threw
+    // 'Response too large' and the whole read failed, so no crawl was seeded and the agent got no sitemap.
+    const text = vi.fn(async (url: string) => {
+      if (url === 'https://www.firm.com/en/sitemap/insights') throw new Error('Response too large');
+      return files[url] ? { status: 200, text: files[url]! } : { status: 404, text: '' };
+    });
+    const robots = async (url: string) => files[url] ? { status: 200, text: files[url]! } : { status: 404, text: '' };
+    const result = await readSitemap('firm.com', new AbortController().signal, { response: viaText(text), robots });
+    expect(result.detail).toBeNull();
+    expect(result.links.map(link => link.url)).toContain('https://firm.com/en/offices/miami');
+    expect(result.links.some(link => link.url.includes('/insights/publications/'))).toBe(false);
+  });
+
   it('gives the same links whatever order the child files answer in', async () => {
     const steady = await read().result;
     const shuffled = await read(url => (url.length * 7) % 23).result;

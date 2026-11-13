@@ -78,7 +78,12 @@ export async function readSitemap(domain: string, signal: AbortSignal, transport
         if (seen.has(sitemap)) continue;
         seen.add(sitemap); batch.push(sitemap);
       }
-      const texts = await Promise.all(batch.map(fetchSitemap));
+      // One file that cannot be read (too large, a dropped connection) is skipped, not the whole read: hklaw.com's 1.4 MB
+      // insights sitemap made every read fail, so no crawl was seeded. A stopped scan still stops it.
+      const texts = await Promise.all(batch.map(url => fetchSitemap(url).catch(error => {
+        if (signal.aborted) throw error;
+        return null;
+      })));
       const children: string[] = [];
       for (const text of texts) {
         if (text === null || links.size >= MAX_SITEMAP_URLS) continue;
