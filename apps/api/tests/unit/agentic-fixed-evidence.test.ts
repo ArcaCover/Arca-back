@@ -133,6 +133,11 @@ describe('fixed targets', () => {
     expect(fixedTargets(links([`${ORIGIN}/en/offices`, `${ORIGIN}/en/people/`, `${ORIGIN}/en/innovation`]),
       new Set([`${ORIGIN}/en/offices`, `${ORIGIN}/en/people`]))).toEqual([`${ORIGIN}/en/innovation`]);
   });
+  it('never takes a careers page for the people directory', () => {
+    expect(fixedTargets(links([`${ORIGIN}/en/careers/attorneys`, `${ORIGIN}/en/careers/professionals`]), new Set())).toEqual([]);
+    expect(fixedTargets(links([`${ORIGIN}/careers/attorneys`, `${ORIGIN}/en/professionals`]), new Set()))
+      .toEqual([`${ORIGIN}/en/professionals`]);
+  });
   it('keeps a practice page about AI as the last resort for an AI slot', () => {
     expect(fixedTargets(links([`${ORIGIN}/en/services/artificial-intelligence`]), new Set())).toEqual([`${ORIGIN}/en/services/artificial-intelligence`]);
   });

@@ -103,10 +103,14 @@ export class WebsiteExtractionSource implements WebsiteSource {
         // insufficient, the directories are skipped and the whole scan ends FAILED. Keep the
         // provider's own message in the stored evidence, or there is no way to tell a token
         // limit from a timeout afterwards. It stays out of `reason`, which the API returns.
-        // The record carries no `reuse`, so no later scan takes it for an analysis.
+        // The record carries no `reuse`, so no later scan takes it for an analysis. The model's attempts of a failed
+        // extraction (ExtractionFailure) are kept as a finished one keeps them: phase, request, response with its usage
+        // and finish reason, and the issue found, so a cut answer or a cap reached can be read from the record.
         const message = error instanceof Error ? error.message : String(error);
+        const attempts = (error as { attempts?: unknown } | null)?.attempts;
         return { data: null, rawContent: JSON.stringify({ ...base, analysis: null,
-            diagnostics: { ...(diagnostics as object ?? {}), error: message, pagesCrawled: crawl.pages.length } }),
+            diagnostics: { ...(diagnostics as object ?? {}), ...(Array.isArray(attempts) ? { attempts } : {}), error: message,
+              pagesCrawled: crawl.pages.length } }),
           status: { status: signal.aborted ? 'timeout' : 'error', dataStatus: 'UNKNOWN', durationMs: Date.now() - start,
             pagesCrawled: crawl.pages.length, code: signal.aborted ? 'DEADLINE_REACHED' : 'PROVIDER_ERROR',
             reason: 'Website evidence extraction unavailable' } };

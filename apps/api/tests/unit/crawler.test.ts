@@ -74,6 +74,25 @@ describe('pagePriority', () => {
     expect(priority('/biotech')).toBe(7);
   });
 
+  it('never takes a careers, jobs or recruiting page for the people directory', () => {
+    // A live scan ranked /en/careers/business-professionals as the firm's people page (DN-12 §13.8).
+    for (const path of ['/en/careers/business-professionals', '/careers/experienced-attorneys', '/careers/lawyers',
+      '/careers/attorneys/summer-associates', '/join-our-team', '/jobs/paralegal', '/recruiting/our-people', '/career-opportunities/team',
+      '/es/trabaja-con-nosotros/abogados', '/empleo/abogados']) {
+      expect(priority(path), path).toBe(7);
+    }
+  });
+
+  it('reads a people word only as a whole segment or the head of one, not inside a compound', () => {
+    for (const path of ['/business-professionals', '/experienced-attorneys', '/en/industries/sports-team-ownership']) {
+      expect(priority(path), path).toBe(7);
+    }
+    for (const path of ['/our-people', '/meet-the-team', '/meet-our-team', '/our-attorneys', '/team-members', '/attorneys/jane-doe',
+      '/en/professionals/d/doe-jane', '/nuestros-abogados', '/abogados-de-inmigracion-miami/', '/people-search']) {
+      expect(priority(path), path).toBe(3);
+    }
+  });
+
   it('gives Spanish pages the same standing as their English equivalents', () => {
     expect(priority('/es/inteligencia-artificial')).toBe(1);
     expect(priority('/es/innovacion')).toBe(1);
@@ -102,6 +121,11 @@ describe('sitemapSeeds', () => {
       '/en/general-pages/artificial-intelligence-navigator', '/en/our-firm', '/en/professionals', '/en/offices',
       '/en/our-firm/history', '/en/professionals/person-0', '/en/offices/miami', '/en/professionals/person-1',
     ]);
+  });
+
+  it('does not seed a careers page as the people directory', () => {
+    expect(sitemapSeeds([page('/en/careers/business-professionals'), page('/en/professionals')], root))
+      .toEqual(['https://firm.com/en/professionals']);
   });
 
   it('takes one language version of a page', () => {

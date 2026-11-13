@@ -12,6 +12,24 @@ export function withoutLocale(path: string): string {
 }
 /** Whole words of a path: separated by "/", "-", "_" or ".", so "firm" never matches "affirmative". */
 const words = (...stems: string[]) => new RegExp(`(?:^|[/._-])(?:${stems.join('|')})(?=[/._-]|$)`);
+/**
+ * A people page: a segment that is a people word, or starts with one (attorneys-and-staff, abogados-de-inmigracion-miami),
+ * optionally after "our", "the", "meet our", "meet the" or "nuestros". Never a compound that only ends in one
+ * (business-professionals, experienced-attorneys, sports-team-ownership): a live scan took a careers page for the
+ * firm's people directory that way (DN-12 §13.8).
+ */
+const PEOPLE_SEGMENT = /(?:^|\/)(?:meet-)?(?:(?:our|the|nuestros?|nuestras?)-)?(?:team|attorneys?|lawyers?|people|professionals|abogad[oa]s?|equipo|socios)(?=[/-]|$)/;
+/**
+ * Careers, jobs and recruiting pages. They name attorneys and teams ("experienced attorneys", "join our team") but list
+ * no one, so they are never the people directory; they rank with every page no group names.
+ */
+const CAREERS = /(?:^|\/)(?:careers?|jobs?|job-openings|recruiting|recruitment|join-us|join-our-team|work-with-us|vacancies|internships?|summer-associates?|summer-program|empleos?|trabaja-con-nosotros|bolsa-de-trabajo|carreras?)(?=[/-]|$)/;
+/** Whether a path (or URL) is a careers, jobs or recruiting page, wherever the site files it. */
+export function isCareersPath(raw: string): boolean {
+  let path = raw;
+  try { path = new URL(raw).pathname; } catch { /* already a path */ }
+  return CAREERS.test(withoutLocale(path.toLowerCase()));
+}
 /** The priority groups, in crawl order. `other` is every page no group names. */
 export const PAGE_GROUPS = { home: 0, ai: 1, about: 2, people: 3, offices: 4, services: 5, privacy: 6, other: 7, news: 8 } as const;
 // Spanish stems carry the same weight as their English equivalents. Without them a Spanish site has no ranked page at
@@ -20,7 +38,7 @@ const RANKED: Array<[number, RegExp[]]> = [
   [PAGE_GROUPS.ai, [/artificial-intelligence|inteligencia-artificial|legal-?tech|innovat|innovaci/,
     words('ai', 'ia')]],
   [PAGE_GROUPS.about, [/about|nosotros|quienes-somos|acerca|la-firma|who-we-are/, words('firm', 'history', 'historia')]],
-  [PAGE_GROUPS.people, [/team|attorney|lawyer|people|professionals|abogad|equipo|socios/, words('bios?')]],
+  [PAGE_GROUPS.people, [PEOPLE_SEGMENT, words('bios?')]],
   [PAGE_GROUPS.offices, [/offices|location|contact|oficinas|ubicaci/]],
   [PAGE_GROUPS.services, [/service|practice|servicio|practica/]],
   [PAGE_GROUPS.privacy, [/privacy|privacidad|aviso-legal/]],
@@ -32,7 +50,8 @@ const rank = (path: string) => RANKED.find(([, patterns]) => patterns.some(patte
  * first, so /en is the home page and /en/offices an office page. Then:
  * home, AI (the subject of the score), about the firm, people, offices and contact, services and practices, privacy,
  * every page no group names, and last blog, news, insights, events and press. A page inside a news section stays
- * there whatever its slug says: a firm with thirty alerts about AI would otherwise spend the whole budget on them.
+ * there whatever its slug says: a firm with thirty alerts about AI would otherwise spend the whole budget on them. A
+ * careers, jobs or recruiting page ranks with the pages no group names, whatever people word its slug carries.
  * A page is ranked by its own last segment before its section, so /firm/legal/privacy is a privacy page and
  * /about/team a people page.
  */
@@ -40,6 +59,7 @@ export function pagePriority(raw: string): number {
   const path = withoutLocale(new URL(raw).pathname.toLowerCase());
   if (path === '/') return PAGE_GROUPS.home;
   if (NEWS.test(path)) return PAGE_GROUPS.news;
+  if (CAREERS.test(path)) return PAGE_GROUPS.other;
   const leaf = path.split('/').filter(Boolean).at(-1) ?? '';
   return rank(`/${leaf}`) ?? rank(path) ?? PAGE_GROUPS.other;
 }

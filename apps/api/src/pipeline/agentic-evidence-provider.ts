@@ -5,6 +5,7 @@ import { SignalExtraction, SignalReview, WebsiteData, type Claim, type EvidenceR
 import { compareText } from '@arca/scoring';
 import { classifyRole, personEvidence } from './attorney-roles.js';
 import type { CrawledPage, CrawlResult } from './crawler.js';
+import { isCareersPath } from './crawl-order.js';
 import { buildCorpus, serializeCorpus, withLinks, withPassages, type EvidenceCorpus } from './evidence-corpus.js';
 import { acceptClaims, toWebsiteData } from './signal-grounding.js';
 import { groundNegativeSignals } from './negative-signal-grounding.js';
@@ -20,7 +21,9 @@ import { DEFAULT_SIGNAL_LLM_MODEL, openAiEndpoint, type LlmEndpoint } from './ll
 import { scanMeter } from './scan-cost.js';
 
 // v6: the fixed evidence steps (sitemap, AI, people and offices pages, AI search) run before the claim rounds.
-export const EXTRACTION_VERSION = 'agentic-signals-v6';
+// v7: ai_blog_posts is derived from the firm's own AI publications the scan knows of when no claim was accepted, and a
+// careers page is never the people directory (DN-12 §13.8).
+export const EXTRACTION_VERSION = 'agentic-signals-v7';
 export const MAX_AGENT_ROUNDS = 3;
 /** Bounded so one flaky call cannot loop forever; each phase gets its own budget of attempts. */
 export const MAX_TRANSIENT_ATTEMPTS = 3;
@@ -158,6 +161,22 @@ function responseText(response: unknown): string {
   return choice.message.content;
 }
 
+type Choice = { message?: { content?: unknown }; finish_reason?: string };
+const firstChoice = (response: unknown) => (response as { choices?: Choice[] } | null)?.choices?.[0];
+/** The model stopped at its completion limit: reasoning tokens count against it, so the answer may be empty. */
+const cutAtLimit = (response: unknown) => firstChoice(response)?.finish_reason === 'length';
+const partialContent = (response: unknown) => {
+  const content = firstChoice(response)?.message?.content;
+  return typeof content === 'string' ? content : '';
+};
+function lengthIssue(response: unknown, request: Record<string, unknown>): string {
+  const usage = (response as { usage?: { completion_tokens?: unknown; completion_tokens_details?: { reasoning_tokens?: unknown } } }).usage;
+  const used = typeof usage?.completion_tokens === 'number' ? ` after ${usage.completion_tokens} completion tokens` : '';
+  const reasoning = usage?.completion_tokens_details?.reasoning_tokens;
+  return `Incomplete response: finish_reason length${used}${typeof reasoning === 'number' ? ` (${reasoning} reasoning)` : ''}` +
+    ` with max_completion_tokens ${String(request.max_completion_tokens ?? 'unset')}`;
+}
+
 function json(text: string): unknown {
   const clean = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   return JSON.parse(clean);
@@ -199,8 +218,11 @@ const segmentsOf = (url: string) => pathOf(url).split('/').filter(Boolean);
 const NEWS_PATH = /(^|\/)(news|press|press-?releases?|blogs?|insights?|publications?|events?|articles?|alerts?|podcasts?|webinars?|media|media-entities|noticias|eventos|category|tag|author)(\/|$)|\/(19|20)\d{2}\/(0?[1-9]|1[0-2])(\/|$)/;
 export const isNewsUrl = (url: string) => NEWS_PATH.test(pathOf(url)) || heuristicPageType(url) === 'blog';
 const TEAM_PATH = /attorney|lawyer|abogad|equipo|team|(^|\/)(people|professionals)(\/|$)/i;
-/** A page the roster pass reads: its path names the team, and it is not a news page whose title happens to. */
-const isTeamUrl = (url: string) => TEAM_PATH.test(pathOf(url)) && !isNewsUrl(url);
+/**
+ * A page the roster pass reads: its path names the team, and it is not a news page whose title happens to, nor a careers
+ * page ("experienced attorneys", "join our team") that lists no one.
+ */
+const isTeamUrl = (url: string) => TEAM_PATH.test(pathOf(url)) && !isNewsUrl(url) && !isCareersPath(url);
 
 /** Pages the backend reads before the claim rounds, whatever the model would choose (DN-05, fixed evidence steps). */
 export const FIXED_FETCH_LIMIT = 4;
@@ -227,7 +249,7 @@ export function fixedTargets(links: Array<{ url: string; kind: 'page' | 'documen
     seen.add(key); return true;
   }).map(link => link.url);
   const order = (a: string, b: string) => segmentsOf(a).length - segmentsOf(b).length || compareText(a, b);
-  const people = pages.filter(url => PEOPLE_INDEX.test(segmentsOf(url).at(-1) ?? '')).sort(order)[0];
+  const people = pages.filter(url => PEOPLE_INDEX.test(segmentsOf(url).at(-1) ?? '') && !isCareersPath(url)).sort(order)[0];
   const offices = pages.filter(url => OFFICE_SEGMENT.test(segmentsOf(url).at(-1) ?? '')).sort(order)[0];
   const ai = pages.filter(url => url !== people && url !== offices && AI_PATH.test(pathOf(url)))
     .sort((a, b) => Number(SERVICE_PATH.test(pathOf(a))) - Number(SERVICE_PATH.test(pathOf(b))) || order(a, b));
@@ -323,13 +345,20 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
     this.client = client ?? new OpenAI({ apiKey, maxRetries: 0, timeout: 120_000 }) as unknown as CompletionClient;
   }
 
+  /**
+   * One model call of a phase. A transient provider error is retried within MAX_TRANSIENT_ATTEMPTS. An answer the
+   * model cut at its completion limit (finish_reason 'length') is sent once more, same messages, with the endpoint's
+   * larger budget (DN-12 §13.8), as `${phase}-length-retry` with its own transient budget; cut again, the call fails
+   * as before. Every request counts against the per-scan cap and every answer is kept in `attempts`.
+   */
   private async complete(phase: string, system: string, user: string, signal: AbortSignal, attempts: Attempt[]) {
-    const request = { model: this.model, stream: false, ...this.endpoint.requestParams(this.model),
+    let request: Record<string, unknown> = { model: this.model, stream: false, ...this.endpoint.requestParams(this.model),
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
       response_format: { type: 'json_object' } };
+    let stem = phase;
     for (let attempt = 1; ; attempt++) {
       const started = Date.now();
-      const label = attempt === 1 ? phase : `${phase}-attempt-${attempt}`;
+      const label = attempt === 1 ? stem : `${stem}-attempt-${attempt}`;
       // Counted before it is sent: the page-type votes and the roster run side by side with other calls.
       const requests = (this.requested.get(attempts) ?? 0) + 1;
       const { maxRequests } = this.options;
@@ -346,6 +375,15 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
         // Record the attempt before validating it: truncated or malformed answers are the ones worth auditing.
         const record: Attempt = { phase: label, request, response, rawContent: '', durationMs: Date.now() - started };
         attempts.push(record);
+        if (cutAtLimit(response)) {
+          record.rawContent = partialContent(response);
+          record.validationIssues = lengthIssue(response, request);
+          const larger = stem === phase ? this.endpoint.lengthRetryParams?.(this.model) : undefined;
+          if (larger && !signal.aborted) {
+            request = { ...request, ...larger }; stem = `${phase}-length-retry`; attempt = 0;
+            continue;
+          }
+        }
         record.rawContent = responseText(response);
         return json(record.rawContent);
       } catch (error) {
@@ -562,7 +600,8 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
     // Every field the model proposed a claim for, accepted or rejected: a rejected claim means it saw
     // something ambiguous, which negative grounding must not treat the same as nothing proposed.
     const claimedFields = new Set(extraction.claims.map(claim => claim.field));
-    const accepted = groundNegativeSignals(toWebsiteData(grounded.accepted, corpus), crawl, pageTypes, claimedFields);
+    // corpus.links holds the links of the pages read and the sitemap's URLs: the posts the scan knows of besides those it read.
+    const accepted = groundNegativeSignals(toWebsiteData(grounded.accepted, corpus), crawl, pageTypes, claimedFields, corpus.links);
     const references = (claim: Claim): EvidenceReference[] => claim.citations.flatMap(citation => {
       const url = urlOf(citation.segmentId);
       return url ? [{ sourceUrl: url, excerpt: citation.quote, method: 'provider' as const }] : [];

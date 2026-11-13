@@ -355,7 +355,7 @@ describe('Agentic evidence provider', () => {
     expect(create.mock.calls[0]![0]).toMatchObject({ model: 'gpt-6-luna', max_completion_tokens: expect.any(Number) });
     expect(create.mock.calls[0]![0]).not.toHaveProperty('temperature');
     expect(provider.id).toBe('openai-agentic');
-    expect(provider.version).toMatch(/^agentic-signals-v6:openai:gpt-6-luna:default:[0-9a-f]{12}$/);
+    expect(provider.version).toMatch(/^agentic-signals-v7:openai:gpt-6-luna:default:[0-9a-f]{12}$/);
   });
 
   it('names in its version everything that changes what the model answers', () => {
@@ -365,7 +365,7 @@ describe('Agentic evidence provider', () => {
     expect(new AgenticEvidenceProvider('key', 'gpt-6-luna', { chat: { completions: { create: vi.fn() } } }).version).toBe(base);
     expect(extractionVersion(openAiEndpoint(), 'gpt-6-astra')).not.toBe(base);
     const low = extractionVersion(openAiEndpoint('low'), 'gpt-6-luna');
-    expect(low).toMatch(/^agentic-signals-v6:openai:gpt-6-luna:low:[0-9a-f]{12}$/);
+    expect(low).toMatch(/^agentic-signals-v7:openai:gpt-6-luna:low:[0-9a-f]{12}$/);
     expect(low.split(':')[4]).not.toBe(base.split(':')[4]);
     expect(extractionVersion(openAiEndpoint(), 'gpt-6-luna', { planPages: false })).not.toBe(base);
     // A prompt edited by one character is another extraction, with no version constant to remember.
@@ -467,6 +467,105 @@ describe('Agentic evidence provider', () => {
         // The reason stays in the stored evidence, out of what the API returns.
         expect(JSON.parse(result.rawContent!).diagnostics.error).toBe('OpenAI request cap reached: one scan may make 2 chat completions');
       } finally { log.mockRestore(); }
+    });
+  });
+
+  describe('answer cut at the completion limit', () => {
+    // DN-12 §13.8. A reasoning model spends part of max_completion_tokens on reasoning, so a long round can stop on
+    // `length` with no usable JSON. The same call is sent once more with a larger budget.
+    const cut = { choices: [{ finish_reason: 'length', message: { content: '{"claims":[{"id":"firm","fiel' } }],
+      usage: { completion_tokens: 16_000, completion_tokens_details: { reasoning_tokens: 15_200 } } };
+    const lengthThen = (outcomes: Array<'length' | 'stop'>) => {
+      let extractCalls = 0;
+      return vi.fn(async (request: Record<string, unknown>) => {
+        const user = (request.messages as Array<{ content: string }>)[1]!.content;
+        if (user.startsWith('CANDIDATE CLAIMS')) return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ verdicts: [] }) } }] };
+        if (outcomes[extractCalls++] === 'length') return cut;
+        return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } }) } }] };
+      });
+    };
+    const crawl = { pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }], partial: false };
+
+    it('retries the same call once with a larger budget and keeps both attempts', async () => {
+      const create = lengthThen(['length', 'stop']);
+      const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+      const result = await provider.extractDetailed(crawl, new AbortController().signal);
+      // No claims, so no review call follows.
+      expect(create).toHaveBeenCalledTimes(2);
+      const [first, retry] = create.mock.calls.map(call => call[0]);
+      expect(first).toMatchObject({ max_completion_tokens: 16_000 });
+      expect(retry).toMatchObject({ max_completion_tokens: 32_000 });
+      // The same messages, only the budget changes.
+      expect(retry!.messages).toEqual(first!.messages);
+      const attempts = result.diagnostics.attempts;
+      expect(attempts.map(attempt => attempt.phase)).toEqual(['extract-round-1', 'extract-round-1-length-retry']);
+      expect(attempts[0]!.validationIssues).toContain('finish_reason length');
+      expect(attempts[0]!.rawContent).toBe('{"claims":[{"id":"firm","fiel');
+      expect(attempts[0]!.response).toEqual(cut);
+      expect(attempts[1]!.request).toMatchObject({ max_completion_tokens: 32_000 });
+      expect(attempts[1]!.validationIssues).toBeUndefined();
+    });
+
+    it('fails as before when the larger budget is cut too, with both attempts recorded', async () => {
+      const create = lengthThen(['length', 'length']);
+      const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+      const failure = await provider.extractDetailed(crawl, new AbortController().signal).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(ExtractionFailure);
+      expect((failure as ExtractionFailure).message).toBe('The model returned an incomplete response');
+      expect(create).toHaveBeenCalledTimes(2);
+      const attempts = (failure as ExtractionFailure).attempts;
+      expect(attempts.map(attempt => attempt.phase)).toEqual(['extract-round-1', 'extract-round-1-length-retry']);
+      expect(attempts.every(attempt => attempt.validationIssues?.includes('finish_reason length'))).toBe(true);
+    });
+
+    it('counts the retry against the per-scan request cap', async () => {
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const create = lengthThen(['length', 'stop']);
+        const provider = new AgenticEvidenceProvider('key', undefined, { chat: { completions: { create } } }, undefined, undefined,
+          { planPages: false, maxRequests: 1 });
+        const failure = await provider.extractDetailed(crawl, new AbortController().signal).catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(ExtractionFailure);
+        expect((failure as ExtractionFailure).cause).toBeInstanceOf(RequestCapReached);
+        expect(create).toHaveBeenCalledTimes(1);
+        expect((failure as ExtractionFailure).attempts.map(attempt => attempt.phase)).toEqual(['extract-round-1']);
+      } finally { log.mockRestore(); }
+    });
+
+    it('does not retry an answer that is incomplete for another reason', async () => {
+      const create = vi.fn(async () => ({ choices: [{ finish_reason: 'content_filter', message: { content: null } }] }));
+      const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+      await expect(provider.extractDetailed(crawl, new AbortController().signal)).rejects.toThrow('The model returned an incomplete response');
+      expect(create).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives each model family a larger budget it accepts', () => {
+      expect(openAiEndpoint().lengthRetryParams?.('gpt-6-luna')).toEqual({ max_completion_tokens: 32_000 });
+      expect(openAiEndpoint('low').lengthRetryParams?.('gpt-5-mini')).toEqual({ max_completion_tokens: 32_000 });
+      // gpt-4o-mini stops at 16,384 output tokens; twice the usual 8,000 stays under it.
+      expect(openAiEndpoint().lengthRetryParams?.('gpt-4.1-mini')).toEqual({ max_completion_tokens: 16_000 });
+    });
+
+    it('stores the attempts of a failed extraction in the website record', async () => {
+      const create = lengthThen(['length', 'length']);
+      const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+      const source = new WebsiteExtractionSource(new InMemoryRepository(), provider, async () => ({ ...crawl, issues: [], aborted: false }));
+      const result = await source.run('firm.com', new AbortController().signal);
+      expect(result.data).toBeNull();
+      const diagnostics = JSON.parse(result.rawContent!).diagnostics;
+      expect(diagnostics).toMatchObject({ error: 'The model returned an incomplete response', pagesCrawled: 1 });
+      // Stored the way a finished extraction stores them: phase, request, response (usage, finish reason) and issues.
+      expect(diagnostics.attempts.map((attempt: { phase: string }) => attempt.phase)).toEqual(['extract-round-1', 'extract-round-1-length-retry']);
+      expect(diagnostics.attempts[1]).toMatchObject({ request: { max_completion_tokens: 32_000 },
+        response: { choices: [{ finish_reason: 'length' }], usage: { completion_tokens: 16_000 } },
+        validationIssues: expect.stringContaining('finish_reason length') });
+    });
+
+    it('keeps the record of a failure that carries no attempts as it was', async () => {
+      const provider = { id: 'p', version: 'v', extract: vi.fn(async () => { throw new Error('boom'); }) };
+      const source = new WebsiteExtractionSource(new InMemoryRepository(), provider, async () => ({ ...crawl, issues: [], aborted: false }));
+      const result = await source.run('firm.com', new AbortController().signal);
+      expect(JSON.parse(result.rawContent!).diagnostics).toEqual({ error: 'boom', pagesCrawled: 1 });
     });
   });
 
