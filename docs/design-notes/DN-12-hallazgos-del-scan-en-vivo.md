@@ -1165,3 +1165,104 @@ Sin red, sin OpenAI y sin Apify: clientes y transportes inyectados.
 - **Ciudades de Florida** se leen contra una lista cerrada de ciudades con despachos y con "Ciudad, FL" en
   páginas de oficinas o contacto. Una ciudad pequeña que solo aparece como enlace, sin el estado, no se reconoce.
 - **El total de abogados** sigue sin pasar a `team_size` (scoring); solo marca la firma grande.
+
+### 13.8 Respuesta cortada, fallo sin diagnóstico, posts de IA y carreras (2026-11-12)
+
+Al verificar la rama en vivo, un scan de `hklaw.com` (`sc_c5c465d176f94c448d12b379866a6d2a`) terminó `FAILED`: la
+extracción del website lanzó "The model returned an incomplete response". El registro guardado solo tenía
+`{error, pagesCrawled}`. Repetir la extracción sin red sobre el mismo crawl salió bien en 6 llamadas (la salida
+más larga, 2.400 tokens), así que el corte es intermitente. Esa repetición dejó a la vista dos huecos más: el
+modelo no afirmó nada de `ai_blog_posts` aunque el sitemap traía más de 40 publicaciones de la firma sobre IA, y el
+crawler ordenaba `/en/careers/business-professionals` como página de personas.
+
+| # | Causa | Cambio |
+|---|---|---|
+| F | El modelo (de razonamiento) gasta parte de `max_completion_tokens` (16.000) en razonar y la llamada para con `finish_reason: 'length'` sin JSON utilizable | Un solo reintento de esa llamada con más presupuesto |
+| G | `website-source.ts` guardaba `diagnostics`, que es `null` cuando `extractDetailed` lanza, aunque `ExtractionFailure` lleva los intentos | El registro guarda los intentos del fallo |
+| H | `ai_blog_posts` depende de que el modelo lo afirme; W4 (5 puntos) quedaba desconocido | Se deriva por regla de las URLs de publicaciones de la firma |
+| I | El grupo de personas del orden de crawl buscaba `professionals` o `attorney` como subcadena | Carreras nunca son personas y la palabra tiene que ser el segmento o su cabeza |
+
+**Respuesta cortada (F). [mía]** Cuando una llamada termina con `finish_reason: 'length'`, se manda otra vez la
+misma llamada, mismos mensajes, con `max_completion_tokens` a 32.000 para los modelos de razonamiento (GPT-5 en
+adelante, muy por debajo de su límite de salida) y a 16.000 para los demás (por debajo de los 16.384 de
+`gpt-4o-mini`, el menor de esa familia). Lo da `lengthRetryParams` del endpoint (`llm-endpoint.ts`). Si vuelve a
+cortarse, falla como antes. Solo hay un reintento por llamada, y la fase pasa a llamarse `<fase>-length-retry`, con
+su propio presupuesto de reintentos transitorios. El reintento es una petición más: cuenta contra el tope por scan
+(§5.2, `OPENAI_MAX_REQUESTS_PER_SCAN`) y contra la línea de coste, y si el tope no deja sitio no se manda. Los dos
+intentos quedan en el historial: el cortado con su respuesta, el contenido parcial y
+`Incomplete response: finish_reason length after N completion tokens (M reasoning) with max_completion_tokens 16000`.
+Cualquier otra respuesta incompleta (sin contenido, `content_filter`) falla sin reintento, como antes. El perfil
+de parámetros de la petición normal no cambia.
+
+**Diagnóstico de un fallo (G).** Si el error trae `attempts` (un `ExtractionFailure`), el registro raw guarda
+`diagnostics: { attempts, error, pagesCrawled }`. Los intentos van igual que en una extracción que termina: fase,
+petición, respuesta (con `usage` y `finish_reason`), contenido y el problema encontrado. La extracción que termina
+ya guarda los prompts completos, así que el fallo no los recorta. Un error sin intentos se guarda como antes. El
+registro sigue sin `reuse` y el motivo sigue fuera de lo que devuelve la API.
+
+**Posts de IA de la firma (H). [mía]** Si ninguna afirmación de `ai_blog_posts` fue aceptada, el grounding
+negativo (`groundNegativeSignals`, con la regla en `ai-publications.ts`) busca entre las páginas leídas y las URLs
+conocidas: los enlaces de las páginas leídas y las del sitemap, que llegan como `corpus.links`.
+
+- Cuenta una URL del mismo host que la firma (con o sin `www`) que sea un post. Tiene que estar bajo una sección
+  de blog, noticias, insights, publicaciones, artículos, alertas, podcasts o media, por debajo de la sección.
+  Quedan fuera eventos, webinars, categorías, etiquetas, temas, autores, páginas de práctica y cualquier slug de una
+  sola palabra (`/insights/ai` es un listado).
+- El post tiene que tratar de IA por su slug o por el título de la página, si se leyó. En el slug cuentan palabras
+  enteras: `ai`, `genai`, `llm(s)`, `chatgpt`, `artificial-intelligence`, `machine-learning`,
+  `large-language-model(s)` e `inteligencia-artificial`. Nunca una palabra que solo contiene "ai" (said, maid,
+  chair, aid, air). En el título, "AI" solo cuenta en mayúsculas.
+- Resultado: `{found: true, count, titles}`. `count` cuenta URLs distintas (sin barra final ni `www`). `titles` son
+  como mucho 5, más recientes primero por el año y mes de la URL: el título de la página si se leyó (sin el
+  " | Firma" final) y, si no, el slug en palabras. La procedencia lleva todas las URLs con `method: 'derived'`.
+- Si no hay ninguno, sigue la regla de antes: `found: false` desde un índice de blog leído, solo si el campo no se
+  afirmó nunca.
+
+**Precedencia.** Una afirmación aceptada gana siempre, diga `true` o `false`. Si el modelo afirmó algo y la
+revisión lo rechazó, la regla sí pone `found: true`. Lo rechazado era la lectura del modelo de un pasaje (su cita,
+su cuenta o su alcance), y cada URL de un post de la firma prueba por sí misma que el post existe. Lo que no cambia
+es `found: false`: un rechazo sigue impidiendo derivarlo desde un índice.
+
+**Riesgo aceptado.** Un nombre propio escrito con la palabra "ai" en el slug (`ai-weiwei-exhibit`) contaría. En el
+título no, porque "Ai" no va en mayúsculas. Una noticia de "In the headlines" (prensa que cita a la firma, servida
+en su propio sitio) cuenta como publicación suya.
+
+Sobre la repetición de hklaw, sin red: 42 posts, desde
+`/en/insights/media-entities/2026/11/regulating-artificial-intelligence-compliance-management` hasta
+`/en/insights/media-entities/2023/08/podcast-inteligencia-artificial`. Ninguno es la página de práctica, el
+navegador de IA ni un evento.
+
+**Carreras no son personas (I).** En `crawl-order.ts` una ruta con un segmento de carreras, empleo o selección
+(`careers`, `jobs`, `recruiting`, `join-our-team`, `internships`, `summer-associates`, `trabaja-con-nosotros`,
+`empleo`, `bolsa-de-trabajo`, `carreras`…) va al grupo de lo que ningún grupo nombra, diga lo que diga su slug. La
+palabra de personas (`team`, `attorneys`, `lawyers`, `people`, `professionals`, `abogados`, `equipo`, `socios`)
+tiene que ser el segmento entero o su cabeza, con `our-`, `the-`, `meet-our-`, `meet-the-` o `nuestros-` delante
+si lo hay. Así, `our-people`, `meet-the-team`, `attorneys-and-staff` y `abogados-de-inmigracion-miami` siguen
+siendo personas, y `business-professionals`, `experienced-attorneys` o `sports-team-ownership` ya no. Los pasos
+fijos (`fixedTargets`) y el roster (`isTeamUrl`) tampoco toman una página de carreras como directorio de personas.
+
+**Versión.** `EXTRACTION_VERSION` pasa a `agentic-signals-v7`: para la misma evidencia la extracción ya puede
+devolver `ai_blog_posts` derivado, así que los análisis guardados con la v6 no se reutilizan (§4.3). El reintento
+por corte no entra en el hash de parámetros: solo cambia si una extracción falla, no lo que dice una que termina.
+
+**Tests.** Sin red y sin OpenAI, con clientes inyectados.
+
+- `agentic-evidence-provider.test.ts`: `length` y luego `stop` (dos intentos, mismos mensajes, 16.000 y luego
+  32.000, el primero con su respuesta y el contenido parcial); `length` dos veces (falla con el mensaje de
+  siempre y los dos intentos); el reintento cuenta contra el tope (con tope 1 no se manda); `content_filter` no
+  se reintenta; presupuesto por familia; el registro raw de un fallo guarda los intentos, y uno sin intentos
+  queda como antes. Versión v7.
+- `negative-signal-grounding.test.ts`: URLs con la forma de las de hklaw (slugs sintéticos), duplicados por barra
+  y `www`, otro host, título de una página leída, vocabulario de IA por palabras enteras, falsos positivos (maid,
+  chair, mail, aid, air), páginas que no son posts, el `false` desde un índice, una afirmación aceptada gana y un
+  rechazo no impide el `true`.
+- `crawler.test.ts`: carreras, empleo y selección no son personas; compuestos frente a segmentos enteros; el
+  sitemap no siembra una página de carreras. `agentic-fixed-evidence.test.ts`: los pasos fijos no la eligen.
+
+**Lo que queda fuera.**
+
+- **Sin canario real.** Ni el reintento por corte ni los posts derivados se han probado contra OpenAI ni contra
+  `hklaw.com` en vivo. Las cifras salen de la repetición sin red.
+- **Un segundo corte** sigue tumbando el website y el scan. No se reduce el corpus ni se parte la llamada.
+- **Posts sin URL conocida.** Solo cuentan los que el scan vio: un blog que solo se pagina con JavaScript o no
+  está en el sitemap no aporta nada.

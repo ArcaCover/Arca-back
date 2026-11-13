@@ -255,6 +255,15 @@ por campo en `provenance` como URL, fragmento y `method:'provider'`. Procedencia
 también vive en diagnósticos. Excerpts copiados de citas, no generados. Ningún candidato rechazado
 participa en identidad o consultas.
 
+**Señales derivadas sin el modelo (2026-11-12).** Tras `toWebsiteData`, el grounding negativo
+(`groundNegativeSignals`) completa por regla algunos campos que ninguna afirmación aceptada resolvió, con
+`method: 'derived'` en `provenance`. `ai_blog_posts` pasa a `found: true` cuando el scan conoce posts propios de
+la firma sobre IA (páginas leídas, sus enlaces y el sitemap, en el mismo host, por palabra entera del slug o por
+el título de la página leída), con `count` igual a las URLs distintas y como mucho 5 títulos. Eso incluye el caso
+de una afirmación que la revisión rechazó: cada URL es evidencia propia de que el post existe. Una afirmación
+aceptada gana siempre. El `found: false` desde un índice de blog sigue exigiendo que el campo no se afirmara
+nunca. Detalle y riesgos aceptados en [DN-12](DN-12-hallazgos-del-scan-en-vivo.md) §13.8.
+
 ## 6. Presupuesto de ejecución y cancelación
 
 Valores iniciales de ingeniería, sujetos a medición; no son promesas de latencia del proveedor:
@@ -333,6 +342,12 @@ siempre. Recibir solo el JSON final; tolerar únicamente un bloque markdown exte
 requiere y lo prueba. No extraer el primer objeto con una regex de una respuesta ambigua. Rechazar
 contenido vacío, múltiples objetos, refusal, respuesta pendiente no completada o
 `finish_reason` incompatible con una terminación completa.
+
+**Corte por límite de salida (2026-11-12).** Una respuesta con `finish_reason: 'length'` se sigue rechazando,
+pero antes se manda una vez más la misma llamada con un presupuesto de salida mayor (32.000 tokens para modelos
+de razonamiento, 16.000 para los demás). Ese reintento es una petición más del tope por scan y queda en el
+historial junto al intento cortado. Si vuelve a cortarse, la llamada falla. Detalle en
+[DN-12](DN-12-hallazgos-del-scan-en-vivo.md) §13.8.
 
 Una sola reparación global para errores de JSON/esquema, con respuesta fallida, errores y corpus
 necesario, manteniendo el presupuesto de tokens/tiempo. Reparar formato no autoriza inventar evidencia.
