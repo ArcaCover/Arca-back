@@ -65,7 +65,7 @@ export async function readSitemap(domain: string, signal: AbortSignal, transport
       if (host(url) === domain && await fetchable(url)) queue.push(url);
     }
     const seen = new Set<string>(), links = new Map<string, 'page' | 'document'>();
-    let indexChildren = 0;
+    let indexChildren = 0, filesRead = 0, filesFailed = 0;
     // Files are fetched a few at a time and read in queue order, whatever order they answer in, so the links are the
     // same on every read. An index's children are queued by how useful they are (people, offices and the firm's own
     // pages before news and events) and each file adds at most MAX_URLS_PER_SITEMAP links, so a news sitemap of
@@ -80,8 +80,12 @@ export async function readSitemap(domain: string, signal: AbortSignal, transport
       }
       // One file that cannot be read (too large, a dropped connection) is skipped, not the whole read: hklaw.com's 1.4 MB
       // insights sitemap made every read fail, so no crawl was seeded. A stopped scan still stops it.
-      const texts = await Promise.all(batch.map(url => fetchSitemap(url).catch(error => {
+      const texts = await Promise.all(batch.map(url => fetchSitemap(url).then(text => {
+        if (text !== null) filesRead++;
+        return text;
+      }, error => {
         if (signal.aborted) throw error;
+        filesFailed++;
         return null;
       })));
       const children: string[] = [];
@@ -105,7 +109,8 @@ export async function readSitemap(domain: string, signal: AbortSignal, transport
     const ordered = [...links].map(([url, kind]) => ({ url, kind }))
       .sort((a, b) => (a.kind === b.kind ? pagePriority(a.url) - pagePriority(b.url) : a.kind === 'page' ? -1 : 1) || a.url.localeCompare(b.url))
       .slice(0, MAX_SITEMAP_URLS);
-    return { links: ordered, detail: ordered.length ? null : 'NO_SITEMAP_URLS' };
+    // Nothing read because every file failed is a failed read, not a site without a sitemap.
+    return { links: ordered, detail: ordered.length ? null : filesFailed && !filesRead ? 'SITEMAP_READ_FAILED' : 'NO_SITEMAP_URLS' };
   } catch (error) {
     return { links: [], detail: error instanceof Error ? error.message.slice(0, 200) : 'SITEMAP_READ_FAILED' };
   }
