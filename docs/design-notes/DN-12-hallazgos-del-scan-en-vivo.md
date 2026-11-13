@@ -2,7 +2,8 @@
 
 - **Fecha:** 2026-11-09
 - **Estado:** hecho en las dos ramas, sin publicar. Cada arreglo tiene su sección (§3 a §8); la verificación
-  conjunta en mock está en §10.
+  conjunta en mock está en §10. La §12 (2026-11-12) recoge los arreglos tras dos scans en vivo de una firma grande
+  que dieron scores distintos.
 - **Repos:** `Arca-back` y `Arca-front`, rama `fix/live-scan-findings` en ambos
 - **Parte de:** DN-07 de crawl (§6, robots y web ilegible), DN-09 (modos), DN-10 y DN-11 (webapp)
 
@@ -367,6 +368,12 @@ como 0. La línea de arranque de `live-debug` dice qué está activo:
 
 ### 5.1 Techo de gasto de Apify
 
+> **Actualización del 2026-11-12 (§12.4 y §12.5).** La reserva ya no es USD 1 para todo run: depende del tipo
+> (USD 1 una búsqueda por firma, USD 0,10 una dirigida del Bar, USD 0,40 una dirigida de Avvo), y el techo
+> exige que quepa cada una. Un arranque cuyo nombre de host no resolvió no salió de la máquina: se reintenta y,
+> si nunca resuelve, cuenta 0 en vez de quedar `START_UNCERTAIN`. Las tablas de abajo describen el 2026-11-09;
+> donde dicen `APIFY_EXPECTED_COST_USD_PER_RUN` o USD 1, léase la reserva del tipo de run.
+
 **Qué pasaba.** Desde el 2026-09-21 el gasto de Apify se registra en el ledger pero nada lo limita (DN-06;
 DN-08, "Riesgos y decisiones pendientes", punto 2). Un scan lanza un run por abogado y por directorio (2N runs), y cuando la web da nombre de
 firma pero ningún abogado lanza una sola búsqueda por firma en el Bar que pide hasta 1.000.000 de
@@ -384,7 +391,7 @@ Cómo cuenta cada fila de `apify_runs` (`committedUsd`, en `apify-client.ts`):
 | Arrancada y sin liquidar (en vuelo o terminada) | Su reserva entera (`reserved_usd`, `APIFY_EXPECTED_COST_USD_PER_RUN`, 1 USD), o el coste ya leído si es mayor |
 | Reservada y a punto de arrancar | Su reserva, hasta que caduca |
 | Arranque sin respuesta (`START_UNCERTAIN`: la petición salió y la respuesta se perdió) | Su reserva, durante toda la ventana de 24 horas |
-| Nunca arrancada (rechazada por el límite de uso o por Apify con un error HTTP, caducada) | 0 |
+| Nunca arrancada (rechazada por el límite de uso o por Apify con un error HTTP, nombre de host sin resolver, caducada) | 0 |
 | Rechazada por el techo | No se lee |
 
 La regla es: `comprometido por las demás filas + reserva de este run > techo` significa rechazo.
@@ -964,3 +971,112 @@ Con ellos, `npm test` da 1252 de 1252.
 
 Lo que no cambió, a propósito: los límites de §4.6 (plantilla cortada, filas antiguas sin código, sitio que siempre
 llega al plazo).
+
+## 12. Mismo despacho, dos scores: firma grande (2026-11-12)
+
+### 12.1 Qué pasó
+
+Dos scans en vivo de `hklaw.com` (Holland & Knight, unos 2.200 abogados y 36 oficinas), con minutos de
+diferencia y las mismas 20 páginas leídas, dieron score 3 y 0. Los registros guardados del website (páginas,
+diagnósticos con las llamadas a herramientas, extracción, revisión y grounding) explican la diferencia:
+
+| # | Causa | Evidencia |
+|---|---|---|
+| 1 | La extracción agéntica elige sus herramientas, y el modelo (`gpt-6-luna`, de razonamiento: sin `temperature` ni `seed`) no elige igual dos veces | El primer scan leyó el sitemap (400 URLs) y buscó en el sitio; el segundo no leyó el sitemap y paró con `NO_NEW_EVIDENCE` |
+| 2 | `find_in_site` solo busca en lo ya leído | La búsqueda de IA devolvió 3 pasajes de noticias; la página de IA de la firma, enlazada desde la portada, nunca se leyó. Gobernanza de IA (35 de 100 puntos) quedó desconocida |
+| 3 | Los abogados de una firma grande salieron de un comunicado de prensa | 5 de los 6 buscados no eran miembros del Bar de Florida. El roster leía como página de equipo un comunicado cuya URL contiene `attorneys` |
+| 4a | Cada run de Apify reservaba USD 1 contra el techo de USD 2 de `live-debug` | El primer scan se cortó tras dos runs que costaron USD 0,045 |
+| 4b | El arranque de la búsqueda por firma del segundo scan falló en 1,3 s sin respuesta HTTP | Quedó `START_UNCERTAIN` sin el error de fondo. Reproducido en esta máquina: `getaddrinfo ENOTFOUND api.apify.com`, más o menos 1 de cada 60 |
+
+### 12.2 Pasos fijos de evidencia antes de las rondas del modelo (A)
+
+**Decisión. [mía]** Lo que no necesita al modelo se hace siempre y en el mismo orden, antes de la primera ronda
+de afirmaciones, y no añade ninguna llamada al modelo:
+
+1. Leer el sitemap (`read_sitemap`, el mismo camino de siempre). Sus URLs entran en los candidatos que el plan
+   de páginas clasifica. Si el modelo lo pide después, encuentra `ALREADY_READ`.
+2. El plan de páginas de siempre (tres votos de clasificación y el suelo de equipo, about, contacto y PDF de
+   privacidad).
+3. Leer hasta 4 páginas no leídas del propio sitio (`FIXED_FETCH_LIMIT`), sacadas del sitemap y de los enlaces
+   de las páginas leídas: primero las de IA, innovación o tecnología legal de la firma, después su directorio de
+   personas y su página de oficinas. Nunca noticias, eventos, publicaciones ni nada fechado por año y mes; una
+   página de práctica sobre IA (consejo a clientes) solo ocupa un hueco de IA si no hay nada mejor. Pasan por la
+   misma herramienta `fetch_pages`, que respeta robots.txt y el host. Entran como páginas pedidas, así que el
+   corpus las coloca por delante de noticias y prácticas dentro del presupuesto de 24.000 caracteres.
+4. Una búsqueda de IA fija (`AI_SEARCH_TERMS`) sobre todo lo leído, primero las páginas recién leídas, como
+   mucho 8 pasajes: comparten el prompt con el corpus y el límite de 24.000 tokens por llamada de DN-05 sigue.
+
+Las llamadas quedan en el historial como ronda 0. El modelo solo decide qué afirmar con lo reunido y puede pedir
+más herramientas en las rondas siguientes, como antes. El tope de peticiones a OpenAI por scan (§5.2) no cambia:
+estos pasos no hacen ninguna. Van con el plan de páginas (`planPages`); `EXTRACTION_VERSION` pasa a
+`agentic-signals-v6`, así que los análisis guardados con la v5 no se reutilizan (§4.3).
+
+Comprobado sobre los dos registros reales, sin red: en ambos los pasos fijos eligen la página de IA de la firma,
+su directorio de profesionales y su página de oficinas, y leen Miami y Tampa como oficinas de Florida.
+
+### 12.3 De dónde salen los nombres de abogados (B)
+
+- El roster ya no lee como página de equipo una de noticias, comunicados o blog, aunque su URL diga
+  `attorneys`. Sí lee `/people` y `/professionals`.
+- Un nombre citado solo desde noticias, comunicados o blog se descarta si alguna otra página nombra abogados
+  (diagnóstico `attorneySource`: `roster`, `site`, `news_only` o `none`). Si nada más los nombra, se quedan y la
+  website data lo marca con `provenance.team_members_news_only`.
+- El roster ya no borra un total de abogados que el sitio declara en otra página cuando él no da uno: el
+  grounding lo sigue rechazando frente a un roster incompleto, y es lo que distingue una firma grande.
+
+### 12.4 Firma grande en el Bar y reserva por tipo de run (C, D)
+
+En [DN-06](DN-06-apify-cost-quality-plan.md) §10: para una firma que declara más de 50 abogados, o cuyos nombres
+solo salen de noticias, o sin nombres, el Bar se busca por firma en cada ciudad de Florida donde el sitio lista
+una oficina, como mucho 3; los nombres solo de noticias no alimentan ninguna búsqueda. Sin ciudad de Florida,
+nada cambia. Y la reserva depende del tipo de run:
+
+| Con el techo por defecto de USD 2 | Antes | Ahora |
+|---|---|---|
+| Búsquedas dirigidas del Bar | 2 | 20 (USD 0,10 cada una) |
+| Búsquedas dirigidas de Avvo | 2 | 5 (USD 0,40) |
+| Búsquedas por firma (todo el registro o una ciudad) | 2 | 2 (USD 1) |
+| Firma grande con 3 oficinas en Florida | — | Caben 2 búsquedas por firma hasta que se liquiden, entre las del Bar por ciudad y la de Avvo por firma si la hay; el resto se rechaza y el directorio queda `partial` por causa transitoria. Para una firma así hay que subir el techo (§5.3) |
+
+### 12.5 Arranque de Apify que no salió de la máquina (E)
+
+Si el POST de arranque falla con un error de DNS (`ENOTFOUND` o `EAI_AGAIN` en la causa del error de `fetch`),
+la petición no salió: ningún run pudo arrancar y repetirla es seguro. Se reintenta 2 veces, a los 0,5 s y a los
+1,5 s. Si nunca resuelve, la fila del ledger queda `UNAVAILABLE`, caducada en el acto: no cuenta contra el techo,
+no deja la consulta en cooldown y el siguiente scan vuelve a intentarlo. El directorio sale `PROVIDER_ERROR`,
+causa transitoria. Cualquier otro fallo sin respuesta HTTP (conexión cortada, plazo, respuesta perdida) sigue
+siendo `START_UNCERTAIN`, sin reintento, como en §5.1.
+
+`last_error` guarda ahora el error de fondo, recortado a 300 caracteres: `Actor start response unavailable: fetch
+failed (read ECONNRESET)` o `Actor start not sent: the Apify host name did not resolve: fetch failed (getaddrinfo
+ENOTFOUND api.apify.com)`. El reintento de DNS del crawler (`network.ts`) es otro cambio, de otra rama.
+
+### 12.6 Tests
+
+Sin red, sin OpenAI y sin Apify: clientes y transportes inyectados.
+
+- `apps/api/tests/unit/agentic-fixed-evidence.test.ts`: orden fijo (sitemap, lectura, búsqueda) antes de la
+  primera ronda y sin ninguna llamada más al modelo; la página de IA llega al prompt por delante de las noticias;
+  la misma evidencia pida lo que pida el modelo después; selección de destinos; ciudades de Florida por enlace y
+  por texto, sin las de fuera; nombres solo de noticias descartados o marcados; un comunicado con `attorneys` en
+  la URL no es página de equipo. Fixtures sintéticas: URLs y frases cortas escritas para el test.
+- `directory-inputs.test.ts` y `directory-scope.test.ts`: búsqueda del Bar por ciudad, tope y orden, sin ciudad
+  como antes, Avvo, deduplicado y motivo; reglas de `directoryScope`. `pipeline.test.ts`: la consulta lleva las
+  ciudades.
+- `apify-reservations.test.ts`: reserva por tipo, cuántas caben bajo el techo y que los límites de cargo nunca lo
+  pasan, los dos tipos contra un mismo techo, la variable que nombra el log; reintento de DNS hasta que resuelve,
+  abandono sin `START_UNCERTAIN`, sin reintento para otros fallos, recorte del error y parada si el llamador
+  cancela. `env.test.ts` y `compose.test.ts`: variables nuevas y validación contra el techo.
+- Actualizados: versión v6, las grabaciones de la repetición determinista (`harbor-vale`, regrabadas con el
+  modelo escrito a mano de la fixture, ninguna llamada real) con un sitemap grabado, y la línea de coste (cuatro
+  búsquedas dirigidas reservan USD 0,40; el test del techo usa USD 0,20).
+
+### 12.7 Lo que queda fuera
+
+- **Sin canario real.** Nada de esto se ha probado contra `hklaw.com` ni contra Apify: el comportamiento del actor
+  del Bar con `locationType: 'city'` sale de su esquema de entrada publicado, no de un run.
+- **El directorio de personas de una firma grande** suele ser un buscador sin nombres: la lectura fija lo trae,
+  pero no garantiza un roster. Por eso la firma grande va por oficinas.
+- **Ciudades de Florida** se leen contra una lista cerrada de ciudades con despachos y con "Ciudad, FL" en
+  páginas de oficinas o contacto. Una ciudad pequeña que solo aparece como enlace, sin el estado, no se reconoce.
+- **El total de abogados** sigue sin pasar a `team_size` (scoring); solo marca la firma grande.
