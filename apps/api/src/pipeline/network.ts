@@ -2,12 +2,39 @@ import { lookup } from 'node:dns/promises';
 import ipaddr from 'ipaddr.js';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-async function publicAddresses(raw: string) {
+import { setTimeout as sleep } from 'node:timers/promises';
+
+export type HostLookup = (host: string, options: { all: true }) => Promise<Array<{ address: string; family: number }>>;
+/**
+ * The pauses before the second and third lookup of a name. A resolver that loses one lookup in sixty (a home router
+ * did) otherwise fails the robots.txt of a whole site now and then, and with it the scan.
+ */
+export const DNS_RETRY_DELAYS_MS: readonly number[] = [250, 750];
+/** Failures that may differ a moment later: nothing found, a temporary resolver failure, a lookup that timed out. */
+const RETRIED_LOOKUP = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ETIMEOUT', 'ETIMEDOUT']);
+export type AddressOptions = { lookup?: HostLookup; delaysMs?: readonly number[]; signal?: AbortSignal };
+async function lookupHost(host: string, options: AddressOptions) {
+  const delays = options.delaysMs ?? DNS_RETRY_DELAYS_MS;
+  const lookupFn: HostLookup = options.lookup ?? ((name, all) => lookup(name, all));
+  for (let attempt = 0; ; attempt++) {
+    try { return await lookupFn(host, { all: true }); }
+    catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (attempt >= delays.length || typeof code !== 'string' || !RETRIED_LOOKUP.has(code)) throw error;
+      await sleep(delays[attempt], undefined, options.signal ? { signal: options.signal } : undefined);
+    }
+  }
+}
+/**
+ * The addresses a URL may be fetched from: public unicast only, validated on the answer of the last lookup, which is
+ * the one the socket is pinned to.
+ */
+export async function publicAddresses(raw: string, options: AddressOptions = {}) {
   const url = new URL(raw);
   if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password ||
     (url.port && url.port !== '80' && url.port !== '443')) throw new Error('Unsafe URL');
   const host = url.hostname.replace(/^\[|\]$/g, '');
-  const addresses = ipaddr.isValid(host) ? [{ address: host, family: ipaddr.parse(host).kind() === 'ipv4' ? 4 : 6 }] : await lookup(host, { all: true });
+  const addresses = ipaddr.isValid(host) ? [{ address: host, family: ipaddr.parse(host).kind() === 'ipv4' ? 4 : 6 }] : await lookupHost(host, options);
   if (!addresses.length || addresses.some(({ address }) => ipaddr.process(address).range() !== 'unicast')) {
     throw new Error('Non-public network target');
   }
@@ -41,7 +68,7 @@ export function collectBody(stream: BodyStream, limit: BodyLimit): Promise<Buffe
 }
 export async function fetchPublicResponse(raw: string, signal: AbortSignal, method = 'GET', body?: Buffer | null,
   limit: BodyLimit = { maxBytes: 5_000_000 }): Promise<PublicResponse> {
-  const addresses = await publicAddresses(raw);
+  const addresses = await publicAddresses(raw, { signal });
   signal.throwIfAborted();
   const url = new URL(raw);
   // Pin the validated lookup result to the socket; never resolve the hostname again after validation.
