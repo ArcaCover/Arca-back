@@ -1,5 +1,5 @@
-import { expect, it } from 'vitest';
-import { buildDirectoryInputs } from '../../src/pipeline/directories.js';
+import { describe, expect, it, vi } from 'vitest';
+import { ApifyDirectorySource, BAR_MAX_OFFICE_SEARCHES, BAR_TECHNICAL_MAX_LAWYERS, buildDirectoryInputs } from '../../src/pipeline/directories.js';
 
 const query = (names: string[]) => ({ canonicalDomain: 'firm.com', names, firmName: 'Duque Immigration Law, PLLC', city: 'Miami', state: 'FL' as const });
 
@@ -40,4 +40,62 @@ it('keeps named Avvo lookups without a city, because the targeted cap bounds eac
 it('scopes the Avvo city to the jurisdiction of the query', () => {
   const [input] = buildDirectoryInputs('avvo', { ...query([]), state: 'GA' });
   expect(input?.input).toMatchObject({ cities: ['Miami, GA'] });
+});
+
+describe('Florida Bar search scoped to the firm\'s Florida offices', () => {
+  const big = { canonicalDomain: 'bigfirm.com', names: [], firmName: 'Holland & Knight', city: null, state: 'FL' as const };
+
+  it('searches the firm in each Florida office city instead of the whole registry', () => {
+    const inputs = buildDirectoryInputs('bar', { ...big, officeCities: ['Miami', 'Tampa'] });
+    expect(inputs.map(item => item.target)).toEqual(['Holland & Knight (Miami)', 'Holland & Knight (Tampa)']);
+    for (const [index, city] of ['Miami', 'Tampa'].entries()) {
+      expect(inputs[index]).toMatchObject({ fallback: true, kind: 'firm', firm: 'Holland & Knight', resultLimit: BAR_TECHNICAL_MAX_LAWYERS,
+        input: { lastNames: [], firstName: '', firm: 'Holland & Knight', locationType: 'city', locations: [city], maxLawyers: BAR_TECHNICAL_MAX_LAWYERS } });
+    }
+  });
+
+  it('caps the number of city searches and keeps the order it was given', () => {
+    const inputs = buildDirectoryInputs('bar', { ...big, officeCities: ['Miami', 'Tampa', 'Orlando', 'Jacksonville', 'miami'] });
+    expect(inputs).toHaveLength(BAR_MAX_OFFICE_SEARCHES);
+    expect(BAR_MAX_OFFICE_SEARCHES).toBe(3);
+    expect(inputs.map(item => item.input.locations)).toEqual([['Miami'], ['Tampa'], ['Orlando']]);
+  });
+
+  it('uses the offices even when the website named some attorneys', () => {
+    const inputs = buildDirectoryInputs('bar', { ...big, names: ['Jane Doe'], officeCities: ['Miami'] });
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]).toMatchObject({ fallback: true, input: { locations: ['Miami'] } });
+  });
+
+  it('keeps today\'s behaviour when no Florida office city is known', () => {
+    expect(buildDirectoryInputs('bar', { ...big, officeCities: [] })).toEqual(buildDirectoryInputs('bar', big));
+    expect(buildDirectoryInputs('bar', big)[0]).toMatchObject({ kind: 'firm', input: { firm: 'Holland & Knight' } });
+    expect(buildDirectoryInputs('bar', big)[0]!.input).not.toHaveProperty('locations');
+    expect(buildDirectoryInputs('bar', { ...big, names: ['Jane Doe'] })[0]).toMatchObject({ kind: 'targeted', fallback: false });
+  });
+
+  it('leaves the Avvo plan to names and the verified city, using an office city only when no city was verified', () => {
+    expect(buildDirectoryInputs('avvo', { ...big, names: ['Jane Doe'], officeCities: ['Tampa'] })[0])
+      .toMatchObject({ kind: 'targeted', input: { searchQueries: ['Jane Doe'] } });
+    expect(buildDirectoryInputs('avvo', { ...big, officeCities: ['Tampa'] })[0])
+      .toMatchObject({ kind: 'firm', input: { searchQueries: ['Holland & Knight'], cities: ['Tampa, FL'] } });
+    expect(buildDirectoryInputs('avvo', { ...big, city: 'Miami', officeCities: ['Tampa'] })[0])
+      .toMatchObject({ input: { cities: ['Miami, FL'] } });
+  });
+
+  it('keeps every attorney of the firm the city searches return, once, and says which offices it covered', async () => {
+    const rows: Record<string, Array<Record<string, unknown>>> = {
+      Miami: [{ name: 'Ana Ruiz', firm: 'Holland & Knight LLP', barNumber: '1' }, { name: 'Bob Other', firm: 'Other LLP', barNumber: '2' }],
+      Tampa: [{ name: 'Carl Diaz', firm: 'Holland & Knight LLP', barNumber: '3' }, { name: 'Ana Ruiz', firm: 'Holland & Knight LLP', barNumber: '1' }],
+      Orlando: [],
+    };
+    const run = vi.fn(async (_actor: string, input: Record<string, unknown>) => rows[(input.locations as string[])[0]!]!);
+    const result = await new ApifyDirectorySource('bar', { run })
+      .run({ ...big, officeCities: ['Miami', 'Tampa', 'Orlando', 'Jacksonville'] }, new AbortController().signal);
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(result.data?.map(match => match.attorney?.name)).toEqual(['Ana Ruiz', 'Carl Diaz']);
+    expect(result.data?.every(match => match.matchConfidence === 'firm_fallback')).toBe(true);
+    expect(result.status).toMatchObject({ status: 'ok', attorneysSearched: null, attorneysFound: 2 });
+    expect(result.status.reason).toBe('Firm searched in 3 of its 4 Florida office cities: Miami, Tampa, Orlando');
+  });
 });

@@ -9,7 +9,7 @@ import { ApifyClient } from '../../src/pipeline/apify-client.js';
 import { ApifyDirectorySource } from '../../src/pipeline/directories.js';
 import type { CrawledPage } from '../../src/pipeline/crawler.js';
 import { canonicalJson, replayAccess, replayApify, replayModel, type ApifyRecording, type ModelRecordings } from '../fixtures/replay/replay.js';
-import { ACCESS_PAGES, DOMAIN, PAGES, withChangedText, withHtmlNoise } from '../fixtures/replay/harbor-vale/site.js';
+import { ACCESS_PAGES, DOMAIN, PAGES, SITEMAP, withChangedText, withHtmlNoise } from '../fixtures/replay/harbor-vale/site.js';
 import { scriptedModel } from '../fixtures/replay/harbor-vale/scripted-model.js';
 
 // DN-12 §4.5. The real pipeline (website source, agentic extraction, grounding, Apify client and ledger, directory
@@ -30,7 +30,7 @@ const NOW = Date.parse('2026-11-09T12:00:00.000Z');
 let scans = 0;
 /** One scan through the real pipeline, stored the way POST /scan stores it. Every scan gets fresh clients and counters. */
 async function scan(repository: InMemoryRepository, pages: CrawledPage[] = PAGES) {
-  const llm = replayModel(model, RECORDING ? scriptedModel : undefined), reader = replayAccess(ACCESS_PAGES), apify = replayApify(apifyRecordings);
+  const llm = replayModel(model, RECORDING ? scriptedModel : undefined), reader = replayAccess(ACCESS_PAGES, SITEMAP), apify = replayApify(apifyRecordings);
   const website = new WebsiteExtractionSource(repository,
     new AgenticEvidenceProvider('replay-key', undefined, llm.client, reader.access),
     async () => ({ pages: structuredClone(pages), partial: false, issues: [], aborted: false }), { now: () => NOW });

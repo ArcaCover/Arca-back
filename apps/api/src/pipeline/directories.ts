@@ -1,7 +1,7 @@
 import { unknownAttorney, Attorney, type AttorneyMatch, type DirectoryQuery, type DirectorySource, type SourceResult,
   type SourceStatus } from '@arca/contracts';
 import { z } from 'zod';
-import { ApifyClientError, type ApifyRunMetadata, type ApifyRunResult } from './apify-client.js';
+import { ApifyClientError, type ApifyRunKind, type ApifyRunMetadata, type ApifyRunResult } from './apify-client.js';
 import { normalizeName, stableSample, matchAttorney } from './matching.js';
 import { compareText, validDate } from '@arca/scoring';
 
@@ -14,6 +14,8 @@ export const BAR_TECHNICAL_MAX_LAWYERS = 1_000_000;
 export const AVVO_TECHNICAL_MAX_LAWYERS = 100_000;
 export const BAR_TARGETED_MAX_LAWYERS = 25;
 export const AVVO_TARGETED_MAX_LAWYERS = 10;
+// City searches of one firm in the Florida Bar, one run each (DN-06 §10). Each is a firm search and reserves as one.
+export const BAR_MAX_OFFICE_SEARCHES = 3;
 // Lookups one source keeps in flight. Bar and Avvo run side by side, so two sources fill the
 // default MAX_APIFY_CONCURRENCY of 16; the Apify client queues anything beyond its limit.
 export const DIRECTORY_LOOKUPS_IN_FLIGHT = 8;
@@ -99,8 +101,12 @@ const providerError = (item: unknown) => {
   return typeof row?.error === 'string' ? row.error.trim() : null;
 };
 const isNoMatch = (item: unknown) => /^no lawyers? matched\b|^no results?\b/i.test(providerError(item) ?? '');
+/**
+ * One planned lookup. `fallback` marks a firm search, whose whole dataset is the firm's roster in its scope; `firm` is the
+ * firm it searched, which a returned lawyer must belong to. `kind` is what the run reserves against the spend ceiling.
+ */
 export type DirectoryInput = { target: string; actor: string; input: Record<string, unknown>; fallback: boolean;
-  resultLimit: number };
+  resultLimit: number; kind: ApifyRunKind; firm: string | null };
 function surname(name: string) {
   const parts = normalizeName(name).split(' ');
   let start = parts.length - 1;
@@ -108,14 +114,36 @@ function surname(name: string) {
     .includes(parts[start - 1]!)) start--;
   return parts.slice(start).join(' ');
 }
+/** The Florida office cities a Bar firm search covers, in the order given, once each and at most BAR_MAX_OFFICE_SEARCHES. */
+function officeSearchCities(query: DirectoryQuery): string[] {
+  const seen = new Set<string>();
+  return (query.officeCities ?? []).map(city => city.trim()).filter(city => {
+    const key = city.toLocaleLowerCase();
+    if (!city || seen.has(key)) return false;
+    seen.add(key); return true;
+  });
+}
 export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQuery, targetedMaxLawyers =
   source === 'bar' ? BAR_TARGETED_MAX_LAWYERS : AVVO_TARGETED_MAX_LAWYERS): DirectoryInput[] {
+  // DN-06 §10: a large firm, or one whose only names came from news pages, is looked up in the Bar by firm in each
+  // of its Florida office cities. Every lawyer of the firm there is returned, with the technical maximum and no
+  // sample, as the firm-wide search does; the city bounds the run instead of the whole registry.
+  const offices = source === 'bar' && query.firmName ? officeSearchCities(query) : [];
+  if (offices.length) {
+    const firm = query.firmName!;
+    return offices.slice(0, BAR_MAX_OFFICE_SEARCHES).map(city => ({ target: `${firm} (${city})`, actor: BAR_ACTOR, fallback: true,
+      kind: 'firm' as const, firm, resultLimit: BAR_TECHNICAL_MAX_LAWYERS,
+      input: { lastNames: [], firstName: '', firm, locationType: 'city', locations: [city], maxLawyers: BAR_TECHNICAL_MAX_LAWYERS,
+        withDetails: true, withLeadScore: false, withProfileSummary: false, eligibleOnly: false, includeDeceased: true } }));
+  }
   const names = stableSample(query.names);
   const fallback = names.length === 0;
   // DN-06: without a verified city an Avvo firm search expands to the whole country with a
   // technical maximum of 100,000 lawyers. Nothing caps that spend any more (D8), so it is not run.
   // Named lookups stay: the targeted maximum bounds each one whether or not a city is known.
-  const location = query.city && query.state ? `${query.city}, ${query.state}` : null;
+  // A Florida office city the website lists scopes it when no city was verified.
+  const city = query.city ?? officeSearchCities(query)[0] ?? null;
+  const location = city && query.state ? `${city}, ${query.state}` : null;
   const unscopedFirmSearch = fallback && source === 'avvo' && location === null;
   const targets = unscopedFirmSearch ? [] : fallback ? (query.firmName ? [query.firmName] : []) : names;
   return targets.map(target => {
@@ -130,7 +158,8 @@ export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQue
       withLeadScore: false, withProfileSummary: false, eligibleOnly: false, includeDeceased: true,
     } : { searchQueries: [target], ...(location ? { cities: [location] } : {}),
       withDetails: true, maxLawyers: resultLimit };
-    return { target, actor: source === 'bar' ? BAR_ACTOR : AVVO_ACTOR, input, fallback, resultLimit };
+    return { target, actor: source === 'bar' ? BAR_ACTOR : AVVO_ACTOR, input, fallback, resultLimit,
+      kind: fallback ? 'firm' as const : 'targeted' as const, firm: fallback ? target : null };
   });
 }
 // What a directory returns when its query yields no lookup target: Apify is never called. The debug sources reuse it
@@ -144,7 +173,7 @@ export function nothingToLookUp(query: DirectoryQuery): SourceResult<AttorneyMat
     attorneysSearched: 0, attorneysFound: 0, candidatesReceived: 0, recordsValid: 0, providerRuns: [], costUsd: 0 } };
 }
 type DirectoryClient = { run(actor: string, input: Record<string, unknown>, signal: AbortSignal,
-  context?: { scanId?: string }): Promise<unknown[] | ApifyRunResult>;
+  context?: { scanId?: string; kind?: ApifyRunKind }): Promise<unknown[] | ApifyRunResult>;
   recordAccepted?(metadata: ApifyRunMetadata, acceptedCount: number): Promise<void> };
 export class ApifyDirectorySource implements DirectorySource {
   readonly jurisdiction?: string;
@@ -156,9 +185,11 @@ export class ApifyDirectorySource implements DirectorySource {
     const started = Date.now();
     const planned = buildDirectoryInputs(this.source, query, this.options.targetedMaxLawyers);
     const names = stableSample(query.names);
-    const fallback = names.length === 0;
+    if (!planned.length) return nothingToLookUp(query);
+    // Firm searches, whole-registry or one per Florida office city, or named lookups: a plan is never both.
+    const fallback = planned.every(item => item.fallback);
     const targets = planned.map(item => item.target);
-    if (!targets.length) return nothingToLookUp(query);
+    const offices = this.source === 'bar' && fallback ? officeSearchCities(query) : [];
     const rawResults: { target: string; items: unknown[] | null; error: string | null }[] = [];
     const matches: AttorneyMatch[] = [];
     const providerRuns: NonNullable<SourceStatus['providerRuns']> = [];
@@ -179,7 +210,7 @@ export class ApifyDirectorySource implements DirectorySource {
         }
         try {
           const plan = planned.find(item => item.target === target)!;
-          const output = await this.client.run(plan.actor, plan.input, signal, { scanId: query.scanId });
+          const output = await this.client.run(plan.actor, plan.input, signal, { scanId: query.scanId, kind: plan.kind });
           const items = Array.isArray(output) ? output : output.items;
           const metadata = Array.isArray(output) ? null : output.metadata;
           if (metadata) {
@@ -202,8 +233,11 @@ export class ApifyDirectorySource implements DirectorySource {
           if (fallback) {
             // A firm fallback is one run whose complete, paginated dataset is the roster. Do not
             // discard any attorney from it or score the firm on an alphabetical sample.
-            const firmKeys = [target, ...(query.aliases ?? [])].map(firmKey);
-            const people = valid.filter(person => person.firmName && firmKeys.includes(firmKey(person.firmName)))
+            const firmKeys = [plan.firm ?? target, ...(query.aliases ?? [])].map(firmKey);
+            // City searches of one firm do not overlap, but a lawyer listed in two of them is still one lawyer.
+            const known = (person: Attorney) => matches.some(match => match.attorney && (person.barNumber
+              ? match.attorney.barNumber === person.barNumber : normalizeName(match.attorney.name) === normalizeName(person.name)));
+            const people = valid.filter(person => person.firmName && firmKeys.includes(firmKey(person.firmName)) && !known(person))
               .sort((a, b) => normalizeName(a.name).localeCompare(normalizeName(b.name)));
             accepted = people.length;
             matches.push(...people.map(attorney => ({ searchedName: target, matchConfidence: 'firm_fallback' as const, attorney, ambiguous: false })));
@@ -252,6 +286,12 @@ export class ApifyDirectorySource implements DirectorySource {
       truncations > 0 && failed === truncations ? 'TRUNCATED' :
       !successful ? 'PROVIDER_ERROR' : failed > providerFailures ? 'PROVIDER_CONTRACT_ERROR' : failed ? 'PROVIDER_ERROR'
         : found ? undefined : 'NO_MATCH';
+    // Which offices the roster covers: a firm with more Florida offices than the cap is not searched in all of them.
+    const searched = offices.slice(0, BAR_MAX_OFFICE_SEARCHES);
+    const scope = !offices.length ? null : offices.length > searched.length
+      ? `Firm searched in ${searched.length} of its ${offices.length} Florida office cities: ${searched.join(', ')}`
+      : `Firm searched in its Florida office cities: ${searched.join(', ')}`;
+    const noMatch = 'Provider completed successfully with no accepted identity match';
     return { data: successful ? matches : null, rawContent: JSON.stringify({
       queries: rawResults.sort((a, b) => a.target.localeCompare(b.target)), providerRuns }),
       status: { status: failed ? successful ? 'partial' : signal.aborted ? 'timeout' : 'error' : 'ok',
@@ -262,6 +302,6 @@ export class ApifyDirectorySource implements DirectorySource {
         costPerAcceptedAttorneyUsd, ...(code ? { code } : {}),
         reason: quotaReached ? APIFY_QUOTA_REASON : ceilingRefusals ? APIFY_SPEND_CEILING_REASON :
           failed ? 'One or more targeted lookups were incomplete; raw responses retained' :
-          found ? null : 'Provider completed successfully with no accepted identity match' } };
+          found ? scope : scope ? `${noMatch}. ${scope}` : noMatch } };
   }
 }

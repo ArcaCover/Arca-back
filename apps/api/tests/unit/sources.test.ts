@@ -50,7 +50,7 @@ describe('provider evidence boundaries', () => {
     await new ApifyDirectorySource('avvo', { run }).run(query, new AbortController().signal);
     expect(run).toHaveBeenCalledWith(AVVO_ACTOR, {
       searchQueries: ['Jane Smith'], cities: ['Miami, FL'], withDetails: true, maxLawyers: AVVO_TARGETED_MAX_LAWYERS,
-    }, expect.any(AbortSignal), { scanId: undefined });
+    }, expect.any(AbortSignal), { scanId: undefined, kind: 'targeted' });
     expect(AVVO_ACTOR).toBe('scrapers_lat/avvo-lawyers-scraper');
   });
   it('caps targeted searches while preserving technical maxima for complete firm fallbacks', async () => {
@@ -58,12 +58,12 @@ describe('provider evidence boundaries', () => {
     const signal = new AbortController().signal;
     await new ApifyDirectorySource('bar', { run }).run(query, signal);
     await new ApifyDirectorySource('avvo', { run }).run(query, signal);
-    expect(run).toHaveBeenNthCalledWith(1, BAR_ACTOR, expect.objectContaining({ maxLawyers: BAR_TARGETED_MAX_LAWYERS }), signal, { scanId: undefined });
-    expect(run).toHaveBeenNthCalledWith(2, AVVO_ACTOR, expect.objectContaining({ maxLawyers: AVVO_TARGETED_MAX_LAWYERS }), signal, { scanId: undefined });
+    expect(run).toHaveBeenNthCalledWith(1, BAR_ACTOR, expect.objectContaining({ maxLawyers: BAR_TARGETED_MAX_LAWYERS }), signal, { scanId: undefined, kind: 'targeted' });
+    expect(run).toHaveBeenNthCalledWith(2, AVVO_ACTOR, expect.objectContaining({ maxLawyers: AVVO_TARGETED_MAX_LAWYERS }), signal, { scanId: undefined, kind: 'targeted' });
     await new ApifyDirectorySource('bar', { run }).run({ ...query, names: [] }, signal);
     await new ApifyDirectorySource('avvo', { run }).run({ ...query, names: [] }, signal);
-    expect(run).toHaveBeenNthCalledWith(3, BAR_ACTOR, expect.objectContaining({ maxLawyers: BAR_TECHNICAL_MAX_LAWYERS }), signal, { scanId: undefined });
-    expect(run).toHaveBeenNthCalledWith(4, AVVO_ACTOR, expect.objectContaining({ maxLawyers: AVVO_TECHNICAL_MAX_LAWYERS }), signal, { scanId: undefined });
+    expect(run).toHaveBeenNthCalledWith(3, BAR_ACTOR, expect.objectContaining({ maxLawyers: BAR_TECHNICAL_MAX_LAWYERS }), signal, { scanId: undefined, kind: 'firm' });
+    expect(run).toHaveBeenNthCalledWith(4, AVVO_ACTOR, expect.objectContaining({ maxLawyers: AVVO_TECHNICAL_MAX_LAWYERS }), signal, { scanId: undefined, kind: 'firm' });
   });
   it('skips an Avvo firm search it could only run nationwide, and says why', async () => {
     const run = vi.fn(async () => []);
@@ -641,7 +641,7 @@ describe('Apify spend ceiling', () => {
       expect(rows(repository).map(row => row.status)).toEqual(['START_UNCERTAIN', 'UNAVAILABLE']);
       // A scan that comes to resume the lost start leaves it uncertain.
       await expect(client.run('owner/actor', { name: 'Lost' }, signal())).rejects.toMatchObject({ code: 'PROVIDER_ERROR' });
-      expect(rows(repository)[0]).toMatchObject({ status: 'START_UNCERTAIN', last_error: 'Actor start response unavailable' });
+      expect(rows(repository)[0]).toMatchObject({ status: 'START_UNCERTAIN', last_error: 'Actor start response unavailable: fetch failed' });
       // Long after its reservation expired the lost start may still have been a run: it holds USD 1 of the USD 2.
       clock += 3_600_000;
       answer = 'ok';

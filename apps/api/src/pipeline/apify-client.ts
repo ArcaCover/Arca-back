@@ -23,8 +23,22 @@ export type ApifyRunMetadata = { provider: 'apify'; actor: string; runId: string
   partial?: boolean; cached?: boolean; resumed?: boolean;
   accountingComplete?: boolean; chargedToScan?: boolean; ledgerId?: string };
 export type ApifyRunResult = { items: unknown[]; metadata: ApifyRunMetadata };
-export type ApifyRunContext = { scanId?: string };
-export type ApifyClientOptions = { store?: RunStore; build?: string; expectedCostUsdPerRun?: number;
+/**
+ * `kind` sets what a run reserves (DN-06, DN-12 §5.1): a targeted lookup asks for a few named lawyers and costs cents, a
+ * firm search asks for every lawyer of a firm, in a city or in the whole registry. A caller that does not say is charged
+ * as a firm search, the larger reservation, so the ceiling errs on the side of refusing.
+ */
+export type ApifyRunKind = 'targeted' | 'firm';
+export type ApifyRunContext = { scanId?: string; kind?: ApifyRunKind };
+export type ApifyClientOptions = { store?: RunStore; build?: string;
+  /** What a firm search reserves, and any run whose kind is not given. */
+  expectedCostUsdPerRun?: number;
+  /** What a targeted lookup reserves, unless its actor has a figure of its own below. */
+  expectedCostUsdPerTargetedRun?: number;
+  /** What a targeted lookup of this actor reserves: one with more results per lookup costs more (Avvo, DN-12 §5.1). */
+  expectedCostUsdPerTargetedRunByActor?: Record<string, number>;
+  /** Waits before each new attempt at a start whose host name did not resolve. One entry per retry. */
+  startRetryBackoffMs?: number[];
   cacheTtlMs?: number; activeTtlMs?: number;
   runTimeoutSecs?: number; pollWaitSecs?: number; maxCachedItems?: number;
   /** How long no new run is started after Apify reports the account's usage limit. */
@@ -65,6 +79,35 @@ const SPEND_CEILING_REASON = 'Apify spend ceiling reached';
 const CHARGE_LIMIT_REASON = 'Charge limit reached; the dataset may be incomplete';
 const START_UNCERTAIN = 'START_UNCERTAIN';
 const START_UNCERTAIN_REASON = 'Actor start response unavailable';
+const START_NOT_SENT_REASON = 'Actor start not sent: the Apify host name did not resolve';
+/** Room kept in last_error for the underlying error, so the row says why without storing a whole stack. */
+const LAST_ERROR_CHARS = 300;
+const DNS_CODES = ['ENOTFOUND', 'EAI_AGAIN'];
+
+/**
+ * The DNS code of an error that failed before any request left the machine, or null. Node's fetch throws
+ * `TypeError('fetch failed')` and keeps the resolver's error, with its code, on `cause`.
+ */
+export function dnsFailure(error: unknown): string | null {
+  for (let current = error, depth = 0; current !== null && typeof current === 'object' && depth < 5; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string' && DNS_CODES.includes(code)) return code;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return null;
+}
+/** The message of an error and of what caused it: "fetch failed (getaddrinfo ENOTFOUND api.apify.com)". */
+function errorDetail(error: unknown): string {
+  const messages: string[] = [];
+  for (let current = error, depth = 0; current !== null && current !== undefined && depth < 5; depth++) {
+    const message = current instanceof Error ? current.message : typeof current === 'string' ? current : '';
+    if (message && !messages.includes(message)) messages.push(message);
+    current = typeof current === 'object' ? (current as { cause?: unknown }).cause : undefined;
+  }
+  const [first, ...rest] = messages.length ? messages : ['unknown error'];
+  return rest.length ? `${first} (${rest.join('; ')})` : first!;
+}
+const withDetail = (reason: string, error: unknown) => `${reason}: ${errorDetail(error)}`.slice(0, LAST_ERROR_CHARS);
 const CENT = 0.01;
 /** Whole cents, rounded down; the hair added first keeps a sum such as 1.91 from landing on 1.90. */
 const cents = (usd: number) => Math.floor(usd * 100 + 1e-6) / 100;
@@ -103,6 +146,9 @@ export class ApifyClient {
     private readonly maxConcurrency = 2, options: ApifyClientOptions = {}) {
     this.store = options.store ?? new InMemoryRepository();
     this.options = { build: options.build ?? 'latest', expectedCostUsdPerRun: options.expectedCostUsdPerRun ?? 1,
+      expectedCostUsdPerTargetedRun: options.expectedCostUsdPerTargetedRun ?? 0.1,
+      expectedCostUsdPerTargetedRunByActor: options.expectedCostUsdPerTargetedRunByActor ?? {},
+      startRetryBackoffMs: options.startRetryBackoffMs ?? [500, 1500],
       cacheTtlMs: options.cacheTtlMs ?? 604_800_000, activeTtlMs: options.activeTtlMs ?? 900_000,
       runTimeoutSecs: options.runTimeoutSecs ?? 300, pollWaitSecs: options.pollWaitSecs ?? 10,
       maxCachedItems: options.maxCachedItems ?? 1000, quotaCooldownMs: options.quotaCooldownMs ?? 300_000,
@@ -166,14 +212,14 @@ export class ApifyClient {
    * Refuses a new run the spend ceiling has no room for. The ledger row is expired at once: the refusal says
    * nothing about the query, so it is neither reused nor held in a retry cooldown.
    */
-  private async ceilingReached(record: ApifyRunRecord, committed: number | null): Promise<never> {
+  private async ceilingReached(record: ApifyRunRecord, committed: number | null, variable: string): Promise<never> {
     const now = this.options.now();
     // Once a minute at most: a scan with a long roster is refused lookup by lookup.
     if (now - this.ceilingLoggedAt >= 60_000) {
       this.ceilingLoggedAt = now;
       console.error(`[apify] ${SPEND_CEILING_REASON}: ${committed === null ? `more than ${SPEND_WINDOW_ROWS} runs` : `USD ${committed.toFixed(2)}`}`
         + ` held by the ledger over the last 24 hours, the ceiling is USD ${this.options.spendCeilingUsd!.toFixed(2)} and a run reserves`
-        + ` USD ${record.reserved_usd.toFixed(2)} (APIFY_SPEND_CEILING_USD, APIFY_EXPECTED_COST_USD_PER_RUN).`
+        + ` USD ${record.reserved_usd.toFixed(2)} (APIFY_SPEND_CEILING_USD, ${variable}).`
         + ' No new run starts; cached queries are still served.');
     }
     scanMeter()?.apifyRefused();
@@ -189,7 +235,7 @@ export class ApifyClient {
    * be handed the same room and their limits could add up to many times the ceiling. With the reservation as the
    * limit, the runs this process started can never be charged more, together, than the ceiling.
    */
-  private async admit(record: ApifyRunRecord): Promise<number> {
+  private async admit(record: ApifyRunRecord, variable: string): Promise<number> {
     const now = this.options.now();
     let rows: ApifySpendRecord[];
     try { rows = await this.store.recentApifyRuns(new Date(now - SPEND_WINDOW_MS).toISOString(), SPEND_WINDOW_ROWS); }
@@ -199,36 +245,45 @@ export class ApifyClient {
         last_error: 'Recorded Apify spend unavailable; run not started' }).catch(() => {});
       throw new ApifyClientError('PROVIDER_ERROR', 'Recorded Apify spend unavailable; run not started');
     }
-    if (rows.length >= SPEND_WINDOW_ROWS) return this.ceilingReached(record, null);
+    if (rows.length >= SPEND_WINDOW_ROWS) return this.ceilingReached(record, null, variable);
     // A run of this process counts at least the limit it was started with until it settles: below one cent of
     // reservation the limit is the larger figure.
     const counted = (row: ApifySpendRecord) => Math.max(committedUsd(row, now),
       row.accounting_complete ? 0 : this.chargeLimits.get(row.id) ?? 0);
     const committed = rows.filter(row => row.id !== record.id).reduce((total, row) => total + counted(row), 0);
     const remaining = this.options.spendCeilingUsd! - committed;
-    if (remaining < record.reserved_usd - CENT / 2) return this.ceilingReached(record, committed);
+    if (remaining < record.reserved_usd - CENT / 2) return this.ceilingReached(record, committed, variable);
     return Math.max(CENT, cents(Math.min(record.reserved_usd, remaining)));
   }
-  private async reserve(request: ReserveApifyRun): Promise<{ reservation: ApifyRunReservation; chargeLimitUsd: number | null }> {
+  private async reserve(request: ReserveApifyRun, variable: string): Promise<{ reservation: ApifyRunReservation; chargeLimitUsd: number | null }> {
     if (this.options.spendCeilingUsd === null) return { reservation: await this.store.reserveApifyRun(request), chargeLimitUsd: null };
     const step = async () => {
       const reservation = await this.store.reserveApifyRun(request);
       // Only a run about to start is checked: a cached answer, a resumed run and a cooldown cost nothing new.
-      return { reservation, chargeLimitUsd: reservation.decision === 'start' ? await this.admit(reservation.record!) : null };
+      return { reservation, chargeLimitUsd: reservation.decision === 'start' ? await this.admit(reservation.record!, variable) : null };
     };
     const turn = this.admissions.then(step, step);
     this.admissions = turn.catch(() => {});
     return turn;
   }
+  /** What a run of this kind and actor reserves, and the variable that sets it. */
+  private reservationFor(actor: string, kind: ApifyRunKind): { usd: number; variable: string } {
+    if (kind === 'firm') return { usd: this.options.expectedCostUsdPerRun, variable: 'APIFY_EXPECTED_COST_USD_PER_RUN' };
+    const own = this.options.expectedCostUsdPerTargetedRunByActor[actor];
+    return own !== undefined ? { usd: own, variable: 'APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN' }
+      : { usd: this.options.expectedCostUsdPerTargetedRun, variable: 'APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN' };
+  }
   async run(actor: string, input: Record<string, unknown>, signal: AbortSignal,
     context: ApifyRunContext = {}): Promise<ApifyRunResult> {
+    // The kind is not part of the fingerprint: the same query is the same run whatever it reserved.
     const queryFingerprint = createHash('sha256').update(canonical({ actor, build: this.options.build, input })).digest('hex');
+    const reserved = this.reservationFor(actor, context.kind ?? 'firm');
     await this.acquire(signal);
     let reservation: ApifyRunReservation, chargeLimitUsd: number | null;
     try {
       ({ reservation, chargeLimitUsd } = await this.reserve({ scanId: context.scanId, queryFingerprint, actor,
-        build: this.options.build, input, expectedCostUsd: this.options.expectedCostUsdPerRun,
-        expiresAt: new Date(Date.now() + this.options.activeTtlMs).toISOString() }));
+        build: this.options.build, input, expectedCostUsd: reserved.usd,
+        expiresAt: new Date(Date.now() + this.options.activeTtlMs).toISOString() }, reserved.variable));
     } catch (error) { this.release(); throw error; }
     let record = reservation.record!;
     if (reservation.decision === 'failed') {
@@ -242,7 +297,7 @@ export class ApifyClient {
         return { items, metadata: this.metadata(record, { cached: true, chargedToScan: false }) };
       } finally { this.release(); }
     }
-    let run: RunState | null = null, startUncertain = false;
+    let run: RunState | null = null, startUncertain: string | null = null;
     try {
       if (reservation.decision === 'resume') record = await this.waitForRunId(record, signal);
       if (record.run_id) {
@@ -261,19 +316,36 @@ export class ApifyClient {
           this.chargeLimits.set(record.id, chargeLimitUsd);
         }
         let start: unknown;
-        try {
-          start = await this.json(`acts/${encodeURIComponent(actor.replace('/', '~'))}/runs?${parameters}`, signal,
-            { method: 'POST', body: JSON.stringify(input) });
-        } catch (error) {
-          // Nothing will settle this row: the ledger counts an uncertain start by its status from here on.
-          this.chargeLimits.delete(record.id);
-          // An HTTP refusal proves the run never started; only a lost response leaves it uncertain.
-          if (error instanceof ApifyHttpError && (error.status === 402 || USAGE_LIMIT.test(error.detail))) await this.quotaExceeded(record);
-          if (!(error instanceof ApifyHttpError)) {
-            startUncertain = true;
-            await this.store.updateApifyRun(record.id, { status: START_UNCERTAIN, last_error: START_UNCERTAIN_REASON });
+        for (let attempt = 0; ; attempt++) {
+          try {
+            start = await this.json(`acts/${encodeURIComponent(actor.replace('/', '~'))}/runs?${parameters}`, signal,
+              { method: 'POST', body: JSON.stringify(input) });
+            break;
+          } catch (error) {
+            // A host name that did not resolve means the request never left this machine: no run can have started,
+            // so the start is safe to send again. Any other failure without an HTTP answer may have reached Apify.
+            const dns = !(error instanceof ApifyHttpError) && dnsFailure(error) !== null;
+            const backoff = this.options.startRetryBackoffMs[attempt];
+            if (dns && backoff !== undefined && !signal.aborted) {
+              try { await delay(backoff, undefined, { signal }); continue; } catch { /* The caller gave up while waiting. */ }
+            }
+            // Nothing will settle this row: the ledger counts an uncertain start by its status from here on.
+            this.chargeLimits.delete(record.id);
+            // An HTTP refusal proves the run never started; only a lost response leaves it uncertain.
+            if (error instanceof ApifyHttpError && (error.status === 402 || USAGE_LIMIT.test(error.detail))) await this.quotaExceeded(record);
+            if (dns) {
+              // Never started and never will: it holds nothing against the ceiling and, expired at once, is neither
+              // reused nor held in a retry cooldown. The next scan simply tries again.
+              await this.store.updateApifyRun(record.id, { status: 'UNAVAILABLE', expires_at: new Date(this.options.now()).toISOString(),
+                last_error: withDetail(START_NOT_SENT_REASON, error) });
+              throw new ApifyClientError('PROVIDER_ERROR', 'Apify unreachable: its host name did not resolve');
+            }
+            if (!(error instanceof ApifyHttpError)) {
+              startUncertain = withDetail(START_UNCERTAIN_REASON, error);
+              await this.store.updateApifyRun(record.id, { status: START_UNCERTAIN, last_error: startUncertain });
+            }
+            throw error;
           }
-          throw error;
         }
         run = z.object({ data: Run }).parse(start).data;
         scanMeter()?.apifyStarted(record.reserved_usd);
@@ -328,12 +400,13 @@ export class ApifyClient {
       if (error instanceof ApifyClientError) throw error;
       // A start that may have happened stays uncertain, also for a scan that only came to resume it: its row must
       // keep counting against the ceiling.
-      const uncertain = run === null && !record.run_id && (startUncertain || record.status === START_UNCERTAIN);
+      const uncertain = run === null && !record.run_id && (startUncertain !== null || record.status === START_UNCERTAIN);
       const status = uncertain ? START_UNCERTAIN
         : signal.aborted ? (run?.status ?? record.status) : (run?.status ?? 'UNAVAILABLE');
       await this.store.updateApifyRun(record.id, { status, run_id: run?.id ?? record.run_id,
         dataset_id: run?.defaultDatasetId ?? record.dataset_id, cost_usd: run?.usageTotalUsd ?? record.cost_usd,
-        last_error: uncertain ? START_UNCERTAIN_REASON
+        // An uncertain start keeps the reason it was stored with, the underlying error included.
+        last_error: uncertain ? startUncertain ?? (record.last_error?.startsWith(START_UNCERTAIN_REASON) ? record.last_error : START_UNCERTAIN_REASON)
           : signal.aborted ? 'Caller deadline reached; remote run retained for recovery' : 'Apify run unavailable' }).catch(() => {});
       record = await this.store.getApifyRun(record.id) ?? record;
       throw new ApifyClientError('PROVIDER_ERROR', signal.aborted ? 'Apify run retained for recovery' : 'Apify run unavailable',

@@ -45,6 +45,11 @@ export const ACCESS_PAGES: CrawledPage[] = [
   page('/contact', 'Contact | Harbor Vale Law', CONTACT),
 ];
 
+/** What the firm's sitemap lists: the extraction reads it before its first round, and finds nothing it had not seen. */
+export const SITEMAP: Record<string, Array<{ url: string; kind: 'page' | 'document' }>> = {
+  [DOMAIN]: ['/', '/about', '/ai-use-policy', '/attorneys', '/contact', '/privacy-policy'].map(path => ({ url: url(path), kind: 'page' as const })),
+};
+
 /**
  * The same site on another visit: a new nonce, a new timestamp, another analytics script, a session attribute.
  * Nothing a visitor or the model reads has changed.

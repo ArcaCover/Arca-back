@@ -37,7 +37,8 @@ export function replayModel(recordings: ModelRecordings, answer?: Answer) {
   return { calls, unexpected, client: { chat: { completions: { create } } } };
 }
 
-export function replayAccess(pages: CrawledPage[]) {
+/** `sitemaps` holds what each domain's sitemap lists; a domain without an entry is unexpected, like an unrecorded page. */
+export function replayAccess(pages: CrawledPage[], sitemaps: Record<string, Array<{ url: string; kind: 'page' | 'document' }>> = {}) {
   const fetched: string[] = [], unexpected: string[] = [];
   const access: SiteAccess = {
     async fetchPages(urls) {
@@ -55,6 +56,9 @@ export function replayAccess(pages: CrawledPage[]) {
       return { pages: [], calls: urls.map(url => ({ tool: 'read_document' as const, target: url, status: 'failed' as const, detail: 'NOT_RECORDED' })) };
     },
     async readSitemap(domain) {
+      const links = sitemaps[domain];
+      if (links) return { links: structuredClone(links), calls: [{ tool: 'read_sitemap', target: `https://${domain}/`,
+        status: links.length ? 'read' : 'failed', detail: links.length ? `${links.length} urls` : 'NO_SITEMAP_URLS' }] };
       unexpected.push(`sitemap ${domain}`);
       return { links: [], calls: [{ tool: 'read_sitemap', target: `https://${domain}/`, status: 'failed', detail: 'NOT_RECORDED' }] };
     },

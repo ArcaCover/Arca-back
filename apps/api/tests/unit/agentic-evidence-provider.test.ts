@@ -355,7 +355,7 @@ describe('Agentic evidence provider', () => {
     expect(create.mock.calls[0]![0]).toMatchObject({ model: 'gpt-6-luna', max_completion_tokens: expect.any(Number) });
     expect(create.mock.calls[0]![0]).not.toHaveProperty('temperature');
     expect(provider.id).toBe('openai-agentic');
-    expect(provider.version).toMatch(/^agentic-signals-v5:openai:gpt-6-luna:default:[0-9a-f]{12}$/);
+    expect(provider.version).toMatch(/^agentic-signals-v6:openai:gpt-6-luna:default:[0-9a-f]{12}$/);
   });
 
   it('names in its version everything that changes what the model answers', () => {
@@ -365,7 +365,7 @@ describe('Agentic evidence provider', () => {
     expect(new AgenticEvidenceProvider('key', 'gpt-6-luna', { chat: { completions: { create: vi.fn() } } }).version).toBe(base);
     expect(extractionVersion(openAiEndpoint(), 'gpt-6-astra')).not.toBe(base);
     const low = extractionVersion(openAiEndpoint('low'), 'gpt-6-luna');
-    expect(low).toMatch(/^agentic-signals-v5:openai:gpt-6-luna:low:[0-9a-f]{12}$/);
+    expect(low).toMatch(/^agentic-signals-v6:openai:gpt-6-luna:low:[0-9a-f]{12}$/);
     expect(low.split(':')[4]).not.toBe(base.split(':')[4]);
     expect(extractionVersion(openAiEndpoint(), 'gpt-6-luna', { planPages: false })).not.toBe(base);
     // A prompt edited by one character is another extraction, with no version constant to remember.

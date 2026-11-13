@@ -3,7 +3,7 @@ import { Layer1Evidence, Layer1Result, type Layer1Pipeline, type WebsiteSource, 
   type SourceName, type PipelineResult, type WebsiteData, type AttorneyMatch } from '@arca/contracts';
 import { classifyUnreadableWebsite, evaluateLayer1Evidence } from '@arca/scoring';
 import { normalizeDomain } from './domain-resolution.js';
-import { buildFirmIdentity } from './firm-identity.js';
+import { buildFirmIdentity, directoryScope } from './firm-identity.js';
 import type { ScanRepository } from '../repositories/types.js';
 import { ScanMeter, meterScan, scanCostLine } from './scan-cost.js';
 
@@ -58,9 +58,12 @@ export class InProcessPipeline implements Layer1Pipeline {
       const website = await bounded<WebsiteData>(() => this.deps.website.run(input.canonicalDomain, signal));
       const identity = buildFirmIdentity(input.canonicalDomain, website.data);
       const jurisdiction = this.deps.bar.jurisdiction ?? null;
-      const query = { canonicalDomain: input.canonicalDomain, names: identity.attorneyNames,
+      // Which names to look up, or which Florida offices to search the firm in instead (DN-06 §10).
+      const scope = directoryScope(identity, website.data, jurisdiction);
+      const query = { canonicalDomain: input.canonicalDomain, names: scope.names,
         firmName: identity.firmName, aliases: identity.aliases, city: identity.city, county: identity.county,
-        addressStreet: identity.addressStreet, phone: identity.phone, state: jurisdiction, scanId: input.scanId };
+        addressStreet: identity.addressStreet, phone: identity.phone, state: jurisdiction, scanId: input.scanId,
+        ...(scope.officeCities.length ? { officeCities: scope.officeCities } : {}) };
       const [bar, avvo] = identity.status === 'INSUFFICIENT' ? [insufficientIdentity(), insufficientIdentity()] : await Promise.all([
           bounded<AttorneyMatch[]>(() => this.deps.bar.run(query, signal)),
           bounded<AttorneyMatch[]>(() => this.deps.avvo.run(query, signal)),

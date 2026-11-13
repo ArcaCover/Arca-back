@@ -44,6 +44,11 @@ const EnvSchema = z.object({
   // Provisional figure the ledger reserves for a run until Apify reports what it really cost.
   // Accounting only unless a spend ceiling is set, which counts it for every run not settled yet.
   APIFY_EXPECTED_COST_USD_PER_RUN: z.coerce.number().positive().default(1),
+  // What a targeted lookup (a few named lawyers) reserves instead. A Florida Bar lookup of one lawyer settled at USD 0.045.
+  // The Avvo actor returns up to ten detailed lawyers per lookup and one such run settled at USD 0.385, so it reserves more.
+  // Firm searches, whole-registry or one per Florida office city, keep APIFY_EXPECTED_COST_USD_PER_RUN (DN-06 §10).
+  APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: z.coerce.number().positive().default(0.1),
+  APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: z.coerce.number().positive().default(0.4),
   // USD of Apify runs the ledger may hold over its last 24 hours before a new run is refused (DN-12 §5).
   // Unset means no ceiling: production records spend and never caps it. live-debug defaults to 2.
   // 0 starts no run at all and still serves the queries already cached.
@@ -95,8 +100,14 @@ export function loadEnv(source = process.env) {
   const apifySpendCeilingUsd = env.APIFY_SPEND_CEILING_USD ?? (mode === 'live-debug' ? LIVE_DEBUG_APIFY_SPEND_CEILING_USD : null);
   const openAiMaxRequestsPerScan = env.OPENAI_MAX_REQUESTS_PER_SCAN
     ?? (mode === 'live-debug' ? LIVE_DEBUG_OPENAI_MAX_REQUESTS_PER_SCAN : null);
-  if (apifySpendCeilingUsd !== null && apifySpendCeilingUsd > 0 && apifySpendCeilingUsd < env.APIFY_EXPECTED_COST_USD_PER_RUN) {
-    throw new Error('APIFY_SPEND_CEILING_USD is below APIFY_EXPECTED_COST_USD_PER_RUN, so no run could ever start; use 0 to serve cached queries only');
+  // Every kind of run must fit under a ceiling on its own: one that only targeted lookups fit under would refuse every
+  // firm search while looking like a budget, and the other way round.
+  if (apifySpendCeilingUsd !== null && apifySpendCeilingUsd > 0) {
+    for (const name of ['APIFY_EXPECTED_COST_USD_PER_RUN', 'APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN', 'APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN'] as const) {
+      if (apifySpendCeilingUsd < env[name]) {
+        throw new Error(`APIFY_SPEND_CEILING_USD is below ${name}, so no such run could ever start; use 0 to serve cached queries only`);
+      }
+    }
   }
   const overridden = [['SOURCE_MODE', inheritedSourceMode, sourceMode], ['STORAGE_BACKEND', inheritedStorageBackend, storageBackend], ['ASSESSMENT_PLANNER', env.ASSESSMENT_PLANNER, assessmentPlanner]]
     .filter(([, was, now]) => was !== now).map(([name, was, now]) => `${name}=${was}→${now}`);

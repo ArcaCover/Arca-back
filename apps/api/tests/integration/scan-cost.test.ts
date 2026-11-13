@@ -13,7 +13,7 @@ import { mockSources } from '../../src/pipeline/mock-sources.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
 import type { ScanCost } from '../../src/pipeline/scan-cost.js';
 import { replayAccess, replayApify, replayModel, type ApifyRecording, type ModelRecordings } from '../fixtures/replay/replay.js';
-import { ACCESS_PAGES, DOMAIN, PAGES } from '../fixtures/replay/harbor-vale/site.js';
+import { ACCESS_PAGES, DOMAIN, PAGES, SITEMAP } from '../fixtures/replay/harbor-vale/site.js';
 
 // DN-12 §5. The real pipeline over the recordings of the replay test (DN-12 §4.5): the Apify client and its ledger,
 // the agentic extraction and the directory sources are the real ones, and nothing leaves the process.
@@ -37,7 +37,7 @@ const lines = (): Line[] => rawLines().map(line => JSON.parse(line.slice(TAG.len
 let scans = 0;
 /** One scan through the real pipeline. Each recorded model answer reports the same token usage. */
 async function scan(repository: InMemoryRepository, options: { spendCeilingUsd?: number | null } = {}) {
-  const llm = replayModel(model), reader = replayAccess(ACCESS_PAGES), apify = replayApify(apifyRecordings);
+  const llm = replayModel(model), reader = replayAccess(ACCESS_PAGES, SITEMAP), apify = replayApify(apifyRecordings);
   const metered = { chat: { completions: { create: async (body: Record<string, unknown>) =>
     ({ ...await llm.client.chat.completions.create(body), usage: { prompt_tokens: 1000, completion_tokens: 200 } }) } } };
   const website = new WebsiteExtractionSource(repository, new AgenticEvidenceProvider('replay-key', undefined, metered, reader.access),
@@ -60,8 +60,8 @@ describe('the cost line of a scan', () => {
     const { scanId, outcome, llm, apify } = await scan(new InMemoryRepository());
     expect(outcome.status).toBe('COMPLETED');
     expect(lines()).toEqual([{ scanId, status: 'COMPLETED', durationMs: 0,
-      // Four actor runs, each holding its USD 1 reservation until Apify settles the charge it reported so far.
-      apify: { started: 4, refused: 0, resumed: 0, chargedUsd: recordedUsd, reservedUsd: 4, cachedUsd: 0 },
+      // Four named lookups, each holding its USD 0.10 targeted reservation until Apify settles the charge it reported so far.
+      apify: { started: 4, refused: 0, resumed: 0, chargedUsd: recordedUsd, reservedUsd: 0.4, cachedUsd: 0 },
       openai: { requests: 7, inputTokens: 7000, outputTokens: 1400 },
       cacheHits: { apifyRuns: 0, websiteAnalysis: false } }]);
     expect(llm.calls).toHaveLength(7);
@@ -87,16 +87,16 @@ describe('the cost line of a scan', () => {
     const [a, b] = await Promise.all([scan(new InMemoryRepository()), scan(new InMemoryRepository())]);
     const byScan = new Map(lines().map(line => [line.scanId, line]));
     for (const { scanId } of [a, b]) {
-      expect(byScan.get(scanId)).toMatchObject({ apify: { started: 4, reservedUsd: 4 }, openai: { requests: 7, inputTokens: 7000 } });
+      expect(byScan.get(scanId)).toMatchObject({ apify: { started: 4, reservedUsd: 0.4 }, openai: { requests: 7, inputTokens: 7000 } });
     }
   });
 
   it('counts the lookups the spend ceiling refused, and the scan degrades for a passing cause', async () => {
     const repository = new InMemoryRepository();
-    const { outcome, apify } = await scan(repository, { spendCeilingUsd: 2 });
-    // Two runs fit under USD 2; the other two were refused before any request.
+    const { outcome, apify } = await scan(repository, { spendCeilingUsd: 0.2 });
+    // Two named lookups fit under USD 0.20; the other two were refused before any request.
     expect(apify.posts).toHaveLength(2);
-    expect(lines()[0]).toMatchObject({ status: 'PARTIAL', apify: { started: 2, refused: 2, reservedUsd: 2 }, openai: { requests: 7 } });
+    expect(lines()[0]).toMatchObject({ status: 'PARTIAL', apify: { started: 2, refused: 2, reservedUsd: 0.2 }, openai: { requests: 7 } });
     expect(outcome.status).toBe('PARTIAL');
     const { bar, avvo } = outcome.result.sources;
     const refused = [bar, avvo].filter(source => /spend ceiling/.test(source.reason ?? ''));
