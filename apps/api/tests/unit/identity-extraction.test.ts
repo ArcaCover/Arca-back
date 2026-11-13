@@ -34,21 +34,21 @@ describe('crawl priority across languages', () => {
 
   it('keeps the established English ordering', () => {
     expect(priority('/')).toBe(0);
-    expect(priority('/about-us')).toBe(1);
-    expect(priority('/our-team')).toBe(2);
-    expect(priority('/practice-areas')).toBe(3);
-    expect(priority('/privacy-policy')).toBe(4);
-    expect(priority('/blog/some-post')).toBe(5);
+    expect(priority('/about-us')).toBe(2);
+    expect(priority('/our-team')).toBe(3);
+    expect(priority('/practice-areas')).toBe(5);
+    expect(priority('/privacy-policy')).toBe(6);
+    expect(priority('/blog/some-post')).toBe(8);
   });
 
   it('gives Spanish pages the same standing as their English equivalents', () => {
-    expect(priority('/nosotros')).toBe(1);
-    expect(priority('/quienes-somos')).toBe(1);
-    expect(priority('/abogados-de-inmigracion-miami/')).toBe(2);
-    expect(priority('/equipo')).toBe(2);
-    expect(priority('/areas-de-practica/')).toBe(3);
-    expect(priority('/servicios')).toBe(3);
-    expect(priority('/politica-de-privacidad/')).toBe(4);
+    expect(priority('/nosotros')).toBe(2);
+    expect(priority('/quienes-somos')).toBe(2);
+    expect(priority('/abogados-de-inmigracion-miami/')).toBe(3);
+    expect(priority('/equipo')).toBe(3);
+    expect(priority('/areas-de-practica/')).toBe(5);
+    expect(priority('/servicios')).toBe(5);
+    expect(priority('/politica-de-privacidad/')).toBe(6);
   });
 
   it('ranks the attorney page of a Spanish site above its blog', () => {

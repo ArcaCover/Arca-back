@@ -1,7 +1,7 @@
 import { fetchPublicResponse } from './network.js';
 import { createRobotsCache, fetchRobotsText, robotsPolicy, type RobotsCache, type RobotsFetch } from './robots.js';
 import { classifyLink } from './evidence-corpus.js';
-import { pagePriority } from './crawler.js';
+import { pagePriority } from './crawl-order.js';
 
 export const MAX_SITEMAP_URLS = 400;
 /** A sitemap file larger than this fails the sitemap read, as it always has. */

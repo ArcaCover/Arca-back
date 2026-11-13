@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { compareText } from '@arca/scoring';
-import { canonicalUrl, type CrawlResult } from './crawler.js';
+import { canonicalUrl } from './crawl-order.js';
+import type { CrawlResult } from './crawler.js';
 import { MAX_DOCUMENT_CHARS } from './document-reader.js';
 
 export type EvidenceSegment = { id: string; pageId: string; url: string;
