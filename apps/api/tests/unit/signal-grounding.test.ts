@@ -76,6 +76,59 @@ describe('signal grounding', () => {
   });
 });
 
+// A document is cut into segments of about 800 characters at line ends, so a sentence can run from one segment into
+// the next and the model can cite either half. Shaped like the Holland & Knight privacy notice of November 2026.
+describe('a quote that crosses a segment boundary', () => {
+  const url = 'https://firm.com/files/privacy_notice.pdf';
+  const filler = (label: string) => `${label} ${'Section heading and contents entry. '.repeat(19)}`.trim();
+  const corpus = buildCorpus({ partial: false, pages: [
+    { url, html: '', kind: 'document', complete: true, text: [
+      filler('Contents.'),
+      'Client services: the provision by the Firm of legal services to our clients (and reference in this',
+      'Notice to our “clients” includes their employees whose Personal Information we process); and',
+      filler('Our Sites.'),
+      filler('Registered offices.'),
+      filler('Retention.'),
+      'To provide Client services to you in connection with your matters.',
+    ].join('\n') },
+    { url: 'https://firm.com/', html: '', text: 'Smith Law serves clients in Miami.' },
+  ] });
+  const parts = corpus.segments.filter(segment => segment.url === url);
+  const home = corpus.segments.find(segment => segment.url === 'https://firm.com/')!;
+  // The claim cites `citations`; the review backs it with `verdictCitations`.
+  const reason = (citations: Claim['citations'], verdictCitations = citations) => acceptClaims(
+    [{ id: 'privacy', field: 'privacy_policy', value: { found: true, mentions_client_data: true }, explanation: 'privacy notice', citations }],
+    { verdicts: [{ claimId: 'privacy', verdict: 'supported', reason: 'notice', citations: verdictCitations }] }, corpus).report.items[0];
+
+  it('is cut where the real notice was cut', () => {
+    expect(parts.length).toBeGreaterThanOrEqual(4);
+    expect(parts[0]!.text.endsWith('(and reference in this')).toBe(true);
+    expect(parts[1]!.text.startsWith('Notice to our “clients”')).toBe(true);
+  });
+  it('accepts a claim quote that the cited segment shares with the segment before it', () => {
+    const quote = 'Client services: the provision by the Firm of legal services to our clients';
+    expect(reason([{ segmentId: parts[1]!.id, quote }])).toMatchObject({ status: 'accepted', reason: null });
+  });
+  it('accepts a review quote that runs on from one segment into the next', () => {
+    const across = 'Client services: the provision by the Firm of legal services to our clients (and reference in this ' +
+      'Notice to our "clients" includes their employees whose Personal Information we process);';
+    expect(reason([{ segmentId: parts[1]!.id, quote: 'Notice to our “clients” includes their employees' }],
+      [{ segmentId: parts[1]!.id, quote: across }])).toMatchObject({ status: 'accepted', reason: null });
+    expect(reason([{ segmentId: parts[0]!.id, quote: across }])).toMatchObject({ status: 'accepted', reason: null });
+  });
+  it('still rejects a quote from a segment that is not next to the cited one, or from another page', () => {
+    const far = 'To provide Client services to you in connection with your matters.';
+    expect(parts.findIndex(part => part.text.includes(far))).toBeGreaterThan(2);
+    expect(reason([{ segmentId: parts[0]!.id, quote: far }])).toMatchObject({ status: 'rejected', reason: 'QUOTE_NOT_IN_SOURCE' });
+    expect(reason([{ segmentId: parts[0]!.id, quote: 'Notice to our “clients” includes their employees' }],
+      [{ segmentId: parts[0]!.id, quote: far }])).toMatchObject({ status: 'rejected', reason: 'QUOTE_NOT_IN_SOURCE' });
+    expect(reason([{ segmentId: home.id, quote: 'Smith Law serves clients in Miami. Contents.' }]))
+      .toMatchObject({ status: 'rejected', reason: 'QUOTE_NOT_IN_SOURCE' });
+    expect(reason([{ segmentId: 'D-0000000000000000-0000000000000000', quote: 'Client services' }]))
+      .toMatchObject({ status: 'rejected', reason: 'UNKNOWN_SEGMENT' });
+  });
+});
+
 describe('absence claims', () => {
   const corpus = buildCorpus({ partial: false, pages: [
     { url: 'https://firm.com/', html: '', text: [

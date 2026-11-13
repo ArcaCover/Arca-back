@@ -84,19 +84,62 @@ function pageLinks(page: CrawlResult['pages'][number]): Array<{ url: string; kin
 }
 
 /**
- * A hash of what an extraction reads of a crawl, and of nothing else: per page, in URL order, the text as the corpus
- * splits it, the metadata the corpus lifts from the HTML (title, description, JSON-LD) and the links it offers.
- * Two crawls of a site with the same fingerprint give the model the same evidence even when their HTML differs
- * (a nonce, a timestamp in a comment, an injected script). Segment ids cannot say that: they hash the HTML.
+ * Path sections that hold dated publications: news, press releases, insights, alerts, events, blog posts and the
+ * index pages that list them. What their bodies and lists say changes with every post; for deciding whether a
+ * stored analysis still stands, a post's address and title are enough. Kept here rather than taken from the
+ * crawler's page ranking, which serves another purpose. `media` is left out on purpose: sites keep their documents
+ * under it (/-/media/files/…).
+ */
+const PUBLICATION_SECTION = new RegExp('^(?:blogs?|news|newsroom|insights?|events?|press|press-?releases?|pressroom|publications?|' +
+  'articles?|alerts?|webinars?|podcasts?|author|category|tag|noticias|eventos|prensa|publicaciones|articulos|comunicados)$');
+export function isPublicationUrl(raw: string): boolean {
+  try { return new URL(raw).pathname.toLowerCase().split('/').some(part => PUBLICATION_SECTION.test(part)); }
+  catch { return false; }
+}
+
+/** Text as the fingerprint compares it: case, quotes, apostrophes, dashes and spacing never tell two readings apart. */
+const stableText = (value: string) => normalizeForGrounding(value).normalize('NFKC').toLocaleLowerCase()
+  .replace(/['"`´‘’‚‛“”„‟]/g, '').replace(/[‐-―−]/g, '-').replace(/\s+/g, ' ').trim();
+
+/** A line, metadata item or link shown on this many pages of a crawl or more is site furniture, not page content. */
+const FURNITURE_PAGES = 3;
+
+/**
+ * A hash of the evidence a stored analysis may stand in for (DN-12 §4.3), built so that it moves when the firm's own
+ * pages say something else and not when only the site's furniture moves. Per page, in URL order:
+ * - every page's URL, so a page added or lost always counts;
+ * - for a publication page (`isPublicationUrl`), only its title, or its first heading when it has none: its body
+ *   and the lists on an index page change with every post;
+ * - for any other page, the text lines, the metadata the corpus lifts from the HTML (title, description, JSON-LD)
+ *   and the links the corpus offers, leaving out each one that appears on FURNITURE_PAGES pages or more
+ *   (navigation, footers, a "latest news" block every page repeats).
+ * Text is compared through `stableText`. The HTML itself never counts (a nonce, a timestamp in a comment, a layout
+ * offset a script writes). The price: a change that only furniture or a publication's body shows (a new phone number
+ * in the footer of every page) does not invalidate a stored analysis; the age cap bounds how long it stands.
  */
 export function corpusFingerprint(crawl: CrawlResult): string {
-  const pages = [...crawl.pages].sort((a, b) => compareText(a.url, b.url)).map(page => ({
-    url: page.url, kind: page.kind ?? 'page', complete: page.complete !== false,
-    metadata: metadata(page.html).map(item => [item.kind, normalizeForGrounding(item.text)]),
-    text: readLines(page.text).map(normalizeForGrounding),
-    links: pageLinks(page).map(link => [link.url, link.kind, link.label]),
-  }));
-  return createHash('sha256').update(JSON.stringify(pages)).digest('hex');
+  const read = crawl.pages.map(page => ({ page, publication: isPublicationUrl(page.url),
+    text: readLines(page.text).map(line => `t:${stableText(line)}`),
+    metadata: metadata(page.html).map(item => `${item.kind}:${stableText(item.text)}`),
+    links: pageLinks(page).map(link => `${link.kind}:${link.url}:${stableText(link.label)}`) }));
+  const shownOn = new Map<string, Set<string>>();
+  for (const { page, text, metadata: meta, links } of read) for (const item of [...text, ...meta, ...links]) {
+    (shownOn.get(item) ?? shownOn.set(item, new Set()).get(item)!).add(page.url);
+  }
+  const own = (items: string[]) => items.filter(item => shownOn.get(item)!.size < FURNITURE_PAGES);
+  const entries = read.map(({ page, publication, text, metadata: meta, links }) => JSON.stringify(publication
+    ? { url: page.url, kind: page.kind ?? 'page', title: stableText(pageTitle(page.html)) }
+    : { url: page.url, kind: page.kind ?? 'page', complete: page.complete !== false,
+      metadata: own(meta), text: own(text), links: own(links) }));
+  // A page read twice (the crawl can store the same URL twice) counts once; order never counts.
+  const unique = [...new Set(entries)].sort((a, b) => compareText(a, b));
+  return createHash('sha256').update(JSON.stringify(unique)).digest('hex');
+}
+
+/** A page's title as the browser shows it, or its first heading when it has none. */
+function pageTitle(html: string): string {
+  const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1];
+  return decode(title && decode(title) ? title : /<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html)?.[1] ?? '');
 }
 
 export function normalizeForGrounding(value: string): string {

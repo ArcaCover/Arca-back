@@ -9,6 +9,7 @@ import { RagWebsiteSource, WebsiteExtractionSource } from '../../src/pipeline/we
 import { RuleBasedEvidenceProvider } from '../../src/pipeline/website-evidence-provider.js';
 import { CHALLENGE_PAGE, type CrawlIssue, type CrawlResult } from '../../src/pipeline/crawler.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
+import { HKLAW_VISITS, hklawCrawl } from '../fixtures/hklaw-recrawl.js';
 import type OpenAI from 'openai';
 
 const query = { canonicalDomain: 'firm.com', names: ['Jane Smith'], firmName: 'Smith Law', city: 'Miami', state: 'FL' as const };
@@ -941,6 +942,18 @@ describe('website signal reuse', () => {
     expect(s.extract).toHaveBeenCalledTimes(4);
   });
 
+  it('reuses the analysis across two visits that differ only in a news headline every press release repeats', async () => {
+    // hklaw.com, 12 November 2026: the second visit called the model again and its answer moved the score from 3 to 0.
+    const s = setup();
+    const first = await s.scan(hklawCrawl(HKLAW_VISITS[0]));
+    s.advance(10 * 60_000);
+    const second = await s.scan(hklawCrawl(HKLAW_VISITS[1]));
+    expect(s.extract).toHaveBeenCalledTimes(1);
+    expect(first.stored.reuse.key).toMatch(/^wsk2-[0-9a-f]{64}$/);
+    expect(second.stored.reuse).toMatchObject({ key: first.stored.reuse.key, from: first.scanId });
+    expect(second.result.data).toEqual(first.result.data);
+  });
+
   it('extracts again under another provider version', async () => {
     const s = setup();
     await s.scan();
@@ -1001,7 +1014,7 @@ describe('website signal reuse', () => {
     const find = vi.spyOn(s.repository, 'findRaw'), read = vi.spyOn(s.repository, 'rawOf');
     await s.scan();
     expect(find).toHaveBeenCalledTimes(1);
-    expect(find.mock.calls[0]).toEqual(['firm.com', 'website', expect.stringMatching(/^wsk1-[0-9a-f]{64}$/), expect.any(String), 3]);
+    expect(find.mock.calls[0]).toEqual(['firm.com', 'website', expect.stringMatching(/^wsk2-[0-9a-f]{64}$/), expect.any(String), 3]);
     const listed = await find.mock.results[0]!.value;
     expect(listed).toHaveLength(3);
     expect(listed[0]).not.toHaveProperty('raw_content');

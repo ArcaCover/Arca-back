@@ -121,10 +121,38 @@ function checkAbsences(claim: Claim, quotes: string[], corpus: EvidenceCorpus): 
   return { value, degradedFields, informative: Object.values(value).some(item => item !== null) };
 }
 
+/**
+ * Where a citation's quote is looked for. Pages and documents are cut into segments of about 800 characters (see
+ * `paragraphs` in evidence-corpus.ts), at a line end or, inside a long line, anywhere, so a sentence can start in one
+ * segment and end in the next, and the model may name either half. A quote therefore stands when it is in the cited
+ * segment, or in that segment read together with the segments just before and after it of the same page and kind,
+ * in corpus order: once joined as the lines they were cut from, once joined directly for a cut inside a line.
+ * Nothing further away counts, and an id the corpus does not hold is still UNKNOWN_SEGMENT.
+ */
+function quoteChecker(corpus: EvidenceCorpus): (citation: { segmentId: string; quote: string }) =>
+  'UNKNOWN_SEGMENT' | 'QUOTE_NOT_IN_SOURCE' | null {
+  const texts = new Map<string, string[]>();
+  corpus.segments.forEach((segment, index) => {
+    const near = (offset: number) => {
+      const other = corpus.segments[index + offset];
+      return other && other.pageId === segment.pageId && other.kind === segment.kind ? other.text : null;
+    };
+    const run = [near(-1), segment.text, near(1)].filter((text): text is string => text !== null);
+    texts.set(segment.id, [segment.text, ...(run.length > 1 ? [run.join('\n'), run.join('')] : [])].map(normalizeForGrounding));
+  });
+  return citation => {
+    const candidates = texts.get(citation.segmentId);
+    if (!candidates) return 'UNKNOWN_SEGMENT';
+    const quote = normalizeForGrounding(citation.quote);
+    return candidates.some(text => text.includes(quote)) ? null : 'QUOTE_NOT_IN_SOURCE';
+  };
+}
+
 export function acceptClaims(claimsInput: Claim[], review: SignalReview, corpus: EvidenceCorpus): {
   accepted: Claim[]; report: GroundingReport;
 } {
   const segments = new Map(corpus.segments.map(segment => [segment.id, segment]));
+  const quoteProblem = quoteChecker(corpus);
   const verdicts = new Map(review.verdicts.map(verdict => [verdict.claimId, verdict]));
   const seen = new Set<string>(), accepted: Claim[] = [], items: GroundingReport['items'] = [];
   for (const raw of claimsInput) {
@@ -138,11 +166,8 @@ export function acceptClaims(claimsInput: Claim[], review: SignalReview, corpus:
     if (!reason && claim.citations.length === 0) reason = 'MISSING_CITATION';
     const quotes: string[] = [];
     if (!reason) for (const citation of claim.citations) {
-      const segment = segments.get(citation.segmentId);
-      if (!segment) { reason = 'UNKNOWN_SEGMENT'; break; }
-      if (!normalizeForGrounding(segment.text).includes(normalizeForGrounding(citation.quote))) {
-        reason = 'QUOTE_NOT_IN_SOURCE'; break;
-      }
+      reason = quoteProblem(citation);
+      if (reason) break;
       quotes.push(citation.quote);
     }
     if (!reason && !quotedValue(claim, quotes)) reason = 'VALUE_NOT_IN_QUOTE';
@@ -174,10 +199,8 @@ export function acceptClaims(claimsInput: Claim[], review: SignalReview, corpus:
     if (!reason && verdict?.verdict === 'unsupported') reason = 'UNSUPPORTED_CLAIM';
     if (!reason && verdict?.verdict === 'supported' && verdict.citations.length === 0) reason = 'MISSING_CITATION';
     if (!reason && verdict) for (const citation of verdict.citations) {
-      const segment = segments.get(citation.segmentId);
-      if (!segment || !normalizeForGrounding(segment.text).includes(normalizeForGrounding(citation.quote))) {
-        reason = segment ? 'QUOTE_NOT_IN_SOURCE' : 'UNKNOWN_SEGMENT'; break;
-      }
+      reason = quoteProblem(citation);
+      if (reason) break;
     }
     if (!reason) accepted.push(claim);
     items.push({ claimId: claim.id, field: claim.field, status: reason ? 'rejected' : 'accepted', reason,
