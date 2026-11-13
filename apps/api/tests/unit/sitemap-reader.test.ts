@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createRobotsCache } from '../../src/pipeline/robots.js';
-import { readSitemap } from '../../src/pipeline/sitemap-reader.js';
+import { MAX_SITEMAP_URLS, MAX_URLS_PER_SITEMAP, readSitemap } from '../../src/pipeline/sitemap-reader.js';
 
 type Reply = { status: number; text: string; location?: string };
 // The reader asks for one response at a time and follows redirects itself; these fixtures speak in text.
@@ -107,5 +107,65 @@ describe('sitemap reader', () => {
     expect(result).toEqual({ links: [], detail: 'NO_SITEMAP_URLS' });
     // The first request and five redirects for /sitemap.xml, then one request for each of the other two names.
     expect(text).toHaveBeenCalledTimes(6 + 2);
+  });
+});
+
+describe('sitemap index of a large firm (hklaw.com, 2026-11-13)', () => {
+  // The live index lists 11 child sitemaps; events, insights and news hold thousands of URLs and came before offices and
+  // professionals, so reading in index order filled the 400-URL cap with events and never reached the people or the
+  // offices, and the sequential read took 7-8 s, past the crawl's wait. Which pages a crawl started from then
+  // depended on timing, and so did the analysis reuse key.
+  const children = ['casestudies', 'careers', 'events', 'firm', 'general', 'insights', 'insightsmedia', 'news', 'offices', 'professionals', 'services'];
+  const many = (section: string, count: number) => Array.from({ length: count }, (_, index) => `https://www.firm.com/en/${section}/item-${index + 1}`);
+  const urlset = (urls: string[]) => `<urlset>${urls.map(url => `<url><loc>${url}</loc></url>`).join('')}</urlset>`;
+  const files: Record<string, string> = {
+    'https://firm.com/robots.txt': 'User-agent: *\nSitemap: https://www.firm.com/sitemap',
+    'https://www.firm.com/sitemap': `<sitemapindex>${children.map(child => `<sitemap><loc>https://www.firm.com/en/sitemap/${child}</loc></sitemap>`).join('')}</sitemapindex>`,
+    'https://www.firm.com/en/sitemap/casestudies': urlset(many('case-studies', 30)),
+    'https://www.firm.com/en/sitemap/careers': urlset(many('careers', 10)),
+    'https://www.firm.com/en/sitemap/events': urlset(many('events', 900)),
+    'https://www.firm.com/en/sitemap/firm': urlset(['https://www.firm.com/en/firm/history']),
+    'https://www.firm.com/en/sitemap/general': urlset(['https://www.firm.com/en/general-pages/artificial-intelligence-navigator']),
+    'https://www.firm.com/en/sitemap/insights': urlset(many('insights/publications', 900)),
+    'https://www.firm.com/en/sitemap/insightsmedia': urlset(many('insights/media', 400)),
+    'https://www.firm.com/en/sitemap/news': urlset(many('news', 900)),
+    'https://www.firm.com/en/sitemap/offices': urlset(['https://www.firm.com/en/offices', 'https://www.firm.com/en/offices/miami']),
+    'https://www.firm.com/en/sitemap/professionals': urlset(['https://www.firm.com/en/professionals', ...many('professionals/a', 300)]),
+    'https://www.firm.com/en/sitemap/services': urlset(['https://www.firm.com/en/services/practices/artificial-intelligence', ...many('services/practices', 80)]),
+  };
+  const read = (delay: (url: string) => number = () => 0) => {
+    const text = vi.fn(async (url: string) => {
+      await new Promise(resolve => setTimeout(resolve, delay(url)));
+      return files[url] ? { status: 200, text: files[url]! } : { status: 404, text: '' };
+    });
+    const robots = async (url: string) => files[url] ? { status: 200, text: files[url]! } : { status: 404, text: '' };
+    return { text, result: readSitemap('firm.com', new AbortController().signal, { response: viaText(text), robots }) };
+  };
+
+  it('reads every child sitemap, the people, offices, firm and AI pages included, with a share for each', async () => {
+    const { text, result } = read();
+    const urls = (await result).links.map(link => link.url);
+    expect(text.mock.calls.filter(call => call[0].includes('/en/sitemap/'))).toHaveLength(children.length);
+    // Pages come back under the bare host, as classifyLink canonicalizes them.
+    for (const url of ['https://firm.com/en/offices/miami', 'https://firm.com/en/professionals', 'https://firm.com/en/firm/history',
+      'https://firm.com/en/general-pages/artificial-intelligence-navigator', 'https://firm.com/en/services/practices/artificial-intelligence']) {
+      expect(urls).toContain(url);
+    }
+    expect(urls.length).toBeLessThanOrEqual(MAX_SITEMAP_URLS);
+    expect(urls.filter(url => url.includes('/en/events/')).length).toBeLessThanOrEqual(MAX_URLS_PER_SITEMAP);
+  });
+
+  it('reads the people and office sitemaps before the news ones', async () => {
+    const { text, result } = read();
+    await result;
+    const order = text.mock.calls.map(call => call[0]).filter(url => url.includes('/en/sitemap/'));
+    expect(order.indexOf('https://www.firm.com/en/sitemap/offices')).toBeLessThan(order.indexOf('https://www.firm.com/en/sitemap/events'));
+    expect(order.indexOf('https://www.firm.com/en/sitemap/professionals')).toBeLessThan(order.indexOf('https://www.firm.com/en/sitemap/news'));
+  });
+
+  it('gives the same links whatever order the child files answer in', async () => {
+    const steady = await read().result;
+    const shuffled = await read(url => (url.length * 7) % 23).result;
+    expect(shuffled).toEqual(steady);
   });
 });

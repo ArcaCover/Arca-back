@@ -21,7 +21,10 @@ export type CrawlIssue = { url: string; code: 'ACCESS_BLOCKED' | 'ROBOTS_UNAVAIL
    */
   scope?: 'page' | 'request' | 'robots' };
 /** `aborted`: the crawl deadline or the caller ended the crawl before the queue was done. */
-export type CrawlResult = { pages: CrawledPage[]; partial: boolean; issues?: CrawlIssue[]; aborted?: boolean };
+/** How the sitemap read that seeds a crawl went: kept with the crawl so a crawl that started differently can be explained. */
+export type SitemapSeedOutcome = { status: 'read' | 'timeout' | 'failed' | 'skipped'; urls: number; seeded: number; ms: number };
+export type CrawlResult = { pages: CrawledPage[]; partial: boolean; issues?: CrawlIssue[]; aborted?: boolean;
+  sitemap?: SitemapSeedOutcome };
 export type CrawlTransport = { response: typeof fetchPublicResponse; robots: RobotsFetch };
 /** Attempts allowed per page, the first one included. */
 export const MAX_PAGE_ATTEMPTS = 3;
@@ -93,10 +96,12 @@ const HTML = /text\/html|application\/xhtml/i;
  */
 const startedDownload = (error: unknown) => error instanceof Error && /Download is starting/i.test(error.message);
 /**
- * How long the sitemap read may hold the start of a crawl. A sitemap answers in well under a second when it exists;
- * one that does not answer by then is given up and the crawl starts from the home page alone, as it did before.
+ * How long the sitemap read may hold the start of a crawl. One file answers in well under a second, but a large firm's
+ * index is many files: hklaw.com's 12 took 7-8 s read one by one and ~3 s four at a time. At 4 s the read finished on
+ * some scans and not on others, so the same site was crawled from different pages (DN-12 §13.10). One that does not
+ * answer by then is given up, the crawl starts from the home page alone, and the outcome is kept with the crawl.
  */
-export const SITEMAP_SEED_TIMEOUT_MS = 4_000;
+export const SITEMAP_SEED_TIMEOUT_MS = 10_000;
 // Measured on gallardolawyers.com: 3 pages at once took 21-25 s, 6 took 14 s for the same 19 pages.
 export const CRAWL_CONCURRENCY = 6;
 /**
@@ -105,7 +110,8 @@ export const CRAWL_CONCURRENCY = 6;
  * reject a robots.txt download the crawl is waiting on; the answers it settled join the scan's cache once it is done.
  */
 async function sitemapLinks(domain: string, signal: AbortSignal, transport: CrawlTransport, robots: RobotsCache,
-  timeoutMs: number): Promise<Array<{ url: string; kind: 'page' | 'document' }>> {
+  timeoutMs: number): Promise<{ links: Array<{ url: string; kind: 'page' | 'document' }>; status: 'read' | 'timeout' | 'failed'; ms: number }> {
+  const started = Date.now();
   const stop = new AbortController();
   const timer = setTimeout(() => stop.abort(new Error('sitemap timed out')), timeoutMs);
   const bounded = AbortSignal.any([signal, stop.signal]);
@@ -114,9 +120,9 @@ async function sitemapLinks(domain: string, signal: AbortSignal, transport: Craw
     // Raced, not only signalled: a transport that ignores the signal must not hold the crawl either.
     const read = await Promise.race([readSitemap(domain, bounded, transport, copy),
       new Promise<null>(resolve => bounded.addEventListener('abort', () => resolve(null), { once: true }))]);
-    if (!read || bounded.aborted) return [];
+    if (!read || bounded.aborted) return { links: [], status: stop.signal.aborted ? 'timeout' : 'failed', ms: Date.now() - started };
     for (const [origin, entry] of copy) if (!robots.has(origin)) robots.set(origin, entry);
-    return read.links;
+    return { links: read.links, status: read.links.length || read.detail === 'NO_SITEMAP_URLS' ? 'read' : 'failed', ms: Date.now() - started };
   } finally {
     clearTimeout(timer);
     stop.abort();
@@ -153,6 +159,7 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
   const pages: CrawledPage[] = [];
   const issues: CrawlIssue[] = [];
   let partial = false;
+  let sitemap: SitemapSeedOutcome | undefined;
   const browser = await chromium.launch({ headless: true, timeout: 10_000,
     args: options.hostResolverRules ? [`--host-resolver-rules=${options.hostResolverRules}`] : [] });
   const abort = () => { void browser.close().catch(() => {}); };
@@ -254,9 +261,11 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
       // to read, and the sitemap's shorter deadline never cuts a download the crawl itself needs.
       const rules = await robotsFor(rootUrl).catch(() => null);
       if (rules && rules.state !== 'unreachable') {
-        const links = await sitemapLinks(domain, signal, transport, robotsCache, options.sitemapTimeoutMs ?? SITEMAP_SEED_TIMEOUT_MS);
-        for (const url of sitemapSeeds(links, rootUrl, new Set(queue.map(item => item.url)))) queue.push({ url, depth: 1, attempt: 0 });
-      }
+        const read = await sitemapLinks(domain, signal, transport, robotsCache, options.sitemapTimeoutMs ?? SITEMAP_SEED_TIMEOUT_MS);
+        const seeds = sitemapSeeds(read.links, rootUrl, new Set(queue.map(item => item.url)));
+        for (const url of seeds) queue.push({ url, depth: 1, attempt: 0 });
+        sitemap = { status: read.status, urls: read.links.length, seeded: seeds.length, ms: read.ms };
+      } else sitemap = { status: 'skipped', urls: 0, seeded: 0, ms: 0 };
     }
     // Links robots.txt excludes. Settled before a batch is picked: they cost no request, so they take no page of the budget.
     const excluded = new Set<string>();
@@ -415,7 +424,7 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
     return { pages: pages.sort((a, b) => a.url.localeCompare(b.url)), partial: partial || signal.aborted,
       issues: [...new Map(issues.filter(issue => !read.has(issue.url))
         .map(issue => [`${issue.scope}:${issue.url}:${issue.code}:${issue.status}`, issue])).values()],
-      aborted: signal.aborted };
+      aborted: signal.aborted, ...(sitemap ? { sitemap } : {}) };
   } finally {
     signal.removeEventListener('abort', abort);
     await browser.close().catch(() => {});

@@ -653,6 +653,8 @@ it('seeds the crawl with the firm, people, office and AI pages its sitemap lists
   expect(result.pages.map(page => path(page.url))).toEqual(['/', '/ai', '/en/offices', '/en/our-firm', '/en/professionals']);
   expect(requested).not.toContain('/practice-areas');
   expect(result.partial).toBe(false);
+  // Kept with the crawl, so a crawl that started from other pages can be explained (DN-12 §13.10).
+  expect(result.sitemap).toMatchObject({ status: 'read', urls: 6, seeded: 4 });
 }, 30_000);
 
 it('crawls as before when the sitemap fails or never answers', async () => {
@@ -670,5 +672,6 @@ it('crawls as before when the sitemap fails or never answers', async () => {
     }, { sitemapTimeoutMs: 500 });
     expect([sitemap, result.pages.map(page => path(page.url))]).toEqual([sitemap, ['/', '/about']]);
     expect([sitemap, result.partial, result.issues]).toEqual([sitemap, false, []]);
+    expect([sitemap, result.sitemap?.status, result.sitemap?.seeded]).toEqual([sitemap, sitemap === 'fails' ? 'failed' : 'timeout', 0]);
   }
 }, 30_000);

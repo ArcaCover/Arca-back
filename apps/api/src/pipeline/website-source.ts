@@ -63,7 +63,9 @@ export class WebsiteExtractionSource implements WebsiteSource {
     // One robots cache for the whole scan: the crawl and every page, document or sitemap the extraction asks for share it.
     const robots = createRobotsCache();
     const crawl = await this.crawl(domain, signal, robots);
-    const base = { provider: this.provider.id, version: this.provider.version, pages: crawl.pages, issues: crawl.issues ?? [] };
+    const base = { provider: this.provider.id, version: this.provider.version, pages: crawl.pages, issues: crawl.issues ?? [],
+      // How the sitemap read that seeded the crawl went: a crawl that started from other pages is explained by it.
+      ...(crawl.sitemap ? { sitemap: crawl.sitemap } : {}) };
     if (!crawl.pages.length) {
       const { classification, ...outcome } = unreadableWebsite(crawl);
       return { data: null, rawContent: JSON.stringify({ ...base, analysis: null, unreadable: classification }),

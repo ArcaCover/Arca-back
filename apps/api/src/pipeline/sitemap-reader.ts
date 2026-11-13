@@ -8,6 +8,21 @@ export const MAX_SITEMAP_URLS = 400;
 export const MAX_SITEMAP_BYTES = 1_000_000;
 /** Redirects followed for one sitemap file, each checked before it is fetched. */
 export const MAX_SITEMAP_REDIRECTS = 5;
+/** Links one sitemap file may add, so every child of an index gets a share of MAX_SITEMAP_URLS. */
+export const MAX_URLS_PER_SITEMAP = 60;
+/** Child sitemaps of an index that are read. hklaw.com lists 11. */
+export const MAX_INDEX_CHILDREN = 16;
+/** Sitemap files fetched at once. Read sequentially, hklaw.com's 12 files took 7-8 s. */
+export const SITEMAP_FETCHES_IN_FLIGHT = 4;
+// Child sitemaps named for listings of dated items (news, events, publications, jobs) are read last.
+const LISTING_SITEMAP = /(news|events?|insights?|blogs?|press|publications?|media|podcasts?|webinars?|careers?|jobs|case-?studies|archive|posts?)/;
+// Those named for the firm itself, its people, offices or practices first.
+const FIRM_SITEMAP = /(professionals?|people|attorneys?|lawyers?|team|offices?|locations?|contact|firm|about|services?|practices?|general|pages?|innovation|artificial-intelligence)/;
+/** 0 for a firm sitemap, 2 for a listing of dated items, 1 for anything else; ties keep the index order. */
+export function sitemapRank(url: string): number {
+  const path = URL.canParse(url) ? new URL(url).pathname.toLowerCase() : '';
+  return LISTING_SITEMAP.test(path) && !FIRM_SITEMAP.test(path.replace(/.*\//, '')) ? 2 : FIRM_SITEMAP.test(path) ? 0 : 1;
+}
 const host = (url: string) => new URL(url).hostname.replace(/^www\./, '');
 const locations = (xml: string) => [...xml.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)]
   .map(match => match[1]!.replace(/&amp;/g, '&'));
@@ -51,19 +66,36 @@ export async function readSitemap(domain: string, signal: AbortSignal, transport
     }
     const seen = new Set<string>(), links = new Map<string, 'page' | 'document'>();
     let indexChildren = 0;
+    // Files are fetched a few at a time and read in queue order, whatever order they answer in, so the links are the
+    // same on every read. An index's children are queued by how useful they are (people, offices and the firm's own
+    // pages before news and events) and each file adds at most MAX_URLS_PER_SITEMAP links, so a news sitemap of
+    // thousands of URLs cannot fill the cap before the offices or the people are read (hklaw.com, DN-12 §13.10).
     while (queue.length && seen.size < 20 && links.size < MAX_SITEMAP_URLS) {
       signal.throwIfAborted();
-      const sitemap = queue.shift()!;
-      if (seen.has(sitemap)) continue;
-      seen.add(sitemap);
-      const text = await fetchSitemap(sitemap);
-      if (text === null) continue;
-      const isIndex = /<sitemapindex\b/i.test(text);
-      for (const loc of locations(text)) {
-        if (isIndex) { if (indexChildren < 10 && host(loc) === domain && await fetchable(loc)) { queue.push(loc); indexChildren++; } continue; }
-        const target = classifyLink(loc, base);
-        if (target && rules.allows(target.url)) links.set(target.url, target.kind);
+      const batch: string[] = [];
+      while (queue.length && batch.length < SITEMAP_FETCHES_IN_FLIGHT && seen.size < 20) {
+        const sitemap = queue.shift()!;
+        if (seen.has(sitemap)) continue;
+        seen.add(sitemap); batch.push(sitemap);
       }
+      const texts = await Promise.all(batch.map(fetchSitemap));
+      const children: string[] = [];
+      for (const text of texts) {
+        if (text === null || links.size >= MAX_SITEMAP_URLS) continue;
+        const isIndex = /<sitemapindex\b/i.test(text);
+        let added = 0;
+        for (const loc of locations(text)) {
+          if (isIndex) {
+            if (indexChildren < MAX_INDEX_CHILDREN && host(loc) === domain && await fetchable(loc)) { children.push(loc); indexChildren++; }
+            continue;
+          }
+          if (added >= MAX_URLS_PER_SITEMAP || links.size >= MAX_SITEMAP_URLS) break;
+          const target = classifyLink(loc, base);
+          if (target && rules.allows(target.url) && !links.has(target.url)) { links.set(target.url, target.kind); added++; }
+        }
+      }
+      queue.push(...children.map((url, index) => ({ url, index })).sort((a, b) => sitemapRank(a.url) - sitemapRank(b.url) || a.index - b.index)
+        .map(child => child.url));
     }
     const ordered = [...links].map(([url, kind]) => ({ url, kind }))
       .sort((a, b) => (a.kind === b.kind ? pagePriority(a.url) - pagePriority(b.url) : a.kind === 'page' ? -1 : 1) || a.url.localeCompare(b.url))
