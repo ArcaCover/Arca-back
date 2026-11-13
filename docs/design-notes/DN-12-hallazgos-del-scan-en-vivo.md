@@ -964,3 +964,47 @@ Con ellos, `npm test` da 1252 de 1252.
 
 Lo que no cambió, a propósito: los límites de §4.6 (plantilla cortada, filas antiguas sin código, sitio que siempre
 llega al plazo).
+
+## 12. Evidencia insuficiente para puntuar (2026-11-12)
+
+Rama `fix/score-stability` en los dos repos. Decisión **[Jesús]**.
+
+**Por qué.** Un scan real de hklaw.com mostró "3 / 100 CRITICAL" cuando solo se pudo evaluar una de las cuatro
+categorías (Professional Standing, `PARTIAL`) y la confianza era `LOW`. El número y el tier se leían como un
+juicio sobre la firma, y eran un hueco en lo que pudimos ver.
+
+**Regla (igual en los dos repos).** Hay evidencia insuficiente cuando `preScore.confidence === 'LOW'` **y**
+menos de 2 de las 4 categorías tienen un estado distinto de `UNKNOWN` (una `PARTIAL` cuenta como evaluada).
+Back: `hasInsufficientEvidence` en `apps/api/src/report/quick-scan.ts`. Front: `hasInsufficientEvidence` en
+`lib/api/adapt.ts`.
+
+**Excepción.** Con el flag `WEBSITE_UNAVAILABLE` la regla no se aplica: ese caso se muestra a propósito como el
+grupo de mayor riesgo con revisión manual (§3.3 y §8), y el aviso de la web nombra el tier. El front deja fuera,
+además, todo resultado al que pinta el aviso de web ilegible, también una web caída sin el flag, para no
+esconder el tier que ese aviso nombra; el PDF solo pone ese aviso con el flag, así que con el flag le basta.
+
+**Qué se muestra en lugar del número y el tier.**
+
+- `/score`: "Not enough evidence to rate" y "We could evaluate only {n} of 4 areas from public sources, so we
+  are not showing a score. The assessment below fills in what public sources cannot show." (con 0: "We could
+  not evaluate any of the 4 areas…"). "Refine your score" sube, como con la web ilegible. Las barras, las
+  señales y el botón del PDF siguen. El aviso de evidencia solo dice qué fuentes fallaron y cierra con "This is
+  not a coverage decision.", sin hablar de "this score".
+- PDF del Quick Scan: en el bloque del score, "Not enough evidence to rate" y la misma frase, con "A full
+  assessment fills in what public sources cannot show." en vez de "The assessment below…". Sin número, sin tier,
+  sin línea de tier y sin línea de confianza. La nota de fuentes incompletas queda en "Some sources did not
+  answer in full." (sin "so this score rests on partial evidence"), y la de que no hay decisión de suscripción
+  sigue. Las categorías, los hallazgos y las fuentes no cambian.
+- Webapp: un análisis guardado solo con scan sale con "—" y "NOT SCORED" en la lista, la comparación y la
+  tarjeta, que además dice la primera frase.
+- `/assessment/results` no cambia: su tier es el del compuesto, y la Capa 1 solo aparece como número en
+  "Public evidence · Layer 1". `AssessmentResult` no trae la confianza ni las categorías de la Capa 1, así que
+  la regla no se puede evaluar ahí sin otra lectura del scan. El PDF de la Capa 2 tampoco cambia.
+
+**Lo que no cambia.** El contrato (`@arca/contracts` 0.4.0, D6): el score y el tier siguen en el resultado, en
+el panel State y en la caché; solo las pantallas y el PDF dejan de presentarlos. El pipeline y el scoring no se
+tocaron.
+
+**Tests.** `apps/api/tests/unit/report.test.ts` (la regla: forma de hklaw → insuficiente; 2 categorías → no;
+confianza no baja → no; `WEBSITE_UNAVAILABLE` → no; y el texto del PDF). En el front, `lib/api/adapt.test.ts`,
+`lib/scan-flow.test.tsx` y `components/app/analyses-pages.test.tsx`.
