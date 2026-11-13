@@ -1298,6 +1298,9 @@ esperaba. Según el tiempo de red, la siembra llegaba o no.
   generales primero; noticias, eventos, publicaciones y empleo al final. Lee hasta 16 hijos.
 - Cada fichero aporta como mucho 60 URLs (`MAX_URLS_PER_SITEMAP`), así que ninguno se come el tope.
 - El crawl espera la siembra hasta 10 s (`SITEMAP_SEED_TIMEOUT_MS`).
+- Un fichero que no se puede leer (más de 1 MB, conexión caída) se salta; ya no hace fallar la lectura entera. La
+  verificación en vivo lo destapó: el sitemap `insights` de hklaw.com pesa 1,4 MB, y con todos los hijos leídos la
+  lectura fallaba siempre (`Response too large`), tanto la siembra del crawl como la herramienta del agente.
 - El resultado guarda cómo fue la lectura (`sitemap: { status, urls, seeded, ms }`, `read` / `timeout` / `failed` /
   `skipped`), también en el registro de evidencia del website: un crawl que empezó distinto queda explicado.
 
