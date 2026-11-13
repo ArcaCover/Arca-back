@@ -26,6 +26,28 @@ export function websiteUnreadNote(tier: Layer1Result['preScore']['tier']) {
     'Answers to the assessment also count, and because the website could not be read, the case will need a manual review.'].join(' ');
 }
 
+type PreScore = Pick<Layer1Result['preScore'], 'confidence' | 'categories' | 'flags'>;
+
+const evaluatedAreas = (preScore: PreScore) =>
+  Object.values(preScore.categories).filter(category => category.status !== 'UNKNOWN').length;
+
+// Too little evidence to present the score and the tier as a judgement of the firm: low confidence and fewer than half
+// of the four categories evaluated (DN-12 §12). The live scan of hklaw.com printed 3 / 100, CRITICAL, from one partial
+// category; that was a gap in what we could see, not a verdict. WEBSITE_UNAVAILABLE is excluded on purpose: that case is
+// shown as the highest-risk group with a manual review (§3.3). The front applies the same rule to /score and the webapp
+// (hasInsufficientEvidence in Arca-front lib/api/adapt.ts).
+export function hasInsufficientEvidence(preScore: PreScore) {
+  return preScore.confidence === 'LOW' && evaluatedAreas(preScore) < 2 && !preScore.flags.includes(WEBSITE_UNAVAILABLE);
+}
+
+// The words /score shows in the place of the score, with the assessment named the way the footer names it.
+function notRatedNote(evaluated: number) {
+  return [evaluated === 0
+    ? 'We could not evaluate any of the 4 areas from public sources, so we are not showing a score.'
+    : `We could evaluate only ${evaluated} of 4 areas from public sources, so we are not showing a score.`,
+  'A full assessment fills in what public sources cannot show.'].join(' ');
+}
+
 const SOURCE_NAMES: Record<string, string> = { website: 'Firm website', bar: 'Florida Bar', avvo: 'Avvo' };
 
 function sourceLine(name: string, source: Layer1Result['sources'][keyof Layer1Result['sources']]) {
@@ -60,9 +82,10 @@ export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 
   // The cause replaces the generic notice about incomplete sources. It says what was observed and what that does to
   // the score, never a decision or a price.
   const websiteUnread = result.preScore.flags.includes(WEBSITE_UNAVAILABLE);
+  const notRated = hasInsufficientEvidence(result.preScore);
   const notes = [
     websiteUnread ? websiteUnreadNote(result.preScore.tier)
-      : view.incomplete ? 'Some sources did not answer in full, so this score rests on partial evidence.' : null,
+      : view.incomplete ? `Some sources did not answer in full${notRated ? '.' : ', so this score rests on partial evidence.'}` : null,
     view.decisionWithheld ? 'There is not enough public evidence yet for an underwriting decision.' : null,
   ].filter(Boolean) as string[];
 
@@ -74,10 +97,14 @@ export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 
   <h1>${escape(view.firm.name ?? result.domain)}</h1>
   <div class="meta">${details.length ? `${escape(details.join(' · '))}<br>` : ''}Scanned ${escape(date)}</div>
 
-  <section class="score">
+  <section class="score">${notRated
+    // No number and no tier: on this little evidence they would read as a judgement of the firm.
+    ? `
+    <div><div class="tier">Not enough evidence to rate</div><div class="tier-line">${escape(notRatedNote(evaluatedAreas(result.preScore)))}</div></div>`
+    : `
     <div class="total">${view.score === null ? '—' : view.score}<small> / 100</small></div>
     <div><div class="tier">${escape(view.tier)}</div><div class="tier-line">${escape(TIER_LINES[view.tier] ?? '')}</div>
-      <div class="meta">Confidence: ${escape(view.confidence.toLowerCase())}</div></div>
+      <div class="meta">Confidence: ${escape(view.confidence.toLowerCase())}</div></div>`}
   </section>
   ${notes.length ? `<ul class="notes">${notes.map(note => `<li>${escape(note)}</li>`).join('')}</ul>` : ''}
 

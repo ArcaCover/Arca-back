@@ -4,7 +4,7 @@ import { createApp } from '../../src/http/app.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import { issueSessionToken } from '../../src/auth/session-token.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
-import { renderQuickScanHtml, reportFilename, websiteUnreadNote } from '../../src/report/quick-scan.js';
+import { hasInsufficientEvidence, renderQuickScanHtml, reportFilename, websiteUnreadNote } from '../../src/report/quick-scan.js';
 import { InProcessPipeline } from '../../src/pipeline/in-process-pipeline.js';
 import { mockSources } from '../../src/pipeline/mock-sources.js';
 import { fixtureResult } from '../../../../packages/contracts/tests/fixture.js';
@@ -115,6 +115,109 @@ describe('Quick Scan Report content', () => {
     const html = renderQuickScanHtml(fixtureResult(), 'COMPLETED');
     expect(html).toContain('<h1>Smith Law</h1>');
     expect(html).toMatch(/<div class="meta">smithlaw\.com( · [^<]+)?<br>Scanned/);
+  });
+});
+
+// The live scan of hklaw.com: only Professional Standing could be evaluated, and only in part, so the engine printed
+// 3 / 100, CRITICAL, with low confidence. The website was read in part; Avvo was never searched.
+function thinEvidence() {
+  const result = fixtureResult();
+  const unknown = (max: number, rules: string[]) => ({ score: null, max, status: 'UNKNOWN' as const,
+    rules: rules.map(id => ({ id, points: null, reason: 'Evidence unavailable or ambiguous' })) });
+  result.domain = 'hklaw.example';
+  result.preScore = { ...result.preScore, total: 3, tier: 'CRITICAL', decision: 'UNKNOWN', confidence: 'LOW',
+    assessmentStatus: 'INSUFFICIENT_EVIDENCE', flags: ['INCOMPLETE_SOURCES', 'INCOMPLETE_EVIDENCE', 'COMMERCIAL_DECISION_BLOCKED'],
+    categories: {
+      aiGovernance: unknown(35, ['W1', 'W2', 'W3', 'W4']),
+      professionalStanding: { score: 3, max: 30, status: 'PARTIAL', rules: [
+        { id: 'B1', points: 3, reason: 'Evaluated from observed evidence' },
+        { id: 'B2_clean', points: null, reason: 'Evidence unavailable or ambiguous' }] },
+      reputation: unknown(20, ['A1', 'A3', 'A6']),
+      firmMaturity: unknown(15, ['W7', 'W6', 'W5a', 'W8', 'W9_A2']),
+    } };
+  result.sources = { website: { status: 'partial', dataStatus: 'PRESENT', durationMs: 60000, code: 'DEADLINE_REACHED' },
+    bar: { status: 'ok', dataStatus: 'PRESENT', durationMs: 10 },
+    avvo: { status: 'skipped', dataStatus: 'UNKNOWN', durationMs: 0, code: 'INSUFFICIENT_IDENTITY' } };
+  return result;
+}
+
+describe('hasInsufficientEvidence', () => {
+  it('is true for the hklaw.com shape: low confidence and one category, partly, evaluated', () => {
+    expect(hasInsufficientEvidence(thinEvidence().preScore)).toBe(true);
+  });
+
+  it('is true when no category could be evaluated and the website was read', () => {
+    const { preScore } = thinEvidence();
+    preScore.categories.professionalStanding = { ...preScore.categories.reputation, max: 30 };
+    expect(hasInsufficientEvidence(preScore)).toBe(true);
+  });
+
+  it('is false once two categories are known or partial, even with low confidence', () => {
+    const { preScore } = thinEvidence();
+    preScore.categories.reputation = { ...preScore.categories.reputation, score: 10, status: 'KNOWN' };
+    expect(hasInsufficientEvidence(preScore)).toBe(false);
+  });
+
+  it('is false when confidence is not low', () => {
+    expect(hasInsufficientEvidence({ ...thinEvidence().preScore, confidence: 'MEDIUM' })).toBe(false);
+  });
+
+  it('is false with WEBSITE_UNAVAILABLE, which keeps its highest-risk treatment and manual review', () => {
+    const { preScore } = thinEvidence();
+    expect(hasInsufficientEvidence({ ...preScore, flags: [...preScore.flags, 'WEBSITE_UNAVAILABLE'] })).toBe(false);
+  });
+
+  it('is false for a fully read firm', () => {
+    expect(hasInsufficientEvidence(fixtureResult().preScore)).toBe(false);
+  });
+});
+
+describe('Quick Scan Report with too little evidence to rate', () => {
+  it('prints no number and no tier, and says how many areas could be evaluated', () => {
+    const html = renderQuickScanHtml(thinEvidence(), 'PARTIAL');
+    expect(html).toContain('Not enough evidence to rate');
+    expect(html).toContain('We could evaluate only 1 of 4 areas from public sources, so we are not showing a score. ' +
+      'A full assessment fills in what public sources cannot show.');
+    expect(html).not.toMatch(/<small> \/ 100/);
+    expect(html).not.toContain('CRITICAL');
+    expect(html).not.toContain('Very few positive public signals');
+    expect(html).not.toMatch(/Confidence: low/);
+  });
+
+  it('keeps the categories, the findings and the sources, and does not speak of a score it does not show', () => {
+    const html = renderQuickScanHtml(thinEvidence(), 'PARTIAL');
+    expect(html).toContain('Professional Standing');
+    expect(html).toContain('3 / 30');
+    expect(html).toContain('Avvo: not searched; we could not look the firm up there');
+    expect(html).toMatch(/not enough public evidence yet for an underwriting decision/i);
+    expect(html).toContain('<li>Some sources did not answer in full.</li>');
+    expect(html).not.toMatch(/score rests on partial evidence/);
+    expect(html).not.toMatch(/[A-Z]{2,}_[A-Z]/);
+  });
+
+  it('says no area could be evaluated when none was', () => {
+    const result = thinEvidence();
+    result.preScore.categories.professionalStanding = { ...result.preScore.categories.reputation, max: 30 };
+    expect(renderQuickScanHtml(result, 'PARTIAL'))
+      .toContain('We could not evaluate any of the 4 areas from public sources, so we are not showing a score.');
+  });
+
+  it('rates the firm as before once two categories could be evaluated', () => {
+    const result = thinEvidence();
+    result.preScore.categories.reputation = { ...result.preScore.categories.reputation, score: 10, status: 'KNOWN' };
+    const html = renderQuickScanHtml(result, 'PARTIAL');
+    expect(html).toMatch(/>3<small> \/ 100/);
+    expect(html).toContain('CRITICAL');
+    expect(html).not.toContain('Not enough evidence to rate');
+  });
+
+  it('keeps the highest-risk group for an unreadable website, whatever else is thin', () => {
+    const result = thinEvidence();
+    result.preScore.flags = [...result.preScore.flags, 'WEBSITE_UNAVAILABLE'];
+    const html = renderQuickScanHtml(result, 'PARTIAL');
+    expect(html).toContain('CRITICAL');
+    expect(html).toMatch(/>3<small> \/ 100/);
+    expect(html).not.toContain('Not enough evidence to rate');
   });
 });
 
