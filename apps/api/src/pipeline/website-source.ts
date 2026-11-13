@@ -70,10 +70,14 @@ export class WebsiteExtractionSource implements WebsiteSource {
         status: { ...outcome, dataStatus: 'UNKNOWN', durationMs: Date.now() - start, pagesCrawled: 0 } };
     }
     // Same firm, same signals (DN-12 §4.3): an analysis is reused when the provider would read the same evidence
-    // again. The key is what the extraction reads (text, metadata, links), not the HTML, which changes on every
-    // visit to most sites, and it changes with the provider version, which covers the model and its prompts.
+    // again. The key is the firm's own content as the extraction reads it (text, metadata, links), without the
+    // furniture every page repeats and without the bodies of news and blog pages, and never the HTML, which changes
+    // on every visit to most sites. It changes with the provider version, which covers the model and its prompts.
+    // wsk2- names that reading; a record keyed wsk1- (every page's full text) is never found by a wsk2- key, so it
+    // is simply not reused. `full` does not depend on the fingerprint and keeps its name: a complete reading stored
+    // under wsk1- still stands in for a crawl that was cut short.
     const version = JSON.stringify([this.provider.id, this.provider.version]);
-    const key = `wsk1-${hash(`${version}\n${corpusFingerprint(crawl)}`)}`, full = `wsf1-${hash(version)}`;
+    const key = `wsk2-${hash(`${version}\n${corpusFingerprint(crawl)}`)}`, full = `wsf1-${hash(version)}`;
     const now = (this.options.now ?? Date.now)(), maxAge = this.options.reuseMaxAgeMs ?? WEBSITE_SIGNAL_REUSE_MAX_AGE_MS;
     const since = new Date(now - maxAge).toISOString();
     // A crawl that was cut short never replaces what a complete one gave: its thinner evidence would only lose
