@@ -145,6 +145,26 @@ describe('spend guards', () => {
     expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.5', APIFY_EXPECTED_COST_USD_PER_RUN: '0.25' }).apifySpendCeilingUsd).toBe(0.5);
     expect(() => loadEnv({ ...liveDebug, APIFY_EXPECTED_COST_USD_PER_RUN: '3' })).toThrow('APIFY_SPEND_CEILING_USD');
   });
+  it('reserves less for a targeted lookup than for a firm search, and every kind must fit under the ceiling', () => {
+    expect(loadEnv(liveDebug)).toMatchObject({ APIFY_EXPECTED_COST_USD_PER_RUN: 1, APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: 0.1,
+      APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: 0.4 });
+    expect(loadEnv({ ...liveDebug, APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.05', APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.5' }))
+      .toMatchObject({ APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: 0.05, APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: 0.5 });
+    for (const value of ['0', '-1', 'cheap']) {
+      expect(() => loadEnv({ ...liveDebug, APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: value }), value).toThrow();
+      expect(() => loadEnv({ ...liveDebug, APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: value }), value).toThrow();
+    }
+    // A ceiling only targeted lookups fit under would refuse every firm search while looking like a budget, and the other way round.
+    expect(() => loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.3', APIFY_EXPECTED_COST_USD_PER_RUN: '0.25' }))
+      .toThrow('APIFY_SPEND_CEILING_USD is below APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN');
+    expect(() => loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.3', APIFY_EXPECTED_COST_USD_PER_RUN: '0.25',
+      APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.2', APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.5' }))
+      .toThrow('APIFY_SPEND_CEILING_USD is below APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN');
+    expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.3', APIFY_EXPECTED_COST_USD_PER_RUN: '0.25',
+      APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.3' }).apifySpendCeilingUsd).toBe(0.3);
+    // 0 still means cached queries only, whatever each kind reserves.
+    expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0' }).apifySpendCeilingUsd).toBe(0);
+  });
 });
 describe('ARCA_MODE', () => {
   const liveKeys = { APIFY_API_TOKEN: 'test', OPENAI_API_KEY: 'sk-test' };

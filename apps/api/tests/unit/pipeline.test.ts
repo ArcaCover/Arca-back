@@ -54,6 +54,20 @@ describe('three-source orchestration', () => {
     expect(queries).toHaveLength(2);
     expect(queries.every(query => query.length === 30 && names.every(name => query.includes(name)))).toBe(true);
   });
+  it('scopes the directories to the Florida offices of a firm whose only names came from news pages', async () => {
+    const queries: Array<{ names: string[]; officeCities?: string[] }> = [];
+    const directories = { run: async (query: { names: string[]; officeCities?: string[] }) => { queries.push(query); return failed(); } };
+    const reference = (sourceUrl: string, excerpt: string) => ({ sourceUrl, excerpt, method: 'page_text' as const });
+    const pipeline = new InProcessPipeline({ repository: new InMemoryRepository(),
+      website: { run: async () => ({ data: { ...unknownWebsite(), firm_name: 'Big Firm',
+        team_members: [{ full_name: 'Jane Doe', title: 'Partner' }],
+        provenance: { florida_office_cities: [reference('https://bigfirm.com/offices/miami', 'Miami')],
+          team_members_news_only: [reference('https://bigfirm.com/news/award', 'Jane Doe')] } }, rawContent: '{}',
+        status: { status: 'ok' as const, dataStatus: 'PRESENT' as const, durationMs: 0 } }) },
+      bar: { ...directories, jurisdiction: 'FL' }, avvo: directories });
+    await pipeline.run({ scanId: 'sc_offices', canonicalDomain: 'bigfirm.com', email: 'owner@bigfirm.com' });
+    expect(queries.map(query => [query.names, query.officeCities])).toEqual([[[], ['Miami']], [[], ['Miami']]]);
+  });
   it('has MEDIUM technical confidence with one failed source', async () => {
     const pipeline = new InProcessPipeline({ ...mockSources(), avvo: { run: failed }, repository: new InMemoryRepository() });
     const result = await pipeline.run({ scanId: 'sc_partial', canonicalDomain: 'robust.arca.example', email: 'owner@robust.arca.example' });

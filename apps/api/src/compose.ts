@@ -12,7 +12,7 @@ import { OPENAI_EVIDENCE_MODEL, OpenAIEvidenceProvider, RuleBasedEvidenceProvide
 import { AgenticEvidenceProvider } from './pipeline/agentic-evidence-provider.js';
 import { openAiEndpoint } from './pipeline/llm-endpoint.js';
 import { ApifyClient } from './pipeline/apify-client.js';
-import { ApifyDirectorySource } from './pipeline/directories.js';
+import { ApifyDirectorySource, AVVO_ACTOR } from './pipeline/directories.js';
 import { PublicDomainResolver } from './pipeline/domain-resolution.js';
 import { mockSources, MOCK_DOMAINS } from './pipeline/mock-sources.js';
 import { RoutingAssessmentRepository, RoutingScanRepository } from './debug/isolation.js';
@@ -74,6 +74,8 @@ export async function compose(env: ReturnType<typeof loadEnv>,
         env.openAiMaxRequestsPerScan === null ? {} : { maxRequests: env.openAiMaxRequestsPerScan });
   const apify = env.sourceMode === 'live' ? new ApifyClient(env.APIFY_API_TOKEN!, fetch, env.MAX_APIFY_CONCURRENCY, {
     store: repository, build: env.APIFY_ACTOR_BUILD, expectedCostUsdPerRun: env.APIFY_EXPECTED_COST_USD_PER_RUN,
+    expectedCostUsdPerTargetedRun: env.APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN,
+    expectedCostUsdPerTargetedRunByActor: { [AVVO_ACTOR]: env.APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN },
     cacheTtlMs: env.APIFY_QUERY_CACHE_TTL_MS, activeTtlMs: env.APIFY_ACTIVE_RUN_TTL_MS,
     runTimeoutSecs: env.APIFY_RUN_TIMEOUT_SECS,
     maxCachedItems: env.APIFY_MAX_CACHED_ITEMS,

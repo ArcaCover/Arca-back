@@ -144,8 +144,10 @@ Los límites en memoria son 10 solicitudes por IP/hora y 3 por email/hora.
 
 En producción el gasto de Apify se **registra pero no se limita**. El ledger (`apify_runs`, `scan_apify_runs`,
 `cost_usd`, `reserved_usd`, `accounting_complete`, `charged_to_scan`) atribuye el coste por scan;
-`APIFY_EXPECTED_COST_USD_PER_RUN` es la cifra provisional que se reserva por cada run hasta que Apify
-liquida su coste real, minutos después de que termine. Sin techo no hay tope por run, por scan ni por
+`APIFY_EXPECTED_COST_USD_PER_RUN` es la cifra provisional que se reserva por cada búsqueda por firma hasta que
+Apify liquida su coste real, minutos después de que termine; una búsqueda dirigida de unos pocos nombres reserva
+`APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN` (0,10) o, en Avvo, `APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN`
+(0,40) (DN-06 §10.2). Sin techo no hay tope por run, por scan ni por
 día, y tampoco `maxTotalChargeUsd` del lado del proveedor: lo único que acota un run individual es
 `APIFY_RUN_TIMEOUT_SECS`.
 

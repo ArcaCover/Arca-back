@@ -10,6 +10,7 @@ import { SupabaseRepository } from '../../src/repositories/supabase.js';
 import type { ScanRecord } from '../../src/repositories/types.js';
 import { InMemoryAssessmentRepository, SupabaseAssessmentRepository } from '../../src/assessment/repository.js';
 import { ApifyClient } from '../../src/pipeline/apify-client.js';
+import { AVVO_ACTOR } from '../../src/pipeline/directories.js';
 import { DEFAULT_SIGNAL_LLM_MODEL } from '../../src/pipeline/llm-endpoint.js';
 import { OPENAI_EVIDENCE_MODEL } from '../../src/pipeline/website-evidence-provider.js';
 import { MockAppAuth } from '../../src/webapp/auth.js';
@@ -141,6 +142,13 @@ describe('compose', () => {
     const website = (appDeps().pipeline as unknown as { deps: { website: { provider: { options: { maxRequests?: number } } } } }).deps.website;
     expect(website.provider.options.maxRequests).toBe(cap);
     if (ceiling === null) expect(composed.banner).not.toContain('spend guards');
+  });
+
+  it('hands the Apify client one reservation per kind of lookup, and one of its own for Avvo', async () => {
+    const composed = await compose(loadEnv({ ...base, ...live, APIFY_EXPECTED_COST_USD_PER_RUN: '1.5',
+      APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.05', APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.3' }));
+    expect((composed.apify as unknown as { options: Record<string, unknown> }).options).toMatchObject({ expectedCostUsdPerRun: 1.5,
+      expectedCostUsdPerTargetedRun: 0.05, expectedCostUsdPerTargetedRunByActor: { [AVVO_ACTOR]: 0.3 } });
   });
 
   // DN-09 4 and 7: the panel's 'Back mode' row must say what this process built, never which keys merely sit in the file.
