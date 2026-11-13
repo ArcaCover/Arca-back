@@ -16,6 +16,13 @@ export const BAR_TARGETED_MAX_LAWYERS = 25;
 export const AVVO_TARGETED_MAX_LAWYERS = 10;
 // City searches of one firm in the Florida Bar, one run each (DN-06 §10). Each is a firm search and reserves as one.
 export const BAR_MAX_OFFICE_SEARCHES = 3;
+// Lawyers one office-city search of a large firm reads (DN-12 §13.9). Uncapped city searches of hklaw.com were cut by
+// the run's charge limit at USD 1 (24-50 lawyers each): a cut dataset is not reused, so every scan paid again and read
+// a different roster. A run that stops at its own maxLawyers ends SUCCEEDED, stays in the query cache and reads the
+// same lawyers next time; at ~USD 0.04 a lawyer with details, 20 stay under the USD 1 a firm run reserves.
+export const BAR_OFFICE_SAMPLE_MAX_LAWYERS = 20;
+// The same for an Avvo firm search scoped by an office city (no verified city): ~USD 0.0385 a profile.
+export const AVVO_OFFICE_SAMPLE_MAX_LAWYERS = 10;
 // Lookups one source keeps in flight. Bar and Avvo run side by side, so two sources fill the
 // default MAX_APIFY_CONCURRENCY of 16; the Apify client queues anything beyond its limit.
 export const DIRECTORY_LOOKUPS_IN_FLIGHT = 8;
@@ -124,16 +131,18 @@ function officeSearchCities(query: DirectoryQuery): string[] {
   });
 }
 export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQuery, targetedMaxLawyers =
-  source === 'bar' ? BAR_TARGETED_MAX_LAWYERS : AVVO_TARGETED_MAX_LAWYERS): DirectoryInput[] {
+  source === 'bar' ? BAR_TARGETED_MAX_LAWYERS : AVVO_TARGETED_MAX_LAWYERS,
+  officeSampleMaxLawyers = source === 'bar' ? BAR_OFFICE_SAMPLE_MAX_LAWYERS : AVVO_OFFICE_SAMPLE_MAX_LAWYERS): DirectoryInput[] {
   // DN-06 §10: a large firm, or one whose only names came from news pages, is looked up in the Bar by firm in each
-  // of its Florida office cities. Every lawyer of the firm there is returned, with the technical maximum and no
-  // sample, as the firm-wide search does; the city bounds the run instead of the whole registry.
+  // of its Florida office cities. Each city search reads a fixed sample of the firm's lawyers there (DN-12 §13.9):
+  // a large firm's whole Florida roster costs more than a scan may spend, and a search cut by its charge limit is
+  // neither complete nor reusable. The search of a firm with no office city keeps the technical maximum (DN-06).
   const offices = source === 'bar' && query.firmName ? officeSearchCities(query) : [];
   if (offices.length) {
     const firm = query.firmName!;
     return offices.slice(0, BAR_MAX_OFFICE_SEARCHES).map(city => ({ target: `${firm} (${city})`, actor: BAR_ACTOR, fallback: true,
-      kind: 'firm' as const, firm, resultLimit: BAR_TECHNICAL_MAX_LAWYERS,
-      input: { lastNames: [], firstName: '', firm, locationType: 'city', locations: [city], maxLawyers: BAR_TECHNICAL_MAX_LAWYERS,
+      kind: 'firm' as const, firm, resultLimit: officeSampleMaxLawyers,
+      input: { lastNames: [], firstName: '', firm, locationType: 'city', locations: [city], maxLawyers: officeSampleMaxLawyers,
         withDetails: true, withLeadScore: false, withProfileSummary: false, eligibleOnly: false, includeDeceased: true } }));
   }
   const names = stableSample(query.names);
@@ -142,7 +151,8 @@ export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQue
   // technical maximum of 100,000 lawyers. Nothing caps that spend any more (D8), so it is not run.
   // Named lookups stay: the targeted maximum bounds each one whether or not a city is known.
   // A Florida office city the website lists scopes it when no city was verified.
-  const city = query.city ?? officeSearchCities(query)[0] ?? null;
+  const officeCity = query.city ? null : officeSearchCities(query)[0] ?? null;
+  const city = query.city ?? officeCity;
   const location = city && query.state ? `${city}, ${query.state}` : null;
   const unscopedFirmSearch = fallback && source === 'avvo' && location === null;
   const targets = unscopedFirmSearch ? [] : fallback ? (query.firmName ? [query.firmName] : []) : names;
@@ -150,8 +160,9 @@ export function buildDirectoryInputs(source: 'bar' | 'avvo', query: DirectoryQue
     const parts = normalizeName(target).split(' ');
     // The Bar actor matches on the whole first name: an initial alone returns "No lawyers matched".
     const title = (word: string) => word.replace(/(^|[-'])([a-z])/g, (_match, lead: string, letter: string) => `${lead}${letter.toUpperCase()}`);
-    const resultLimit = fallback ? (source === 'bar' ? BAR_TECHNICAL_MAX_LAWYERS : AVVO_TECHNICAL_MAX_LAWYERS)
-      : targetedMaxLawyers;
+    // An Avvo firm search scoped by an office city is a large firm's: it reads a sample, as the Bar city searches do.
+    const resultLimit = fallback ? (source === 'bar' ? BAR_TECHNICAL_MAX_LAWYERS
+      : officeCity ? officeSampleMaxLawyers : AVVO_TECHNICAL_MAX_LAWYERS) : targetedMaxLawyers;
     const input = source === 'bar' ? {
       lastNames: fallback ? [] : [surname(target).split(' ').map(title).join(' ')], firstName: fallback ? '' : title(parts[0]!),
       ...(fallback ? { firm: target } : {}), maxLawyers: resultLimit, withDetails: true,
@@ -178,12 +189,12 @@ type DirectoryClient = { run(actor: string, input: Record<string, unknown>, sign
 export class ApifyDirectorySource implements DirectorySource {
   readonly jurisdiction?: string;
   constructor(private readonly source: 'bar' | 'avvo', private readonly client: DirectoryClient,
-    private readonly options: { targetedMaxLawyers?: number } = {}) {
+    private readonly options: { targetedMaxLawyers?: number; officeSampleMaxLawyers?: number } = {}) {
     if (source === 'bar') this.jurisdiction = BAR_JURISDICTION;
   }
   async run(query: DirectoryQuery, signal: AbortSignal): Promise<SourceResult<AttorneyMatch[]>> {
     const started = Date.now();
-    const planned = buildDirectoryInputs(this.source, query, this.options.targetedMaxLawyers);
+    const planned = buildDirectoryInputs(this.source, query, this.options.targetedMaxLawyers, this.options.officeSampleMaxLawyers);
     const names = stableSample(query.names);
     if (!planned.length) return nothingToLookUp(query);
     // Firm searches, whole-registry or one per Florida office city, or named lookups: a plan is never both.
@@ -288,9 +299,10 @@ export class ApifyDirectorySource implements DirectorySource {
         : found ? undefined : 'NO_MATCH';
     // Which offices the roster covers: a firm with more Florida offices than the cap is not searched in all of them.
     const searched = offices.slice(0, BAR_MAX_OFFICE_SEARCHES);
-    const scope = !offices.length ? null : offices.length > searched.length
+    const sample = planned[0]?.resultLimit ?? BAR_OFFICE_SAMPLE_MAX_LAWYERS;
+    const scope = !offices.length ? null : `${offices.length > searched.length
       ? `Firm searched in ${searched.length} of its ${offices.length} Florida office cities: ${searched.join(', ')}`
-      : `Firm searched in its Florida office cities: ${searched.join(', ')}`;
+      : `Firm searched in its Florida office cities: ${searched.join(', ')}`}; up to ${sample} lawyers per city`;
     const noMatch = 'Provider completed successfully with no accepted identity match';
     return { data: successful ? matches : null, rawContent: JSON.stringify({
       queries: rawResults.sort((a, b) => a.target.localeCompare(b.target)), providerRuns }),

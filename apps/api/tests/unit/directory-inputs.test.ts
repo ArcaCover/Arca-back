@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ApifyDirectorySource, BAR_MAX_OFFICE_SEARCHES, BAR_TECHNICAL_MAX_LAWYERS, buildDirectoryInputs } from '../../src/pipeline/directories.js';
+import { ApifyDirectorySource, AVVO_OFFICE_SAMPLE_MAX_LAWYERS, AVVO_TECHNICAL_MAX_LAWYERS, BAR_MAX_OFFICE_SEARCHES,
+  BAR_OFFICE_SAMPLE_MAX_LAWYERS, BAR_TECHNICAL_MAX_LAWYERS, buildDirectoryInputs } from '../../src/pipeline/directories.js';
 
 const query = (names: string[]) => ({ canonicalDomain: 'firm.com', names, firmName: 'Duque Immigration Law, PLLC', city: 'Miami', state: 'FL' as const });
 
@@ -45,13 +46,31 @@ it('scopes the Avvo city to the jurisdiction of the query', () => {
 describe('Florida Bar search scoped to the firm\'s Florida offices', () => {
   const big = { canonicalDomain: 'bigfirm.com', names: [], firmName: 'Holland & Knight', city: null, state: 'FL' as const };
 
-  it('searches the firm in each Florida office city instead of the whole registry', () => {
+  it('searches the firm in each Florida office city instead of the whole registry, with a fixed sample per city', () => {
+    // Live 2026-11-13: uncapped city searches of hklaw.com charged USD 0.98-1.00 each and were cut by the charge limit
+    // (24, 47 and 50 lawyers); a cut dataset is not reused, so every scan paid again and read a different roster.
+    // A run that stops at its own maxLawyers ends SUCCEEDED, is cached and reads the same lawyers next time.
     const inputs = buildDirectoryInputs('bar', { ...big, officeCities: ['Miami', 'Tampa'] });
     expect(inputs.map(item => item.target)).toEqual(['Holland & Knight (Miami)', 'Holland & Knight (Tampa)']);
+    expect(BAR_OFFICE_SAMPLE_MAX_LAWYERS).toBe(20);
     for (const [index, city] of ['Miami', 'Tampa'].entries()) {
-      expect(inputs[index]).toMatchObject({ fallback: true, kind: 'firm', firm: 'Holland & Knight', resultLimit: BAR_TECHNICAL_MAX_LAWYERS,
-        input: { lastNames: [], firstName: '', firm: 'Holland & Knight', locationType: 'city', locations: [city], maxLawyers: BAR_TECHNICAL_MAX_LAWYERS } });
+      expect(inputs[index]).toMatchObject({ fallback: true, kind: 'firm', firm: 'Holland & Knight', resultLimit: BAR_OFFICE_SAMPLE_MAX_LAWYERS,
+        input: { lastNames: [], firstName: '', firm: 'Holland & Knight', locationType: 'city', locations: [city], maxLawyers: BAR_OFFICE_SAMPLE_MAX_LAWYERS } });
     }
+    expect(buildDirectoryInputs('bar', { ...big, officeCities: ['Miami'] }, undefined, 7)[0])
+      .toMatchObject({ resultLimit: 7, input: { maxLawyers: 7 } });
+  });
+
+  it('keeps the whole registry search uncapped for a firm with no Florida office city (DN-06)', () => {
+    expect(buildDirectoryInputs('bar', big)[0]).toMatchObject({ resultLimit: BAR_TECHNICAL_MAX_LAWYERS, input: { maxLawyers: BAR_TECHNICAL_MAX_LAWYERS } });
+  });
+
+  it('samples the Avvo firm search when its city came from an office list, and not when the city was verified', () => {
+    expect(AVVO_OFFICE_SAMPLE_MAX_LAWYERS).toBe(10);
+    expect(buildDirectoryInputs('avvo', { ...big, officeCities: ['Tampa'] })[0])
+      .toMatchObject({ resultLimit: AVVO_OFFICE_SAMPLE_MAX_LAWYERS, input: { maxLawyers: AVVO_OFFICE_SAMPLE_MAX_LAWYERS } });
+    expect(buildDirectoryInputs('avvo', { ...big, city: 'Miami' })[0])
+      .toMatchObject({ resultLimit: AVVO_TECHNICAL_MAX_LAWYERS, input: { maxLawyers: AVVO_TECHNICAL_MAX_LAWYERS } });
   });
 
   it('caps the number of city searches and keeps the order it was given', () => {
@@ -96,6 +115,6 @@ describe('Florida Bar search scoped to the firm\'s Florida offices', () => {
     expect(result.data?.map(match => match.attorney?.name)).toEqual(['Ana Ruiz', 'Carl Diaz']);
     expect(result.data?.every(match => match.matchConfidence === 'firm_fallback')).toBe(true);
     expect(result.status).toMatchObject({ status: 'ok', attorneysSearched: null, attorneysFound: 2 });
-    expect(result.status.reason).toBe('Firm searched in 3 of its 4 Florida office cities: Miami, Tampa, Orlando');
+    expect(result.status.reason).toBe('Firm searched in 3 of its 4 Florida office cities: Miami, Tampa, Orlando; up to 20 lawyers per city');
   });
 });

@@ -64,6 +64,7 @@ describe('independent source and storage configuration', () => {
       APIFY_EXPECTED_COST_USD_PER_RUN: 1,
       APIFY_RUN_TIMEOUT_SECS: 300, APIFY_ACTIVE_RUN_TTL_MS: 900000,
       APIFY_BAR_TARGETED_MAX_RESULTS: 25, APIFY_AVVO_TARGETED_MAX_RESULTS: 10,
+      APIFY_BAR_OFFICE_SAMPLE_MAX_RESULTS: 20, APIFY_AVVO_OFFICE_SAMPLE_MAX_RESULTS: 10,
       APIFY_MAX_CACHED_ITEMS: 1000,
       // Repairing a partial scan must not re-pay directory runs, so the query cache cannot
       // expire before the scan cache does.

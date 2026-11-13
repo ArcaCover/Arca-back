@@ -64,6 +64,10 @@ const EnvSchema = z.object({
   APIFY_RUN_TIMEOUT_SECS: z.coerce.number().int().min(60).max(86_400).default(300),
   APIFY_BAR_TARGETED_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(25),
   APIFY_AVVO_TARGETED_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(10),
+  // Lawyers one office-city firm search of a large firm reads (DN-12 §13.9): a fixed sample, so the run ends on its own
+  // limit, under its reservation, and stays reusable.
+  APIFY_BAR_OFFICE_SAMPLE_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(20),
+  APIFY_AVVO_OFFICE_SAMPLE_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(10),
   APIFY_MAX_CACHED_ITEMS: z.coerce.number().int().min(1).max(10_000).default(1000),
   PIPELINE_TIMEOUT_MS: z.coerce.number().int().min(10_000).max(3_600_000).default(600_000),
   // Domain scan cache window. Layer 1 evidence (a published AI policy, bar standing, an

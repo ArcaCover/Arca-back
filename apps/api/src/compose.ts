@@ -85,8 +85,10 @@ export async function compose(env: ReturnType<typeof loadEnv>,
   const sources = env.sourceMode === 'mock' ? mockSources() : {
     website: new WebsiteExtractionSource(repository, websiteEvidenceProvider!, undefined,
       { reuseMaxAgeMs: env.WEBSITE_SIGNAL_REUSE_MAX_AGE_MS }),
-    bar: new ApifyDirectorySource('bar', apify!, { targetedMaxLawyers: env.APIFY_BAR_TARGETED_MAX_RESULTS }),
-    avvo: new ApifyDirectorySource('avvo', apify!, { targetedMaxLawyers: env.APIFY_AVVO_TARGETED_MAX_RESULTS }),
+    bar: new ApifyDirectorySource('bar', apify!, { targetedMaxLawyers: env.APIFY_BAR_TARGETED_MAX_RESULTS,
+      officeSampleMaxLawyers: env.APIFY_BAR_OFFICE_SAMPLE_MAX_RESULTS }),
+    avvo: new ApifyDirectorySource('avvo', apify!, { targetedMaxLawyers: env.APIFY_AVVO_TARGETED_MAX_RESULTS,
+      officeSampleMaxLawyers: env.APIFY_AVVO_OFFICE_SAMPLE_MAX_RESULTS }),
   };
   const domainResolver = env.sourceMode === 'mock' ? new PublicDomainResolver(async url => {
     if (!(MOCK_DOMAINS as readonly string[]).includes(new URL(url).hostname)) throw new Error('Unknown mock domain');
