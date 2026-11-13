@@ -1,8 +1,12 @@
 import { chromium } from 'playwright';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fetchPublicResponse } from './network.js';
+import { GROUP_PAGE_LIMITS, canonicalUrl, pagePriority, sitemapSeeds } from './crawl-order.js';
+import { readSitemap } from './sitemap-reader.js';
 import { USER_AGENT, createRobotsCache, fetchRobotsText, robotsPolicy, type RobotsCache, type RobotsFetch,
   type RobotsPolicy } from './robots.js';
+
+export { MAX_SITEMAP_SEEDS, PAGE_GROUPS, canonicalUrl, pagePriority, sitemapSeeds, withoutLocale } from './crawl-order.js';
 
 /** `requested` marks a page the extraction agent asked for, so the corpus never drops it for crawled pages. */
 export type CrawledPage = { url: string; html: string; text: string; kind?: 'page' | 'document'; complete?: boolean; requested?: boolean };
@@ -81,41 +85,6 @@ export function createPacer(budgetMs: number, now: () => number = Date.now): (de
     return last - at;
   };
 }
-export function pagePriority(raw: string): number {
-  const path = new URL(raw).pathname.toLowerCase();
-  if (path === '/') return 0;
-  // Spanish stems carry the same weight as their English equivalents. Without them a Spanish site
-  // has no ranked page at all, the whole crawl ties at the lowest priority and the budget goes to
-  // whatever sorts first alphabetically, which is usually the blog.
-  const groups = [
-    /about|nosotros|quienes-somos|acerca|la-firma/,
-    /team|attorney|lawyer|people|abogad|equipo|socios/,
-    /service|practice|servicio|practica/,
-    /privacy|privacidad|aviso-legal/,
-    /blog|insight|news|noticias/,
-  ];
-  const index = groups.findIndex(group => group.test(path));
-  return index < 0 ? 6 : index + 1;
-}
-/** Caps how many pages of one priority group a single crawl will visit. Without it a firm with many
-    attorney bios (priority group 2, muscalaw.com had 15) fills the whole page budget before privacy
-    or blog — lower-priority groups that settle real signals — ever get a turn. Only group 2 is capped:
-    it is the one observed to explode in page count; the others stay uncapped as before. */
-const GROUP_PAGE_LIMITS: Partial<Record<number, number>> = { 2: 3 };
-export function canonicalUrl(raw: string, base: string): string | null {
-  try {
-    const url = new URL(raw, base);
-    const host = new URL(base).hostname.replace(/^www\./, '');
-    if (!['https:', 'http:'].includes(url.protocol) || url.hostname.replace(/^www\./, '') !== host ||
-      url.username || url.password || url.port || /\.(pdf|jpg|jpeg|png|gif|webp|zip|svg|mp4|css|js)$/i.test(url.pathname)) return null;
-    url.hash = ''; url.search = '';
-    // The same page reached with and without "www." must canonicalize to one identical string, or a
-    // self-link in the other form (common on real sites: muscalaw.com's own home link) gets queued
-    // and crawled a second time, spending a page of budget on content already read.
-    url.hostname = host;
-    return url.href;
-  } catch { return null; }
-}
 const HTML = /text\/html|application\/xhtml/i;
 /**
  * The request handler stops a link that answers with a file, but it never sees what comes after a redirect (the
@@ -123,8 +92,36 @@ const HTML = /text\/html|application\/xhtml/i;
  * file reaches the browser, which ends the navigation with this error: the same answer, not a failure to retry.
  */
 const startedDownload = (error: unknown) => error instanceof Error && /Download is starting/i.test(error.message);
+/**
+ * How long the sitemap read may hold the start of a crawl. A sitemap answers in well under a second when it exists;
+ * one that does not answer by then is given up and the crawl starts from the home page alone, as it did before.
+ */
+export const SITEMAP_SEED_TIMEOUT_MS = 4_000;
 // Measured on gallardolawyers.com: 3 pages at once took 21-25 s, 6 took 14 s for the same 19 pages.
 export const CRAWL_CONCURRENCY = 6;
+/**
+ * The links of the site's sitemap, or none: a sitemap that is missing, fails or takes longer than `timeoutMs` leaves
+ * the crawl as it was and is not one of its issues. Read through a copy of the robots cache, so its deadline cannot
+ * reject a robots.txt download the crawl is waiting on; the answers it settled join the scan's cache once it is done.
+ */
+async function sitemapLinks(domain: string, signal: AbortSignal, transport: CrawlTransport, robots: RobotsCache,
+  timeoutMs: number): Promise<Array<{ url: string; kind: 'page' | 'document' }>> {
+  const stop = new AbortController();
+  const timer = setTimeout(() => stop.abort(new Error('sitemap timed out')), timeoutMs);
+  const bounded = AbortSignal.any([signal, stop.signal]);
+  const copy: RobotsCache = new Map(robots);
+  try {
+    // Raced, not only signalled: a transport that ignores the signal must not hold the crawl either.
+    const read = await Promise.race([readSitemap(domain, bounded, transport, copy),
+      new Promise<null>(resolve => bounded.addEventListener('abort', () => resolve(null), { once: true }))]);
+    if (!read || bounded.aborted) return [];
+    for (const [origin, entry] of copy) if (!robots.has(origin)) robots.set(origin, entry);
+    return read.links;
+  } finally {
+    clearTimeout(timer);
+    stop.abort();
+  }
+}
 export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
   transport: CrawlTransport = { response: fetchPublicResponse, robots: fetchRobotsText }, options: {
   timeoutMs?: number; maxPages?: number; maxDepth?: number;
@@ -132,6 +129,10 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
   concurrency?: number;
   /** Start from the requested URL only. Without it the root page is queued first and wins a one-page budget. */
   seedOnly?: boolean;
+  /** Start from the sitemap's AI, about, people and office pages too (see `sitemapSeeds`). On unless `seedOnly`. */
+  sitemap?: boolean;
+  /** How long the sitemap may take before the crawl starts without it. */
+  sitemapTimeoutMs?: number;
   /** The scan's robots cache. Without one the rules are fetched for this crawl alone. */
   robots?: RobotsCache;
   /**
@@ -245,6 +246,18 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
     await context.routeWebSocket('**/*', socket => socket.close());
     let queue = [...new Set(options.seedOnly ? [seedUrl] : [rootUrl, seedUrl])].map(url => ({ url, depth: 0, attempt: 0 }));
     const visited = new Set<string>();
+    // Where read pages ended up after their redirects. A root that redirects to /en must not be read again when a link
+    // to /en turns up; these are not counted against the page budget, only the links followed are.
+    const landed = new Set<string>();
+    if (!options.seedOnly && maxDepth > 0 && options.sitemap !== false) {
+      // The root's rules first, under the crawl's own signal: an origin robots.txt leaves unreachable has no sitemap
+      // to read, and the sitemap's shorter deadline never cuts a download the crawl itself needs.
+      const rules = await robotsFor(rootUrl).catch(() => null);
+      if (rules && rules.state !== 'unreachable') {
+        const links = await sitemapLinks(domain, signal, transport, robotsCache, options.sitemapTimeoutMs ?? SITEMAP_SEED_TIMEOUT_MS);
+        for (const url of sitemapSeeds(links, rootUrl, new Set(queue.map(item => item.url)))) queue.push({ url, depth: 1, attempt: 0 });
+      }
+    }
     // Links robots.txt excludes. Settled before a batch is picked: they cost no request, so they take no page of the budget.
     const excluded = new Set<string>();
     // Requeued pages leave `visited`, so a retry costs another attempt but never another page budget.
@@ -260,6 +273,7 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
     const groupCounts = new Map<number, number>();
     const pace = createPacer(pacingBudgetMs(timeoutMs));
     while (queue.length && visited.size < maxPages && !signal.aborted) {
+      queue = queue.filter(item => !landed.has(item.url));
       const allowed: typeof queue = [];
       for (const item of queue) {
         // Only an aborted crawl rejects here, and the loop ends on it.
@@ -281,7 +295,7 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
       const batch: typeof queue = [];
       for (const item of queue) {
         if (batch.length >= capacity) break;
-        if (visited.has(item.url)) continue;
+        if (visited.has(item.url) || landed.has(item.url)) continue;
         const group = pagePriority(item.url), limit = GROUP_PAGE_LIMITS[group];
         if (limit !== undefined && (groupCounts.get(group) ?? 0) + (picked.get(group) ?? 0) >= limit) continue;
         batch.push(item); picked.set(group, (picked.get(group) ?? 0) + 1);
@@ -379,10 +393,14 @@ export async function crawlWebsite(domainOrUrl: string, parent: AbortSignal,
           // site that redirects the bare domain to www (muscalaw.com does) would otherwise leave this
           // page indexed under a different string than the one every discovered link to it
           // canonicalizes to, so it would look unread the next time such a link surfaces.
-          pages.push({ url: canonicalUrl(page.url(), rootUrl) ?? page.url(), html, text });
+          const final = canonicalUrl(page.url(), rootUrl) ?? page.url();
+          // Two links that redirect to one page (the root and /en) read it once, whichever finished first.
+          if (landed.has(final)) return;
+          landed.add(final);
+          pages.push({ url: final, html, text });
           if (item.depth < maxDepth) for (const link of links) {
             const url = canonicalUrl(link, page.url());
-            if (url && !visited.has(url) && !excluded.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1, attempt: 0 });
+            if (url && !visited.has(url) && !landed.has(url) && !excluded.has(url) && !queue.some(item => item.url === url)) queue.push({ url, depth: item.depth + 1, attempt: 0 });
           }
         } catch (error) {
           const known = (page && decided.get(page)) ?? (startedDownload(error) ? { code: 'NOT_HTML' as const, status: null } : undefined);

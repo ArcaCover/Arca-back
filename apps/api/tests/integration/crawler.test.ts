@@ -10,6 +10,7 @@ const html = (body: string, status = 200) => ({ status, headers: { 'content-type
 const path = (url: string) => new URL(url).pathname;
 const listed = (result: CrawlResult) => (result.issues ?? [])
   .map(issue => `${issue.scope} ${issue.code} ${issue.status} ${new URL(issue.url).host}${path(issue.url)}`).sort();
+// The crawl also reads the sitemap through the same transport. Tests that count what the transport was asked turn that off.
 // The browser follows a redirect with its own network, so a loopback server stands for the www host behind one.
 async function loopback(handler: Parameters<typeof createServer>[1]) {
   const server = createServer(handler);
@@ -174,7 +175,7 @@ it('takes a file behind a redirect for a link to non-HTML content, not for a pag
         if (path(raw) === '/about') return html('About the firm');
         return { status: 301, headers: { location: `http://www.fixture.example${path(raw)}` }, body: Buffer.alloc(0) };
       },
-    }, { hostResolverRules: www.hostResolverRules });
+    }, { hostResolverRules: www.hostResolverRules, sitemap: false });
     expect(result.pages.map(page => path(page.url))).toEqual(['/', '/about']);
     expect(result.partial).toBe(false);
     expect(listed(result)).toEqual([
@@ -428,7 +429,7 @@ it('takes a challenge page for a refusal whatever status carries it, and asks fo
     const result = await crawlWebsite('fixture.example', new AbortController().signal, {
       robots: async () => ({ status: 404, text: '' }),
       response: async () => { asked++; return { status, headers: { 'content-type': 'text/html', ...headers }, body: Buffer.from(`<body>${body}</body>`) }; },
-    });
+    }, { sitemap: false });
     expect(result.pages).toEqual([]);
     expect([status, asked]).toEqual([status, 1]);
     expect(result.issues?.find(issue => issue.scope === 'page')).toMatchObject({ code: 'ACCESS_BLOCKED', status, detail: 'challenge page' });
@@ -439,7 +440,7 @@ it('takes a challenge page for a refusal whatever status carries it, and asks fo
   const busy = await crawlWebsite('fixture.example', new AbortController().signal, {
     robots: async () => ({ status: 404, text: '' }),
     response: async () => { asked++; return html('Service temporarily unavailable', 503); },
-  });
+  }, { sitemap: false });
   expect(asked).toBe(MAX_PAGE_ATTEMPTS);
   expect(listed(busy)).toEqual(['page HTTP_ERROR 503 fixture.example/', 'request HTTP_ERROR 503 fixture.example/']);
   expect(unreadableWebsite(busy)).toMatchObject({ classification: 'TRANSIENT', code: 'PROVIDER_ERROR' });
@@ -457,7 +458,7 @@ it('does not spend the page budget on links robots.txt excludes', async () => {
       // Every page repeats the menu, as real sites do.
       return html(`Page ${path(raw)}${excluded}${readable.map(link => `<a href="${link}">Page</a>`).join('')}`);
     },
-  }, { maxPages: 4 });
+  }, { maxPages: 4, sitemap: false });
   expect(result.pages.map(page => path(page.url))).toEqual(['/', ...readable]);
   expect(requested.sort()).toEqual(['/', ...readable]);
   expect(result.partial).toBe(false);
@@ -487,7 +488,7 @@ it('calls the crawl partial when a page of the site keeps failing', async () => 
       attempts++;
       return html('Server error', 500);
     },
-  });
+  }, { sitemap: false });
   expect(result.pages.map(page => path(page.url))).toEqual(['/']);
   expect(result.partial).toBe(true);
   expect(attempts).toBe(MAX_PAGE_ATTEMPTS);
@@ -569,7 +570,7 @@ it('does not follow a redirect into an origin whose robots.txt excludes the page
       requested.push(raw);
       return { status: 301, headers: { location: 'https://www.fixture.example/' }, body: Buffer.alloc(0) };
     },
-  });
+  }, { sitemap: false });
   expect(result.pages).toEqual([]);
   // The site's answer, reported as such: not a failed navigation retried three times.
   expect(listed(result)).toEqual(['page ROBOTS_DISALLOWED null fixture.example/']);
@@ -589,7 +590,7 @@ it('spaces the pages of a site that declares a long Crawl-delay and still reads 
       await sleep(4_500);
       return path(raw) === '/' ? html(`Home${links}`) : html(`Page ${path(raw)}`);
     },
-  }, { maxPages: 7 });
+  }, { maxPages: 7, sitemap: false });
   expect(result.pages).toHaveLength(7);
   expect(result.aborted).toBe(false);
   expect(result.partial).toBe(false);
@@ -598,3 +599,76 @@ it('spaces the pages of a site that declares a long Crawl-delay and still reads 
   expect(starts).toHaveLength(7);
   expect(starts.at(-1)! - starts[1]!).toBeGreaterThanOrEqual(5 * 1_071 - 1_000);
 }, 60_000);
+
+// The paths a firm whose whole site lives under /en linked from its home page on the live scan (URLs only).
+const LOCALE_HOME_LINKS = ['/', '/en', '/en/services/practices', '/en/professionals', '/en/services/industries', '/en/insights',
+  '/en/events', '/en/news', '/en/offices', '/en/careers', '/en/general-pages/election-analysis-center',
+  '/en/general-pages/health-artificial-intelligence-navigator',
+  '/en/insights/publications/2026/03/2025-private-equity-year-in-review', '/en/insights/publications/2026/11/embracing-statutes-of-repose',
+  '/en/insights/publications/2026/11/new-congress-new-scrutiny-oversight-risks',
+  '/en/news/pressreleases/2026/06/firm-ranks-among-leading-law-firms', '/en/news/pressreleases/2026/08/attorneys-recognized',
+  '/en/firm/client-payment-information', '/en/firm/legal', '/en/firm/legal/privacy'];
+const NEWS = /^\/en\/(news|insights|events)/;
+
+it('reads a site under a language prefix by its sections, the home page once and the news last', async () => {
+  const requested: string[] = [];
+  const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async () => ({ status: 404, text: '' }),
+    response: async raw => {
+      requested.push(path(raw));
+      // The bare root sends the reader on to the English home page, which links back to itself.
+      if (path(raw) === '/') return html('<script>location.replace("/en")</script>');
+      if (path(raw) === '/en') return html(`Home${LOCALE_HOME_LINKS.map(link => `<a href="${link}">Link</a>`).join('')}`);
+      if (path(raw) === '/en/offices') return html('Offices<a href="/en/offices/miami">Miami</a>');
+      if (/sitemap/.test(path(raw))) return html('Not found', 404);
+      return html(`Page ${path(raw)}`);
+    },
+  }, { maxPages: 15 });
+  const paths = result.pages.map(page => path(page.url));
+  expect(new Set(paths).size).toBe(paths.length);
+  expect(requested.filter(url => url === '/en')).toHaveLength(1);
+  expect(paths).toEqual(expect.arrayContaining(['/en', '/en/general-pages/health-artificial-intelligence-navigator',
+    '/en/professionals', '/en/offices', '/en/firm/client-payment-information', '/en/firm/legal/privacy',
+    // One level deeper, and still ahead of the fourth news page.
+    '/en/offices/miami']));
+  expect(paths.filter(url => NEWS.test(url))).toHaveLength(3);
+  expect(paths).toHaveLength(15);
+  expect(result.partial).toBe(false);
+}, 60_000);
+
+it('seeds the crawl with the firm, people, office and AI pages its sitemap lists', async () => {
+  const sitemap = ['/en/our-firm', '/en/professionals', '/en/offices', '/ai', '/blog/e', '/practice-areas']
+    .map(link => `<url><loc>https://fixture.example${link}</loc></url>`).join('');
+  const requested: string[] = [];
+  const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+    robots: async () => ({ status: 404, text: '' }),
+    response: async raw => {
+      requested.push(path(raw));
+      if (path(raw) === '/sitemap.xml') return { status: 200, headers: { 'content-type': 'application/xml' }, body: Buffer.from(`<urlset>${sitemap}</urlset>`) };
+      if (/sitemap/.test(path(raw))) return html('Not found', 404);
+      if (path(raw) === '/') return html(`Home${['a', 'b', 'c', 'd'].map(post => `<a href="/blog/${post}">Post</a>`).join('')}`);
+      return html(`Page ${path(raw)}`);
+    },
+  }, { maxPages: 5 });
+  expect(result.pages.map(page => path(page.url))).toEqual(['/', '/ai', '/en/offices', '/en/our-firm', '/en/professionals']);
+  expect(requested).not.toContain('/practice-areas');
+  expect(result.partial).toBe(false);
+}, 30_000);
+
+it('crawls as before when the sitemap fails or never answers', async () => {
+  for (const sitemap of ['fails', 'hangs'] as const) {
+    const result = await crawlWebsite('fixture.example', new AbortController().signal, {
+      robots: async () => ({ status: 404, text: '' }),
+      response: async raw => {
+        if (/sitemap/.test(path(raw))) {
+          if (sitemap === 'fails') throw new Error('getaddrinfo ENOTFOUND fixture.example');
+          // Ignores the signal, as a transport that hangs would.
+          return new Promise<never>(() => {});
+        }
+        return path(raw) === '/' ? html('Smith Law<a href="/about">About</a>') : html('About the firm');
+      },
+    }, { sitemapTimeoutMs: 500 });
+    expect([sitemap, result.pages.map(page => path(page.url))]).toEqual([sitemap, ['/', '/about']]);
+    expect([sitemap, result.partial, result.issues]).toEqual([sitemap, false, []]);
+  }
+}, 30_000);
