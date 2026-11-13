@@ -30,6 +30,9 @@ listing page plus one or two individual profiles is enough for `W5a_teamPageQual
 (`derived-signals.ts`), not derived from measurement across many real sites. Revisit once there is
 outcome data from more than one firm.
 
+*Nota (2026-11-12):* los números de grupo de esta sección ya no son los vigentes. El orden actual, con un
+tope también para las noticias, está en §6, "Orden del crawl".
+
 ## 3. A transient provider error must not discard the whole scan
 
 `maxRetries: 0` on the OpenAI-compatible client is deliberate (§294/§530 of DN-05): the SDK's own
@@ -232,3 +235,71 @@ el backend lo cerraría (resolver la cadena en el manejador y entregar al navega
 ya comprobada), pero hoy las cookies que un sitio fija al redirigir solo las conserva el navegador, y sin ellas
 algunos sitios entrarían en bucle. Queda pendiente de decisión. Una firma cuya portada redirige a otro dominio
 termina FAILED (TRANSIENT) en vez de leer la portada del dominio nuevo.
+
+**Orden del crawl (2026-11-12).** Dos scans reales de `hklaw.com` con minutos de diferencia dieron 3 y 0. Todo el
+sitio vive bajo `/en/…`, y `pagePriority` miraba la ruta entera: `/en` no contaba como portada, `/en/professionals`
+(el directorio de abogados) y `/en/offices` no caían en ningún grupo, y la página de IA de la firma
+(`/en/general-pages/…-artificial-intelligence-navigator`) tampoco. Las noticias y los artículos (`/en/news/…`,
+`/en/insights/…`) sí tenían grupo, así que ganaban: 13 de las 20 páginas leídas eran noticias. Además la portada se
+leyó dos veces (`/` redirigía a `/en`, y luego el enlace a `/en` se encolaba como no visitado). Cambios, en
+`crawl-order.ts` (el crawler lo reexporta):
+
+- **Prefijo de idioma.** Antes de clasificar se quita un primer segmento de idioma: `/en`, `/es`, `/en-us`, `/es-mx`,
+  `/pt-br`. Son dos letras de una lista de idiomas, con región opcional, y no dos letras cualquiera, para que una
+  sección `/ai/` no se tome por idioma. `/en` solo es la portada (prioridad 0).
+- **Orden nuevo**, de primero a último:
+
+  | Prioridad | Grupo | Raíces (inglés y español) |
+  |---|---|---|
+  | 0 | Portada | `/`, `/en`, `/es-mx`… |
+  | 1 | IA | `artificial-intelligence`, `inteligencia-artificial`, la palabra `ai` o `ia` (`/ai/`, `/ai-…`, `…-ai`, `generative-ai`), `legal-tech`, `innovat…`, `innovaci…` |
+  | 2 | Sobre la firma | `about`, `firm`, `our-firm`, `history`, `who-we-are`, `nosotros`, `quienes-somos`, `acerca`, `la-firma`, `historia` |
+  | 3 | Personas (tope 3) | `team`, `attorney`, `lawyer`, `people`, `our-people`, `professionals`, `bios`, `abogad…`, `equipo`, `socios` |
+  | 4 | Oficinas y contacto | `offices`, `location`, `contact`, `oficinas`, `contacto`, `ubicaci…` |
+  | 5 | Servicios y áreas | `service`, `practice`, `servicio`, `practica` |
+  | 6 | Privacidad | `privacy`, `privacidad`, `aviso-legal` |
+  | 7 | Cualquier otra página | lo que no cae en ningún grupo |
+  | 8 | Noticias (tope 3) | `blog`, `news`, `insights`, `events`, `press`, `noticias`, `eventos`, `prensa` |
+
+- Las raíces nuevas cortas (`firm`, `history`, `bios`, `ai`, y las de noticias) se comparan como **palabra entera**
+  de la ruta (separada por `/`, `-`, `_` o `.`): `affirmative` no es `firm`, `biotech` no es `bios` y `newsletter`
+  no es `news`. Las raíces que ya existían siguen comparándose como subcadena, como antes.
+- **Una página dentro de una sección de noticias es noticia**, diga lo que diga su slug: una firma con treinta
+  alertas sobre IA gastaría el presupuesto entero en ellas. Fuera de las noticias, una página se clasifica primero
+  por su **último segmento** y después por la ruta entera: `/en/firm/legal/privacy` es privacidad y `/about/team`
+  es personas.
+- **Topes.** Personas sigue en 3 (el directorio y dos fichas; el directorio ya nombra a todos, ver §2). Las
+  noticias tienen ahora tope 3: el crawl ordena primero por profundidad y después por prioridad, así que sin tope
+  las noticias que enlaza la portada (profundidad 1) ganaban a cualquier página de profundidad 2. Ningún tope deja
+  huecos: si no queda nada más en la cola, las páginas por encima del tope rellenan el resto, como antes.
+- **La portada una vez.** Al guardar una página se apunta su URL canónica final, después de las redirecciones. Un
+  enlace a esa URL ya no se encola, y si dos enlaces de la misma tanda acaban en la misma página, se guarda una sola
+  vez. Esas URLs no cuentan contra el presupuesto de 20: solo cuentan los enlaces que se siguen.
+
+**El sitemap como semilla.** Antes de la primera tanda, el crawl lee el sitemap con `readSitemap`, el mismo lector
+del agente: respeta robots igual que antes (si el `robots.txt` de la raíz es inalcanzable no se pide nada), sigue
+un solo nivel de índice, comprueba cada salto de redirección y guarda como mucho 400 URLs. De ellas encola, a
+profundidad 1, hasta 8 páginas (`MAX_SITEMAP_SEEDS`) de los grupos IA, sobre la firma, personas y oficinas
+(`sitemapSeeds`): por turnos entre los cuatro grupos, la ruta más corta de cada uno primero (el directorio antes que
+las fichas) y una sola versión de idioma de cada página. Así entran páginas a las que la portada solo llega por un
+menú que el crawler no ve, o que están un nivel demasiado hondo.
+
+- Tiene su propio plazo de 4 s (`SITEMAP_SEED_TIMEOUT_MS`). Un sitemap que no existe, falla o no responde a tiempo no
+  añade nada, no es una incidencia del crawl y no lo deja `partial`: el crawl empieza desde la portada, como antes.
+- Lee con una copia de la caché de robots, para que su plazo no pueda cortar una descarga de `robots.txt` que el
+  crawl espera. Si termina a tiempo, las respuestas de robots que obtuvo pasan a la caché del scan (una descarga por
+  origen, como siempre). El `robots.txt` de la raíz se resuelve antes, con la señal del propio crawl.
+- No se lee en las lecturas de una página del agente (`seedOnly`) ni con `maxDepth: 0`. Los tests que cuentan las
+  peticiones del transporte lo apagan con `sitemap: false`.
+- Coste: algunas peticiones más por scan: los tres nombres habituales (`/sitemap.xml`, `/sitemap_index.xml`,
+  `/wp-sitemap.xml`), los que declare `robots.txt` y hasta 10 hijos de un índice, 20 ficheros como mucho. El agente
+  puede volver a leer el mismo sitemap con su herramienta.
+
+**Reintento de DNS.** El router local pierde una búsqueda de DNS de cada 60, medido. En el segundo scan de
+`hklaw.com` un `getaddrinfo ENOTFOUND www.hklaw.com` al pedir `robots.txt` dejó las reglas inalcanzables, y con
+ellas el sitio entero y el scan FAILED (transitorio). Ahora `network.ts` repite la búsqueda hasta dos veces más,
+tras 250 ms y 750 ms (`DNS_RETRY_DELAYS_MS`), cuando falla con `ENOTFOUND`, `EAI_AGAIN` o un timeout de búsqueda
+(`ETIMEOUT`, `ETIMEDOUT`). Cualquier otro error falla a la primera, como antes. La comprobación de direcciones
+públicas se hace sobre la respuesta de la última búsqueda, que es la que se fija al socket. La espera se corta si el
+llamante aborta. Un dominio que de verdad no existe tarda ahora un segundo más en fallar. Las búsquedas que hace
+Chromium para los saltos que sigue él mismo (ver el límite de arriba) no pasan por aquí.
