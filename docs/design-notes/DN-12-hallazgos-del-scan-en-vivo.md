@@ -1266,3 +1266,41 @@ por corte no entra en el hash de parámetros: solo cambia si una extracción fal
 - **Un segundo corte** sigue tumbando el website y el scan. No se reduce el corpus ni se parte la llamada.
 - **Posts sin URL conocida.** Solo cuentan los que el scan vio: un blog que solo se pagina con JavaScript o no
   está en el sitemap no aporta nada.
+
+### 13.9 Muestra fija por ciudad en las búsquedas de una firma grande (2026-11-13)
+
+**Qué pasó.** En la verificación en vivo, las tres búsquedas por ciudad de hklaw.com (Fort Lauderdale, Jacksonville,
+Miami) se lanzaron con el máximo técnico de abogados y las cortó el límite de cobro de USD 1 de cada run: 24, 47 y 50
+abogados, a USD 0,98-1,00 cada una (unos USD 0,02-0,04 por abogado con detalle). Un dataset cortado no se reutiliza
+(`reached its charge limit … is not reused`), así que cada scan volvía a pagarlo y leía otra lista. Leer el roster de
+Florida completo de una firma de 2.200 abogados costaría más de USD 10 por scan.
+
+**Cambio.** Una búsqueda por ciudad de una firma grande lee una muestra fija: `APIFY_BAR_OFFICE_SAMPLE_MAX_RESULTS`
+(20 por defecto) en el Bar y `APIFY_AVVO_OFFICE_SAMPLE_MAX_RESULTS` (10) en Avvo cuando la ciudad sale de una oficina y
+no de una ciudad verificada. El run termina por su propio `maxLawyers`, por debajo de la reserva, queda `SUCCEEDED` y
+entra en la caché de consultas: el siguiente scan lee los mismos abogados sin pagar. El motivo de la fuente lo dice
+(`…; up to 20 lawyers per city`). La búsqueda de una firma sin ciudad de oficina conserva el máximo técnico (DN-06).
+
+**Decisión para el founder.** Professional Standing de una firma grande sale de una muestra de hasta 60 abogados de
+Florida (3 ciudades × 20), no del roster completo. Subir los dos valores amplía la muestra a costa de cada scan.
+
+### 13.10 Lectura del sitemap reproducible (2026-11-13)
+
+**Qué pasó.** Dos scans de hklaw.com con minutos de diferencia rastrearon páginas distintas (6 de 20) y, con ello,
+sacaron claves de reutilización distintas: uno volvió a llamar al modelo. El sitemap de hklaw.com es un índice de 11
+ficheros. Se leían de uno en uno y en el orden del índice, con un tope de 400 URLs: `events` (490 KB) llenaba el tope
+antes de llegar a `offices` y `professionals`, y la lectura completa tardaba 7-8 s frente a los 4 s que el crawl la
+esperaba. Según el tiempo de red, la siembra llegaba o no.
+
+**Cambio.**
+- `readSitemap` lee 4 ficheros a la vez y los procesa en el orden de la cola, respondan en el orden que respondan.
+- Los hijos de un índice se ordenan por utilidad (`sitemapRank`): firma, personas, oficinas, servicios y páginas
+  generales primero; noticias, eventos, publicaciones y empleo al final. Lee hasta 16 hijos.
+- Cada fichero aporta como mucho 60 URLs (`MAX_URLS_PER_SITEMAP`), así que ninguno se come el tope.
+- El crawl espera la siembra hasta 10 s (`SITEMAP_SEED_TIMEOUT_MS`).
+- El resultado guarda cómo fue la lectura (`sitemap: { status, urls, seeded, ms }`, `read` / `timeout` / `failed` /
+  `skipped`), también en el registro de evidencia del website: un crawl que empezó distinto queda explicado.
+
+**Tests.** `sitemap-reader.test.ts` (índice con la forma del de hklaw: se leen los 11 hijos, oficinas y personas
+antes que noticias, mismo resultado con respuestas en otro orden) y `crawler.test.ts` (el desenlace del sitemap queda
+en el resultado: `read`, `failed`, `timeout`).
