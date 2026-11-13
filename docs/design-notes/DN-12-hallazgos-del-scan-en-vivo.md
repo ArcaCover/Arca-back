@@ -224,16 +224,17 @@ Debajo de la caché de scans, `WebsiteExtractionSource` reutiliza el análisis g
 Antes la clave era el sha256 del HTML crudo y solo se miraba la fila más reciente: cualquier nonce o marca
 de tiempo obligaba a pagar el modelo otra vez, con otro resultado posible.
 
-- **Clave.** Un hash de lo que el modelo lee, no del HTML: por página y en orden de URL, el texto tal como
-  lo parte el corpus, los metadatos que el corpus extrae (título, descripción, JSON-LD) y los enlaces que
-  ofrece (`corpusFingerprint`, en `evidence-corpus.ts`), más `provider.id` y `provider.version`.
+- **Clave.** Un hash del contenido propio del despacho tal como lo lee el modelo, no del HTML
+  (`corpusFingerprint`, en `evidence-corpus.ts`), más `provider.id` y `provider.version`. Desde el
+  2026-11-12 es `wsk2-` y deja fuera lo que cambia sin que cambie el despacho; el detalle está en
+  "Clave estable" más abajo.
 - **Versión de extracción.** La del extractor agéntico es ahora
   `agentic-signals-v5:openai:<modelo>:<esfuerzo de razonamiento>:<hash>`, donde el hash cubre los cuatro
   prompts y los parámetros de la petición (`extractionVersion`). Editar un prompt invalida los análisis
   guardados sin que nadie tenga que acordarse de subir `EXTRACTION_VERSION`, que sigue siendo manual para
   lo que el hash no ve (el flujo, las reglas de grounding). Los proveedores `openai` (una pasada) y `rules`
   conservan su versión fija.
-- **Búsqueda.** El registro guardado lleva dos marcas de texto plano: `wsk1-<hash>` (la clave) y
+- **Búsqueda.** El registro guardado lleva dos marcas de texto plano: `wsk2-<hash>` (la clave) y
   `wsf1-<hash>` (versión de extracción, solo si el crawl fue completo). `findRaw` le pide a la base de datos
   las filas del dominio que contienen la marca (un `LIKE` sobre `raw_content`) y devuelve solo ids; después
   `rawOf` lee **una** fila. Un acierto cuesta una lectura grande y un fallo ninguna (antes: una lectura
@@ -254,8 +255,48 @@ de tiempo obligaba a pagar el modelo otra vez, con otro resultado posible.
 - **Auditoría.** La fila que reutiliza guarda `reuse.from` con el scan que pagó la extracción y no copia
   los intentos del modelo (`diagnostics`), que siguen en aquella fila.
 
+**Clave estable (`wsk2-`, 2026-11-12). [mía]** Dos scans en vivo de hklaw.com con diez minutos de diferencia
+dieron score 3 y después 0. Los dos crawls leyeron las mismas 20 URLs con el mismo texto salvo un titular del
+bloque "Latest News and Headlines", repetido en el índice de noticias y en cada nota de prensa ("How Banks Can
+Prepare For Democrats Oversight Era" pasó a "...for Democrats' Oversight Era"). La clave `wsk1-` era un hash
+exacto de todo el texto, así que cambió, el modelo volvió a leer el sitio y respondió otra cosa. La clave nueva:
+
+- **Siempre las URLs.** Cada página aporta su URL: una página de más o de menos sigue siendo otra clave.
+- **Publicaciones: solo el título.** Una página cuya ruta tiene una sección de publicaciones (`news`,
+  `insights`, `events`, `blog`, `press`, `publications`, `alerts`, `noticias`, `eventos`, `prensa`…;
+  `isPublicationUrl`) aporta la URL y su `<title>` (o el primer `<h1` si no tiene), nunca el cuerpo: el
+  cuerpo y las listas de un índice cambian con cada entrada. El test es propio y no el `pagePriority` del
+  crawler, que sirve para otra cosa y puede cambiar. `media` queda fuera a propósito: hklaw.com guarda sus PDF
+  bajo `/-/media/files/`.
+- **Mobiliario fuera.** Del resto se toman las líneas de texto, los metadatos (título, descripción, JSON-LD) y
+  los enlaces, sin los que aparecen en **3 o más páginas** distintas del crawl: navegación, pie, un bloque de
+  "últimas noticias". Una página guardada dos veces cuenta una.
+- **Texto normalizado.** Mayúsculas, comillas, apóstrofos, guiones tipográficos y espacios no distinguen dos
+  lecturas.
+- **Registros anteriores.** Una fila `wsk1-` nunca coincide con una clave `wsk2-` (la búsqueda es por la marca),
+  así que la primera re-ejecución de cada dominio extrae una vez más y a partir de ahí reutiliza. `wsf1-` no
+  depende de la huella y no cambia: una lectura completa guardada con `wsk1-` sigue valiendo para un crawl
+  cortado (la fila que la reutiliza copia su `reuse`, con la clave antigua, y la siguiente lectura completa
+  extrae).
+
+El test usa una versión reducida de los dos crawls reales (`apps/api/tests/fixtures/hklaw-recrawl.ts`: URLs,
+títulos, navegación y una línea por página, sin el texto completo) y comprueba que dan la misma clave y que la
+dan distinta un cambio en una página que no es publicación, una página añadida y una quitada
+(`evidence-corpus.test.ts`, "corpus fingerprint"; `sources.test.ts`, "website signal reuse"). Contra los dos
+registros guardados completos también coinciden.
+
+**Citas que cruzan un corte de segmento (2026-11-12).** En esos mismos dos scans la política de privacidad se
+perdía por `QUOTE_NOT_IN_SOURCE`: el aviso en PDF se corta cada ~800 caracteres a mitad de frase y el modelo citaba
+el segmento siguiente al que tenía la frase. Ahora una cita vale también en el segmento citado unido a su anterior y
+su siguiente de la misma página; nada más se relaja. Detalle y motivo de no tocar la segmentación en DN-05 §5.4.
+Con los dos registros guardados, la afirmación de privacidad pasa a `accepted` en ambos.
+
 **Límites conocidos.**
 
+- **El precio de la clave estable.** Un cambio que solo se ve en el mobiliario (un teléfono nuevo en el pie de
+  todas las páginas) o en el cuerpo de una publicación (un artículo sobre IA reescrito sin cambiar el título) no
+  invalida el análisis guardado; lo acota la edad máxima de 30 días. Un bloque volátil que solo enseñan una o dos
+  páginas que no son publicaciones (unas "últimas noticias" solo en la portada) sigue cambiando la clave.
 - La clave cubre las páginas del crawl inicial. Lo que el agente lee después (la página "about" que pide
   el plan de páginas, un PDF) queda fuera: un cambio solo ahí no se ve hasta que caduca la edad máxima.
 - Sigue dependiendo del conjunto de páginas: un crawl con una página de más o de menos es otra clave. Por

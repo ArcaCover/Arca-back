@@ -234,6 +234,21 @@ invariantes y ausencia de contradicciones sin resolver. El resto queda `unknown`
 `UNCERTAIN_ATTRIBUTION`, `CONFLICT`, `INCOMPLETE_SCOPE`, `UNMAPPED_AREA`, `BUDGET_LIMIT`,
 `PROVIDER_ERROR`.
 
+**Dónde se busca una cita (2026-11-12).** El corpus corta páginas y documentos en segmentos de unos 800
+caracteres al final de una línea (o en mitad de una línea muy larga), así que una frase puede empezar en un
+segmento y seguir en el siguiente, y el modelo puede citar cualquiera de las dos mitades. Una cita vale si está
+en el segmento citado o en ese segmento leído junto al anterior y al siguiente **de la misma página y del mismo
+tipo**, en el orden del corpus (unidos como las líneas que eran y, para un corte dentro de una línea, sin
+separador). Se aplica igual a las citas de la afirmación y a las del dictamen. Nada más lejano cuenta, una cita
+de otra página sigue siendo `QUOTE_NOT_IN_SOURCE` y un id que el corpus no tiene sigue siendo
+`UNKNOWN_SEGMENT`. Motivo: en los dos scans en vivo de hklaw.com (DN-12 §4.3) la afirmación de política de
+privacidad citaba "Client services: the provision by the Firm of legal services to our clients" con el id del
+segmento siguiente al que contiene la frase, y se perdía con `QUOTE_NOT_IN_SOURCE`.
+
+La segmentación no cambia: cortar en fin de frase con solapamiento cambiaría el texto y el id de cada segmento
+de documento (los ids hashean el texto), y el solapamiento gastaría parte del presupuesto de caracteres de
+documentos y del prompt sin ganar nada que la comprobación con vecinos no dé ya.
+
 `toWebsiteData` inicia con `unknownWebsite()`, aplica la tabla y termina con `WebsiteData.parse`.
 Arrays desconocidos son null; vacíos exigen ausencia/completitud aceptadas. Guardar citas aceptadas
 por campo en `provenance` como URL, fragmento y `method:'provider'`. Procedencia por elemento/ID
