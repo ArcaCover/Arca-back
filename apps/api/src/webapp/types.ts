@@ -40,6 +40,28 @@ export type AuditRecord = {
 /** What appendAudit takes. The actor kind is required, as the column has no default: a row never passes as a member's by omission. */
 export type NewAuditRecord = Omit<AuditRecord, 'seq'>;
 /**
+ * Who the audit rows a store writes itself name, as part of an atomic write (DN-13 §5.4). The service decides it (a member, ARCA
+ * staff, or the system for the mock seed); the store only copies it.
+ */
+export type AuditActor = Pick<AuditRecord, 'actor_kind' | 'actor_user_id'>;
+/**
+ * What the service checked before asking for a member change, so the store can check it again against the rows as it locks them
+ * (DN-13 §4.6): the acting member and the role it found them in, who the audit row names, and when.
+ */
+export type MemberChange = { actorUserId: string; actorRole: Role; audit: AuditActor; at: string };
+/** The subscription state a provider event leads to, already mapped to a billing status (DN-13 §6.6). A null field keeps what is stored. */
+export type BillingStateRecord = {
+  status: BillingStatus; plan_code: string | null; customer_id: string | null; subscription_id: string | null;
+  current_period_end: string | null; provider_status?: string | null; price_id?: string | null; cancel_at_period_end?: boolean | null;
+  current_period_start?: string | null; livemode?: boolean | null;
+};
+/**
+ * `duplicate`: the event was already processed. `duplicate_subscription`: it belongs to another subscription that pays while the
+ * stored one is live, so it is audited and not applied (a double charge for a person to undo). `stale_subscription`: it belongs to
+ * another subscription that gives no access, so it is only marked processed.
+ */
+export type BillingApplyOutcome = 'applied' | 'duplicate' | 'duplicate_subscription' | 'stale_subscription';
+/**
  * A page of the audit log, newest first (`created_at desc, seq desc`). `before` is the seq of the last row of the previous
  * page and the page goes on after that row in this order. The row is looked up within the same filter, so a seq that names no
  * row, or a row of another organization, gives an empty page.
@@ -73,7 +95,7 @@ export const MAX_CUSTOM_ACTIONS = 100;
  * invitation per email and organization. The service revokes the old one before inviting again, so it only shows up in a race.
  */
 export type WebappConflictReason = 'scan_claimed' | 'last_owner' | 'already_member' | 'already_invited' | 'deletion_pending'
-  | 'action_limit';
+  | 'action_limit' | 'already_reviewed' | 'invitation_closed';
 /** A rule of the data model that the write would break. The routes turn it into a 409. */
 export class WebappConflict extends Error {
   constructor(readonly reason: WebappConflictReason) {
@@ -90,6 +112,17 @@ export class IneligibleAssignee extends Error {
   constructor() {
     super('The assignee cannot hold an action of this organization');
     this.name = 'IneligibleAssignee';
+  }
+}
+
+/**
+ * The actor's right over the member no longer holds when the store checks it again under its lock: the actor's role changed, or
+ * the target's role did (an admin acting on someone just made owner). Nothing was written; the service answers 403.
+ */
+export class MemberChangeRefused extends Error {
+  constructor() {
+    super('The actor can no longer change this member');
+    this.name = 'MemberChangeRefused';
   }
 }
 
@@ -111,15 +144,20 @@ export class IneligibleAssignee extends Error {
  * The two locks conflict, so a change to viewer or a removal waits for an assignment in flight and then releases it, or the
  * assignment waits for the change and then reads the new role.
  *
- * Not closed yet: the service checks the actor's right over the target (canManageMember) against the target's role as it read it
- * before the write, and setRole and removeMember change or delete the row whatever its role is by then, so an admin whose request
- * overlaps an owner's promotion of the target can demote or remove an owner, and the audit row records the stale role. The SQL
- * version must re-check that right against the role it reads under the `for update` lock, and change or delete nothing when it no
- * longer holds; that means passing the store what the service checked. The in-memory store has the same window today.
+ * The actor's right over the target (canManageMember) is checked again by setRole and removeMember (DN-13 §4.6): the service passes
+ * what it checked (MemberChange), and the store compares it with the actor's and the target's roles as it locks them, changing or
+ * deleting nothing (MemberChangeRefused) when it no longer holds. The audit row of the change names the role the store found.
+ *
+ * The writes DN-13 §5.4 makes atomic write their own audit rows in the same step, naming the AuditActor they are given: setRole,
+ * removeMember, acceptInvitation, revokeInvitation, reviewDeletionRequest, applyBillingState and, when asked, grantPlatformAdmin
+ * and revokePlatformAdmin. The Supabase repository runs each as one RPC function (supabase/migrations/*_real_accounts_billing.sql).
  */
 export interface WebappRepository {
+  /** One profile per email, in any case: another user's email is refused with a plain Error. */
   upsertProfile(profile: ProfileRecord): Promise<void>;
   getProfile(userId: string): Promise<ProfileRecord | null>;
+  /** The profile of an email, in any case. A user has one once they signed in (ensureProfile). */
+  findProfileByEmail(email: string): Promise<ProfileRecord | null>;
   /** Atomic: the organization, its first owner and the claimed analysis go in together or not at all (`scan_claimed`). */
   createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null): Promise<void>;
   getOrganization(id: string): Promise<OrganizationRecord | null>;
@@ -134,17 +172,20 @@ export interface WebappRepository {
   /** `already_member` when the user already belongs to the organization. */
   addMember(member: MembershipRecord): Promise<void>;
   /**
-   * `last_owner` when it would leave the organization without an owner. A role that cannot update actions (a viewer) holds none:
-   * the same call unassigns every action of the organization the user held, and nothing else on those rows changes. True when it
-   * changed the role, false when the user is not a member, as when another request removed them after the caller read it.
+   * `last_owner` when it would leave the organization without an owner; MemberChangeRefused when the change no longer holds. A
+   * role that cannot update actions (a viewer) holds none: the same call unassigns every action of the organization the user held,
+   * and nothing else on those rows changes. Audits `member.role_changed` with the role it found, unless that is already the new
+   * one. Returns the role the user had, or null when they are not a member, as when another request removed them after the caller
+   * read it: then nothing is written.
    */
-  setRole(orgId: string, userId: string, role: Role): Promise<boolean>;
+  setRole(orgId: string, userId: string, role: Role, change: MemberChange): Promise<Role | null>;
   /**
-   * `last_owner` when it would leave the organization without an owner. The same call unassigns every action of the organization
-   * the user held (DN-11 D15), and they stay unassigned if the user comes back. True when it removed the member, false when there
-   * was none to remove, as for the second of two removals that race.
+   * `last_owner` and MemberChangeRefused as setRole. The same call unassigns every action of the organization the user held
+   * (DN-11 D15), and they stay unassigned if the user comes back, and revokes the pending invitations of their email there, or a
+   * link would let them back in. Audits `member.removed`, then each `invitation.revoked`. Returns the role the user had, or null
+   * when there was none to remove, as for the second of two removals that race.
    */
-  removeMember(orgId: string, userId: string): Promise<boolean>;
+  removeMember(orgId: string, userId: string, change: MemberChange): Promise<Role | null>;
 
   createInvitation(invitation: InvitationRecord): Promise<void>;
   /** Finds it whatever its state, so the caller can tell an accepted or revoked invitation from an unknown one. */
@@ -152,6 +193,18 @@ export interface WebappRepository {
   /** Not accepted and not revoked. Expiry is the caller's call: it compares `expires_at` with its own clock. */
   listInvitations(orgId: string): Promise<InvitationRecord[]>;
   updateInvitation(id: string, patch: Partial<Pick<InvitationRecord, 'accepted_at' | 'revoked_at'>>): Promise<void>;
+  /**
+   * In one step: the membership (someone who already belongs keeps their role), the acceptance, every other pending invitation of
+   * that email in the organization revoked (`invitation.revoked`, reason `accepted`) and `member.joined` when they joined.
+   * `invitation_closed` when it was accepted or revoked by then, as for the second of two accepts that race; a plain Error when it
+   * does not exist. Expiry is the caller's.
+   */
+  acceptInvitation(invitationId: string, userId: string, at: string, actor: AuditActor): Promise<{ joined: boolean; role: Role }>;
+  /**
+   * Revokes a pending invitation of this organization and audits `invitation.revoked`, with the reason when given. True only for
+   * the call that revoked it: the second of two revokes, or an invitation of another organization, writes nothing.
+   */
+  revokeInvitation(orgId: string, invitationId: string, at: string, actor: AuditActor, reason: 'reinvited' | null): Promise<boolean>;
 
   /** `scan_claimed` when any organization already holds the scan. */
   claimAnalysis(analysis: OrgAnalysisRecord): Promise<void>;
@@ -173,21 +226,39 @@ export interface WebappRepository {
   upsertSubscription(subscription: SubscriptionRecord): Promise<void>;
   /** Moves `organizations.billing_status`, the value that gates access. The subscription row is written by upsertSubscription. */
   setBillingStatus(orgId: string, status: BillingStatus): Promise<void>;
-  /** True for the first time an event id is seen, false for every repeat. */
+  /** True for the first time an event id is seen, false for every repeat. Seeing an event is not processing it. */
   recordBillingEvent(id: string, type: string): Promise<boolean>;
+  /**
+   * Records the event and applies the state in one step (DN-13 §6.5): the subscription, billing_status and `billing.event_applied`
+   * (as the system), or nothing. An event already processed is a duplicate whatever its state. An organization that does not exist
+   * throws a plain Error and records nothing.
+   */
+  applyBillingState(event: { id: string; type: string; livemode?: boolean | null }, orgId: string, state: BillingStateRecord,
+    at: string): Promise<BillingApplyOutcome>;
 
   /** `deletion_pending` when the organization already has a pending request. */
   createDeletionRequest(request: DeletionRequestRecord): Promise<void>;
   getPendingDeletionRequest(orgId: string): Promise<DeletionRequestRecord | null>;
   listDeletionRequests(): Promise<DeletionRequestRecord[]>;
   getDeletionRequest(id: string): Promise<DeletionRequestRecord | null>;
-  /** Only a pending request can be reviewed. */
-  reviewDeletionRequest(id: string, status: 'approved' | 'rejected', reviewedBy: string, note: string | null, at: string): Promise<void>;
+  /**
+   * Only a pending request can be reviewed: `already_reviewed` otherwise, as for the second of two reviews that race. In one step
+   * with the review, an approval marks the organization deleted (the first deletion time stays), and `org.deletion_<status>` is
+   * audited.
+   */
+  reviewDeletionRequest(id: string, status: 'approved' | 'rejected', reviewedBy: string, note: string | null, at: string,
+    actor: AuditActor): Promise<void>;
   /** Idempotent: the first deletion time stays. */
   markOrganizationDeleted(orgId: string, at: string): Promise<void>;
 
   isPlatformAdmin(userId: string): Promise<boolean>;
-  grantPlatformAdmin(userId: string, grantedBy: string): Promise<void>;
+  /**
+   * True when it granted the role, false when the user already had it. With `audit`, `platform_admin.granted` is written in the
+   * same step, and only when it changed. `grantedBy` is null for the `admin:grant` script.
+   */
+  grantPlatformAdmin(userId: string, grantedBy: string | null, audit?: { actor: AuditActor; at: string }): Promise<boolean>;
+  /** True when it took the role away; `platform_admin.revoked` as grantPlatformAdmin. */
+  revokePlatformAdmin(userId: string, audit?: { actor: AuditActor; at: string }): Promise<boolean>;
 
   /** Every row of the organization, from both sources and every plan, oldest first: the caller picks the current plan. */
   listActions(orgId: string): Promise<OrgActionRecord[]>;

@@ -9,7 +9,8 @@ import { verifySessionToken } from '../auth/session-token.js';
 import type { ScanRecord, ScanRepository } from '../repositories/types.js';
 import type { AppUser } from './auth.js';
 import type { BillingEvent, BillingProvider } from './billing.js';
-import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, WebappConflict, type ActionPatch, type AuditRecord, type CustomActionRecord,
+import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict, type ActionPatch, type AuditActor, type AuditRecord,
+  type BillingApplyOutcome, type CustomActionRecord,
   type DeletionRequestRecord, type InvitationRecord, type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord,
   type PlanRecord, type WebappConflictReason, type WebappRepository } from './types.js';
 
@@ -32,6 +33,8 @@ const CONFLICTS: Record<WebappConflictReason, string> = {
   already_invited: 'This email already has a pending invitation',
   deletion_pending: 'A deletion request is already pending',
   action_limit: `An organization keeps at most ${MAX_CUSTOM_ACTIONS} actions of its own`,
+  already_reviewed: 'This deletion request was already reviewed',
+  invitation_closed: 'This invitation is no longer valid',
 };
 /** The rules the repository enforces atomically come back as a 409. */
 async function orConflict<T>(write: Promise<T>): Promise<T> {
@@ -133,6 +136,7 @@ const TARGETS: Readonly<Record<string, 'user' | 'email' | 'scan' | 'org' | 'acti
   'org.created': 'org', 'org.renamed': 'org',
   'action.created': 'action', 'action.updated': 'action', 'action.deleted': 'action',
   'plan.updated': 'plan',
+  'platform_admin.granted': 'user', 'platform_admin.revoked': 'user',
 };
 type Change = NonNullable<ActivityEventView['change']>;
 const textOrNull = (value: unknown): string | null | undefined => typeof value === 'string' || value === null ? value : undefined;
@@ -320,8 +324,10 @@ export class WebappService {
     const id = asUuid(invitationId);
     const invitation = id && (await this.repo.listInvitations(org.id)).find(pending => pending.id === id);
     if (!invitation) throw fail('not_found', 'Invitation not found');
-    await this.repo.updateInvitation(invitation.id, { revoked_at: this.timestamp() });
-    await this.audit(actor.userId, org.id, 'invitation.revoked', invitation.email, { invitationId: invitation.id }, 'member');
+    // The second of two revokes that race finds it revoked already, and writes and audits nothing.
+    if (!(await this.repo.revokeInvitation(org.id, invitation.id, this.timestamp(), this.actor(actor.userId, 'member'), null))) {
+      throw fail('not_found', 'Invitation not found');
+    }
   }
 
   async acceptInvitation(user: AppUser, token: string): Promise<OrgView> {
@@ -334,22 +340,18 @@ export class WebappService {
     const org = await this.repo.getOrganization(invitation.org_id);
     if (!org) throw fail('not_found', 'Invitation not found');
     if (org.deleted_at !== null) throw fail('gone', 'This organization was deleted');
-    const at = this.timestamp();
-    const existing = await this.repo.getMembership(org.id, user.userId);
-    if (existing) {
-      // Someone who already belongs keeps their role; the invitation is only closed, and so are the other links of that email.
-      await this.repo.updateInvitation(invitation.id, { accepted_at: at });
-      await this.revokePending(user.userId, org.id, invitation.email, 'accepted');
-      return this.view(org, existing.role);
-    }
+    // Members are listed with the email of their profile, so the profile comes first.
     await this.ensureProfile(user);
-    await orConflict(this.repo.addMember({ org_id: org.id, user_id: user.userId, role: invitation.role, invited_by: invitation.invited_by,
-      created_at: at }));
-    await this.repo.updateInvitation(invitation.id, { accepted_at: at });
-    // No other link stays live, or a member removed later could use it to come back.
-    await this.revokePending(user.userId, org.id, invitation.email, 'accepted');
-    await this.audit(user.userId, org.id, 'member.joined', user.userId, { role: invitation.role, invitationId: invitation.id }, 'member');
-    return this.view(org, invitation.role);
+    // One step in the store (DN-13 §5.4): the membership, unless they already belong (then they keep their role), the acceptance,
+    // the other links of that email revoked, since a member removed later could use one to come back, and the audit. An accept
+    // that raced another, or a revoke, finds it closed: the same 410 as above.
+    try {
+      const { role } = await this.repo.acceptInvitation(invitation.id, user.userId, this.timestamp(), this.actor(user.userId, 'member'));
+      return this.view(org, role);
+    } catch (error) {
+      if (error instanceof WebappConflict && error.reason === 'invitation_closed') throw fail('gone', CONFLICTS.invitation_closed);
+      throw error;
+    }
   }
 
   /**
@@ -361,9 +363,11 @@ export class WebappService {
     const target = await this.member(org.id, targetUserId);
     if (!canManageMember(actorRole, target.role, role)) throw fail('forbidden', 'Your role cannot give this role to this member');
     if (target.role !== role) {
+      // The store checks the actor's right again against the roles as it locks them, and audits the role it found (DN-13 §4.6).
       // Removed by another request since it was read: nothing was written, so nothing is audited.
-      if (!(await orConflict(this.repo.setRole(org.id, target.user_id, role)))) throw fail('not_found', 'Member not found');
-      await this.audit(actor.userId, org.id, 'member.role_changed', target.user_id, { from: target.role, to: role }, 'member');
+      const before = await this.memberChange(this.repo.setRole(org.id, target.user_id, role, this.change(actor, actorRole)),
+        'Your role cannot give this role to this member');
+      if (before === null) throw fail('not_found', 'Member not found');
     }
     return this.memberView({ ...target, role });
   }
@@ -373,12 +377,11 @@ export class WebappService {
     const { org, role: actorRole } = await this.authorize(actor, orgId, 'members.remove', { payment: true });
     const target = await this.member(org.id, targetUserId);
     if (!canManageMember(actorRole, target.role)) throw fail('forbidden', 'Your role cannot remove this member');
-    // Two removals that race both find the member; only the one that removed them audits.
-    if (!(await orConflict(this.repo.removeMember(org.id, target.user_id)))) throw fail('not_found', 'Member not found');
-    await this.audit(actor.userId, org.id, 'member.removed', target.user_id, { role: target.role }, 'member');
-    // A link still pending for their email would let the removed member back in.
-    const profile = await this.repo.getProfile(target.user_id);
-    if (profile) await this.revokePending(actor.userId, org.id, profile.email, 'member_removed');
+    // Two removals that race both find the member; only the one that removed them writes anything. The same step audits it and
+    // revokes the links still pending for their email, which would let them back in.
+    const before = await this.memberChange(this.repo.removeMember(org.id, target.user_id, this.change(actor, actorRole)),
+      'Your role cannot remove this member');
+    if (before === null) throw fail('not_found', 'Member not found');
   }
 
   /** Paying is how an organization gets in, so checkout and portal ask for billing.manage but not for a payment. */
@@ -403,22 +406,14 @@ export class WebappService {
    * Moves the subscription and billing_status, never the deletion state (DN-10 §4.4). Each event id counts once. An event names
    * its organization by the id its checkout carried; one that is not a UUID names none.
    */
-  async applyBillingEvent(event: BillingEvent): Promise<'applied' | 'duplicate' | 'unknown_org'> {
+  async applyBillingEvent(event: BillingEvent): Promise<BillingApplyOutcome | 'unknown_org'> {
     const orgId = asUuid(event.orgId);
     const org = orgId && await this.repo.getOrganization(orgId);
     if (!org) return 'unknown_org';
-    if (!(await this.repo.recordBillingEvent(event.id, event.type))) return 'duplicate';
-    const current = await this.repo.getSubscription(org.id);
-    const planCode = event.planCode ?? current?.plan_code ?? null;
-    // An event that names no plan, for an organization that never subscribed, only moves billing_status.
-    if (planCode) {
-      await this.repo.upsertSubscription({ org_id: org.id, plan_code: planCode, customer_id: event.customerId ?? current?.customer_id ?? null,
-        subscription_id: event.subscriptionId ?? current?.subscription_id ?? null, status: event.status,
-        current_period_end: event.currentPeriodEnd ?? current?.current_period_end ?? null, updated_at: this.timestamp() });
-    }
-    await this.repo.setBillingStatus(org.id, event.status);
-    await this.audit(null, org.id, 'billing.event_applied', event.id, { type: event.type, status: event.status, planCode }, 'system');
-    return 'applied';
+    // Recorded and applied in one step (DN-13 §6.5): a crash in between can no longer leave an event seen but never applied. An
+    // event that names no plan, for an organization that never subscribed, only moves billing_status.
+    return this.repo.applyBillingState({ id: event.id, type: event.type }, org.id, { status: event.status, plan_code: event.planCode,
+      customer_id: event.customerId, subscription_id: event.subscriptionId, current_period_end: event.currentPeriodEnd }, this.timestamp());
   }
 
   /** Only a request: nothing changes until an ARCA person reviews it, and access stays meanwhile (DN-10 §4.5). */
@@ -610,12 +605,9 @@ export class WebappService {
     if (request.status !== 'pending') throw fail('conflict', 'This deletion request was already reviewed');
     const status = decision === 'approve' ? 'approved' : 'rejected';
     const at = this.timestamp();
-    await this.repo.reviewDeletionRequest(request.id, status, admin.userId, note ?? null, at);
-    if (status === 'approved') {
-      await this.repo.markOrganizationDeleted(request.org_id, at);
-      await this.deps.billing.cancel(request.org_id);
-    }
-    await this.audit(admin.userId, request.org_id, `org.deletion_${status}`, request.id, { note: note ?? null }, 'platform');
+    // The review, the deletion mark and the audit are one step; the second of two reviews that race is the same 409 (DN-13 §5.4).
+    await orConflict(this.repo.reviewDeletionRequest(request.id, status, admin.userId, note ?? null, at, this.actor(admin.userId, 'platform')));
+    if (status === 'approved') await this.deps.billing.cancel(request.org_id);
     return deletionView({ ...request, status, reviewed_by: admin.userId, reviewed_at: at, review_note: note ?? null });
   }
 
@@ -681,12 +673,26 @@ export class WebappService {
     return { userId: member.user_id, email: profile.email, role: member.role, joinedAt: iso(member.created_at) };
   }
 
-  /** Revokes every pending invitation of this email in the organization, expired ones included: listInvitations returns them all. */
-  private async revokePending(actor: string, orgId: string, email: string, reason: 'reinvited' | 'accepted' | 'member_removed') {
+  /**
+   * Revokes every pending invitation of this email in the organization, expired ones included: listInvitations returns them all.
+   * Accepting and removing a member revoke theirs in their own step.
+   */
+  private async revokePending(actor: string, orgId: string, email: string, reason: 'reinvited') {
     const at = this.timestamp();
     for (const invitation of (await this.repo.listInvitations(orgId)).filter(pending => sameEmail(pending.email, email))) {
-      await this.repo.updateInvitation(invitation.id, { revoked_at: at });
-      await this.audit(actor, orgId, 'invitation.revoked', invitation.email, { invitationId: invitation.id, reason }, 'member');
+      await this.repo.revokeInvitation(orgId, invitation.id, at, this.actor(actor, 'member'), reason);
+    }
+  }
+
+  /** What the service checked before a member change, for the store to check again under its lock. */
+  private change(actor: AppUser, actorRole: Role) {
+    return { actorUserId: actor.userId, actorRole, audit: this.actor(actor.userId, 'member'), at: this.timestamp() };
+  }
+  /** A member change refused by the store, because a role moved meanwhile, is the 403 the service's own check gives. */
+  private async memberChange(write: Promise<Role | null>, refusal: string): Promise<Role | null> {
+    try { return await orConflict(write); } catch (error) {
+      if (error instanceof MemberChangeRefused) throw fail('forbidden', refusal);
+      throw error;
     }
   }
 
@@ -704,9 +710,14 @@ export class WebappService {
    */
   private async audit(actor: string | null, orgId: string | null, action: string, target: string, data: Record<string, unknown>,
     actorKind: AuditActorKind) {
+    await this.repo.appendAudit({ id: randomUUID(), ...this.actor(actor, actorKind), org_id: orgId, action, target, data,
+      created_at: this.timestamp() });
+  }
+
+  /** Who an audit row names, the rows a store writes itself included: the mock seed's member actions are the system's. */
+  private actor(actor: string | null, actorKind: AuditActorKind): AuditActor {
     const system = this.deps.auditAsSystem === true && actorKind === 'member';
-    await this.repo.appendAudit({ id: randomUUID(), actor_kind: system ? 'system' : actorKind, actor_user_id: system ? null : actor,
-      org_id: orgId, action, target, data, created_at: this.timestamp() });
+    return { actor_kind: system ? 'system' : actorKind, actor_user_id: system ? null : actor };
   }
 
   /** The analysis behind the current plan, or null when no analysis of the organization has a completed assessment. */
