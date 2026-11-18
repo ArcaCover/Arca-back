@@ -10,6 +10,7 @@ import { InProcessPipeline } from '../pipeline/in-process-pipeline.js';
 import type { MockAppAuth } from '../webapp/auth.js';
 import type { MockBillingProvider } from '../webapp/billing.js';
 import type { InMemoryWebappRepository } from '../webapp/in-memory.js';
+import type { MemoryMailer } from '../webapp/mailer.js';
 import type { WebappService } from '../webapp/service.js';
 import type { RoutingAssessmentRepository, RoutingScanRepository } from './isolation.js';
 import { describeDemo, seedDemo, type SeedDeps, type SeededDemo } from './seed.js';
@@ -64,9 +65,11 @@ export function createDebugTools(options: {
   /**
    * The simulated login and payment of the webapp (DN-10 §4.1, §4.4), in both debug modes: in live-debug the scans are real
    * and the accounts, organizations and billing are these in-memory pieces (DN-12 §7). The demo seed (DN-11 §4.6) runs on
-   * them in mock only.
+   * them in mock only. With the real providers (DN-13 §3.2) there is none, so those routes do not exist. `mailer` holds the
+   * invitations the simulated webapp sent; a reset forgets them with the rest of its memory.
    */
-  webapp?: { auth: MockAppAuth; billing: MockBillingProvider; service: WebappService; repository: InMemoryWebappRepository };
+  webapp?: { auth: MockAppAuth; billing: MockBillingProvider; service: WebappService; repository: InMemoryWebappRepository;
+    mailer?: MemoryMailer };
   /** How long a seed request waits before it answers 504; the run itself goes on. */
   seedTimeoutMs?: number;
 }): DebugTools {
@@ -172,6 +175,7 @@ export function createDebugTools(options: {
         if (refused) return refused;
         limiter.clear();
         webapp?.repository.clear();
+        webapp?.mailer?.clear();
         if (options.mode === 'mock') {
           scans.overlay.clear();
           assessments.overlay.clear();

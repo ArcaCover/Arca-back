@@ -19,11 +19,13 @@ import { RoutingAssessmentRepository, RoutingScanRepository } from './debug/isol
 import { createDebugTools } from './debug/tools.js';
 import { createOpenAIPlanner } from '@arca/questions';
 import { renderPdf } from './report/pdf.js';
-import { MockAppAuth } from './webapp/auth.js';
+import { MockAppAuth, SupabaseJwtAuth } from './webapp/auth.js';
 import { MockBillingProvider } from './webapp/billing.js';
 import { InMemoryWebappRepository } from './webapp/in-memory.js';
+import { MailingWebappService } from './webapp/invitation-email.js';
+import { MemoryMailer, SesMailer } from './webapp/mailer.js';
 import { DEFAULT_PLANS } from './webapp/plans.js';
-import { WebappService } from './webapp/service.js';
+import { REAL_WEBAPP_ADAPTERS, type RealWebappAdapters, type StorageClient } from './webapp/real-adapters.js';
 
 /**
  * The webapp of the debug modes: accounts, organizations and billing in memory, behind the simulated login and payment. Its
@@ -33,11 +35,38 @@ import { WebappService } from './webapp/service.js';
 function simulatedWebapp(env: ReturnType<typeof loadEnv>, scans: RoutingScanRepository, assessments: RoutingAssessmentRepository) {
   const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
   const billing = new MockBillingProvider(env.APP_BASE_URL);
-  const service = new WebappService({ repository, scans, assessments, billing, sessionSecret: env.SESSION_TOKEN_SECRET,
+  // Invitations are kept in memory, for the tests and the debug panel; the response still carries the link (DN-13 §7.1).
+  const mailer = new MemoryMailer();
+  const service = new MailingWebappService({ repository, scans, assessments, billing, sessionSecret: env.SESSION_TOKEN_SECRET,
     appBaseUrl: env.APP_BASE_URL,
     // A scan with an injected fault lives in memory only, so it can never belong to an organization.
-    isDurableScan: scanId => !scans.isIsolated(scanId) });
-  return { repository, billing, service, auth: new MockAppAuth(env.SESSION_TOKEN_SECRET) };
+    isDurableScan: scanId => !scans.isIsolated(scanId) }, { mailer, from: env.emailFrom });
+  return { repository, billing, service, mailer, auth: new MockAppAuth(env.SESSION_TOKEN_SECRET) };
+}
+
+/**
+ * The real webapp (DN-13 §7.1): production with WEBAPP_ENABLED=true, or live-debug with WEBAPP_PROVIDERS=real. Supabase Auth
+ * verifies the tokens; the repository and the billing provider come from the seam, and without them the start is refused rather
+ * than served by a simulated piece. It claims the scans and assessments it is given, the same ones the funnel writes.
+ */
+async function realWebapp(env: ReturnType<typeof loadEnv>, adapters: RealWebappAdapters, deps: { client: () => StorageClient;
+  scans: ScanRepository; assessments: AssessmentRepository; isDurableScan?: (scanId: string) => boolean }) {
+  const missing = [...(adapters.repository ? [] : ['the Supabase webapp repository (DN-13 T4)']),
+    ...(adapters.billing ? [] : ['the Stripe billing provider (DN-13 T14)']),
+    ...(env.emailProvider === 'ses' && !adapters.sesSendEmail ? ['the SES sender (see SesMailer)'] : [])];
+  if (missing.length) {
+    throw new Error(`The real webapp cannot start without ${missing.join(', ')}, handed to compose as RealWebappAdapters. `
+      + 'Production keeps answering 501 with WEBAPP_ENABLED=false');
+  }
+  const auth = new SupabaseJwtAuth(env.SUPABASE_URL!, { fetchJwks: adapters.fetchJwks });
+  await auth.checkSigningKeys();
+  const billing = adapters.billing!({ secretKey: env.STRIPE_SECRET_KEY!, webhookSecret: env.STRIPE_WEBHOOK_SECRET!, mode: env.stripeMode!,
+    appBaseUrl: env.APP_BASE_URL });
+  const mailer = env.emailProvider === 'ses' ? new SesMailer(adapters.sesSendEmail!) : new MemoryMailer();
+  const service = new MailingWebappService({ repository: adapters.repository!(deps.client()), scans: deps.scans,
+    assessments: deps.assessments, billing, sessionSecret: env.SESSION_TOKEN_SECRET, appBaseUrl: env.APP_BASE_URL,
+    isDurableScan: deps.isDurableScan }, { mailer, from: env.emailFrom });
+  return { service, auth };
 }
 
 /** A scan still RUNNING past this point outlived its pipeline budget: a restart cut it short. */
@@ -49,9 +78,11 @@ export const interruptedBefore = (pipelineTimeoutMs: number) => new Date(Date.no
  * storageBackend and ASSESSMENT_PLANNER: under mock the raw SOURCE_MODE and STORAGE_BACKEND still say what the file said.
  * The server fills `clientIps` per request, from the socket and the trusted proxy hops.
  * `storage` replaces the durable repositories the environment names. Only tests pass it, to stand in for Supabase.
+ * `adapters` are the real webapp's pieces (DN-13 §7.1), read only when the environment asks for the real webapp.
  */
 export async function compose(env: ReturnType<typeof loadEnv>,
-  storage?: { scans: ScanRepository; assessments: AssessmentRepository }): Promise<{ app: Hono; drain: () => Promise<void>;
+  storage?: { scans: ScanRepository; assessments: AssessmentRepository },
+  adapters: RealWebappAdapters = REAL_WEBAPP_ADAPTERS): Promise<{ app: Hono; drain: () => Promise<void>;
   recoverAssessments: () => Promise<void>; repository: ScanRepository; apify: ApifyClient | null; banner: string;
   clientIps: WeakMap<Request, string> }> {
   const mode = env.mode;
@@ -64,6 +95,14 @@ export async function compose(env: ReturnType<typeof loadEnv>,
   const assessments = scans && new RoutingAssessmentRepository(durableAssessments, new InMemoryAssessmentRepository(), scans);
   const repository = scans ?? durable;
   const assessmentRepository = assessments ?? durableAssessments;
+  // The private webapp (DN-10, DN-13 §3.2). Production builds none unless WEBAPP_ENABLED=true, and then the real one: by default
+  // every webapp route answers 501. The debug modes run the simulated one, over the memory of mock or, in live-debug, over the
+  // real scans (DN-12 §7), unless live-debug asks for the real providers. Built before anything reaches Supabase, so a missing
+  // adapter stops the start first.
+  const simulated = env.webapp === 'simulated' && scans && assessments ? simulatedWebapp(env, scans, assessments) : undefined;
+  const webapp = simulated ?? (env.webapp === 'real' ? await realWebapp(env, adapters, {
+    client: () => storageClient ?? createStorageClient(env.SUPABASE_URL!, env.supabaseKey!), scans: repository,
+    assessments: assessmentRepository, isDurableScan: scans ? scanId => !scans.isIsolated(scanId) : undefined }) : undefined);
   await repository.recoverInterrupted(interruptedBefore(env.PIPELINE_TIMEOUT_MS));
   // The fixtures read the website in mock; otherwise the configured provider does. /__debug/mode reports this very value.
   const evidence = env.sourceMode === 'mock' ? 'mock' as const : env.WEBSITE_EVIDENCE_PROVIDER;
@@ -98,11 +137,8 @@ export async function compose(env: ReturnType<typeof loadEnv>,
   // The model a built component calls: the extraction's first, then the planner's. Rules and fixtures call none.
   const signalLlmModel = evidence === 'agentic' ? env.SIGNAL_LLM_MODEL : evidence === 'openai' ? OPENAI_EVIDENCE_MODEL
     : assessmentAgent?.model ?? null;
-  // The private webapp (DN-10) has no Supabase or Stripe adapter yet, so production builds none and answers 501. The debug
-  // modes run the simulated one: over mock's memory, or in live-debug over the real scans (DN-12 §7). It is tied to the
-  // routing repositories, which production never builds.
-  const webapp = scans && assessments ? simulatedWebapp(env, scans, assessments) : undefined;
-  const debug = mode !== 'production' && scans && assessments ? createDebugTools({ mode, sources, scans, assessments, webapp,
+  // Only the simulated webapp reaches the debug tools: with the real providers there is no mock login or payment (404).
+  const debug = mode !== 'production' && scans && assessments ? createDebugTools({ mode, sources, scans, assessments, webapp: simulated,
     pipelineTimeoutMs: env.PIPELINE_TIMEOUT_MS,
     // What this process built, so the label cannot lie (DN-09 4): a key sitting in .env.local is not a service in use.
     // Enums, booleans and a model name only, never a key or a URL (DN-09 7). storageBackend is where scans and assessments
@@ -127,8 +163,9 @@ export async function compose(env: ReturnType<typeof loadEnv>,
   const guards = [...(apify && env.apifySpendCeilingUsd !== null ? [`Apify ceiling USD ${env.apifySpendCeilingUsd} per 24 h`] : []),
     ...(evidence === 'agentic' && env.openAiMaxRequestsPerScan !== null ? [`OpenAI cap ${env.openAiMaxRequestsPerScan} requests per scan`] : [])];
   const banner = `[api] MODE=${mode} sources=${env.sourceMode} storage=${env.storageBackend}`
-    // storage= is where the scans live. Where the webapp does not live there too, the line says so.
-    + (webapp && env.storageBackend !== 'memory' ? ' webapp=simulated-in-memory' : '')
+    // storage= is where the scans live. Where the webapp does not live there too, the line says so, and what the real one runs on.
+    + (simulated && env.storageBackend !== 'memory' ? ' webapp=simulated-in-memory' : '')
+    + (env.webapp === 'real' ? ` webapp=real stripe=${env.stripeMode} email=${env.emailProvider}` : '')
     + (mode === 'production' ? '' : ` (debug routes on ${listenHostname(mode)} only)`)
     + (guards.length ? ` spend guards: ${guards.join(', ')}` : '')
     + (env.overridden.length ? ` overrides: ${env.overridden.join(', ')}` : '');
