@@ -4,7 +4,7 @@ import { createApp } from '../../src/http/app.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import { issueSessionToken } from '../../src/auth/session-token.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
-import { hasInsufficientEvidence, renderQuickScanHtml, reportFilename, websiteUnreadNote } from '../../src/report/quick-scan.js';
+import { WEBSITE_UNREAD_NOTE, hasInsufficientEvidence, renderQuickScanHtml, reportFilename, scoreWithheld } from '../../src/report/quick-scan.js';
 import { InProcessPipeline } from '../../src/pipeline/in-process-pipeline.js';
 import { mockSources } from '../../src/pipeline/mock-sources.js';
 import { fixtureResult } from '../../../../packages/contracts/tests/fixture.js';
@@ -35,36 +35,34 @@ describe('Quick Scan Report content', () => {
     expect(html).not.toMatch(/website could not be read/i);
   });
 
-  it('says in one sentence that the website could not be read, without a decision or a price', async () => {
-    const { status, result } = await new InProcessPipeline({ ...mockSources(), repository: new InMemoryRepository() })
-      .run({ scanId: 'sc_blocked', canonicalDomain: 'blocked.arca.example', email: 'owner@blocked.arca.example' });
-    expect(status).toBe('PARTIAL');
-    const html = renderQuickScanHtml(result, 'PARTIAL');
-    const notes = [...html.matchAll(/<li>([^<]*)<\/li>/g)].map(match => match[1]).filter(text => /could not read/.test(text!));
-    // The /score notice in the third person: the group is the score's, "for now"; only the manual review holds.
-    expect(notes).toEqual(['We could not read the firm&#39;s website during the scan. What we could not verify counts as unknown, ' +
-      'which places the firm in the highest-risk group for now. Answers to the assessment also count, and because the website ' +
-      'could not be read, the case will need a manual review.']);
-    expect(html).not.toMatch(/until the assessment|whatever/);
-    // The cause stands in for the generic notice, and the report still says no decision was made.
-    expect(html).not.toMatch(/did not answer in full/i);
-    expect(html).toMatch(/not enough public evidence yet for an underwriting decision/i);
-    expect(html).toMatch(/not an offer of insurance, a quote or an underwriting decision/i);
-    // The firm name falls back to the domain, the one thing known about a site that was not read.
-    expect(html).toContain('<h1>blocked.arca.example</h1>');
-    // ...and the line under it does not print the domain a second time.
-    expect(html.match(/blocked\.arca\.example/g)).toHaveLength(2);
-    expect(html).toContain('<div class="meta">Scanned ');
-    expect(html).toMatch(/>0<small> \/ 100/);
-    expect(html).toContain('CRITICAL');
-    expect(html).toContain('Firm website: unavailable');
-    // The directories were never asked: they were skipped, not unavailable.
-    expect(html).toContain('Florida Bar: not searched; we could not look the firm up there');
-    expect(html).toContain('Avvo: not searched; we could not look the firm up there');
-    expect(html).not.toMatch(/(Florida Bar|Avvo): unavailable/);
-    // Nothing in the report names the restriction, a premium or a coverage outcome.
-    expect(html).not.toMatch(/REFERRAL|referral|declin|premium|\$|approved|eligible|coverage/);
-  });
+  it.each(['blocked.arca.example', 'down.arca.example'])(
+    'shows %s as low confidence: no number, no tier, one notice, no highest-risk group or manual review', async domain => {
+      const { status, result } = await new InProcessPipeline({ ...mockSources(), repository: new InMemoryRepository() })
+        .run({ scanId: 'sc_unread', canonicalDomain: domain, email: `owner@${domain}` });
+      expect(status).toBe('PARTIAL');
+      const html = renderQuickScanHtml(result, 'PARTIAL');
+      expect(html).toContain('<div class="tier">No score from public evidence</div>');
+      expect(html).toContain('We could not read the firm&#39;s website, so there is no public evidence to score. A full assessment ' +
+        'gives a score based on the firm&#39;s answers, marked as low confidence.');
+      expect(html.match(/could not read/g)).toHaveLength(1);
+      expect(html).toContain('Confidence: low');
+      // No Layer 1 number and no tier: a 0 and CRITICAL here would read as a verdict on a firm we could not see.
+      expect(html).not.toMatch(/<div class="total">/);
+      expect(html).not.toMatch(/CRITICAL|Very few positive public signals/);
+      expect(html).not.toMatch(/highest-risk|manual review|until the assessment|whatever/i);
+      // The score block says why; the generic notice about sources is not repeated, and no decision is implied.
+      expect(html).not.toMatch(/did not answer in full/i);
+      expect(html).toMatch(/not enough public evidence yet for an underwriting decision/i);
+      expect(html).toMatch(/not an offer of insurance, a quote or an underwriting decision/i);
+      // The firm name falls back to the domain, the one thing known about a site that was not read.
+      expect(html).toContain(`<h1>${domain}</h1>`);
+      expect(html.match(new RegExp(domain.replaceAll('.', '\.'), 'g'))).toHaveLength(2);
+      expect(html).toContain('Firm website: unavailable');
+      // The directories were never asked: they were skipped, not unavailable.
+      expect(html).toContain('Florida Bar: not searched; we could not look the firm up there');
+      expect(html).toContain('Avvo: not searched; we could not look the firm up there');
+      expect(html).not.toMatch(/REFERRAL|referral|declin|premium|\$|approved|eligible|coverage/);
+    });
 
   it('never says the firm could not be identified when a directory was skipped for want of a city', () => {
     // The live scan of 2026-11-06 (flow.test.ts): the firm was named and the Bar found it, but Avvo was not run
@@ -102,13 +100,9 @@ describe('Quick Scan Report content', () => {
     expect(renderQuickScanHtml(evening, 'COMPLETED')).toMatch(/observed on November 9, 2026/);
   });
 
-  it('names the highest-risk group only for a CRITICAL tier, and never promises the group will change or hold', () => {
-    expect(websiteUnreadNote('CRITICAL')).toContain('which places the firm in the highest-risk group for now.');
-    for (const tier of ['FORTRESS', 'FORTIFIED', 'GUARDED', 'EXPOSED', 'UNKNOWN'] as const) {
-      expect(websiteUnreadNote(tier)).toBe("We could not read the firm's website during the scan. What we could not verify counts as unknown. " +
-        'Answers to the assessment also count, and because the website could not be read, the case will need a manual review.');
-    }
-    for (const tier of ['CRITICAL', 'GUARDED'] as const) expect(websiteUnreadNote(tier)).not.toMatch(/until|whatever|complet/i);
+  it('words the unreadable website in the third person, as the low-confidence state of /score', () => {
+    expect(WEBSITE_UNREAD_NOTE).toBe("We could not read the firm's website, so there is no public evidence to score. " +
+      "A full assessment gives a score based on the firm's answers, marked as low confidence.");
   });
 
   it('prints the domain under a firm name the scan found', () => {
@@ -141,6 +135,18 @@ function thinEvidence() {
   return result;
 }
 
+describe('scoreWithheld', () => {
+  it('withholds the score of an unreadable website, whatever else the evidence shows', () => {
+    const { preScore } = thinEvidence();
+    expect(scoreWithheld({ ...preScore, flags: [...preScore.flags, 'WEBSITE_UNAVAILABLE'] })).toBe('WEBSITE_UNAVAILABLE');
+    expect(scoreWithheld({ ...fixtureResult().preScore, flags: ['WEBSITE_UNAVAILABLE'] })).toBe('WEBSITE_UNAVAILABLE');
+  });
+  it('withholds it for thin evidence, and not for a firm it can rate', () => {
+    expect(scoreWithheld(thinEvidence().preScore)).toBe('INSUFFICIENT_EVIDENCE');
+    expect(scoreWithheld(fixtureResult().preScore)).toBeNull();
+  });
+});
+
 describe('hasInsufficientEvidence', () => {
   it('is true for the hklaw.com shape: low confidence and one category, partly, evaluated', () => {
     expect(hasInsufficientEvidence(thinEvidence().preScore)).toBe(true);
@@ -162,7 +168,7 @@ describe('hasInsufficientEvidence', () => {
     expect(hasInsufficientEvidence({ ...thinEvidence().preScore, confidence: 'MEDIUM' })).toBe(false);
   });
 
-  it('is false with WEBSITE_UNAVAILABLE, which keeps its highest-risk treatment and manual review', () => {
+  it('is false with WEBSITE_UNAVAILABLE, which has its own withheld state', () => {
     const { preScore } = thinEvidence();
     expect(hasInsufficientEvidence({ ...preScore, flags: [...preScore.flags, 'WEBSITE_UNAVAILABLE'] })).toBe(false);
   });
@@ -211,13 +217,14 @@ describe('Quick Scan Report with too little evidence to rate', () => {
     expect(html).not.toContain('Not enough evidence to rate');
   });
 
-  it('keeps the highest-risk group for an unreadable website, whatever else is thin', () => {
+  it('gives an unreadable website its own words, whatever else is thin', () => {
     const result = thinEvidence();
     result.preScore.flags = [...result.preScore.flags, 'WEBSITE_UNAVAILABLE'];
     const html = renderQuickScanHtml(result, 'PARTIAL');
-    expect(html).toContain('CRITICAL');
-    expect(html).toMatch(/>3<small> \/ 100/);
+    expect(html).toContain('No score from public evidence');
     expect(html).not.toContain('Not enough evidence to rate');
+    expect(html).not.toContain('CRITICAL');
+    expect(html).not.toMatch(/>3<small> \/ 100/);
   });
 });
 

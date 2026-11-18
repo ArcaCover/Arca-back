@@ -5,7 +5,7 @@ import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import { InMemoryAssessmentRepository } from '../../src/assessment/repository.js';
 import { issueSessionToken } from '../../src/auth/session-token.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
-import { DEMO_DISCLOSURE, assessmentReportFilename, isCompleted, renderAssessmentHtml, websiteUnreadNote,
+import { ANSWERS_ONLY_LINE, DEMO_DISCLOSURE, assessmentReportFilename, displayedScore, isCompleted, renderAssessmentHtml,
   type CompletedAssessment } from '../../src/report/assessment.js';
 import { fixtureResult } from '../../../../packages/contracts/tests/fixture.js';
 
@@ -130,21 +130,25 @@ describe('GET /assessment/:assessmentId/report.pdf', () => {
     expect(s.renderReport).not.toHaveBeenCalled();
   });
 
-  it('says that the website could not be read when the result carries the flag', async () => {
+  it('says plainly that the score rests on the answers alone when the website could not be read', async () => {
     const flagged = await setup({ layer1: result => { result.preScore.flags = [...result.preScore.flags, 'WEBSITE_UNAVAILABLE']; } });
     const id = await flagged.start();
-    await flagged.complete(id);
+    const record = await flagged.complete(id);
+    expect(record.result).toMatchObject({ layer1Score: null, compositeScore: record.result.layer2Score });
+    expect(record.result.flags).toContain('LAYER1_UNAVAILABLE');
     expect((await flagged.report(id)).status).toBe(200);
     const html = flagged.renderReport.mock.calls[0]![0];
-    expect(count(html, /website during the scan/g)).toBe(1);
-    expect(html).toContain('<ul class="notes"><li>We could not read the firm&#39;s website during the scan. Until it can be read, this outlook ' +
-      'needs a manual review, whatever the answers show. This is not a coverage decision or a price.</li></ul>');
+    expect(html).toContain(`<div class="total">${displayedScore(record.result.layer2Score)}<small> / 100</small></div>`);
+    expect(html).toContain(`<div class="tier-line">Based only on the firm&#39;s answers; no public evidence could be verified (low confidence).</div>`);
+    expect(count(html, /no public evidence could be verified/g)).toBe(1);
+    expect(html).toContain('Public evidence · Layer 1</div><div class="part-score">Not scored</div>');
+    expect(html).not.toMatch(/Combined from the public evidence|highest-risk|manual review|whatever the answers/);
 
     const clean = await setup();
     const cleanId = await clean.start();
     await clean.complete(cleanId);
     await clean.report(cleanId);
-    expect(clean.renderReport.mock.calls[0]![0]).not.toMatch(/could not read|manual review/);
+    expect(clean.renderReport.mock.calls[0]![0]).not.toMatch(/could not read|manual review|no public evidence could be verified/);
   });
 
   it('answers 503 when no renderer is configured or the renderer fails, never a storage error', async () => {
@@ -265,17 +269,17 @@ describe('Assessment Report content', () => {
 
   it('carries one demo disclosure and no price, coverage promise, decision or email', async () => {
     const restricted = await completed({ layer1: result => {
-      result.preScore.overrides = [{ id: 'WEBSITE_UNAVAILABLE', decision: 'REFERRAL_SENIOR', reason: 'The firm website could not be read' }];
       result.preScore.flags = ['WEBSITE_UNAVAILABLE', 'PROVIDER_COST_UNKNOWN', 'COMMERCIAL_DECISION_BLOCKED'];
     } });
-    expect(restricted.result.decision).toBe('REFERRAL_SENIOR');
+    // Low confidence, not high risk: no senior referral rides on an unreadable website any more (DN-12 §14).
+    expect(restricted.result.decision).toBe('UNKNOWN');
     const html = renderAssessmentHtml(restricted);
     expect(html).toContain(`<p class="disclosure"><strong>Demo assessment.</strong> ${DEMO_DISCLOSURE}</p>`);
     expect(DEMO_DISCLOSURE).toBe('The questions and the scoring are provisional, so these results are illustrative. ' +
       'This is not an insurance offer, a price or an underwriting decision.');
-    // The website notice ends as the screen's does, "not a coverage decision or a price"; the rest of the page says
-    // nothing about price or coverage beyond the one disclosure.
-    const notice = websiteUnreadNote(restricted.result.tier).replaceAll("'", '&#39;');
+    // The answers-only line stands in for the combined-score line; the rest of the page says nothing about price or
+    // coverage beyond the one disclosure.
+    const notice = ANSWERS_ONLY_LINE.replaceAll("'", '&#39;');
     expect(text(html)).toContain(notice);
     const seen = text(html).replace(notice, '');
     for (const once of [/Demo assessment/g, /provisional/gi, /illustrative/gi, /insurance offer/gi, /underwriting decision/gi, /\bprice\b/gi]) {
@@ -303,27 +307,18 @@ describe('Assessment Report content', () => {
     expect(text(html)).not.toContain('UNKNOWN');
   });
 
-  it('names the highest-risk group in the website sentence only when the tier agrees', async () => {
-    // The results screen's notice in the third person (DN-12 §6.2). The group is the score's; only the manual review
-    // holds whatever the answers show.
-    expect(websiteUnreadNote('CRITICAL')).toBe("We could not read the firm's website during the scan. This outlook is in the " +
-      'highest-risk group, and because the website could not be read, it needs a manual review whatever the answers show. ' +
-      'This is not a coverage decision or a price.');
-    for (const tier of ['FORTRESS', 'FORTIFIED', 'GUARDED', 'EXPOSED', 'UNKNOWN'] as const) {
-      expect(websiteUnreadNote(tier)).toBe("We could not read the firm's website during the scan. Until it can be read, this outlook " +
-        'needs a manual review, whatever the answers show. This is not a coverage decision or a price.');
-    }
-    // Never that the group itself holds whatever the answers show.
-    expect(websiteUnreadNote('CRITICAL')).not.toMatch(/stays in the highest-risk group/);
-    // Nothing public and the weakest answers: the tier is CRITICAL, and the page says so once.
+  it('never names a risk group or a manual review for an unreadable website, even with the weakest answers', async () => {
+    expect(ANSWERS_ONLY_LINE).toBe("Based only on the firm's answers; no public evidence could be verified (low confidence).");
+    // Nothing public and the weakest answers: the tier follows the answers alone, and the page says why once.
     const weakest: Record<string, AnswerValue> = { 'D1.1': { kind: 'option', optionId: 'none' }, 'D1.2': { kind: 'option', optionId: 'no' },
       'D2.1': { kind: 'options', optionIds: ['none'] }, 'D3.1': { kind: 'scale', value: 0 }, 'D3.2': { kind: 'option', optionId: 'none' },
       'D4.1': { kind: 'options', optionIds: ['none'] }, 'D5.1': { kind: 'number', value: 0 }, 'D6.1': { kind: 'option', optionId: 'no' } };
     const record = await completed({ layer1: result => { result.preScore.total = 0; result.preScore.tier = 'CRITICAL';
       result.preScore.flags = ['WEBSITE_UNAVAILABLE']; } }, weakest);
-    expect(record.result.tier).toBe('CRITICAL');
+    expect(record.result).toMatchObject({ layer1Score: null, compositeScore: record.result.layer2Score, tier: 'CRITICAL' });
     const html = renderAssessmentHtml(record);
-    expect(count(html, /This outlook is in the highest-risk group/g)).toBe(1);
+    expect(count(html, /no public evidence could be verified \(low confidence\)/g)).toBe(1);
+    expect(html).not.toMatch(/highest-risk|manual review/);
   });
 
   it('falls back to the domain when the scan found no firm name, and never lets stored text become markup', async () => {

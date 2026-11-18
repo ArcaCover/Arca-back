@@ -27,7 +27,9 @@ export function websiteDegradation(status: Cause): Degradation {
   // A partial website without a code was read as far as the site allows (a page that refuses to be read). A
   // result stored before the code existed looks the same: it cannot say what cut it, and it is served as it stands.
   if (status.status === 'partial') return status.code !== undefined && PASSING_WEBSITE_CODES.has(status.code) ? 'TRANSIENT' : 'STRUCTURAL';
-  // No page at all: only the site's refusal (the WEBSITE_UNAVAILABLE outcome) is an answer about the firm.
+  // No page at all, the WEBSITE_UNAVAILABLE outcome (DN-12 §14): every such scan is PARTIAL now, but only the site's
+  // refusal (robots.txt, 401/403, a challenge) is kept for the window. DNS, a timeout, a 5xx or robots.txt out of reach
+  // could read differently tomorrow, so they are repaired after the cooldown.
   return classifyUnreadableWebsite(status) === 'DEFINITIVE' ? 'STRUCTURAL' : 'TRANSIENT';
 }
 

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Layer1Evidence, Layer1Result, type Layer1Pipeline, type WebsiteSource, type DirectorySource, type SourceResult,
   type SourceName, type PipelineResult, type WebsiteData, type AttorneyMatch } from '@arca/contracts';
-import { classifyUnreadableWebsite, evaluateLayer1Evidence } from '@arca/scoring';
+import { evaluateLayer1Evidence, isWebsiteUnavailable } from '@arca/scoring';
 import { normalizeDomain } from './domain-resolution.js';
 import { buildFirmIdentity, directoryScope } from './firm-identity.js';
 import type { ScanRepository } from '../repositories/types.js';
@@ -88,12 +88,15 @@ export class InProcessPipeline implements Layer1Pipeline {
         ...assessment,
         meta: { scanDurationMs: Math.max(0, now() - start), cached: false, completedAt: new Date(now()).toISOString() } });
       const successful = Object.values(sources).filter(source => source.status === 'ok' || source.status === 'partial').length;
-      // No usable source normally means there is nothing to report. A website that refuses to be read is the
-      // exception: a second scan would find the same, so the scan ends with the result that says so (flag and
-      // override WEBSITE_UNAVAILABLE) and the assessment can start from it. A passing failure, or one of our own,
-      // stays FAILED: the visitor tries again and nothing is concluded about the firm.
-      const refused = classifyUnreadableWebsite(sources.website) === 'DEFINITIVE';
-      return { status: successful === 0 ? refused ? 'PARTIAL' : 'FAILED'
+      // No usable source normally means there is nothing to report. A website the site kept us from reading, for any
+      // cause on its side (a refusal, DNS, a refused connection, a timeout, a 5xx, robots.txt out of reach), is the
+      // exception: the scan ends PARTIAL with the result that says so (flag WEBSITE_UNAVAILABLE, confidence LOW) and the
+      // assessment scores the answers alone (DN-12 §14). Only our own failures stay FAILED, and the visitor tries again:
+      // a source that threw, the pipeline's deadline, the extraction failing on pages that were read. Storage failing
+      // throws before this point and is stored FAILED by the caller. Whether the cause is definitive or transient only
+      // decides how long the scan cache keeps the result (scan-cache.ts).
+      const unreadable = isWebsiteUnavailable(sources.website);
+      return { status: successful === 0 ? unreadable ? 'PARTIAL' : 'FAILED'
         : Object.values(sources).every(source => source.status === 'ok') ? 'COMPLETED' : 'PARTIAL', result };
     } finally { clearTimeout(timer); }
   }

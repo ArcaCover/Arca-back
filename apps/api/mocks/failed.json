@@ -7,9 +7,9 @@
       "status": "error",
       "dataStatus": "UNKNOWN",
       "durationMs": 1,
-      "pagesCrawled": 0,
+      "pagesCrawled": 6,
       "code": "PROVIDER_ERROR",
-      "reason": "The website could not be reached"
+      "reason": "Website evidence extraction unavailable"
     },
     "bar": {
       "status": "error",

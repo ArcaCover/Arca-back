@@ -1,6 +1,6 @@
 import type { AnswerValue, AssessmentResult, RenderedQuestion } from '@arca/contracts';
 import { visibleQuestions } from '@arca/questions';
-import { WEBSITE_UNAVAILABLE, numberLabel } from '@arca/scoring';
+import { LAYER1_UNAVAILABLE, numberLabel } from '@arca/scoring';
 import type { AssessmentPlan, AssessmentRecord } from '../assessment/repository.js';
 import { BASE_STYLE, COLORS, escape, isoDay, longDate } from './layout.js';
 
@@ -17,17 +17,9 @@ export const isCompleted = (record: AssessmentRecord): record is CompletedAssess
 export const DEMO_DISCLOSURE = 'The questions and the scoring are provisional, so these results are illustrative. ' +
   'This is not an insurance offer, a price or an underwriting decision.';
 
-// Shown when the result carries the WEBSITE_UNAVAILABLE flag: the notice of /assessment/results in the third person
-// (DN-12 §6.2). The tier follows the composite score, so better answers can move the outlook out of the highest-risk
-// group: the group is named only when the tier printed above is CRITICAL, and only the manual review holds whatever
-// the answers show.
-export function websiteUnreadNote(tier: AssessmentResult['tier']) {
-  return ["We could not read the firm's website during the scan.",
-    tier === 'CRITICAL'
-      ? 'This outlook is in the highest-risk group, and because the website could not be read, it needs a manual review whatever the answers show.'
-      : 'Until it can be read, this outlook needs a manual review, whatever the answers show.',
-    'This is not a coverage decision or a price.'].join(' ');
-}
+// The line under the score when the website could not be read and the composite is the answers alone (LAYER1_UNAVAILABLE):
+// the results screen's line in the third person (DN-12 §14). Low confidence, not high risk: no group, no manual review.
+export const ANSWERS_ONLY_LINE = "Based only on the firm's answers; no public evidence could be verified (low confidence).";
 
 // The completion day in Florida, the same day the report prints (layout.ts).
 export function assessmentReportFilename(record: CompletedAssessment) {
@@ -55,6 +47,7 @@ export function renderAssessmentHtml(record: CompletedAssessment) {
   const firm = firmName ?? layer1.domain;
   const completed = longDate(result.completedAt);
   const scored = result.compositeScore !== null;
+  const answersOnly = result.flags.includes(LAYER1_UNAVAILABLE);
   // The questions the firm ended on, in the order the questionnaire showed them and in their stored wording.
   const asked = visibleQuestions(record.bank_snapshot, record.plan, layer1, record.answers)
     .flatMap(question => record.rendered.filter(rendered => rendered.id === question.id));
@@ -87,10 +80,9 @@ export function renderAssessmentHtml(record: CompletedAssessment) {
   <section class="score">
     <div class="total">${result.compositeScore !== null ? displayedScore(result.compositeScore) : '—'}<small> / 100</small></div>
     <div><div class="tier">${scored ? escape(result.tier) : 'NOT SCORED'}</div>
-      <div class="tier-line">${scored ? "Combined from the public evidence and the firm's answers"
+      <div class="tier-line">${answersOnly ? escape(ANSWERS_ONLY_LINE) : scored ? "Combined from the public evidence and the firm's answers"
         : 'The quick scan did not support a combined score. The questionnaire score is shown below.'}</div></div>
   </section>
-  ${result.flags.includes(WEBSITE_UNAVAILABLE) ? `<ul class="notes"><li>${escape(websiteUnreadNote(result.tier))}</li></ul>` : ''}
   <div class="parts">${part('Public evidence · Layer 1', result.layer1Score)}${part("The firm's answers · Layer 2", result.layer2Score)}</div>
 
   <h2>Governance profile by area</h2>

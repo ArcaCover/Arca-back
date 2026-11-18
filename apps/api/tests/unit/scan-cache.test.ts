@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { SourceStatus } from '@arca/contracts';
+import type { CrawlIssue, CrawlResult } from '../../src/pipeline/crawler.js';
+import { unreadableWebsite } from '../../src/pipeline/website-outcome.js';
 import { answersFromCache, directoryDegradation, resultDegradation, websiteDegradation,
   type Degradation } from '../../src/http/scan-cache.js';
 
@@ -60,7 +62,7 @@ describe('whether a stored scan answers a new request', () => {
   it('serves a completed scan and a structural partial for the whole window', () => {
     expect(answersFromCache(stored('COMPLETED', { website: ok, bar: ok, avvo: ok }, 6 * 24 * HOUR), now, HOUR)).toBe(true);
     expect(answersFromCache(stored('PARTIAL', { website: ok, bar: ok, avvo: skipped }, 6 * 24 * HOUR), now, HOUR)).toBe(true);
-    // The blocked-site outcome (D4): the website refuses and no directory was asked.
+    // The blocked-site outcome (DN-12 §14): the website refuses and no directory was asked.
     expect(answersFromCache(stored('PARTIAL', { website: { status: 'error', code: 'ACCESS_BLOCKED' }, bar: skipped, avvo: skipped },
       6 * 24 * HOUR), now, HOUR)).toBe(true);
   });
@@ -80,5 +82,46 @@ describe('whether a stored scan answers a new request', () => {
     expect(answersFromCache(stored('FAILED', null, 0), now, HOUR)).toBe(false);
     expect(answersFromCache(stored('COMPLETED', null, 0), now, HOUR)).toBe(false);
     expect(answersFromCache(stored('RUNNING', { website: ok, bar: ok, avvo: ok }, 0), now, HOUR)).toBe(false);
+  });
+});
+
+describe('a PARTIAL whose website could not be read at all (WEBSITE_UNAVAILABLE, DN-12 §14)', () => {
+  const HOUR = 3_600_000, now = Date.parse('2026-11-17T12:00:00.000Z');
+  const home = 'https://firm.com/';
+  const page = (code: CrawlIssue['code'], status: number | null = null): CrawlIssue => ({ url: home, code, status, scope: 'page' });
+  const skipped: Cause = { status: 'skipped', code: 'INSUFFICIENT_IDENTITY' };
+  // The website status the real outcome table gives for each cause, so the cache is tested on what the pipeline stores.
+  const website = (crawl: Partial<CrawlResult>) => {
+    const { classification: _classification, ...status } = unreadableWebsite({ pages: [], partial: true, issues: [], ...crawl });
+    return status;
+  };
+  const stored = (crawl: Partial<CrawlResult>, completedAgo: number) => ({ status: 'PARTIAL' as const,
+    result: { sources: { website: website(crawl), bar: skipped, avvo: skipped } as never },
+    completed_at: new Date(now - completedAgo).toISOString() });
+
+  it.each<[string, Partial<CrawlResult>]>([
+    ['robots.txt disallows the site', { issues: [page('ROBOTS_DISALLOWED')] }],
+    ['its pages answer 401', { issues: [page('ACCESS_BLOCKED', 401)] }],
+    ['its pages answer 403', { issues: [page('ACCESS_BLOCKED', 403)] }],
+    ['it answers with a challenge page', { issues: [page('ACCESS_BLOCKED', 503)] }],
+  ])('keeps a definitive refusal for the whole window: %s', (_name, crawl) => {
+    expect(websiteDegradation(website(crawl))).toBe('STRUCTURAL');
+    expect(answersFromCache(stored(crawl, 10 * 60_000), now, HOUR)).toBe(true);
+    expect(answersFromCache(stored(crawl, 6 * 24 * HOUR), now, HOUR)).toBe(true);
+  });
+
+  it.each<[string, Partial<CrawlResult>]>([
+    ['the host name does not resolve or the connection fails', { issues: [page('REQUEST_FAILED')] }],
+    ['the crawl deadline passed before any page', { aborted: true }],
+    ['its pages answer 503', { issues: [page('HTTP_ERROR', 503)] }],
+    ['its pages answer 429', { issues: [page('ACCESS_BLOCKED', 429)] }],
+    ['robots.txt answered 503', { issues: [page('ROBOTS_UNAVAILABLE', 503)] }],
+    ['robots.txt answered 429', { issues: [page('ROBOTS_UNAVAILABLE', 429)] }],
+    ['robots.txt could not be reached', { issues: [page('ROBOTS_UNAVAILABLE', null)] }],
+    ['the home page came back empty', { issues: [page('NO_READABLE_CONTENT', 200)] }],
+  ])('repairs a transient cause after the cooldown: %s', (_name, crawl) => {
+    expect(websiteDegradation(website(crawl))).toBe('TRANSIENT');
+    expect(answersFromCache(stored(crawl, 10 * 60_000), now, HOUR)).toBe(true);
+    expect(answersFromCache(stored(crawl, HOUR + 1), now, HOUR)).toBe(false);
   });
 });

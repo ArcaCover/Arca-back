@@ -77,6 +77,21 @@ describe('same firm, same score inside the cache window', () => {
     expect(s.run).toHaveBeenCalledTimes(1);
   });
 
+  it('repairs a website that could not be reached once the cooldown has ended (DN-12 §14)', async () => {
+    // down.arca.example: no page read for a passing cause on the site's side. PARTIAL with WEBSITE_UNAVAILABLE, but the
+    // site may answer in an hour, so it is not kept for the window as a refusal is.
+    const s = setup();
+    const first = await s.scan('down.arca.example');
+    expect(first).toMatchObject({ status: 'PARTIAL', cached: false });
+    expect(first.result.preScore.flags).toContain('WEBSITE_UNAVAILABLE');
+    s.advance(10 * 60_000);
+    expect(await s.scan('down.arca.example')).toMatchObject({ http: 202, status: 'PARTIAL', cached: true });
+    expect(s.run).toHaveBeenCalledTimes(1);
+    s.advance(HOUR);
+    expect(await s.scan('down.arca.example')).toMatchObject({ status: 'PARTIAL', cached: false });
+    expect(s.run).toHaveBeenCalledTimes(2);
+  });
+
   it('runs a partial with a passing failure again once the cooldown has ended, and only then', async () => {
     // partial.arca.example: Avvo was down (PROVIDER_ERROR). A second scan could find it up.
     const s = setup();

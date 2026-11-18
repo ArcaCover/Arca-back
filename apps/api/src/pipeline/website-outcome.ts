@@ -52,7 +52,9 @@ function cause(issue: CrawlIssue, crawl: CrawlResult): Cause {
  * Only a refusal is definitive: robots.txt excluding the site, or its pages answering 401/403 or a challenge page
  * (whatever status carries the challenge).
  * One passing failure is enough to call the whole outcome transient, and so is a page that came back missing or
- * empty: a firm is never branded unreadable while a second scan could still read it.
+ * empty: a result is never kept for the whole cache window while a second scan could still read the site.
+ * Either way the scan ends PARTIAL with WEBSITE_UNAVAILABLE (`pagesCrawled: 0` marks it as the site's doing, DN-12 §14);
+ * the class only decides how long the scan cache serves it.
  */
 export function unreadableWebsite(crawl: CrawlResult): UnreadableOutcome {
   const causes = pageIssues(crawl).map(issue => cause(issue, crawl));

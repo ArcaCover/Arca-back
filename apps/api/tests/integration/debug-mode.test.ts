@@ -436,23 +436,25 @@ describe('debug wiring', () => {
     expect(state.sources?.bar).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY' });
     expect(state.sources?.avvo).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY' });
     expect(typeof state.sources?.website.durationMs).toBe('number');
-    // A clean failure keeps them too: the fixture's site could not be reached, which is a passing failure.
+    // A clean failure keeps them too: the fixture's extraction failed on pages that were read, our own failure.
     const clean = await s.start(undefined, 'owner@failed.arca.example', 'failed.arca.example');
     await s.drain();
     expect((await s.final(clean)).status).toBe('FAILED');
     const cleanState = await internal(clean);
     expect(cleanState).toMatchObject({ status: 'FAILED', storage: 'supabase', injected: false, canonicalDomain: 'failed.arca.example' });
-    expect(cleanState.sources?.website).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR', reason: 'The website could not be reached' });
+    expect(cleanState.sources?.website).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR', pagesCrawled: 6,
+      reason: 'Website evidence extraction unavailable' });
     expect(JSON.stringify(cleanState)).not.toContain('owner@failed.arca.example');
   });
 
-  // The website axis has one definitive value, `blocked`. `error` and `timeout` are passing failures and end FAILED (above).
-  it('website blocked ends PARTIAL and high risk, in memory, and its assessment can start', async () => {
+  // `blocked` is the site keeping us out and ends PARTIAL. `error` (a throw) and `timeout` (the pipeline's deadline) are our
+  // own failures and end FAILED (above). down.arca.example covers a site that cannot be reached.
+  it('website blocked ends PARTIAL with low confidence, in memory, and its assessment can start', async () => {
     const s = debugSetup();
     const { started, final } = await s.finish({ website: 'blocked' });
     expect(final.status).toBe('PARTIAL');
     expect(final.result?.sources.website).toMatchObject({ status: 'error', code: 'ACCESS_BLOCKED' });
-    expect(final.result?.preScore).toMatchObject({ total: 0, tier: 'CRITICAL', decision: 'REFERRAL_SENIOR' });
+    expect(final.result?.preScore).toMatchObject({ confidence: 'LOW', decision: 'UNKNOWN', overrides: [] });
     expect(final.result?.preScore.flags).toContain('WEBSITE_UNAVAILABLE');
     // Nothing was read, so nothing was looked up: the injected block costs no directory call either.
     expect(s.directoryRuns.bar).not.toHaveBeenCalled();

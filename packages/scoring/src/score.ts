@@ -4,7 +4,7 @@ import { mean, oneDecimal, sum, allKnownTrue, anyKnownTrue, tierForScore, decisi
 import { disciplinaryEvidence, yearsSince } from './discipline.js';
 import { normalizeAreas, jaccard, PRACTICE_AREAS } from './areas.js';
 import { canonicalMatches, compareText } from './canonical.js';
-import { classifyUnreadableWebsite, WEBSITE_UNAVAILABLE, WEBSITE_UNAVAILABLE_OVERRIDE } from './website-outcome.js';
+import { isWebsiteUnavailable, WEBSITE_UNAVAILABLE } from './website-outcome.js';
 
 function uniqueMatches(matches: AttorneyMatch[] | null): AttorneyMatch[] | null {
   if (matches === null) return null;
@@ -67,11 +67,11 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
   const okSources = Object.values(input.sources).filter(source => source.status === 'ok').length;
   const flags: string[] = [];
   if (Object.values(input.sources).some(source => source.status !== 'ok')) flags.push('INCOMPLETE_SOURCES');
-  // A website that refuses to be read is a fact about the firm, and a second scan would find the same. A website
-  // that failed for a passing reason says nothing about it, so it adds nothing here.
-  const websiteRefused = classifyUnreadableWebsite(input.sources.website) === 'DEFINITIVE';
-  if (websiteRefused) flags.push(WEBSITE_UNAVAILABLE);
-  const overrides = websiteRefused ? [...disciplinary.overrides, { ...WEBSITE_UNAVAILABLE_OVERRIDE }] : disciplinary.overrides;
+  // A website the site kept us from reading leaves no public evidence to score: the result says so, and the assessment
+  // scores the answers alone (DN-12 §14). It is low confidence, not high risk, so it restricts no decision. A website
+  // that failed on our side is not flagged: that scan ends FAILED.
+  if (isWebsiteUnavailable(input.sources.website)) flags.push(WEBSITE_UNAVAILABLE);
+  const overrides = disciplinary.overrides;
   if (barPeople.some(person => !person || person.admissionDate === null || person.barStatus === null || person.barStatus === 'UNKNOWN') ||
     avvoPeople.some(person => !person || [person.avvoRating, person.reviewCount, person.averageReviewRating,
       person.awardsCount ?? person.awards, person.practiceAreas].some(value => value === null))) flags.push('PARTIAL_ATTORNEY_DATA');

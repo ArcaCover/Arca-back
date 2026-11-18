@@ -1,6 +1,7 @@
 import { AssessmentResult, type AnswerValue, type Layer1Result } from '@arca/contracts';
 import { evaluateCondition, validateAnswer, type Answers, type Question, type QuestionBank } from '@arca/questions';
 import { restrictDecision, tierForScore } from './math.js';
+import { LAYER1_UNAVAILABLE, WEBSITE_UNAVAILABLE } from './website-outcome.js';
 
 export const LAYER2_SCORING_VERSION = 'layer2-demo-fixed-coverage-0.1.0';
 // Demonstration only; the product owner has not approved the composite weighting.
@@ -52,8 +53,14 @@ export function scoreAssessment({assessmentId,layer1,bank,answers,completedAt}: 
 }): AssessmentResult {
   const domains=domainResults(bank,answers);
   const layer2Score=round(domains.reduce((sum,d)=>sum+d.score*d.weight/100,0));
-  const compositeScore=layer1.preScore.total===null?null:round(layer1.preScore.total*DEMO_LAYER1_WEIGHT+layer2Score*DEMO_LAYER2_WEIGHT);
+  // With the firm website unread, Layer 1 has no public evidence: a 0 there would only drag the composite down, so the
+  // composite is the answers alone, marked low confidence by the flags (DN-12 §14).
+  const answersOnly=layer1.preScore.flags.includes(WEBSITE_UNAVAILABLE);
+  const layer2Weight=answersOnly?1:DEMO_LAYER2_WEIGHT;
+  const layer1Score=answersOnly?null:layer1.preScore.total;
+  const compositeScore=answersOnly?layer2Score:layer1Score===null?null:round(layer1Score*DEMO_LAYER1_WEIGHT+layer2Score*DEMO_LAYER2_WEIGHT);
   const flags=new Set([...layer1.preScore.flags,'DEMO_BANK_NOT_APPROVED','DEMO_COMPOSITE_FORMULA','COMMERCIAL_DECISION_BLOCKED']);
+  if (answersOnly) flags.add(LAYER1_UNAVAILABLE);
   if (domains.some(d=>d.status==='PARTIAL')) flags.add('INCOMPLETE_SCORED_COVERAGE');
   if (layer1.preScore.assessmentStatus==='INSUFFICIENT_EVIDENCE') flags.add('INSUFFICIENT_EVIDENCE');
   for(const q of bank.questions) {
@@ -71,7 +78,7 @@ export function scoreAssessment({assessmentId,layer1,bank,answers,completedAt}: 
     const current=domains.find(d=>d.key===q.domain)!;
     const candidates=betterAnswers(q,answer).map(candidate=>{
       const projected=domainResults(bank,{...answers,[q.id]:candidate.answer}).find(d=>d.key===q.domain)!;
-      return {...candidate,gain:round((projected.score-current.score)*current.weight/100*DEMO_LAYER2_WEIGHT)};
+      return {...candidate,gain:round((projected.score-current.score)*current.weight/100*layer2Weight)};
     }).filter(c=>c.gain>0).sort((a,b)=>a.gain-b.gain||a.label.localeCompare(b.label));
     const next=candidates[0];
     // Only the step itself. The screen and the report say once that the gains are provisional estimates, each on its own.
@@ -83,6 +90,6 @@ export function scoreAssessment({assessmentId,layer1,bank,answers,completedAt}: 
   const restrictions=layer1.preScore.overrides.filter(o=>['REFERRAL','REFERRAL_SENIOR','DECLINE'].includes(o.decision));
   const decision=restrictDecision('UNKNOWN',restrictions);
   return AssessmentResult.parse({assessmentId,scanId:layer1.scanId,bankVersion:bank.bankVersion,bankStatus:'DEMO',
-    scoringVersion:LAYER2_SCORING_VERSION,commercialDecisionBlocked:true,layer1Score:layer1.preScore.total,layer2Score,
+    scoringVersion:LAYER2_SCORING_VERSION,commercialDecisionBlocked:true,layer1Score,layer2Score,
     compositeScore,tier:tierForScore(compositeScore),decision,domains,flags:[...flags].sort(),actionPlan,completedAt});
 }

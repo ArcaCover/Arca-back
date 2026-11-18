@@ -15,16 +15,10 @@ const TIER_LINES: Record<string, string> = {
   UNKNOWN: 'Not enough public evidence to place the firm in a tier',
 };
 
-// Shown when the result carries the WEBSITE_UNAVAILABLE flag, in the words of the /score notice, in the third person
-// (DN-12 §3.3). The risk group follows the score, the Layer 2 composite included, so the group is named only when the
-// tier printed above is CRITICAL (in practice always, for this flag) and is never promised to change or to hold. Only
-// the manual review holds, whatever the answers are.
-export function websiteUnreadNote(tier: Layer1Result['preScore']['tier']) {
-  return ["We could not read the firm's website during the scan.",
-    tier === 'CRITICAL' ? 'What we could not verify counts as unknown, which places the firm in the highest-risk group for now.'
-      : 'What we could not verify counts as unknown.',
-    'Answers to the assessment also count, and because the website could not be read, the case will need a manual review.'].join(' ');
-}
+// What the report says in the place of the score when the firm website could not be read at all (WEBSITE_UNAVAILABLE): the
+// /score notice in the third person (DN-12 §14). Low confidence, not high risk: no number, no tier, no manual review.
+export const WEBSITE_UNREAD_NOTE = "We could not read the firm's website, so there is no public evidence to score. " +
+  "A full assessment gives a score based on the firm's answers, marked as low confidence.";
 
 type PreScore = Pick<Layer1Result['preScore'], 'confidence' | 'categories' | 'flags'>;
 
@@ -33,11 +27,21 @@ const evaluatedAreas = (preScore: PreScore) =>
 
 // Too little evidence to present the score and the tier as a judgement of the firm: low confidence and fewer than half
 // of the four categories evaluated (DN-12 §12). The live scan of hklaw.com printed 3 / 100, CRITICAL, from one partial
-// category; that was a gap in what we could see, not a verdict. WEBSITE_UNAVAILABLE is excluded on purpose: that case is
-// shown as the highest-risk group with a manual review (§3.3). The front applies the same rule to /score and the webapp
-// (hasInsufficientEvidence in Arca-front lib/api/adapt.ts).
+// category; that was a gap in what we could see, not a verdict. WEBSITE_UNAVAILABLE is left to its sibling state below,
+// which has its own words. The front applies the same rule to /score and the webapp (hasInsufficientEvidence in
+// Arca-front lib/api/adapt.ts).
 export function hasInsufficientEvidence(preScore: PreScore) {
   return preScore.confidence === 'LOW' && evaluatedAreas(preScore) < 2 && !preScore.flags.includes(WEBSITE_UNAVAILABLE);
+}
+
+/**
+ * Why the report shows no number and no tier, or null when it shows them. An unreadable website comes first: there is no
+ * public evidence at all, and the assessment scores the answers alone (DN-12 §14). Then thin evidence (§12). The front
+ * draws the same two states (`notRated` in Arca-front lib/api/adapt.ts).
+ */
+export function scoreWithheld(preScore: PreScore): 'WEBSITE_UNAVAILABLE' | 'INSUFFICIENT_EVIDENCE' | null {
+  if (preScore.flags.includes(WEBSITE_UNAVAILABLE)) return 'WEBSITE_UNAVAILABLE';
+  return hasInsufficientEvidence(preScore) ? 'INSUFFICIENT_EVIDENCE' : null;
 }
 
 // The words /score shows in the place of the score, with the assessment named the way the footer names it.
@@ -79,13 +83,12 @@ export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 
   const list = (items: typeof helping, mark: string) => items.length
     ? `<ul>${items.map(item => `<li><span class="dot" style="background:${mark}"></span><span>${escape(item.label)} <em>${escape(item.source)}</em></span></li>`).join('')}</ul>`
     : '<p class="none">Nothing observed.</p>';
-  // The cause replaces the generic notice about incomplete sources. It says what was observed and what that does to
-  // the score, never a decision or a price.
-  const websiteUnread = result.preScore.flags.includes(WEBSITE_UNAVAILABLE);
-  const notRated = hasInsufficientEvidence(result.preScore);
+  // With the website unread the score block says why, so the generic notice about incomplete sources is not repeated.
+  // Nothing here names a decision or a price.
+  const withheld = scoreWithheld(result.preScore);
   const notes = [
-    websiteUnread ? websiteUnreadNote(result.preScore.tier)
-      : view.incomplete ? `Some sources did not answer in full${notRated ? '.' : ', so this score rests on partial evidence.'}` : null,
+    withheld === 'WEBSITE_UNAVAILABLE' ? null
+      : view.incomplete ? `Some sources did not answer in full${withheld ? '.' : ', so this score rests on partial evidence.'}` : null,
     view.decisionWithheld ? 'There is not enough public evidence yet for an underwriting decision.' : null,
   ].filter(Boolean) as string[];
 
@@ -97,7 +100,12 @@ export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 
   <h1>${escape(view.firm.name ?? result.domain)}</h1>
   <div class="meta">${details.length ? `${escape(details.join(' · '))}<br>` : ''}Scanned ${escape(date)}</div>
 
-  <section class="score">${notRated
+  <section class="score">${withheld === 'WEBSITE_UNAVAILABLE'
+    // No number and no tier: with no public evidence a 0 and CRITICAL would read as a verdict. Low confidence instead.
+    ? `
+    <div><div class="tier">No score from public evidence</div><div class="tier-line">${escape(WEBSITE_UNREAD_NOTE)}</div>
+      <div class="meta">Confidence: low</div></div>`
+    : withheld
     // No number and no tier: on this little evidence they would read as a judgement of the firm.
     ? `
     <div><div class="tier">Not enough evidence to rate</div><div class="tier-line">${escape(notRatedNote(evaluatedAreas(result.preScore)))}</div></div>`
