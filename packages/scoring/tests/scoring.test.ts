@@ -99,13 +99,15 @@ describe('complete Layer 1 mathematics', () => {
     expect(result.signals.bar.B2_worstDisciplinary).toBeNull();
     expect(result.signals.avvo.A1_avgRating).toBeNull();
   });
-  it('keeps unknown provider accounting explicit', () => {
+  it('keeps unknown provider accounting on the source, out of the score flags', () => {
+    const settled = scoreEvidence(robust()).preScore;
     const input = robust();
     Object.assign(input.sources.avvo, { accountingComplete: false, costUsd: null });
-    const flags = scoreEvidence(input).preScore.flags;
-    expect(flags).toContain('PROVIDER_COST_UNKNOWN');
+    // A freshly charged run has open accounting and a cached one does not: the same firm, the same flags.
+    expect(scoreEvidence(input).preScore).toEqual(settled);
+    expect(settled.flags).not.toContain('PROVIDER_COST_UNKNOWN');
     // Spend is no longer capped, so no run can be refused for budget and the flag is gone.
-    expect(flags).not.toContain('PROVIDER_BUDGET_EXCEEDED');
+    expect(settled.flags).not.toContain('PROVIDER_BUDGET_EXCEEDED');
   });
   it('does not fabricate an age at an ambiguous year boundary', () => {
     const website = unknownWebsite(); website.firm_established_year = 2016;

@@ -9,6 +9,7 @@ import { issueSessionToken, verifySessionToken } from '../auth/session-token.js'
 import type { DebugTools } from '../debug/tools.js';
 import type { ScanRepository, ScanRecord } from '../repositories/types.js';
 import { ScanLimiter } from './rate-limit.js';
+import { answersFromCache } from './scan-cache.js';
 import { buildOpenApiDocument } from './openapi.js';
 import { renderQuickScanHtml, reportFilename } from '../report/quick-scan.js';
 import { InMemoryRepository } from '../repositories/in-memory.js';
@@ -30,7 +31,7 @@ export type AppDeps = {
   renderReport?: (html: string) => Promise<Uint8Array<ArrayBuffer>>;
   /** Debug modes only. Without it there is no /__debug route, the scenario header is never read and CORS refuses it. */
   debug?: DebugTools;
-  /** The private webapp (DN-10). Only mock builds it for now; without it every webapp route answers 501. */
+  /** The private webapp (DN-10). Only the debug modes build one, simulated in memory; without it, as in production, every webapp route answers 501. */
   webapp?: { service: WebappService; auth: AppAuth };
 };
 export function createApp(deps: AppDeps) {
@@ -95,16 +96,12 @@ export function createApp(deps: AppDeps) {
     const sessionToken = await issueSessionToken(scanId, email, deps.sessionSecret);
     // An injected scan never reads the domain cache, which would show the cached result instead of the fault.
     const cached = scenario ? null : await deps.repository.cached(canonicalDomain, new Date(timestamp - scanCacheTtlMs).toISOString());
-    // Completed scans are returned immediately. Partial scans warm the website and per-query caches,
-    // then run again so only missing or expired external evidence is repaired.
-    // A partial scan is repaired at most once per cooldown. Inside it, the last repair is served
-    // as it stands: a source that is down for good would otherwise re-run the whole pipeline for
-    // every visitor, all cache window long, and make each one wait for the same failure.
-    const recentlyRepaired = cached?.status === 'PARTIAL' && cached.completed_at !== null &&
-      Date.parse(cached.completed_at) > timestamp - partialRepairCooldownMs;
-    const reusable = cached?.result && (cached.status === 'COMPLETED' || recentlyRepaired) ? cached : null;
-    const cachedResult = reusable ? Layer1Result.parse({ ...reusable.result, scanId, domain: canonicalDomain, email,
-      meta: { ...reusable.result!.meta, cached: true } }) : null;
+    // Same firm, same score (DN-12 §4): inside the window the stored result is the answer of record, a PARTIAL
+    // included when a second scan would find the same gaps. Only a PARTIAL with a passing failure runs again, at
+    // most once per cooldown: the website and per-query caches make that run repair just what was missing.
+    const reusable = cached && answersFromCache(cached, timestamp, partialRepairCooldownMs) ? cached : null;
+    const cachedResult = reusable?.result ? Layer1Result.parse({ ...reusable.result, scanId, domain: canonicalDomain, email,
+      meta: { ...reusable.result.meta, cached: true } }) : null;
     if (cachedResult && cachedResult.domain !== canonicalDomain) throw new Error('Cached domain identity mismatch');
     const cachedStatus = reusable?.status === 'PARTIAL' ? 'PARTIAL' as const : 'COMPLETED' as const;
     const scan: ScanRecord = {
@@ -141,8 +138,9 @@ export function createApp(deps: AppDeps) {
         const result = Layer1Result.parse({ ...outcome.result, scanId, domain: canonicalDomain, email,
           meta: { ...outcome.result.meta, reusedEvidence } });
         if (result.domain !== canonicalDomain) throw new Error('Assessment domain identity mismatch');
-        // A failed scan carries no result, whichever way it failed. Every source was unusable,
-        // so the assessment is an empty shell, and PollResponse has no room for one on FAILED.
+        // A failed scan carries no result, whichever way it failed. Every source was unusable through a
+        // failure of ours, so the assessment is an empty shell, and PollResponse has no room for one on FAILED.
+        // (A website the site kept us from reading is not a failure: the pipeline ends that scan PARTIAL.)
         // Raw evidence still lands in scan_raw_data, so nothing diagnostic is lost.
         // The debug view keeps the per-source summary the record drops; it is set before a poll can see FAILED.
         if (outcome.status === 'FAILED') debug?.keepFailedSources(scanId, result.sources);
@@ -178,7 +176,13 @@ export function createApp(deps: AppDeps) {
       return c.json({ error: 'report_unavailable', message: 'The report exists once the scan has a result' }, 409);
     }
     if (!deps.renderReport) return c.json({ error: 'report_unavailable', message: 'Report rendering is not configured' }, 503);
-    const pdf = await deps.renderReport(renderQuickScanHtml(scan.result, scan.status));
+    // A render that fails or runs out of time (the renderer's concurrency cap and deadline) is the report being
+    // unavailable for now, as on the assessment report: 503, not an unexpected server error.
+    const pdf = await deps.renderReport(renderQuickScanHtml(scan.result, scan.status)).catch((error: unknown) => {
+      console.error('[api] report rendering failed', scan.scan_id, error instanceof Error ? error.message : 'Unknown error');
+      return null;
+    });
+    if (!pdf) return c.json({ error: 'report_unavailable', message: 'The report could not be prepared; try again' }, 503);
     return c.body(pdf, 200, { 'Content-Type': 'application/pdf', 'Cache-Control': 'no-store',
       'Content-Disposition': `attachment; filename="${reportFilename(scan.result)}"` });
   });
@@ -200,7 +204,8 @@ export function createApp(deps: AppDeps) {
   const assessments = new AssessmentService({ repository: assessmentRepository, now, agent: deps.assessmentAgent,
     agentFor: debug ? scanId => debug.assessmentAgentFor(scanId) : undefined,
     planningTimeoutMs: deps.assessmentPlanningTimeoutMs, maxWritesPerMinute: deps.assessmentMaxWritesPerMinute });
-  app.route('/', assessmentRoutes({ scans: deps.repository, repository: assessmentRepository, service: assessments, sessionSecret: deps.sessionSecret }));
+  app.route('/', assessmentRoutes({ scans: deps.repository, repository: assessmentRepository, service: assessments, sessionSecret: deps.sessionSecret,
+    renderReport: deps.renderReport, reportFault: debug ? scanId => debug.reportFault(scanId) : undefined }));
   app.route('/', deps.webapp ? webappRoutes(deps.webapp) : notConfiguredWebapp());
   if (debug) {
     // The mock demo seed (DN-11 §4.6) runs this very scan, past the limiter, to its end, then the assessment through this service.

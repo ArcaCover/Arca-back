@@ -104,14 +104,29 @@ describe('injected website source inside the real pipeline', () => {
       scenario({ website: 'error' }), { latency: false }), bar, avvo, repository: new InMemoryRepository() });
     const outcome = await pipeline.run(input);
     expect(outcome.result.sources.website).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR' });
+    // Our own failure (a source that threw reports no page count): the scan fails and the firm is not marked.
+    expect(outcome.status).toBe('FAILED');
+    expect(outcome.result.preScore.flags).not.toContain('WEBSITE_UNAVAILABLE');
   });
-  it('website blocked reaches the scan result as an access block', async () => {
+  it("website timeout is the pipeline's own deadline: our failure too", async () => {
+    const { bar, avvo } = spies();
+    const pipeline = new InProcessPipeline({ website: injectWebsite({ run: vi.fn(async () => websiteResult) },
+      scenario({ website: 'timeout' }), { latency: false }), bar, avvo, repository: new InMemoryRepository() });
+    const outcome = await pipeline.run(input);
+    expect(outcome.status).toBe('FAILED');
+    expect(outcome.result.preScore.flags).not.toContain('WEBSITE_UNAVAILABLE');
+  });
+  it('website blocked is the site keeping us out: the scan ends PARTIAL with low confidence', async () => {
     const { bar, avvo } = spies();
     const pipeline = new InProcessPipeline({ website: injectWebsite({ run: vi.fn(async () => websiteResult) },
       scenario({ website: 'blocked' }), { latency: false }), bar, avvo, repository: new InMemoryRepository() });
     const outcome = await pipeline.run(input);
+    expect(outcome.status).toBe('PARTIAL');
     expect(outcome.result.sources.website).toMatchObject({ status: 'error', code: 'ACCESS_BLOCKED' });
+    expect(outcome.result.preScore).toMatchObject({ confidence: 'LOW', decision: 'UNKNOWN', overrides: [] });
+    expect(outcome.result.preScore.flags).toContain('WEBSITE_UNAVAILABLE');
     expect(bar.run).not.toHaveBeenCalled();
+    expect(avvo.run).not.toHaveBeenCalled();
   });
   it('a latency longer than the pipeline budget ends as a website timeout instead of hanging', async () => {
     vi.useFakeTimers();

@@ -20,15 +20,40 @@ describe('Supabase Data API adapter', () => {
     });
     expect(await repository.cached('firm.com', '2026-09-07T00:00:00.000Z')).toBeNull();
   });
-  it('joins raw evidence to its canonical domain through PostgREST', async () => {
-    const { repository } = setup(url => {
+  it('lets the database search raw evidence for a marker and returns ids, never the content', async () => {
+    const marker = `wsk1-${'ab12'.repeat(16)}`;
+    const { repository, request } = setup(url => {
       expect(url.pathname).toBe('/rest/v1/scan_raw_data');
-      expect(url.searchParams.get('select')).toBe('*,scans!inner(canonical_domain)');
-      expect(url.searchParams.get('scans.canonical_domain')).toBe('eq.firm.com');
-      expect(url.searchParams.get('source')).toBe('eq.website');
-      return Response.json([]);
+      const select = url.searchParams.get('select')!;
+      expect(select.replaceAll(' ', '')).toBe('scan_id,source,content_hash,fetched_at,scans!inner(canonical_domain)');
+      expect(select).not.toContain('raw_content');
+      expect(Object.fromEntries(url.searchParams)).toMatchObject({ 'scans.canonical_domain': 'eq.firm.com', source: 'eq.website',
+        fetched_at: 'gte.2026-10-10T00:00:00.000Z', raw_content: `like.%${marker}%`, order: 'fetched_at.desc', limit: '3' });
+      return Response.json([{ scan_id: 'sc_new', source: 'website', content_hash: 'a'.repeat(64),
+        fetched_at: '2026-11-08T00:00:00.000Z', scans: { canonical_domain: 'firm.com' } }]);
     });
-    expect(await repository.latestRaw('firm.com', 'website')).toBeNull();
+    expect(await repository.findRaw('firm.com', 'website', marker, '2026-10-10T00:00:00.000Z', 3)).toEqual([
+      { scan_id: 'sc_new', source: 'website', content_hash: 'a'.repeat(64), fetched_at: '2026-11-08T00:00:00.000Z' }]);
+    // A marker is a plain token: anything a LIKE pattern or a query string could read as syntax never reaches the database.
+    for (const unsafe of ['wsk1-%', 'wsk1_abcdef', 'wsk1-abc,def', 'WSK1-ABCDEF', 'short']) {
+      await expect(repository.findRaw('firm.com', 'website', unsafe, '2026-10-10T00:00:00.000Z', 3)).rejects.toThrow('Invalid raw evidence marker');
+    }
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+  it('reads the one raw record of a scan and reports a storage error instead of an absent record', async () => {
+    const record = { scan_id: 'sc_new', source: 'website' as const, raw_content: '{"analysis":null}', content_hash: 'a'.repeat(64),
+      fetched_at: '2026-11-08T00:00:00.000Z' };
+    const found = setup(url => {
+      expect(url.pathname).toBe('/rest/v1/scan_raw_data');
+      expect(Object.fromEntries(url.searchParams)).toMatchObject({ scan_id: 'eq.sc_new', source: 'eq.website',
+        order: 'fetched_at.desc', limit: '1' });
+      return Response.json([record]);
+    });
+    expect(await found.repository.rawOf('sc_new', 'website')).toEqual(record);
+    const failing = setup(() => Response.json({ code: '57014', message: 'canceling statement due to statement timeout' }, { status: 500 }));
+    await expect(failing.repository.rawOf('sc_new', 'website')).rejects.toThrow('Unable to read evidence');
+    await expect(failing.repository.findRaw('firm.com', 'website', 'wsk1-abcdef', '2026-10-10T00:00:00.000Z', 3))
+      .rejects.toThrow('Unable to search evidence');
   });
   it('preserves unknown JSON values in evidence writes', async () => {
     const raw = { scan_id: 'sc_test', source: 'bar' as const, raw_content: '{"discipline":null}', content_hash: 'a'.repeat(64), fetched_at: '2026-09-08T00:00:00.000Z' };
@@ -64,5 +89,23 @@ describe('Supabase Data API adapter', () => {
       actor: 'owner/actor', build: '1.2.3', input: { name: 'Jane' }, expectedCostUsd: 1,
       expiresAt: '2026-09-14T23:00:00.000Z' }))
       .resolves.toEqual({ decision: 'start', record: null, chargedToScan: true });
+  });
+  it('reads the recent ledger rows for the spend ceiling without their datasets', async () => {
+    const row = { id: 'ledger-1', run_id: 'run-1', status: 'SUCCEEDED', cost_usd: 0.045, reserved_usd: 1, accounting_complete: true,
+      created_at: '2026-11-09T11:00:00+00:00', expires_at: '2026-11-16T11:00:00+00:00' };
+    const { repository } = setup(url => {
+      expect(url.pathname).toBe('/rest/v1/apify_runs');
+      const select = url.searchParams.get('select')!;
+      expect(select.split(',').sort()).toEqual(['accounting_complete', 'cost_usd', 'created_at', 'expires_at', 'id', 'reserved_usd', 'run_id', 'status']);
+      // `items` and `input_json` hold whole datasets and queries: the sum needs neither.
+      expect(select).not.toContain('items');
+      // Refused starts count nothing and are left out, so refusals cannot fill the rows read.
+      expect(Object.fromEntries(url.searchParams)).toMatchObject({ created_at: 'gte.2026-11-08T12:00:00.000Z',
+        status: 'neq.SPEND_CEILING_REACHED', order: 'created_at.desc', limit: '1000' });
+      return Response.json([row]);
+    });
+    expect(await repository.recentApifyRuns('2026-11-08T12:00:00.000Z', 1000)).toEqual([row]);
+    const failing = setup(() => Response.json({ code: '57014', message: 'canceling statement due to statement timeout' }, { status: 500 }));
+    await expect(failing.repository.recentApifyRuns('2026-11-08T12:00:00.000Z', 1000)).rejects.toThrow('Unable to read recent Apify runs');
   });
 });

@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
 import { Layer1Evidence, Layer1Result, type Layer1Pipeline, type WebsiteSource, type DirectorySource, type SourceResult,
   type SourceName, type PipelineResult, type WebsiteData, type AttorneyMatch } from '@arca/contracts';
-import { evaluateLayer1Evidence } from '@arca/scoring';
+import { evaluateLayer1Evidence, isWebsiteUnavailable } from '@arca/scoring';
 import { normalizeDomain } from './domain-resolution.js';
-import { buildFirmIdentity } from './firm-identity.js';
+import { buildFirmIdentity, directoryScope } from './firm-identity.js';
 import type { ScanRepository } from '../repositories/types.js';
+import { ScanMeter, meterScan, scanCostLine } from './scan-cost.js';
 
 export class InProcessPipeline implements Layer1Pipeline {
   constructor(private readonly deps: {
@@ -15,6 +16,20 @@ export class InProcessPipeline implements Layer1Pipeline {
     if (!input.canonicalDomain || normalizeDomain(input.canonicalDomain) !== input.canonicalDomain) {
       throw new Error('A normalized canonical domain is required before assessment');
     }
+    const now = this.deps.now ?? Date.now, start = now(), meter = new ScanMeter();
+    // A run that throws is stored FAILED by its caller, and what it spent before that is spent all the same.
+    let status: PipelineResult['status'] = 'FAILED';
+    try {
+      const outcome = await meterScan(meter, () => this.execute(input));
+      status = outcome.status;
+      return outcome;
+    } finally {
+      // One line per pipeline run, whichever way it ended (DN-12 §5.4). A scan served from the cache runs no
+      // pipeline and leaves none. A source the deadline cut off is counted up to this moment.
+      console.log(scanCostLine({ scanId: input.scanId, status, durationMs: Math.max(0, now() - start) }, meter.cost()));
+    }
+  }
+  private async execute(input: { scanId: string; canonicalDomain: string; email: string }): Promise<PipelineResult> {
     const now = this.deps.now ?? Date.now, start = now();
     const controller = new AbortController();
     const budget = this.deps.timeoutMs ?? 55_000;
@@ -43,9 +58,12 @@ export class InProcessPipeline implements Layer1Pipeline {
       const website = await bounded<WebsiteData>(() => this.deps.website.run(input.canonicalDomain, signal));
       const identity = buildFirmIdentity(input.canonicalDomain, website.data);
       const jurisdiction = this.deps.bar.jurisdiction ?? null;
-      const query = { canonicalDomain: input.canonicalDomain, names: identity.attorneyNames,
+      // Which names to look up, or which Florida offices to search the firm in instead (DN-06 §10).
+      const scope = directoryScope(identity, website.data, jurisdiction);
+      const query = { canonicalDomain: input.canonicalDomain, names: scope.names,
         firmName: identity.firmName, aliases: identity.aliases, city: identity.city, county: identity.county,
-        addressStreet: identity.addressStreet, phone: identity.phone, state: jurisdiction, scanId: input.scanId };
+        addressStreet: identity.addressStreet, phone: identity.phone, state: jurisdiction, scanId: input.scanId,
+        ...(scope.officeCities.length ? { officeCities: scope.officeCities } : {}) };
       const [bar, avvo] = identity.status === 'INSUFFICIENT' ? [insufficientIdentity(), insufficientIdentity()] : await Promise.all([
           bounded<AttorneyMatch[]>(() => this.deps.bar.run(query, signal)),
           bounded<AttorneyMatch[]>(() => this.deps.avvo.run(query, signal)),
@@ -70,7 +88,16 @@ export class InProcessPipeline implements Layer1Pipeline {
         ...assessment,
         meta: { scanDurationMs: Math.max(0, now() - start), cached: false, completedAt: new Date(now()).toISOString() } });
       const successful = Object.values(sources).filter(source => source.status === 'ok' || source.status === 'partial').length;
-      return { status: successful === 0 ? 'FAILED' : Object.values(sources).every(source => source.status === 'ok') ? 'COMPLETED' : 'PARTIAL', result };
+      // No usable source normally means there is nothing to report. A website the site kept us from reading, for any
+      // cause on its side (a refusal, DNS, a refused connection, a timeout, a 5xx, robots.txt out of reach), is the
+      // exception: the scan ends PARTIAL with the result that says so (flag WEBSITE_UNAVAILABLE, confidence LOW) and the
+      // assessment scores the answers alone (DN-12 §14). Only our own failures stay FAILED, and the visitor tries again:
+      // a source that threw, the pipeline's deadline, the extraction failing on pages that were read. Storage failing
+      // throws before this point and is stored FAILED by the caller. Whether the cause is definitive or transient only
+      // decides how long the scan cache keeps the result (scan-cache.ts).
+      const unreadable = isWebsiteUnavailable(sources.website);
+      return { status: successful === 0 ? unreadable ? 'PARTIAL' : 'FAILED'
+        : Object.values(sources).every(source => source.status === 'ok') ? 'COMPLETED' : 'PARTIAL', result };
     } finally { clearTimeout(timer); }
   }
 }

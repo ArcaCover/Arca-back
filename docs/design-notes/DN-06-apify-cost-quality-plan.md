@@ -1,6 +1,16 @@
 # DN-06 — Plan de precisión y costo de adquisición con Apify
 
-Fecha: 14 de septiembre de 2026. Estado: implementación y primer E2E terminados; canario posterior a las correcciones y benchmark ampliado pendientes.
+Fecha: 14 de septiembre de 2026. Estado: implementación y primer E2E terminados; canario posterior a las correcciones y benchmark ampliado pendientes. La §10 (2026-11-12) añade la búsqueda por oficina de Florida y la reserva por tipo de run.
+
+> **Nota del 2026-11-09.** Los presupuestos de la §8 (USD 1 por run, 10 por scan y 100 por día, y
+> `maxTotalChargeUsd` en el arranque del actor) se retiraron el 2026-09-21: desde entonces el gasto de Apify
+> **se registra y no se limita**. Esa decisión sigue vigente en producción. Lo que cambia el 2026-11-09 es que
+> `live-debug` trae un techo propio, activo por defecto: `APIFY_SPEND_CEILING_USD` (USD 2 sobre las últimas
+> 24 horas del ledger), que rechaza un run antes de arrancarlo y, mientras hay techo, vuelve a enviar
+> `maxTotalChargeUsd`, igual a la reserva del run (USD 1 por defecto, como la §8). Producción no lo tiene
+> si su entorno no lo fija. El diseño, lo que cuenta cada fila del ledger y sus límites están en el
+> [DN-12](DN-12-hallazgos-del-scan-en-vivo.md), §5. Desde el 2026-11-12 la reserva depende del tipo de run:
+> USD 1 una búsqueda por firma, USD 0,10 una dirigida del Bar y USD 0,40 una dirigida de Avvo (§10.2).
 
 ## 1. Decisión recomendada
 
@@ -179,3 +189,73 @@ La repetición offline sobre exactamente los mismos artefactos crudos, sin nueva
 | Costo adicional de la repetición | — | USD 0; solo procesamiento local |
 
 Los cuatro nombres que siguen sin match seguro son Christopher Rivera, Lorena Gaona Krewson, Mariangeli Mercado y Nelson Vladimir Jaramillo. La corrección los conserva como desconocidos porque los artefactos disponibles no contienen una corroboración cruzada suficiente. Falta un canario real, limitado por presupuesto, para comprobar que el resultado se mantiene con respuestas actuales de los actores y medir el costo posterior a la corrección.
+
+## 10. Firma grande: búsqueda por oficina de Florida y reserva por tipo de run (2026-11-12)
+
+Dos scans en vivo de una firma de unos 2.200 abogados y 36 oficinas, con minutos de diferencia, dieron score 3
+y 0 (DN-12 §13). En lo que toca a esta nota: el primero buscó en el Bar seis nombres sacados de un comunicado de
+prensa, de los que cinco no eran miembros del Bar de Florida, y el techo de `live-debug` lo cortó tras dos runs
+que costaron USD 0,045 en total, porque cada run reservaba USD 1. El segundo no tenía nombres, lanzó la
+búsqueda por firma en todo el registro y su arranque quedó `START_UNCERTAIN` por un fallo de DNS de esta
+máquina.
+
+### 10.1 Búsqueda por firma en cada ciudad de oficina de Florida
+
+**Decisión. [mía]** Para una firma cuyo sitio declara más de 50 abogados, o cuyos únicos nombres salen de
+noticias, comunicados o blog, o que no nombra abogados, el Bar se busca **por firma en cada ciudad de Florida
+donde el sitio lista una oficina** (`locationType: 'city'`, `locations: [ciudad]`, `firm`), en vez de buscar
+una muestra de nombres. Como mucho 3 ciudades (`BAR_MAX_OFFICE_SEARCHES`): primero la ciudad verificada de la
+firma, si es una de ellas, y después el resto en orden estable. Sin ninguna ciudad de Florida conocida no
+cambia nada: nombres uno a uno si los hay, y la búsqueda por firma de siempre si no.
+
+Coherencia con las decisiones anteriores de esta nota:
+
+- **Nunca muestrear el roster** (§3, DN-02). Cada búsqueda por ciudad pide el máximo técnico
+  (`BAR_TECHNICAL_MAX_LAWYERS`) y se aceptan todos los abogados de la firma que devuelve, como la búsqueda por
+  firma en todo el registro. No se acota `maxLawyers`, que además cambiaría el fingerprint (DN-12 §5.6).
+- **Sin expansión nacional no presupuestada** (§4, H1.5). La ciudad acota la búsqueda más que el registro
+  entero. La búsqueda de Avvo por firma sigue sin correr sin ciudad; cuando no hay ciudad verificada pero sí
+  una oficina de Florida, esa ciudad la acota.
+- **Un tope no convierte una muestra en el roster completo** (§4, H2.6). Si la firma tiene más oficinas en
+  Florida que el tope, el motivo del directorio lo dice: `Firm searched in 3 of its 7 Florida office cities:
+  ...`. Con todas buscadas: `Firm searched in its Florida office cities: ...`.
+- **El coste de cada run queda acotado por su reserva** mientras haya techo (DN-12 §5.1): cada búsqueda por
+  ciudad es un run de tipo firma y reserva como tal.
+
+De dónde salen los datos, sin tocar el contrato (DN-12 D6): la extracción del website deja en
+`WebsiteData.provenance` tres claves que el scoring no lee.
+
+| Clave | Cuándo | Qué guarda |
+|---|---|---|
+| `florida_office_cities` | El backend lee, por regla, una ciudad de Florida en un enlace a una página de oficina (`/offices/miami`) o en "Ciudad, FL" / "Ciudad, Florida" de una página de oficinas o de contacto | Una referencia por ciudad; el extracto es la ciudad tal como la escribe la página |
+| `large_firm` | El modelo afirma un `attorney_count` mayor que 50 con citas literales, aceptado o rechazado solo por alcance incompleto (`INCOMPLETE_SCOPE`) y no marcado `unsupported` en la revisión | Las citas de ese total |
+| `team_members_news_only` | Todos los nombres de abogados se citaron solo desde noticias, comunicados o blog | Las citas de esos nombres |
+
+`directoryScope` (`firm-identity.ts`) decide con ellas los nombres y las ciudades de la consulta.
+`DirectoryQuery` gana el campo opcional `officeCities`, que solo existe en memoria: no cambia ningún formato
+guardado. Las ciudades ambiguas (Naples, Melbourne, Hollywood, Panama City) solo cuentan con el estado al lado.
+
+### 10.2 Reserva por tipo de run
+
+La §8 y DN-12 §5.1 reservaban USD 1 por run, fuera cual fuera. Una búsqueda dirigida del Bar liquidó en USD
+0,045 y una de Avvo con 10 resultados en USD 0,385; la búsqueda por firma es la que puede gastar de verdad.
+Con USD 1 por run, el techo de USD 2 de `live-debug` solo dejaba dos búsquedas dirigidas.
+
+**Decisión. [mía]** La reserva depende del tipo de run:
+
+| Tipo | Variable | Por defecto |
+|---|---|---|
+| Búsqueda por firma, en todo el registro o en una ciudad | `APIFY_EXPECTED_COST_USD_PER_RUN` | USD 1 |
+| Búsqueda dirigida del Bar (unos pocos nombres) | `APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN` | USD 0,10 |
+| Búsqueda dirigida de Avvo (hasta 10 abogados con detalle) | `APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN` | USD 0,40 |
+
+La de Avvo tiene variable propia porque con USD 0,10 de límite de cargo una búsqueda que devuelve sus 10
+resultados se cortaría hacia el segundo y quedaría `partial`. Bajo techo, la reserva sigue siendo también el
+límite de cargo del run (`maxTotalChargeUsd`). Un llamador que no dice el tipo reserva como búsqueda por firma.
+El tipo no entra en el fingerprint: la misma consulta es el mismo run, reserve lo que reserve.
+
+La validación del entorno sigue el mismo principio de DN-12 §5.1: con techo mayor que 0, **cada** reserva tiene
+que caber bajo él; un techo en el que solo caben las dirigidas rechazaría todas las búsquedas por firma
+pareciendo un presupuesto. El error nombra la variable a cambiar.
+
+En producción, sin techo, las reservas siguen siendo solo contabilidad: el gasto se registra y no se limita.

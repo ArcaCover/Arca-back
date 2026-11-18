@@ -5,7 +5,7 @@ import { AttachAnalysisRequest, CheckoutRequest, CreateActionRequest, CreateClai
 import type { AppAuth, AppUser } from './auth.js';
 import { WebappFailure, type WebappService } from './service.js';
 
-// Every path the private webapp answers on (DN-10 §4.7, DN-11 §4.9). Outside mock they all answer 501 until the real adapters exist.
+// Every path the private webapp answers on (DN-10 §4.7, DN-11 §4.9). In production they all answer 501 until the real adapters exist.
 const WEBAPP_PATHS = ['/me', '/claims', '/plans', '/orgs', '/orgs/*', '/invitations/*', '/admin/*', '/billing/*'] as const;
 
 // A page of the audit log (DN-11 §4.3, §4.5): `before` is the seq the previous page ended on; a limit out of range is a 400.
@@ -104,12 +104,12 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth }): H
   app.put('/admin/plans/:code', platformAdmin(async (c, admin) =>
     c.json(await service.updatePlan(admin, param(c, 'code'), await body(c, UpdatePlanRequest)))));
 
-  // Stripe comes after the demo (DN-10 §10): without a signature to verify, no event is accepted, in mock either.
+  // Stripe comes after the demo (DN-10 §10): without a signature to verify, no event is accepted, in the debug modes either.
   app.post('/billing/webhook', c => notConfigured(c));
   return app;
 }
 
-/** What every mode but mock serves for now: the webapp exists, but its real adapters (Supabase Auth, Stripe) do not yet. */
+/** What production serves for now: the webapp exists, but its real adapters (Supabase Auth, Stripe) do not yet. */
 export function notConfiguredWebapp(): Hono {
   const app = new Hono();
   for (const path of WEBAPP_PATHS) app.all(path, noStore, c => notConfigured(c));

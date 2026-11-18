@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type { ScanRepository, ScanRecord, RawRecord, ApifyRunRecord, ReserveApifyRun, ApifyRunReservation,
-  ApifyRunUpdate } from './types.js';
+  ApifyRunUpdate, ApifySpendRecord } from './types.js';
+import { RAW_MARKER } from './types.js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
-import { ACTIVE_APIFY_STATUSES } from './types.js';
+import { ACTIVE_APIFY_STATUSES, SPEND_CEILING_STATUS } from './types.js';
 
 export class InMemoryRepository implements ScanRepository {
   readonly scans = new Map<string, ScanRecord>();
@@ -30,8 +31,15 @@ export class InMemoryRepository implements ScanRepository {
       .sort((a, b) => b.completed_at!.localeCompare(a.completed_at!))[0] ?? null);
   }
   async saveRaw(record: RawRecord) { this.raw.push(structuredClone(record)); }
-  async latestRaw(domain: string, source: SourceName) {
-    return structuredClone(this.raw.filter(r => r.source === source && this.scans.get(r.scan_id)?.canonical_domain === domain)
+  async findRaw(domain: string, source: SourceName, marker: string, since: string, limit: number) {
+    if (!RAW_MARKER.test(marker)) throw new Error('Invalid raw evidence marker');
+    return this.raw.filter(r => r.source === source && this.scans.get(r.scan_id)?.canonical_domain === domain &&
+      r.fetched_at >= since && r.raw_content.includes(marker))
+      .sort((a, b) => b.fetched_at.localeCompare(a.fetched_at)).slice(0, limit)
+      .map(({ scan_id, source, content_hash, fetched_at }) => ({ scan_id, source, content_hash, fetched_at }));
+  }
+  async rawOf(scanId: string, source: SourceName) {
+    return structuredClone(this.raw.filter(r => r.scan_id === scanId && r.source === source)
       .sort((a, b) => b.fetched_at.localeCompare(a.fetched_at))[0] ?? null);
   }
   async recoverInterrupted(before: string) {
@@ -59,7 +67,7 @@ export class InMemoryRepository implements ScanRepository {
     if (existing && existing.expires_at > now) {
       attach(existing.id, false); return { decision: 'failed', record: structuredClone(existing), chargedToScan: false };
     }
-    // Spend is recorded, never capped: the ledger below is the whole point, the gate is gone.
+    // The ledger records spend and refuses nothing. A spend ceiling, where one is set, is the Apify client's.
     const record: ApifyRunRecord = { id: randomUUID(), query_fingerprint: request.queryFingerprint,
       actor: request.actor, build: request.build, build_id: null, build_number: null,
       input_json: structuredClone(request.input), run_id: null,
@@ -77,5 +85,11 @@ export class InMemoryRepository implements ScanRepository {
   async updateApifyRun(id: string, update: ApifyRunUpdate) {
     const record = this.apifyRuns.get(id); if (!record) throw new Error('Apify run not found');
     Object.assign(record, structuredClone(update), { updated_at: new Date().toISOString() });
+  }
+  async recentApifyRuns(since: string, limit: number): Promise<ApifySpendRecord[]> {
+    return [...this.apifyRuns.values()].filter(run => run.created_at >= since && run.status !== SPEND_CEILING_STATUS)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, limit)
+      .map(({ id, run_id, status, cost_usd, reserved_usd, accounting_complete, created_at, expires_at }) =>
+        ({ id, run_id, status, cost_usd, reserved_usd, accounting_complete, created_at, expires_at }));
   }
 }

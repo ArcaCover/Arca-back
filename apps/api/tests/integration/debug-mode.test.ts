@@ -357,6 +357,25 @@ describe('debug wiring', () => {
     expect(s.renderReport).not.toHaveBeenCalled();
   });
 
+  it("report fault answers 503 for the scan's assessment report too, and a clean scan's report is untouched", async () => {
+    const s = debugSetup();
+    const report = async (scenario?: DebugScenarioInput) => {
+      const { started } = await s.finish(scenario);
+      const created = await s.app.request(`/scan/${started.scanId}/assessment`, { method: 'POST', headers: s.auth(started) });
+      const { assessmentId } = StartedAssessmentResponse.parse(await created.json());
+      await s.drain();
+      return s.app.request(`/assessment/${assessmentId}/report.pdf`, { headers: s.auth(started) });
+    };
+    const injected = await report({ http: { report: 'unavailable' } });
+    expect(injected.status).toBe(503);
+    expect(await injected.json()).toEqual({ error: 'report_unavailable', message: 'Injected report failure' });
+    // Without the fault the same request reaches the ordinary answer for an assessment that is not completed.
+    const clean = await report();
+    expect(clean.status).toBe(409);
+    expect(await clean.json()).toMatchObject({ error: 'incomplete' });
+    expect(s.renderReport).not.toHaveBeenCalled();
+  });
+
   it('planner timeout falls back to rules', async () => {
     // A working agent is wired, so a rules plan can only come from the injected stall.
     const agent: PlanningAgent = { model: 'fixture-agent', plan: async input => rulesPlan(input.bank, input.layer1, input.evidence) };
@@ -417,14 +436,37 @@ describe('debug wiring', () => {
     expect(state.sources?.bar).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY' });
     expect(state.sources?.avvo).toMatchObject({ status: 'skipped', code: 'INSUFFICIENT_IDENTITY' });
     expect(typeof state.sources?.website.durationMs).toBe('number');
-    // A clean failure keeps them too: the fixture's site refuses every request.
+    // A clean failure keeps them too: the fixture's extraction failed on pages that were read, our own failure.
     const clean = await s.start(undefined, 'owner@failed.arca.example', 'failed.arca.example');
     await s.drain();
     expect((await s.final(clean)).status).toBe('FAILED');
     const cleanState = await internal(clean);
     expect(cleanState).toMatchObject({ status: 'FAILED', storage: 'supabase', injected: false, canonicalDomain: 'failed.arca.example' });
-    expect(cleanState.sources?.website).toMatchObject({ status: 'error', code: 'ACCESS_BLOCKED', reason: 'The site refused every request' });
+    expect(cleanState.sources?.website).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR', pagesCrawled: 6,
+      reason: 'Website evidence extraction unavailable' });
     expect(JSON.stringify(cleanState)).not.toContain('owner@failed.arca.example');
+  });
+
+  // `blocked` is the site keeping us out and ends PARTIAL. `error` (a throw) and `timeout` (the pipeline's deadline) are our
+  // own failures and end FAILED (above). down.arca.example covers a site that cannot be reached.
+  it('website blocked ends PARTIAL with low confidence, in memory, and its assessment can start', async () => {
+    const s = debugSetup();
+    const { started, final } = await s.finish({ website: 'blocked' });
+    expect(final.status).toBe('PARTIAL');
+    expect(final.result?.sources.website).toMatchObject({ status: 'error', code: 'ACCESS_BLOCKED' });
+    expect(final.result?.preScore).toMatchObject({ confidence: 'LOW', decision: 'UNKNOWN', overrides: [] });
+    expect(final.result?.preScore.flags).toContain('WEBSITE_UNAVAILABLE');
+    // Nothing was read, so nothing was looked up: the injected block costs no directory call either.
+    expect(s.directoryRuns.bar).not.toHaveBeenCalled();
+    expect(s.directoryRuns.avvo).not.toHaveBeenCalled();
+    for (const spy of Object.values(s.durableSpy)) expect(spy).not.toHaveBeenCalled();
+    const response = await s.app.request(`/scan/${started.scanId}/assessment`, { method: 'POST', headers: s.auth(started) });
+    expect(response.status).toBe(202);
+    const { assessmentId } = StartedAssessmentResponse.parse(await response.json());
+    await s.drain();
+    const view = AssessmentView.parse(await (await s.app.request(`/assessment/${assessmentId}`, { headers: s.auth(started) })).json());
+    expect(view.status).toBe('READY');
+    expect(view.questions.length).toBeGreaterThanOrEqual(8);
   });
 
   it('/__debug/mode answers with the description only', async () => {

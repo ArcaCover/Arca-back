@@ -1,13 +1,18 @@
 import { Layer1Evidence, type SourceStatus } from '@arca/contracts';
 import { scoreEvidence } from './score.js';
 import { independentlyConfirmed, reconcileAvvoMatches, reconcileBarMatches } from './matching.js';
+import { canonicalIdentity, canonicalMatches, canonicalSource } from './canonical.js';
 
 /**
  * Deterministic Layer 1 boundary. It knows structured evidence, never crawlers,
  * provider SDKs, prompts or OpenAI clients.
  */
 export function evaluateLayer1Evidence(rawEvidence: Layer1Evidence) {
-  const evidence = Layer1Evidence.parse(rawEvidence);
+  const parsed = Layer1Evidence.parse(rawEvidence);
+  // The same evidence must give the same result in whatever order the sources listed it. Everything
+  // below, including the cross-check that takes the first lookup for a name, reads this fixed order.
+  const evidence = { ...parsed, identity: canonicalIdentity(parsed.identity),
+    bar: canonicalMatches(parsed.bar), avvo: canonicalMatches(parsed.avvo) };
   // Let either directory corroborate a longer legal name. A profile may use a personal address and omit
   // the current firm, while Bar and Avvo still agree on full name plus address, phone or admission year.
   const provisionalAvvo = reconcileAvvoMatches(evidence.avvo, evidence.bar, evidence.identity);
@@ -30,9 +35,9 @@ export function evaluateLayer1Evidence(rawEvidence: Layer1Evidence) {
     return { ...status, attorneysFound: found };
   };
   const sources = {
-    website: evidence.sources.website,
-    bar: settle(evidence.sources.bar, bar, avvo),
-    avvo: settle(evidence.sources.avvo, avvo, bar),
+    website: canonicalSource(evidence.sources.website),
+    bar: canonicalSource(settle(evidence.sources.bar, bar, avvo)),
+    avvo: canonicalSource(settle(evidence.sources.avvo, avvo, bar)),
   };
   return { identity: evidence.identity,
     ...scoreEvidence({ website: evidence.website, bar, avvo, sources, now: evidence.observedAt,

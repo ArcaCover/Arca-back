@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { loadEnv } from '../../src/config/env.js';
+import { LIVE_DEBUG_APIFY_SPEND_CEILING_USD, LIVE_DEBUG_OPENAI_MAX_REQUESTS_PER_SCAN, loadEnv } from '../../src/config/env.js';
 import { listenHostname } from '../../src/config/mode.js';
+import { WEBSITE_SIGNAL_REUSE_MAX_AGE_MS } from '../../src/pipeline/website-source.js';
 
 const base = { SESSION_TOKEN_SECRET: 's'.repeat(40), CORS_ALLOWED_ORIGINS: 'http://localhost:3000' };
 const database = { SUPABASE_URL: 'https://fixture.supabase.co', SUPABASE_SECRET_KEY: 'sb_secret_fixture' };
@@ -63,6 +64,7 @@ describe('independent source and storage configuration', () => {
       APIFY_EXPECTED_COST_USD_PER_RUN: 1,
       APIFY_RUN_TIMEOUT_SECS: 300, APIFY_ACTIVE_RUN_TTL_MS: 900000,
       APIFY_BAR_TARGETED_MAX_RESULTS: 25, APIFY_AVVO_TARGETED_MAX_RESULTS: 10,
+      APIFY_BAR_OFFICE_SAMPLE_MAX_RESULTS: 20, APIFY_AVVO_OFFICE_SAMPLE_MAX_RESULTS: 10,
       APIFY_MAX_CACHED_ITEMS: 1000,
       // Repairing a partial scan must not re-pay directory runs, so the query cache cannot
       // expire before the scan cache does.
@@ -80,12 +82,89 @@ describe('independent source and storage configuration', () => {
     expect(loadEnv({ ...mock, MAX_APIFY_CONCURRENCY: '32' }).MAX_APIFY_CONCURRENCY).toBe(32);
     expect(() => loadEnv({ ...mock, MAX_APIFY_CONCURRENCY: '33' })).toThrow();
   });
+  it('reuses a stored website analysis for 30 days by default, and never when the age is 0', () => {
+    const mock = { ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' };
+    expect(loadEnv(mock).WEBSITE_SIGNAL_REUSE_MAX_AGE_MS).toBe(WEBSITE_SIGNAL_REUSE_MAX_AGE_MS);
+    expect(loadEnv({ ...mock, WEBSITE_SIGNAL_REUSE_MAX_AGE_MS: '0' }).WEBSITE_SIGNAL_REUSE_MAX_AGE_MS).toBe(0);
+    expect(() => loadEnv({ ...mock, WEBSITE_SIGNAL_REUSE_MAX_AGE_MS: '-1' })).toThrow();
+  });
+  it('loads the values that force a fresh run of a cached firm', () => {
+    // DN-12 §4.4: no header and no contract change, only the environment of one start.
+    const forced = loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory', SCAN_CACHE_TTL_MS: '1',
+      SCAN_PARTIAL_REPAIR_COOLDOWN_MS: '0', WEBSITE_SIGNAL_REUSE_MAX_AGE_MS: '0' });
+    expect(forced).toMatchObject({ SCAN_CACHE_TTL_MS: 1, SCAN_PARTIAL_REPAIR_COOLDOWN_MS: 0, WEBSITE_SIGNAL_REUSE_MAX_AGE_MS: 0 });
+    // The cooldown has to go down with the window: its default alone is refused.
+    expect(() => loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory', SCAN_CACHE_TTL_MS: '1' }))
+      .toThrow('SCAN_PARTIAL_REPAIR_COOLDOWN_MS');
+  });
   it('repairs a partial scan at most hourly by default, never less often than the cache window', () => {
     const mock = { ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' };
     expect(loadEnv(mock).SCAN_PARTIAL_REPAIR_COOLDOWN_MS).toBe(3_600_000);
     expect(loadEnv({ ...mock, SCAN_PARTIAL_REPAIR_COOLDOWN_MS: '0' }).SCAN_PARTIAL_REPAIR_COOLDOWN_MS).toBe(0);
     expect(() => loadEnv({ ...mock, SCAN_CACHE_TTL_MS: '3600000', SCAN_PARTIAL_REPAIR_COOLDOWN_MS: '7200000' }))
       .toThrow('SCAN_PARTIAL_REPAIR_COOLDOWN_MS');
+  });
+});
+describe('spend guards', () => {
+  // DN-12 §5: production records spend and caps nothing unless its environment says so; live-debug guards itself.
+  const production = { ...base, SOURCE_MODE: 'live', STORAGE_BACKEND: 'memory', APIFY_API_TOKEN: 'test', OPENAI_API_KEY: 'sk-test' };
+  const liveDebug = { ...base, ...database, ARCA_MODE: 'live-debug', SOURCE_MODE: 'live', STORAGE_BACKEND: 'supabase',
+    APIFY_API_TOKEN: 'test', OPENAI_API_KEY: 'sk-test' };
+  it('leaves production without a spend ceiling and without a request cap', () => {
+    expect(loadEnv(production)).toMatchObject({ mode: 'production', apifySpendCeilingUsd: null, openAiMaxRequestsPerScan: null });
+    expect(loadEnv(production).APIFY_SPEND_CEILING_USD).toBeUndefined();
+    expect(loadEnv(production).OPENAI_MAX_REQUESTS_PER_SCAN).toBeUndefined();
+    // Mock builds no paid client, so it has nothing to guard.
+    expect(loadEnv({ ...base, ARCA_MODE: 'mock' })).toMatchObject({ apifySpendCeilingUsd: null, openAiMaxRequestsPerScan: null });
+  });
+  it('turns both guards on in live-debug by default', () => {
+    expect(LIVE_DEBUG_APIFY_SPEND_CEILING_USD).toBe(2);
+    expect(LIVE_DEBUG_OPENAI_MAX_REQUESTS_PER_SCAN).toBe(30);
+    expect(loadEnv(liveDebug)).toMatchObject({ mode: 'live-debug', apifySpendCeilingUsd: 2, openAiMaxRequestsPerScan: 30 });
+  });
+  it('takes an explicit value in any mode', () => {
+    expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '7.5', OPENAI_MAX_REQUESTS_PER_SCAN: '12' }))
+      .toMatchObject({ apifySpendCeilingUsd: 7.5, openAiMaxRequestsPerScan: 12 });
+    expect(loadEnv({ ...production, APIFY_SPEND_CEILING_USD: '50', OPENAI_MAX_REQUESTS_PER_SCAN: '40' }))
+      .toMatchObject({ apifySpendCeilingUsd: 50, openAiMaxRequestsPerScan: 40 });
+    // 0 is a ceiling too: no new run, cached queries only.
+    expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0' }).apifySpendCeilingUsd).toBe(0);
+  });
+  it('reads an empty value as not set, never as a ceiling of 0', () => {
+    for (const blank of ['', '  ']) {
+      expect(loadEnv({ ...production, APIFY_SPEND_CEILING_USD: blank, OPENAI_MAX_REQUESTS_PER_SCAN: blank }))
+        .toMatchObject({ apifySpendCeilingUsd: null, openAiMaxRequestsPerScan: null });
+      expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: blank, OPENAI_MAX_REQUESTS_PER_SCAN: blank }))
+        .toMatchObject({ apifySpendCeilingUsd: 2, openAiMaxRequestsPerScan: 30 });
+    }
+  });
+  it('refuses values that are not a ceiling or a cap', () => {
+    for (const value of ['-1', 'two', 'Infinity']) expect(() => loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: value }), value).toThrow();
+    for (const value of ['0', '-3', '2.5', 'many']) expect(() => loadEnv({ ...liveDebug, OPENAI_MAX_REQUESTS_PER_SCAN: value }), value).toThrow();
+    // A ceiling no run fits under would refuse everything while looking like a budget.
+    expect(() => loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.5' })).toThrow('APIFY_SPEND_CEILING_USD is below APIFY_EXPECTED_COST_USD_PER_RUN');
+    expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.5', APIFY_EXPECTED_COST_USD_PER_RUN: '0.25' }).apifySpendCeilingUsd).toBe(0.5);
+    expect(() => loadEnv({ ...liveDebug, APIFY_EXPECTED_COST_USD_PER_RUN: '3' })).toThrow('APIFY_SPEND_CEILING_USD');
+  });
+  it('reserves less for a targeted lookup than for a firm search, and every kind must fit under the ceiling', () => {
+    expect(loadEnv(liveDebug)).toMatchObject({ APIFY_EXPECTED_COST_USD_PER_RUN: 1, APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: 0.1,
+      APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: 0.4 });
+    expect(loadEnv({ ...liveDebug, APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.05', APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.5' }))
+      .toMatchObject({ APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: 0.05, APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: 0.5 });
+    for (const value of ['0', '-1', 'cheap']) {
+      expect(() => loadEnv({ ...liveDebug, APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: value }), value).toThrow();
+      expect(() => loadEnv({ ...liveDebug, APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: value }), value).toThrow();
+    }
+    // A ceiling only targeted lookups fit under would refuse every firm search while looking like a budget, and the other way round.
+    expect(() => loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.3', APIFY_EXPECTED_COST_USD_PER_RUN: '0.25' }))
+      .toThrow('APIFY_SPEND_CEILING_USD is below APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN');
+    expect(() => loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.3', APIFY_EXPECTED_COST_USD_PER_RUN: '0.25',
+      APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.2', APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.5' }))
+      .toThrow('APIFY_SPEND_CEILING_USD is below APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN');
+    expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0.3', APIFY_EXPECTED_COST_USD_PER_RUN: '0.25',
+      APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.3' }).apifySpendCeilingUsd).toBe(0.3);
+    // 0 still means cached queries only, whatever each kind reserves.
+    expect(loadEnv({ ...liveDebug, APIFY_SPEND_CEILING_USD: '0' }).apifySpendCeilingUsd).toBe(0);
   });
 });
 describe('ARCA_MODE', () => {

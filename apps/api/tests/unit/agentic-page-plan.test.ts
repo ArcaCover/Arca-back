@@ -38,14 +38,17 @@ describe('agentic page plan', () => {
         calls: urls.map(target => ({ tool: 'fetch_pages' as const, target, status: 'read' as const, detail: null })) })),
       readDocuments: vi.fn(async (urls: string[]) => ({ pages: [],
         calls: urls.map(target => ({ tool: 'read_document' as const, target, status: 'failed' as const, detail: 'HTTP_ERROR' })) })),
-      readSitemap: vi.fn(),
+      readSitemap: vi.fn(async () => ({ links: [], calls: [{ tool: 'read_sitemap' as const, target: 'https://firm.com/', status: 'failed' as const, detail: 'NO_SITEMAP_URLS' }] })),
     };
     const provider = new AgenticEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never);
     const result = await provider.extractDetailed({ pages: [home], partial: false }, new AbortController().signal);
     expect(classifications).toHaveLength(3);
     expect(access.fetchPages).toHaveBeenCalledWith(['https://firm.com/our-lawyers'], expect.anything());
     expect(access.readDocuments).toHaveBeenCalledWith(['https://firm.com/privacy.pdf'], expect.anything());
-    expect(result.diagnostics.toolCalls[0]).toMatchObject({ round: 0, tool: 'fetch_pages', target: 'https://firm.com/our-lawyers', status: 'read' });
+    // The sitemap is read first, before the pages are labelled; then the floor reads the team page.
+    expect(access.readSitemap).toHaveBeenCalledTimes(1);
+    expect(result.diagnostics.toolCalls.slice(0, 2)).toMatchObject([{ round: 0, tool: 'read_sitemap' },
+      { round: 0, tool: 'fetch_pages', target: 'https://firm.com/our-lawyers', status: 'read' }]);
     expect(firstExtraction).toContain('Jane Doe');
     expect(result.websiteData.team_members?.map(member => member.full_name).sort()).toEqual(['Jane Doe', 'John Roe']);
     expect(result.websiteData.team_page_quality).toBe('detailed');

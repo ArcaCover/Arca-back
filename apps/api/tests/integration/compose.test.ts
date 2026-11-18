@@ -10,8 +10,11 @@ import { SupabaseRepository } from '../../src/repositories/supabase.js';
 import type { ScanRecord } from '../../src/repositories/types.js';
 import { InMemoryAssessmentRepository, SupabaseAssessmentRepository } from '../../src/assessment/repository.js';
 import { ApifyClient } from '../../src/pipeline/apify-client.js';
+import { AVVO_ACTOR } from '../../src/pipeline/directories.js';
 import { DEFAULT_SIGNAL_LLM_MODEL } from '../../src/pipeline/llm-endpoint.js';
 import { OPENAI_EVIDENCE_MODEL } from '../../src/pipeline/website-evidence-provider.js';
+import { MockAppAuth } from '../../src/webapp/auth.js';
+import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 
 // Observed, not replaced: compose still builds the real app and tools.
 vi.mock('../../src/http/app.js', async importOriginal => {
@@ -63,6 +66,12 @@ describe('compose', () => {
     expect(assessments).toBeInstanceOf(durableAssessments);
     expect(scans).not.toBe(tools.scans.overlay);
     expect(assessments).not.toBe(tools.assessments.overlay);
+    // Both debug modes run the webapp on the same simulated pieces, held in memory whatever the scans are stored in (DN-12 §7),
+    // and the debug login signs in to the very service the app serves.
+    expect(tools.webapp!.repository).toBeInstanceOf(InMemoryWebappRepository);
+    expect(tools.webapp!.auth).toBeInstanceOf(MockAppAuth);
+    expect(deps.webapp!.service).toBe(tools.webapp!.service);
+    expect(deps.webapp!.auth).toBe(tools.webapp!.auth);
     if (mode === 'mock') {
       // A debug reset forgets the durable memory as well.
       await (scans as InMemoryRepository).create(scanRecord);
@@ -85,6 +94,8 @@ describe('compose', () => {
     expect(createDebugTools).not.toHaveBeenCalled();
     const deps = appDeps();
     expect(deps.debug).toBeUndefined();
+    // No webapp either: createApp answers 501 on its routes (DN-10 §10).
+    expect(deps.webapp).toBeUndefined();
     expect(deps.repository).toBeInstanceOf(SupabaseRepository);
     expect(deps.assessmentRepository).toBeInstanceOf(SupabaseAssessmentRepository);
     expect(composed.repository).toBe(deps.repository);
@@ -97,18 +108,47 @@ describe('compose', () => {
     const legacy = await compose(loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' }));
     expect(createDebugTools).not.toHaveBeenCalled();
     expect(appDeps().debug).toBeUndefined();
+    expect(appDeps().webapp).toBeUndefined();
     expect(appDeps().repository).toBeInstanceOf(InMemoryRepository);
     expect(legacy.banner).toBe('[api] MODE=production sources=mock storage=memory');
   });
 
-  it('banner names the mode, the loopback-only debug routes and only the overrides that happened', async () => {
+  it('banner names the mode, the loopback-only debug routes, a webapp kept apart from the storage, and only the overrides that happened', async () => {
     expect((await compose(loadEnv({ ...base, ...live, ARCA_MODE: 'mock' }))).banner).toBe('[api] MODE=mock sources=mock storage=memory '
       + '(debug routes on 127.0.0.1 only) overrides: SOURCE_MODE=live→mock, STORAGE_BACKEND=supabase→memory');
     // What scripts/with-mode.mjs sets for mock: nothing left to override.
     expect((await compose(loadEnv({ ...base, ...live, ARCA_MODE: 'mock', SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory' }))).banner)
       .toBe('[api] MODE=mock sources=mock storage=memory (debug routes on 127.0.0.1 only)');
+    // live-debug pays real providers, so its line also says what guards the spend (DN-12 §5). Its scans are in Supabase and its
+    // accounts, organizations and billing are not, so the line says that too (DN-12 §7).
     expect((await compose(loadEnv({ ...base, ...live, ARCA_MODE: 'live-debug' }))).banner)
-      .toBe('[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only)');
+      .toBe('[api] MODE=live-debug sources=live storage=supabase webapp=simulated-in-memory (debug routes on 127.0.0.1 only) '
+        + 'spend guards: Apify ceiling USD 2 per 24 h, OpenAI cap 30 requests per scan');
+    // A guard is named only where it acts: the rules provider calls no model.
+    expect((await compose(loadEnv({ ...base, ...live, ARCA_MODE: 'live-debug', WEBSITE_EVIDENCE_PROVIDER: 'rules', APIFY_SPEND_CEILING_USD: '5' }))).banner)
+      .toBe('[api] MODE=live-debug sources=live storage=supabase webapp=simulated-in-memory (debug routes on 127.0.0.1 only) '
+        + 'spend guards: Apify ceiling USD 5 per 24 h');
+  });
+
+  // DN-12 §5: the ceiling and the cap reach the clients compose builds, and production builds them without either.
+  it.each([
+    { name: 'production', env: {}, ceiling: null, cap: undefined },
+    { name: 'live-debug', env: { ARCA_MODE: 'live-debug' }, ceiling: 2, cap: 30 },
+    { name: 'production with both set', env: { APIFY_SPEND_CEILING_USD: '25', OPENAI_MAX_REQUESTS_PER_SCAN: '40' }, ceiling: 25, cap: 40 },
+  ])('$name builds its paid clients with spend ceiling $ceiling and request cap $cap', async ({ env, ceiling, cap }) => {
+    const composed = await compose(loadEnv({ ...base, ...live, ...env }));
+    // Private on purpose; read here only to check the wiring.
+    expect((composed.apify as unknown as { options: { spendCeilingUsd: number | null } }).options.spendCeilingUsd).toBe(ceiling);
+    const website = (appDeps().pipeline as unknown as { deps: { website: { provider: { options: { maxRequests?: number } } } } }).deps.website;
+    expect(website.provider.options.maxRequests).toBe(cap);
+    if (ceiling === null) expect(composed.banner).not.toContain('spend guards');
+  });
+
+  it('hands the Apify client one reservation per kind of lookup, and one of its own for Avvo', async () => {
+    const composed = await compose(loadEnv({ ...base, ...live, APIFY_EXPECTED_COST_USD_PER_RUN: '1.5',
+      APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.05', APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: '0.3' }));
+    expect((composed.apify as unknown as { options: Record<string, unknown> }).options).toMatchObject({ expectedCostUsdPerRun: 1.5,
+      expectedCostUsdPerTargetedRun: 0.05, expectedCostUsdPerTargetedRunByActor: { [AVVO_ACTOR]: 0.3 } });
   });
 
   // DN-09 4 and 7: the panel's 'Back mode' row must say what this process built, never which keys merely sit in the file.

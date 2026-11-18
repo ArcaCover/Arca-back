@@ -3,7 +3,7 @@ import { SignJWT, jwtVerify } from 'jose';
 
 export type AppUser = { userId: string; email: string };
 
-/** Who calls the webapp. Supabase Auth verifies in production (DN-10 §4.1); the mock issuer exists only in mock. */
+/** Who calls the webapp. Supabase Auth will verify in production (DN-10 §4.1); the mock issuer exists only in the debug modes. */
 export interface AppAuth {
   verify(token: string): Promise<AppUser | null>;
 }

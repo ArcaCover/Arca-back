@@ -2,8 +2,11 @@ import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import { WebsiteData, AttorneyMatch, SourceStatus, type WebsiteSource, type DirectorySource, type SourceResult } from '@arca/contracts';
 
+// Two websites that could not be read at all, both PARTIAL with WEBSITE_UNAVAILABLE and low confidence (DN-12 §14):
+// `blocked` refuses to be read (robots.txt, definitive: cached for the whole window) and `down` could not be reached
+// (transient: repaired after the cooldown). `failed` is our own failure, the extraction of pages that were read: FAILED.
 export const MOCK_DOMAINS = ['robust.arca.example', 'minimal.arca.example', 'sanctioned.arca.example',
-  'partial.arca.example', 'failed.arca.example'] as const;
+  'partial.arca.example', 'blocked.arca.example', 'down.arca.example', 'failed.arca.example'] as const;
 const Scenario = z.object({ website: WebsiteData.nullable(), bar: z.array(AttorneyMatch).nullable(),
   avvo: z.array(AttorneyMatch).nullable(), sources: z.object({ website: SourceStatus, bar: SourceStatus, avvo: SourceStatus }) });
 async function load(domain: string) {

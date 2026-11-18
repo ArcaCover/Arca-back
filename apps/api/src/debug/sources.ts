@@ -35,6 +35,9 @@ export function injectWebsite(real: WebsiteSource, scenario: DebugScenario, opti
         return { data: unknownWebsite(), rawContent: injected('no_identity'), status: { status: 'ok', dataStatus: 'EMPTY',
           durationMs: 0, pagesCrawled: 1, reason: null } };
       case 'blocked':
+        // The site keeps us out (a definitive refusal), so the scan ends PARTIAL with WEBSITE_UNAVAILABLE and low confidence
+        // (DN-12 §14). `error` (a throw) and `timeout` (the pipeline's own deadline) below are our own failures and end
+        // FAILED. A site that cannot be reached is the mock domain down.arca.example: this axis lives in the contract.
         return { data: null, rawContent: injected('blocked'), status: { status: 'error', dataStatus: 'UNKNOWN', durationMs: 0,
           pagesCrawled: 0, code: 'ACCESS_BLOCKED', reason: 'Website access was blocked' } };
       case 'error':

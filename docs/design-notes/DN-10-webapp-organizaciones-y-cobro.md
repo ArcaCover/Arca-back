@@ -85,10 +85,10 @@ El reclamo va en dos pasos (§4.7). El token del scan viaja en el cuerpo de `POS
   - comprueba `aud = authenticated`, la expiración y `sub` = user id.
 - **Google** queda listo para el futuro: es activar el proveedor en Supabase y añadir un botón. El back no cambia, porque solo ve un JWT de Supabase.
 - **Dos tokens, sin mezclarlos.** El token de sesión **del scan** (DN-01) sigue igual, para el embudo anónimo. El de Supabase es para la webapp.
-- **Modo `mock` (DN-09).** No hay Supabase Auth real:
-  - `POST /__debug/auth/login { email, platformAdmin? }`, que existe **solo en `mock`**, emite un JWT con el mismo formato y claims (en `live-debug` el login es el real de Supabase);
+- **Modos de debug (DN-09).** No hay Supabase Auth real:
+  - `POST /__debug/auth/login { email, platformAdmin? }` emite un JWT con el mismo formato y claims. Existía solo en `mock`; desde el 2026-11-09 existe también en `live-debug` (DN-12 §7, D7);
   - ese JWT se firma con una clave derivada de `SESSION_TOKEN_SECRET` (HMAC-SHA256 de `arca-mock-auth`), nunca con el secreto mismo, y lleva su propio emisor (`arca-mock-auth`) y audiencia (`authenticated`): un token de la app nunca vale como token del scan, ni al revés;
-  - el verificador del back acepta ese emisor **solo** en mock;
+  - el verificador del back acepta ese emisor **solo** en los modos de debug;
   - en producción, ese emisor y esa ruta no existen.
 
 ### 4.2 Modelo de datos (migración nueva en `supabase/migrations/`)
@@ -147,7 +147,7 @@ La tabla quedó así con DN-11 §4.1: el `member` perdió `analysis.create` y ha
 
   Con ellos actualiza `subscriptions` y `organizations.billing_status`, y nunca toca el borrado. Es idempotente por `stripe_events`.
 - **Planes.** `GET /plans` es público y devuelve los planes activos (nombre, precio, intervalo). El precio se cambia en la tabla `plans` (o con `PUT /admin/plans`) y el siguiente checkout ya lo usa.
-- **Modo `mock` (DN-09).** Sin Stripe real: el checkout devuelve una URL local, `/app/billing/mock-checkout?session=<id>`, y no activa nada por sí solo. La suscripción se activa en memoria solo con el pago simulado, `POST /__debug/billing/pay { sessionId }` (solo en `mock` y con `X-Arca-Debug: 1`); pagar dos veces la misma sesión da 409. **Stripe en modo test** llegará después, en `live-debug` (§10).
+- **Modo `mock` (DN-09).** Sin Stripe real: el checkout devuelve una URL local, `/app/billing/mock-checkout?session=<id>`, y no activa nada por sí solo. La suscripción se activa en memoria solo con el pago simulado, `POST /__debug/billing/pay { sessionId }` (con `X-Arca-Debug: 1`); pagar dos veces la misma sesión da 409. Desde el 2026-11-09 `live-debug` usa este mismo checkout simulado (DN-12 §7). **Stripe en modo test** sigue pendiente (§10).
 
 ### 4.5 Bloqueo hasta pagar
 
@@ -164,7 +164,7 @@ Hay rutas `/admin/*` que solo responden a `platform_admins`:
 - `POST /admin/deletion-requests/:id/approve` y `/reject`;
 - `GET` y `PUT /admin/plans`.
 
-Los endpoints están probados con tests. Hay además una prueba de concepto en `/app/admin`, que solo cubre los precios de los planes y la cola de solicitudes de borrado (§12.3); el panel completo es trabajo futuro. **Quién es admin de plataforma:** se otorga con un script del back (`npm run admin:grant -- <email>`); en `mock`, con `platformAdmin: true` en el login simulado. **Aprobar un borrado** pone `deleted_at` y cancela la suscripción en Stripe. **Rechazarlo** solo cierra la solicitud: el estado de cobro nunca cambió. El borrado físico de datos queda fuera de alcance, por implicaciones legales. **[mía]**
+Los endpoints están probados con tests. Hay además una prueba de concepto en `/app/admin`, que solo cubre los precios de los planes y la cola de solicitudes de borrado (§12.3); el panel completo es trabajo futuro. **Quién es admin de plataforma:** se otorga con un script del back (`npm run admin:grant -- <email>`); en los modos de debug, con `platformAdmin: true` en el login simulado. **Aprobar un borrado** pone `deleted_at` y cancela la suscripción en Stripe. **Rechazarlo** solo cierra la solicitud: el estado de cobro nunca cambió. El borrado físico de datos queda fuera de alcance, por implicaciones legales. **[mía]**
 
 ### 4.7 Endpoints (resumen)
 
@@ -183,8 +183,8 @@ Los endpoints están probados con tests. Hay además una prueba de concepto en `
 | `GET /plans` | pública | Planes activos |
 | `POST /orgs/:id/deletion-request` | `org.request_deletion` | Pasa a `deletion_requested` |
 | `/admin/*` | `platform_admin` | Cimientos del panel de ARCA |
-| `POST /__debug/auth/login` | solo mock | Login simulado (§4.1) |
-| `POST /__debug/billing/pay` | solo mock | Pago simulado de una sesión del checkout simulado (§4.4) |
+| `POST /__debug/auth/login` | mock y live-debug (DN-12 §7) | Login simulado (§4.1) |
+| `POST /__debug/billing/pay` | mock y live-debug (DN-12 §7) | Pago simulado de una sesión del checkout simulado (§4.4) |
 
 **Reclamar el análisis [mía].** Va en dos pasos, para que sobreviva al magic link (que puede abrirse en otra pestaña o dispositivo) sin guardar el token del scan fuera de `sessionStorage`:
 1. En los resultados, `POST /claims { scanToken }`, con el token del scan en el cuerpo, devuelve un `claimId` aleatorio de un solo uso, válido 24 h. El back guarda su hash, el `scan_id` y el email del scan. Como el token no va en una cabecera, `allowHeaders` de CORS sigue siendo exactamente `Content-Type,Authorization`.
@@ -231,9 +231,9 @@ En `mock` no hace falta ninguna de las claves. Todas siguen las reglas de DN-09:
   - `/app/members`: lista, invitar, cambiar rol y quitar.
   - `/app/settings`: datos de la organización y "Solicitar eliminación".
   - `/app/invite/[token]`.
-  - `/app/billing/mock-checkout`: la página que hace de Stripe en `mock`, con el botón del pago simulado. Fuera de `mock` responde **404** (componente de servidor con `notFound()`) y **no está en el bundle de producción**: el componente del pago se carga con `next/dynamic` dentro de la guarda literal, así que el build de producción no emite su chunk.
+  - `/app/billing/mock-checkout`: la página que hace de Stripe en `mock` y en `live-debug` (DN-12 §7), con el botón del pago simulado. En producción responde **404** (componente de servidor con `notFound()`) y **no está en el bundle de producción**: el componente del pago se carga con `next/dynamic` dentro de la guarda literal, así que el build de producción no emite su chunk.
   - `/app/admin`: prueba de concepto del panel de ARCA, solo para admins de plataforma: precios de los planes y cola de solicitudes de borrado.
-- **En `/assessment/results`:** un CTA "Save your results and activate your account". **Solo existe en `mock`** (guarda literal `process.env.NEXT_PUBLIC_ARCA_MODE === "mock"`, DN-09) hasta que lleguen los adaptadores reales de Auth y Stripe; fuera de `mock` no se pinta. Al pulsarlo cambia el token del scan por un reclamo (`POST /claims`, con el token en el cuerpo) y aplica las reglas de §4.7: el análisis se añade a la organización activa solo si el email de la sesión coincide con el del reclamo (sin distinguir mayúsculas), el rol tiene `analysis.create` y la organización tiene acceso pagado; si no, va a `/app/signup` con el reclamo, y un **402** lleva a `/app/billing`.
+- **En `/assessment/results`:** un CTA "Save your results and activate your account". Nació **solo en `mock`** (guarda literal `process.env.NEXT_PUBLIC_ARCA_MODE === "mock"`, DN-09) hasta que lleguen los adaptadores reales de Auth y Stripe. Con D7 (DN-12 §7) pasa a ofrecerse también en `live-debug`, etiquetado como simulado; ese cambio es del front. En producción no se pinta. Al pulsarlo cambia el token del scan por un reclamo (`POST /claims`, con el token en el cuerpo) y aplica las reglas de §4.7: el análisis se añade a la organización activa solo si el email de la sesión coincide con el del reclamo (sin distinguir mayúsculas), el rol tiene `analysis.create` y la organización tiene acceso pagado; si no, va a `/app/signup` con el reclamo, y un **402** lleva a `/app/billing`.
 - **Sin diseño:** componentes simples con los tokens de la marca. Lo que un rol no puede hacer se oculta, en todos los modos, y **el back es el que niega** (DN-11 D3). En mock, el interruptor "Show forbidden actions" del panel de debug lo vuelve a mostrar (controles, ítems de la barra y pantallas), para que la demo enseñe el 403 del back. Esto reemplaza la regla anterior, que dejaba los botones activos en los modos de debug. **[Jesús]**
 - **El código de la app** vive en carpetas propias: `app/app/...`, `components/app/...` y `lib/app/...`.
 
@@ -245,7 +245,7 @@ En `mock` no hace falta ninguna de las claves. Todas siguen las reglas de DN-09:
 | Escalar privilegios | Matriz en el back; un admin no puede tocar owners ni dar `owner`; siempre queda al menos un owner |
 | Reclamar el análisis de otro | Token del scan, email coincidente, un solo reclamo |
 | Webhook de Stripe falso | Verificación de la firma; idempotencia |
-| JWT falso o caducado | Verificación de la firma, `aud` y `exp`; el emisor mock solo existe en mock |
+| JWT falso o caducado | Verificación de la firma, `aud` y `exp`; el emisor mock solo existe en los modos de debug, nunca en producción |
 | Borrado malicioso o accidental | Solo solicitud, con revisión humana y auditoría |
 | Invitación robada o vieja | Solo se guarda el hash del token, con expiración de 7 días; se acepta con el login del email invitado; reinvitar, aceptar o quitar al miembro revoca los demás enlaces de ese email (§4.7) |
 | Fuga de datos entre organizaciones | Cada consulta filtra por `org_id` de una membresía verificada; tests de "otra organización da 404" |
@@ -290,7 +290,7 @@ Se recomienda cuando la app tenga usuarios reales. Separa riesgos, aísla las co
 12. Reclamo en dos pasos con un ticket de un solo uso, para sobrevivir al magic link; email del registro prefijado y bloqueado; el login no crea usuarios.
 13. Un cliente con organización que repite el embudo añade el análisis a su organización (`analysis.create`), no crea otra.
 14. Admin de plataforma por script (`admin:grant`) o, en mock, desde el login simulado.
-15. El login simulado existe solo en `mock`; en `live-debug` el login es el real.
+15. ~~El login simulado existe solo en `mock`; en `live-debug` el login es el real.~~ Reemplazada por D7 de DN-12 (§7): el login y el pago simulados existen en los dos modos de debug.
 16. ~~En los modos de debug los botones sin permiso se ven activos para mostrar el 403 del back.~~ Reemplazada por DN-11 D3: se ocultan en todos los modos, y en mock el interruptor "Show forbidden actions" los vuelve a mostrar (§5).
 
 ## 10. Alcance de la demo de mañana y lo que viene después
@@ -313,7 +313,14 @@ Se recomienda cuando la app tenga usuarios reales. Separa riesgos, aísla las co
 3. Stripe real: checkout con `price_data`, portal y webhook con firma. Primero en `live-debug` con claves de test, sobre un proyecto **Arca-dev**, no sobre la base de producción.
 4. El panel de ARCA completo (hoy solo la prueba de concepto de `/app/admin`), correos reales de invitación y la mudanza a `app.arcacover.com` cuando toque.
 
-En `live-debug` las rutas de la webapp responden 501 `not_configured` mientras falten los adaptadores reales, para que nunca parezca que funcionan contra servicios que no existen. **[mía]**
+~~En `live-debug` las rutas de la webapp responden 501 `not_configured` mientras falten los adaptadores reales, para que nunca parezca que funcionan contra servicios que no existen. **[mía]**~~
+
+**Reemplazada el 2026-11-09 por D7 de DN-12 (§7). [Jesús]** Tras un scan real en `live-debug`, el embudo terminaba sin salida y nada decía por qué. Ahora:
+
+- **`live-debug`** corre la webapp sobre el repositorio en memoria, con el login y el pago simulados de `mock`, y lee los scans y assessments reales de Supabase. Un reclamo no escribe nada en Supabase. La semilla de demo sigue solo en `mock`. Lo que protegía la decisión anterior se mantiene de otra forma: la simulación se dice (la línea de arranque del back lleva `webapp=simulated-in-memory` y el front la etiqueta).
+- **Producción** no cambia: las rutas de la webapp responden 501 `not_configured`, no existe ninguna ruta de debug y no se ofrece ningún registro, mientras falten los adaptadores reales.
+
+Los pasos 1 a 4 de arriba siguen pendientes. D7 no adelanta ninguno: no hay repositorio de Supabase para la webapp, ni Supabase Auth, ni Stripe.
 
 ## 11. Cómo correr la demo
 
@@ -422,7 +429,7 @@ Qué test fija cada regla de la demo:
   - "the demo flow works end to end": el recorrido de §10 contra la API;
   - aislamiento entre organizaciones (404), organización borrada (410), cada rol contra cada ruta (403), sin token o con el token del scan (401);
   - "production wiring": todas las rutas de la webapp dan 501, no hay login simulado y CORS sigue exacto;
-  - "live-debug has no mock login": `/__debug/auth/login` y `/__debug/billing/pay` dan 404.
+  - "live-debug has no mock login": `/__debug/auth/login` y `/__debug/billing/pay` dan 404. (Ese bloque ya no existe: desde DN-12 §7 se llama "live-debug: real scans, a simulated webapp held in memory" y fija lo contrario, con la semilla aún en 404.)
 - **Back**, `webapp-service.test.ts`: el checkout recibe el plan con el precio nuevo después de `updatePlan`.
 - **Front**, `components/app/app-flow.test.tsx`, bloque "the platform admin page (proof of concept)":
   - "Not available" para quien no es admin de plataforma, sin llamar a la API de admin;

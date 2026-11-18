@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AgenticEvidenceProvider, ExtractionFailure, MAX_TRANSIENT_ATTEMPTS } from '../../src/pipeline/agentic-evidence-provider.js';
+import { AgenticEvidenceProvider, ExtractionFailure, MAX_TRANSIENT_ATTEMPTS, RequestCapReached, extractionVersion } from '../../src/pipeline/agentic-evidence-provider.js';
+import { WebsiteExtractionSource } from '../../src/pipeline/website-source.js';
+import { InMemoryRepository } from '../../src/repositories/in-memory.js';
+import { classifyUnreadableWebsite } from '@arca/scoring';
 import { openAiEndpoint, type LlmEndpoint } from '../../src/pipeline/llm-endpoint.js';
+import { createRobotsCache } from '../../src/pipeline/robots.js';
 
 // These tests script every model call; the page plan adds classification calls and floor reads they do not expect.
 const withoutPagePlan = (...args: ConstructorParameters<typeof AgenticEvidenceProvider>) =>
@@ -209,6 +213,30 @@ describe('Agentic evidence provider', () => {
     expect(result.diagnostics.toolCalls).toEqual([{ round: 1, tool: 'fetch_pages', target: 'https://firm.com/about', status: 'read', detail: null }]);
   });
 
+  it('reads through the scan\'s robots cache, so the tools reuse the rules the crawl fetched', async () => {
+    const page = { url: 'https://firm.com/', html: '<a href="/about">About</a>', text: 'Smith Law is a law firm.' };
+    const script = () => scripted([
+      user => ({ claims: [], action: { type: 'fetch_pages', linkIds: [/\[(L-[^\]]+)\] PAGE/.exec(user)![1]], targetFields: ['firm_name'], reason: 'about' } }),
+      () => ({ claims: [], action: { type: 'finish', reason: 'done' } }),
+    ]);
+    const scoped = { fetchPages: vi.fn(async (urls: string[]) => ({
+      pages: urls.map(url => ({ url, html: '', text: 'About Smith Law.' })),
+      calls: urls.map(target => ({ tool: 'fetch_pages' as const, target, status: 'read' as const, detail: null })) })),
+      readDocuments: vi.fn(), readSitemap: vi.fn() };
+    const access = { fetchPages: vi.fn(), readDocuments: vi.fn(), readSitemap: vi.fn(), withRobots: vi.fn((_robots: unknown) => scoped) };
+    const robots = createRobotsCache();
+    await withoutPagePlan('key', undefined, { chat: { completions: { create: script() } } }, access as never)
+      .extractDetailed({ pages: [page], partial: false }, new AbortController().signal, { robots });
+    expect(access.withRobots).toHaveBeenCalledWith(robots);
+    expect(scoped.fetchPages).toHaveBeenCalledWith(['https://firm.com/about'], expect.anything());
+    expect(access.fetchPages).not.toHaveBeenCalled();
+    // Run on its own (the demo and evaluation scripts), the tools of one extraction still share a cache of their own.
+    await withoutPagePlan('key', undefined, { chat: { completions: { create: script() } } }, access as never)
+      .extractDetailed({ pages: [page], partial: false }, new AbortController().signal);
+    expect(access.withRobots.mock.calls[1]![0]).toBeInstanceOf(Map);
+    expect(access.withRobots.mock.calls[1]![0]).not.toBe(robots);
+  });
+
   it('never retries a URL whose earlier tool call already failed', async () => {
     const page = { url: 'https://firm.com/', html: '<a href="/about">About</a><a href="/team">Team</a>', text: 'Smith Law is a law firm.' };
     const create = scripted([
@@ -327,7 +355,218 @@ describe('Agentic evidence provider', () => {
     expect(create.mock.calls[0]![0]).toMatchObject({ model: 'gpt-6-luna', max_completion_tokens: expect.any(Number) });
     expect(create.mock.calls[0]![0]).not.toHaveProperty('temperature');
     expect(provider.id).toBe('openai-agentic');
-    expect(provider.version).toMatch(/:openai:gpt-6-luna$/);
+    expect(provider.version).toMatch(/^agentic-signals-v7:openai:gpt-6-luna:default:[0-9a-f]{12}$/);
+  });
+
+  it('names in its version everything that changes what the model answers', () => {
+    // Stored analyses are reused only under the same version (DN-12 §4.3), so none of these may go unnoticed.
+    const base = extractionVersion(openAiEndpoint(), 'gpt-6-luna');
+    expect(extractionVersion(openAiEndpoint(), 'gpt-6-luna')).toBe(base);
+    expect(new AgenticEvidenceProvider('key', 'gpt-6-luna', { chat: { completions: { create: vi.fn() } } }).version).toBe(base);
+    expect(extractionVersion(openAiEndpoint(), 'gpt-6-astra')).not.toBe(base);
+    const low = extractionVersion(openAiEndpoint('low'), 'gpt-6-luna');
+    expect(low).toMatch(/^agentic-signals-v7:openai:gpt-6-luna:low:[0-9a-f]{12}$/);
+    expect(low.split(':')[4]).not.toBe(base.split(':')[4]);
+    expect(extractionVersion(openAiEndpoint(), 'gpt-6-luna', { planPages: false })).not.toBe(base);
+    // A prompt edited by one character is another extraction, with no version constant to remember.
+    expect(extractionVersion(openAiEndpoint(), 'gpt-6-luna', {}, ['classify', 'extract', 'roster', 'review']))
+      .not.toBe(extractionVersion(openAiEndpoint(), 'gpt-6-luna', {}, ['classify', 'extract.', 'roster', 'review']));
+  });
+
+  describe('request cap per scan', () => {
+    // DN-12 §5.2. An agent that asks for another page whenever one is listed, so the extraction takes several requests.
+    const page = { url: 'https://firm.com/', html: '<a href="/about">About</a><a href="/team">Team</a>', text: 'Smith Law is a law firm.' };
+    const pages = [{ url: 'https://firm.com/about', html: '', text: 'About Smith Law.' }, { url: 'https://firm.com/team', html: '', text: 'The people of Smith Law.' }];
+    const setup = (maxRequests?: number) => {
+      let segmentId = '';
+      const create = vi.fn(async (request: Record<string, unknown>) => {
+        const user = (request.messages as Array<{ content: string }>)[1]!.content;
+        segmentId ||= /\[(D-[^\]]+)\]/.exec(user)?.[1] ?? '';
+        const linkId = /\[(L-[^\]]+)\] PAGE/.exec(user)?.[1] ?? '';
+        const claims = [{ id: 'firm', field: 'firm_name', value: 'Smith Law', explanation: 'operator', citations: [{ segmentId, quote: 'Smith Law' }] }];
+        const content = user.startsWith('CANDIDATE CLAIMS')
+          ? JSON.stringify({ verdicts: [{ claimId: 'firm', verdict: 'supported', reason: 'operator', citations: claims[0]!.citations }] })
+          : JSON.stringify({ claims, action: linkId ? { type: 'fetch_pages', linkIds: [linkId], targetFields: ['firm_name'], reason: 'more' }
+            : { type: 'finish', reason: 'enough' } });
+        return { choices: [{ finish_reason: 'stop', message: { content } }] };
+      });
+      const access = { fetchPages: vi.fn(async (urls: string[]) => ({ pages: pages.filter(item => urls.includes(item.url)),
+        calls: urls.map(target => ({ tool: 'fetch_pages' as const, target, status: 'read' as const, detail: null })) })),
+        readDocuments: vi.fn(), readSitemap: vi.fn() };
+      const provider = new AgenticEvidenceProvider('key', undefined, { chat: { completions: { create } } }, access as never, undefined,
+        { planPages: false, ...(maxRequests === undefined ? {} : { maxRequests }) });
+      return { provider, create };
+    };
+    const crawl = { pages: [page], partial: false };
+
+    it('makes every request it needs when no cap is set, as production does', async () => {
+      const { provider, create } = setup();
+      const result = await provider.extractDetailed(crawl, new AbortController().signal);
+      expect(result.websiteData.firm_name).toBe('Smith Law');
+      expect(create.mock.calls.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it('stops at the cap without sending one request more, and fails the extraction with the reason', async () => {
+      const uncapped = setup();
+      await uncapped.provider.extractDetailed(crawl, new AbortController().signal);
+      const needed = uncapped.create.mock.calls.length;
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const { provider, create } = setup(needed - 1);
+        const failure = await provider.extractDetailed(crawl, new AbortController().signal).catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(ExtractionFailure);
+        expect((failure as ExtractionFailure).message).toBe(`OpenAI request cap reached: one scan may make ${needed - 1} chat completions`);
+        expect((failure as ExtractionFailure).cause).toBeInstanceOf(RequestCapReached);
+        expect(create).toHaveBeenCalledTimes(needed - 1);
+        // Every answer the model did give stays auditable.
+        expect((failure as ExtractionFailure).attempts).toHaveLength(needed - 1);
+        const lines = log.mock.calls.map(call => String(call[0])).filter(line => line.startsWith('[openai] request cap reached'));
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toContain('OPENAI_MAX_REQUESTS_PER_SCAN');
+        // A cap that leaves room changes nothing.
+        const roomy = setup(needed);
+        await expect(roomy.provider.extractDetailed(crawl, new AbortController().signal)).resolves.toMatchObject({ websiteData: { firm_name: 'Smith Law' } });
+        expect(roomy.create).toHaveBeenCalledTimes(needed);
+      } finally { log.mockRestore(); }
+    });
+
+    it('counts each scan on its own, and retries count too', async () => {
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const uncapped = setup();
+        await uncapped.provider.extractDetailed(crawl, new AbortController().signal);
+        const needed = uncapped.create.mock.calls.length;
+        // Two scans share one provider: each gets the whole cap.
+        const shared = setup(needed);
+        await Promise.all([shared.provider.extractDetailed(crawl, new AbortController().signal),
+          shared.provider.extractDetailed(crawl, new AbortController().signal)]);
+        expect(shared.create).toHaveBeenCalledTimes(needed * 2);
+        // A request the provider answered with a 5xx was still a request.
+        const flaky = setup(needed);
+        flaky.create.mockImplementationOnce(async () => { throw Object.assign(new Error('overloaded'), { status: 503 }); });
+        await expect(flaky.provider.extractDetailed(crawl, new AbortController().signal)).rejects.toThrow('OpenAI request cap reached');
+        expect(flaky.create).toHaveBeenCalledTimes(needed);
+      } finally { log.mockRestore(); }
+    });
+
+    it('does not change the version stored analyses are reused under', () => {
+      const client = { chat: { completions: { create: vi.fn() } } };
+      expect(new AgenticEvidenceProvider('key', 'gpt-6-luna', client, undefined, undefined, { maxRequests: 30 }).version)
+        .toBe(new AgenticEvidenceProvider('key', 'gpt-6-luna', client).version);
+    });
+
+    it('fails the website source for a passing cause: nothing is concluded about the firm', async () => {
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const { provider } = setup(2);
+        const source = new WebsiteExtractionSource(new InMemoryRepository(), provider, async () => ({ ...crawl, issues: [], aborted: false }));
+        const result = await source.run('firm.com', new AbortController().signal);
+        expect(result.data).toBeNull();
+        expect(result.status).toMatchObject({ status: 'error', code: 'PROVIDER_ERROR', reason: 'Website evidence extraction unavailable' });
+        expect(classifyUnreadableWebsite(result.status)).toBe('TRANSIENT');
+        // The reason stays in the stored evidence, out of what the API returns.
+        expect(JSON.parse(result.rawContent!).diagnostics.error).toBe('OpenAI request cap reached: one scan may make 2 chat completions');
+      } finally { log.mockRestore(); }
+    });
+  });
+
+  describe('answer cut at the completion limit', () => {
+    // DN-12 §13.8. A reasoning model spends part of max_completion_tokens on reasoning, so a long round can stop on
+    // `length` with no usable JSON. The same call is sent once more with a larger budget.
+    const cut = { choices: [{ finish_reason: 'length', message: { content: '{"claims":[{"id":"firm","fiel' } }],
+      usage: { completion_tokens: 16_000, completion_tokens_details: { reasoning_tokens: 15_200 } } };
+    const lengthThen = (outcomes: Array<'length' | 'stop'>) => {
+      let extractCalls = 0;
+      return vi.fn(async (request: Record<string, unknown>) => {
+        const user = (request.messages as Array<{ content: string }>)[1]!.content;
+        if (user.startsWith('CANDIDATE CLAIMS')) return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ verdicts: [] }) } }] };
+        if (outcomes[extractCalls++] === 'length') return cut;
+        return { choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ claims: [], action: { type: 'finish', reason: 'done' } }) } }] };
+      });
+    };
+    const crawl = { pages: [{ url: 'https://firm.com/', html: '', text: 'Smith Law.' }], partial: false };
+
+    it('retries the same call once with a larger budget and keeps both attempts', async () => {
+      const create = lengthThen(['length', 'stop']);
+      const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+      const result = await provider.extractDetailed(crawl, new AbortController().signal);
+      // No claims, so no review call follows.
+      expect(create).toHaveBeenCalledTimes(2);
+      const [first, retry] = create.mock.calls.map(call => call[0]);
+      expect(first).toMatchObject({ max_completion_tokens: 16_000 });
+      expect(retry).toMatchObject({ max_completion_tokens: 32_000 });
+      // The same messages, only the budget changes.
+      expect(retry!.messages).toEqual(first!.messages);
+      const attempts = result.diagnostics.attempts;
+      expect(attempts.map(attempt => attempt.phase)).toEqual(['extract-round-1', 'extract-round-1-length-retry']);
+      expect(attempts[0]!.validationIssues).toContain('finish_reason length');
+      expect(attempts[0]!.rawContent).toBe('{"claims":[{"id":"firm","fiel');
+      expect(attempts[0]!.response).toEqual(cut);
+      expect(attempts[1]!.request).toMatchObject({ max_completion_tokens: 32_000 });
+      expect(attempts[1]!.validationIssues).toBeUndefined();
+    });
+
+    it('fails as before when the larger budget is cut too, with both attempts recorded', async () => {
+      const create = lengthThen(['length', 'length']);
+      const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+      const failure = await provider.extractDetailed(crawl, new AbortController().signal).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(ExtractionFailure);
+      expect((failure as ExtractionFailure).message).toBe('The model returned an incomplete response');
+      expect(create).toHaveBeenCalledTimes(2);
+      const attempts = (failure as ExtractionFailure).attempts;
+      expect(attempts.map(attempt => attempt.phase)).toEqual(['extract-round-1', 'extract-round-1-length-retry']);
+      expect(attempts.every(attempt => attempt.validationIssues?.includes('finish_reason length'))).toBe(true);
+    });
+
+    it('counts the retry against the per-scan request cap', async () => {
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const create = lengthThen(['length', 'stop']);
+        const provider = new AgenticEvidenceProvider('key', undefined, { chat: { completions: { create } } }, undefined, undefined,
+          { planPages: false, maxRequests: 1 });
+        const failure = await provider.extractDetailed(crawl, new AbortController().signal).catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(ExtractionFailure);
+        expect((failure as ExtractionFailure).cause).toBeInstanceOf(RequestCapReached);
+        expect(create).toHaveBeenCalledTimes(1);
+        expect((failure as ExtractionFailure).attempts.map(attempt => attempt.phase)).toEqual(['extract-round-1']);
+      } finally { log.mockRestore(); }
+    });
+
+    it('does not retry an answer that is incomplete for another reason', async () => {
+      const create = vi.fn(async () => ({ choices: [{ finish_reason: 'content_filter', message: { content: null } }] }));
+      const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+      await expect(provider.extractDetailed(crawl, new AbortController().signal)).rejects.toThrow('The model returned an incomplete response');
+      expect(create).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives each model family a larger budget it accepts', () => {
+      expect(openAiEndpoint().lengthRetryParams?.('gpt-6-luna')).toEqual({ max_completion_tokens: 32_000 });
+      expect(openAiEndpoint('low').lengthRetryParams?.('gpt-5-mini')).toEqual({ max_completion_tokens: 32_000 });
+      // gpt-4o-mini stops at 16,384 output tokens; twice the usual 8,000 stays under it.
+      expect(openAiEndpoint().lengthRetryParams?.('gpt-4.1-mini')).toEqual({ max_completion_tokens: 16_000 });
+    });
+
+    it('stores the attempts of a failed extraction in the website record', async () => {
+      const create = lengthThen(['length', 'length']);
+      const provider = withoutPagePlan('key', undefined, { chat: { completions: { create } } });
+      const source = new WebsiteExtractionSource(new InMemoryRepository(), provider, async () => ({ ...crawl, issues: [], aborted: false }));
+      const result = await source.run('firm.com', new AbortController().signal);
+      expect(result.data).toBeNull();
+      const diagnostics = JSON.parse(result.rawContent!).diagnostics;
+      expect(diagnostics).toMatchObject({ error: 'The model returned an incomplete response', pagesCrawled: 1 });
+      // Stored the way a finished extraction stores them: phase, request, response (usage, finish reason) and issues.
+      expect(diagnostics.attempts.map((attempt: { phase: string }) => attempt.phase)).toEqual(['extract-round-1', 'extract-round-1-length-retry']);
+      expect(diagnostics.attempts[1]).toMatchObject({ request: { max_completion_tokens: 32_000 },
+        response: { choices: [{ finish_reason: 'length' }], usage: { completion_tokens: 16_000 } },
+        validationIssues: expect.stringContaining('finish_reason length') });
+    });
+
+    it('keeps the record of a failure that carries no attempts as it was', async () => {
+      const provider = { id: 'p', version: 'v', extract: vi.fn(async () => { throw new Error('boom'); }) };
+      const source = new WebsiteExtractionSource(new InMemoryRepository(), provider, async () => ({ ...crawl, issues: [], aborted: false }));
+      const result = await source.run('firm.com', new AbortController().signal);
+      expect(JSON.parse(result.rawContent!).diagnostics).toEqual({ error: 'boom', pagesCrawled: 1 });
+    });
   });
 
   it('asks OpenAI reasoning models for the configured reasoning effort only', async () => {

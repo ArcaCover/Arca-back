@@ -32,7 +32,7 @@ Según `Arca-front/CLAUDE.md` **[doc]**, ARCA es una MGA de *surplus lines* que 
 
 - **El embudo completo está cableado:** `/quote` → `POST /scan` → `/quote/scanning` (polling) → `/score` (más el PDF) → `/assessment` → `/assessment/results`. Front y back comparten contratos zod `.strict()`.
 - **El CI del back pasó en verde el 2026-10-16:** 42 archivos y 387 tests **[GitHub]**. El front tiene 9 archivos de test y **no tiene CI**.
-- **El modo `mock` del back recorre el flujo en milisegundos** con cinco dominios `*.arca.example`, sin OpenAI, Apify ni DNS, y con el scoring real.
+- **El modo `mock` del back recorre el flujo en milisegundos** con cinco dominios `*.arca.example` (seis desde el 2026-11-09, con `blocked`; DN-12), sin OpenAI, Apify ni DNS, y con el scoring real.
 - **No hay ninguna medición documentada de un scan live completo con el código actual.** Las últimas son del 2026-09-15, con código anterior: 1 min 48 s (FAILED) y 7 min 13 s (PARTIAL) **[doc]**.
 
 ### Qué es solo demo
@@ -175,6 +175,7 @@ Navegador ──> Arca-front (Next 16, Vercel)          [solo páginas; no hay r
 - **Website:**
   - crawl con Playwright: 20 páginas, profundidad 2, 6 en paralelo, 30 s en total y como máximo 3 páginas del grupo de equipo;
   - toda petición pasa por `network.ts`, con anti-SSRF y la IP fijada;
+  - `robots.txt` sigue RFC 9309 desde un solo módulo (`robots.ts`), con una descarga por origen y scan (2026-11-09; DN-07 de crawl, §6);
   - después, la extracción `agentic`: clasificación con 3 votos, un "suelo de adquisición" de hasta 4 páginas más 2 PDFs (cada una lanza otro Chromium, en secuencia), roster, hasta 3 rondas con herramientas, revisión semántica y grounding determinista;
   - cada llamada a OpenAI tiene 120 s y hasta 3 intentos.
 - **Identidad:** VERIFIED, PARTIAL o INSUFFICIENT. **Con INSUFFICIENT no se llama a Bar ni a Avvo**, que quedan `skipped/INSUFFICIENT_IDENTITY`.
@@ -192,15 +193,15 @@ Navegador ──> Arca-front (Next 16, Vercel)          [solo páginas; no hay r
 |---|---|
 | `RUNNING` | Desde `create` hasta el final del job. También es lo que responde un `POST` cuyo PARTIAL cacheado está dentro del cooldown. |
 | `COMPLETED` | Las tres fuentes en `ok`, después de `settle()`, que puede convertir un TRUNCATED o un NO_MATCH confirmados. |
-| `PARTIAL` | Al menos una fuente `ok`/`partial`, pero no las tres `ok`. **Cualquier** página no recuperable del crawl (un 404, robots o algo que no es HTML) marca el website como `partial`. |
-| `FAILED` | Ninguna fuente útil, en la práctica cualquier fallo del website. También una excepción en el job o `recoverInterrupted` sobre un RUNNING de más de `PIPELINE_TIMEOUT_MS` + 120 s. **Nunca lleva `result`.** |
+| `PARTIAL` | Al menos una fuente `ok`/`partial`, pero no las tres `ok`. Desde el 2026-11-09 el website queda `partial` solo por el plazo del crawl o por una página del propio sitio que no se pudo leer (falla tras sus reintentos, responde 401/403 u otro 4xx que no sea 404/410, o sale sin texto). Un enlace excluido por robots, un 404/410, algo que no es HTML o un subrecurso fallido se anotan en `issues` y en `reason`, pero el website sigue `ok` (DN-07 de crawl, §6). Desde el 2026-11-09 (DN-12) también termina PARTIAL, sin ninguna fuente útil, el scan de una web que **se niega** a ser leída (causa DEFINITIVE: robots.txt excluye el sitio, 401/403 o página de desafío). Lleva el `result` completo, con el flag y el override `WEBSITE_UNAVAILABLE` (decisión `REFERRAL_SENIOR`), y el assessment puede empezar desde él. |
+| `FAILED` | Ninguna fuente útil **y** la web no falló por una negativa del sitio: plazo, error de red, robots.txt inalcanzable, 429, 5xx, portada vacía o fallo de la extracción (causas TRANSIENT). Hasta el 2026-11-09 era cualquier fallo del website. También una excepción en el job o `recoverInterrupted` sobre un RUNNING de más de `PIPELINE_TIMEOUT_MS` + 120 s. **Nunca lleva `result`.** |
 
 **Cachés:**
 
 | Caché | Clave y TTL | Peculiaridades |
 |---|---|---|
-| Scan por dominio | Dominio, misma `contractVersion`, COMPLETED o PARTIAL; `SCAN_CACHE_TTL_MS` = 7 días | Un COMPLETED se re-sella para el nuevo solicitante. Un PARTIAL se vuelve a ejecutar si la última reparación tiene más de 1 h. Un FAILED nunca se reutiliza. El TTL no puede valer 0. |
-| Análisis del website | `provider.id`, `version` y el sha256 del HTML | Es frágil: un nonce en el HTML obliga a pagar el LLM otra vez, y solo se mira el **último** raw del dominio. |
+| Scan por dominio | Dominio, misma `contractVersion`, COMPLETED o PARTIAL; `SCAN_CACHE_TTL_MS` = 7 días | Un COMPLETED se re-sella para el nuevo solicitante. Un PARTIAL de causa estructural o definitiva también, toda la ventana; solo uno con una causa transitoria se vuelve a ejecutar si su última ejecución tiene más de 1 h (2026-11-09; DN-12 §4.2). Un FAILED nunca se reutiliza. El TTL no puede valer 0. |
+| Análisis del website | `provider.id`, `version` (con modelo, esfuerzo y hash de los prompts) y un hash de lo que lee el modelo: texto, metadatos y enlaces por página; `WEBSITE_SIGNAL_REUSE_MAX_AGE_MS` = 30 días | Desde 2026-11-09 (DN-12 §4.3) un nonce en el HTML ya no obliga a pagar el LLM. Se buscan hasta 3 filas por una marca, se saltan las que no tienen análisis y un crawl cortado conserva el análisis del completo. Sigue dependiendo del conjunto de páginas. |
 | Búsquedas de Apify | sha256 de actor, build e input; 7 días | Estados reuse, resume, failed (15 min de cooldown) y start. Un run truncado o parcial queda cacheado 7 días, así que reparar ese PARTIAL repite el mismo resultado. |
 
 **Tiempos:**
@@ -249,13 +250,13 @@ La UI y `CLAUDE.md` prometen "menos de 60 s" y no se corresponden con nada de es
 2. **Sesgo contra firmas de fuera de Florida.** Bar solo consulta la Florida Bar. Las búsquedas sin match quedan `ok/EMPTY` con consistencia 0, lo que da B3 −5 y el flag `LOW_BAR_CONSISTENCY`. La etiqueta "Florida Bar" está fija en `views.ts:22` y `report/quick-scan.ts:23`.
 3. **Una sanción reciente resta menos que una antigua.** Menos de 12 meses resta 0 puntos (la cubre el override); de 1 a 3 años resta −12 (`discipline.ts:51`). No hay justificación documentada.
 4. **El extractor `agentic` no puede producir dos penalizaciones:** `website_quality: 'minimal'` (W7 −3) ni `no_team_page` (W5a −2). Solo existen con `rules`, `openai` o los mocks (`derived-signals.ts:47,58`).
-5. **Es fácil quedar en PARTIAL para siempre.** Un 404 estable dentro del crawl, o un run de Apify truncado y cacheado 7 días, deja el scan en PARTIAL de forma persistente.
+5. **Es fácil quedar en PARTIAL para siempre.** Un run de Apify truncado y cacheado 7 días deja el scan en PARTIAL de forma persistente. Un 404 estable dentro del crawl ya no (2026-11-09; DN-07 de crawl, §6). Y un PARTIAL de causa estructural ya no se re-ejecuta cada hora: se sirve toda la ventana (2026-11-09; DN-12 §4.2).
 6. **El abort descarta el raw del website.** El run de Apify queda en el ledger, pero el raw se pierde (también lo señala DN-06:33).
 
 **El modo mock de hoy** (`SOURCE_MODE=mock`; `server.ts:30-47`, `pipeline/mock-sources.ts`):
 - **Qué sustituye:** las tres fuentes, a nivel de interfaz, por `apps/api/mocks/<prefijo>.json`. Los archivos se leen en cada scan, así que editarlos no exige reiniciar.
 - **Qué sigue siendo real:** identidad, reconciliación, scoring, persistencia y estados. El mock devuelve evidencia, no un resultado fijo.
-- **Dominios:** el resolver solo acepta los 5 de `MOCK_DOMAINS` y no hace DNS. Cualquier otro dominio da `400 invalid_domain`.
+- **Dominios:** el resolver solo acepta los de `MOCK_DOMAINS` (5 en la fecha de esta nota; 6 desde el 2026-11-09) y no hace DNS. Cualquier otro dominio da `400 invalid_domain`.
 - **Qué desactiva:** no se crean ni Apify ni el proveedor LLM, y el planner de L2 siempre es `rules`.
 - **Qué no desactiva:**
   - la caché de 7 días y el rate limit;
@@ -269,9 +270,10 @@ La UI y `CLAUDE.md` prometen "menos de 60 s" y no se corresponden con nada de es
 | `minimal` | COMPLETED | 25 EXPOSED | UNKNOWN (INSUFFICIENT_EVIDENCE) |
 | `sanctioned` | COMPLETED | 72 FORTIFIED | REFERRAL_SENIOR (RECENT_SANCTION; la fecha es hoy − 30 días) |
 | `partial` | PARTIAL (Avvo `error/PROVIDER_ERROR`) | 17 CRITICAL, calculado a mano | UNKNOWN (MEDIUM) |
-| `failed` | FAILED, sin `result` | — | El website da `error/ACCESS_BLOCKED`; los bloques `bar` y `avvo` de `failed.json` nunca se leen |
+| `blocked` (desde el 2026-11-09, DN-12) | PARTIAL (website `error/ACCESS_BLOCKED`: robots.txt excluye el sitio) | 0 CRITICAL | REFERRAL_SENIOR (override `WEBSITE_UNAVAILABLE`; LOW, INSUFFICIENT_EVIDENCE). Bar y Avvo quedan `skipped` por falta de identidad |
+| `failed` | FAILED, sin `result` | — | El website da `error/PROVIDER_ERROR` ("The website could not be reached", causa transitoria). Hasta el 2026-11-09 daba `ACCESS_BLOCKED`, que ahora terminaría PARTIAL. Los bloques `bar` y `avvo` de `failed.json` nunca se leen |
 
-Los tests afirman los totales 82, 25 y 72 y los estados de `robust`, `partial` y `failed` (`tests/unit/pipeline.test.ts`, `tests/integration/mock-scenarios.test.ts`).
+Los tests afirman los totales 82, 25 y 72 y los estados de `robust`, `partial`, `blocked` y `failed` (`tests/unit/pipeline.test.ts`, `tests/integration/mock-scenarios.test.ts`, `tests/integration/unreadable-website.test.ts`).
 
 **Lo que el mock no cubre:**
 - website `partial` o timeout;
@@ -397,7 +399,7 @@ Los tests afirman los totales 82, 25 y 72 y los estados de `robust`, `partial` y
 - solo `http` y `https`, sin credenciales en la URL y solo puertos 80 y 443;
 - solo IPs unicast públicas, fijadas en el socket;
 - respuestas de 5 MB como máximo y 5 redirecciones revalidadas;
-- el crawler pasa todas sus peticiones por ese transporte.
+- el crawler pasa sus peticiones por ese transporte, **salvo los saltos de una redirección HTTP**, que Chromium sigue por su cuenta (comprobado el 2026-11-09; DN-07 de crawl, §6).
 
 **Escapado de contenido de terceros.** El PDF escapa el contenido rastreado (`report/quick-scan.ts:7-8`) y Chromium lo renderiza con JS desactivado y todas las peticiones abortadas. El front no usa `dangerouslySetInnerHTML`.
 
@@ -436,7 +438,8 @@ Los tests afirman los totales 82, 25 y 72 y los estados de `robust`, `partial` y
 | `SIGNAL_LLM_REASONING_EFFORT` | — | Solo para modelos de razonamiento; el planner no lo usa. |
 | `ASSESSMENT_PLANNER` | `rules` | `agent` solo actúa en live. |
 | `PIPELINE_TIMEOUT_MS` | 600 000 | Presupuesto del pipeline; +120 s es el umbral de recuperación. |
-| `SCAN_CACHE_TTL_MS` / `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` | 7 días / 1 h | El TTL tiene que ser > 0. |
+| `SCAN_CACHE_TTL_MS` / `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` | 7 días / 1 h | El TTL tiene que ser > 0. El cooldown solo aplica a un PARTIAL con causa transitoria (DN-12 §4.2). |
+| `WEBSITE_SIGNAL_REUSE_MAX_AGE_MS` | 30 días | Edad máxima de un análisis de website reutilizado; `0` extrae siempre (DN-12 §4.3 y §4.4). |
 | `MAX_APIFY_CONCURRENCY` | 16 | Limita la concurrencia, **no el gasto**. |
 | `APIFY_ACTOR_BUILD` | `latest` | Sin fijar. |
 | `APIFY_EXPECTED_COST_USD_PER_RUN` | 1 | Reserva contable, **no es un tope**. |
@@ -776,7 +779,8 @@ La prioridad es mi criterio (Alta, Media o Baja). La columna "Fuente" indica dó
 | Alta | Gates de DN-05 §12 sin cumplir (20 snapshots, ≥40 casos adversariales, conjunto reservado, 3 corridas, p95 ≤120 s) con `agentic` ya por defecto | DN-05:474-542; DN-05-evaluacion §6.6, §8 |
 | Media | Latencia: no hay medición después de `8659d6b`; la última daba de 338 a 618 s | DN-05-evaluacion §6.10, §8 |
 | Media | Deadline por fase en `InProcessPipeline`, y no descartar el raw al abortar | DN-05 §6; DN-07c:49-51; DN-05-review R05; DN-06:33 |
-| Media | Estado de la fuente según la cobertura real, no según `crawl.partial` (un 404 deja PARTIAL para siempre) | DN-05 §8; DN-05-review R08; `crawler.ts:135-143` |
+| Media | Estado de la fuente según la cobertura real, no según `crawl.partial`. Resuelto en parte el 2026-11-09: un 404, robots, algo que no es HTML o un enlace que redirige fuera del sitio ya no dejan PARTIAL | DN-05 §8; DN-05-review R08; DN-07 de crawl, §6 |
+| Media | Causas estructurales que hoy dejan el website `partial` sin un código que las distinga de una transitoria: una página interior con 401/403, otro 4xx o sin texto. Hay que decidirlo antes de fijar qué `partial` se repara cada hora. El `Crawl-delay` ya no acaba en el plazo (2026-11-09): separa los inicios de página y añade como mucho 7,5 s | DN-07 de crawl, §6 |
 | Media | Flag "cola agotada" frente a "presupuesto agotado", para poder fijar los negativos de IA | DN-07c:68-71 |
 | Media | Que `agentic` pueda producir W7 `minimal` y W5a `no_team_page` | `derived-signals.ts:47,58` |
 | Baja | `extractionFingerprint` y política de caché (hash frágil, solo el último raw) | DN-05 §9; `website-source.ts:24-36` |
@@ -819,7 +823,7 @@ La prioridad es mi criterio (Alta, Media o Baja). La columna "Fuente" indica dó
 |---|---|---|
 | `README.md:9-10`, DN-03:43 | Proveedor por defecto `rules`; live no necesita OpenAI | `agentic` (`env.ts:12`), y exige `OPENAI_API_KEY` salvo con `rules` explícito (`env.ts:59-61`) |
 | `README.md:154`, DN-01:90 | Presupuesto del pipeline de 55 s | 600 s (`env.ts:40`); 55 s es solo el default de la clase |
-| `README.md:140`, DN-05 §3 | Crawl de 20 s | 30 s (`crawler.ts:82`) |
+| `README.md:140`, DN-05 §3 | Crawl de 20 s | 30 s (`crawler.ts:82`). El README quedó corregido el 2026-11-09 |
 | `README.md:116-118,148-150`, DN-01:32 | 2 identidades, 7 candidatos, 2 actores, 10 registros; muestra de 15 | Roster completo; 8 por directorio y 16 en total; 25 en Bar y 10 en Avvo |
 | `README.md:63-69` | 5 rutas HTTP | 11 rutas (§3.4) |
 | DN-01:27, `README.md:72` | Los overrides no tocan el score | Una investigación activa pone el total a 0 (`score.ts:56-57`) |
@@ -850,7 +854,7 @@ La prioridad es mi criterio (Alta, Media o Baja). La columna "Fuente" indica dó
   - las rutas de `SignalPath` que el banco no usa (`W2.tools`, `W5_teamSize`, `A8_disciplined`);
   - el índice `assessments_expiry_idx`, sin ningún barrido que lo use.
 - **Front:** las ramas de `planning_failed`, `assessment_exists` y `FAILED`, y `lib/supabase.ts`.
-- **Mocks:** los bloques `bar` y `avvo` de `mocks/failed.json`.
+- **Mocks:** los bloques `bar` y `avvo` de `mocks/failed.json` (y, desde el 2026-11-09, los de `mocks/blocked.json`).
 - **Variables:** `NODE_ENV` en el back; `NVIDIA_NIM_API_KEY` y `SIGNAL_LLM_ENDPOINT` en `.env.local`.
 
 ### 9.3 Deuda técnica
@@ -918,7 +922,7 @@ npm run build                  # tsc -b: emite dist de los 4 proyectos (lo neces
 
 # Modo mock sin servicios externos. Las variables del shell ganan a .env.local.
 $env:SOURCE_MODE = 'mock'; $env:STORAGE_BACKEND = 'memory'; npm run dev    # API en :8080
-# Dominios válidos: robust|minimal|sanctioned|partial|failed.arca.example
+# Dominios válidos: robust|minimal|sanctioned|partial|blocked|failed.arca.example
 # Al terminar: Remove-Item Env:SOURCE_MODE, Env:STORAGE_BACKEND
 ```
 

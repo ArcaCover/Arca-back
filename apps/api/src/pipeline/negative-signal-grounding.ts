@@ -1,6 +1,7 @@
 import type { WebsiteData } from '@arca/contracts';
 import type { CrawlResult } from './crawler.js';
 import { heuristicPageType, type PageType } from './page-types.js';
+import { aiPublications } from './ai-publications.js';
 
 // A blog-typed page also covers a single article, /category/x, /tag/x and /author/x (page-types.ts).
 // Only a page that reads as the section root — /blog, /news, /insights, no further path segment —
@@ -20,7 +21,12 @@ const BLOG_INDEX_PATH = /^\/(blog|news|insights|noticias)\/?$/i;
  * (does it cover client data specifically) stay unknown, matching that same provider's own
  * conservative default for that sub-field.
  *
- * ai_blog_posts grounds to found:false only from an index-like page, and only when the field was
+ * ai_blog_posts grounds to found:true from the firm's own posts about AI the scan knows of (pages read, `links`
+ * seen on them and in the sitemap; ai-publications.ts), with count, titles and the source URLs, whenever no claim was
+ * accepted. That includes a claim review rejected: the rejection judged the model's reading of a passage (its
+ * citation, count or scope), while each URL is evidence of its own that the post exists on the firm's site, so the
+ * rejection is no reason to ignore it (DN-12 §13.8). An accepted claim always wins, whatever it says.
+ * It grounds to found:false only from an index-like page with no AI post found, and only when the field was
  * never claimed at all (accepted or rejected) — a claim review rejected means the model saw
  * something ambiguous, which is a different, less certain case than nothing having been proposed.
  *
@@ -29,7 +35,7 @@ const BLOG_INDEX_PATH = /^\/(blog|news|insights|noticias)\/?$/i;
  * does not yet track — see DN-07.
  */
 export function groundNegativeSignals(data: WebsiteData, crawl: CrawlResult, pageTypes: Map<string, PageType>,
-  claimedFields: ReadonlySet<string>): WebsiteData {
+  claimedFields: ReadonlySet<string>, links: Array<{ url: string; kind: 'page' | 'document' }> = []): WebsiteData {
   const typeOf = (url: string) => pageTypes.get(url) ?? heuristicPageType(url);
   const provenance = { ...data.provenance };
 
@@ -44,12 +50,16 @@ export function groundNegativeSignals(data: WebsiteData, crawl: CrawlResult, pag
   }
 
   let ai_blog_posts = data.ai_blog_posts;
-  if (ai_blog_posts.found === null && !claimedFields.has('ai_blog_posts')) {
+  const posts = ai_blog_posts.found === null ? aiPublications(crawl.pages, links) : null;
+  if (posts) {
+    ai_blog_posts = { found: true, count: posts.count, titles: posts.titles };
+    provenance.ai_blog_posts = posts.references;
+  } else if (ai_blog_posts.found === null && !claimedFields.has('ai_blog_posts')) {
     const blogIndexUrl = crawl.pages.find(page => typeOf(page.url) === 'blog' && BLOG_INDEX_PATH.test(new URL(page.url).pathname))?.url;
     if (blogIndexUrl) {
       ai_blog_posts = { found: false, count: 0, titles: [] };
       provenance.ai_blog_posts = [{ sourceUrl: blogIndexUrl,
-        excerpt: 'Blog index page was read; no AI-related post was accepted from it', method: 'derived' }];
+        excerpt: 'Blog index page was read; no AI-related post was accepted from it or found among the known URLs', method: 'derived' }];
     }
   }
 

@@ -234,11 +234,35 @@ invariantes y ausencia de contradicciones sin resolver. El resto queda `unknown`
 `UNCERTAIN_ATTRIBUTION`, `CONFLICT`, `INCOMPLETE_SCOPE`, `UNMAPPED_AREA`, `BUDGET_LIMIT`,
 `PROVIDER_ERROR`.
 
+**Dónde se busca una cita (2026-11-12).** El corpus corta páginas y documentos en segmentos de unos 800
+caracteres al final de una línea (o en mitad de una línea muy larga), así que una frase puede empezar en un
+segmento y seguir en el siguiente, y el modelo puede citar cualquiera de las dos mitades. Una cita vale si está
+en el segmento citado o en ese segmento leído junto al anterior y al siguiente **de la misma página y del mismo
+tipo**, en el orden del corpus (unidos como las líneas que eran y, para un corte dentro de una línea, sin
+separador). Se aplica igual a las citas de la afirmación y a las del dictamen. Nada más lejano cuenta, una cita
+de otra página sigue siendo `QUOTE_NOT_IN_SOURCE` y un id que el corpus no tiene sigue siendo
+`UNKNOWN_SEGMENT`. Motivo: en los dos scans en vivo de hklaw.com (DN-12 §4.3) la afirmación de política de
+privacidad citaba "Client services: the provision by the Firm of legal services to our clients" con el id del
+segmento siguiente al que contiene la frase, y se perdía con `QUOTE_NOT_IN_SOURCE`.
+
+La segmentación no cambia: cortar en fin de frase con solapamiento cambiaría el texto y el id de cada segmento
+de documento (los ids hashean el texto), y el solapamiento gastaría parte del presupuesto de caracteres de
+documentos y del prompt sin ganar nada que la comprobación con vecinos no dé ya.
+
 `toWebsiteData` inicia con `unknownWebsite()`, aplica la tabla y termina con `WebsiteData.parse`.
 Arrays desconocidos son null; vacíos exigen ausencia/completitud aceptadas. Guardar citas aceptadas
 por campo en `provenance` como URL, fragmento y `method:'provider'`. Procedencia por elemento/ID
 también vive en diagnósticos. Excerpts copiados de citas, no generados. Ningún candidato rechazado
 participa en identidad o consultas.
+
+**Señales derivadas sin el modelo (2026-11-12).** Tras `toWebsiteData`, el grounding negativo
+(`groundNegativeSignals`) completa por regla algunos campos que ninguna afirmación aceptada resolvió, con
+`method: 'derived'` en `provenance`. `ai_blog_posts` pasa a `found: true` cuando el scan conoce posts propios de
+la firma sobre IA (páginas leídas, sus enlaces y el sitemap, en el mismo host, por palabra entera del slug o por
+el título de la página leída), con `count` igual a las URLs distintas y como mucho 5 títulos. Eso incluye el caso
+de una afirmación que la revisión rechazó: cada URL es evidencia propia de que el post existe. Una afirmación
+aceptada gana siempre. El `found: false` desde un índice de blog sigue exigiendo que el campo no se afirmara
+nunca. Detalle y riesgos aceptados en [DN-12](DN-12-hallazgos-del-scan-en-vivo.md) §13.8.
 
 ## 6. Presupuesto de ejecución y cancelación
 
@@ -318,6 +342,12 @@ siempre. Recibir solo el JSON final; tolerar únicamente un bloque markdown exte
 requiere y lo prueba. No extraer el primer objeto con una regex de una respuesta ambigua. Rechazar
 contenido vacío, múltiples objetos, refusal, respuesta pendiente no completada o
 `finish_reason` incompatible con una terminación completa.
+
+**Corte por límite de salida (2026-11-12).** Una respuesta con `finish_reason: 'length'` se sigue rechazando,
+pero antes se manda una vez más la misma llamada con un presupuesto de salida mayor (32.000 tokens para modelos
+de razonamiento, 16.000 para los demás). Ese reintento es una petición más del tope por scan y queda en el
+historial junto al intento cortado. Si vuelve a cortarse, la llamada falla. Detalle en
+[DN-12](DN-12-hallazgos-del-scan-en-vivo.md) §13.8.
 
 Una sola reparación global para errores de JSON/esquema, con respuesta fallida, errores y corpus
 necesario, manteniendo el presupuesto de tokens/tiempo. Reparar formato no autoriza inventar evidencia.

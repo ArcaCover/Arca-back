@@ -38,6 +38,7 @@ Lo que más falta no es saltarse la espera sino **provocar los fallos a propósi
 | LLM (OpenAI) | real | real | ninguno |
 | Apify | real | real, salvo lo inyectado | ninguno |
 | Base de datos | Supabase | Supabase para lo limpio; **memoria para todo scan con fallo inyectado** | memoria |
+| Webapp privada: cuentas, organizaciones y cobro (DN-10) | no hay: sus rutas responden 501 | **simulada, en memoria**: login y pago simulados, sobre los scans y assessments reales (DN-12 §7) | simulada, en memoria, con la semilla de demo (DN-11) |
 | Etiqueta en el front | ninguna | **LIVE DEBUG** (rojo) | **MOCK** (ámbar a rayas) |
 | Panel de estado y botones | no existen | sí | sí |
 | Rutas `/__debug/*` en el back | no existen (404 de Hono) | sí, solo en `127.0.0.1` | sí, solo en `127.0.0.1` |
@@ -92,7 +93,7 @@ Nombres **[mía]**. `live-debug` es lo que en la conversación se llamó "dev-li
 - Con modo no-producción, `server.ts`:
   1. escucha solo en `127.0.0.1` (hoy escucha en todas las interfaces);
   2. construye `debug` con el modo, el catálogo de escenarios y los repositorios de aislamiento (§5.5);
-  3. imprime una línea de arranque inequívoca, p. ej. `[api] MODE=live-debug (debug routes on 127.0.0.1 only)`.
+  3. imprime una línea de arranque inequívoca, p. ej. `[api] MODE=live-debug (debug routes on 127.0.0.1 only)`. La línea completa de hoy está en §11.3.
 
 ### 5.2 Rutas `/__debug/*` (solo en mock y live-debug)
 
@@ -100,7 +101,9 @@ Nombres **[mía]**. `live-debug` es lo que en la conversación se llamó "dev-li
 |---|---|---|
 | `GET /__debug/mode` | ninguna (solo loopback) | `{ mode, sourceMode, storageBackend, websiteEvidenceProvider, assessmentPlanner, signalLlmModel, inUse: { openai, apify, supabase } }`. Describe lo que el proceso **construyó**, no lo que dice la configuración: `websiteEvidenceProvider` es `agentic`, `openai`, `rules` o `mock`; `signalLlmModel` es el modelo de OpenAI que llama un componente construido, o `null` si ninguno lo llama; `inUse` dice para qué servicios se construyó un cliente. Solo enums, booleanos y el nombre del modelo, **nunca** claves ni URLs. |
 | `GET /__debug/scan/:scanId` | Bearer del scan, igual que el poll | Estado interno: el `ScanRecord` (tiempos, resolución de dominio, `cached`), el escenario inyectado, si está en el overlay de memoria y el resumen de diagnósticos crudos (fuentes, códigos, razones, duraciones). Todo como JSON; el front lo pinta como texto. |
-| `POST /__debug/reset` | cabecera `X-Arca-Debug: 1` (solo loopback) | Vacía el rate limiter. **Solo en `mock`** vacía además los repositorios en memoria; en `live-debug` los scans inyectados siguen en memoria. **No toca Supabase.** Sin la cabecera responde 400: así deja de ser una petición CORS simple, el navegador hace preflight y solo pasan los orígenes permitidos. |
+| `POST /__debug/reset` | cabecera `X-Arca-Debug: 1` (solo loopback) | Vacía el rate limiter y la memoria de la webapp simulada (en `live-debug` desde DN-12 §7). **Solo en `mock`** vacía además los repositorios de scans y assessments en memoria; en `live-debug` los scans inyectados siguen en memoria. **No toca Supabase.** Sin la cabecera responde 400: así deja de ser una petición CORS simple, el navegador hace preflight y solo pasan los orígenes permitidos. |
+| `POST /__debug/auth/login`, `POST /__debug/billing/pay` | cabecera `X-Arca-Debug: 1` (solo loopback) | El login y el pago simulados de la webapp (DN-10 §4.1 y §4.4). En `mock` y, desde DN-12 §7, también en `live-debug`. |
+| `POST /__debug/seed` | cabecera `X-Arca-Debug: 1` (solo loopback) | La organización de demo (DN-11 §4.6). **Solo en `mock`**: en `live-debug` no existe (404), porque lanzaría un scan real saltándose el limitador. |
 
 ### 5.3 Escenarios de fallo
 
@@ -115,7 +118,7 @@ Catálogo:
 
 | Eje | Valores | Notas |
 |---|---|---|
-| `website` | `default`, `no_identity`, `blocked`, `error`, `timeout` | `default` es el fixture en mock y el crawler real en live-debug. `no_identity`: se leyó la web pero no hay firma ni abogados, así que la identidad sale INSUFFICIENT y Bar y Avvo quedan `skipped` (`INSUFFICIENT_IDENTITY`). El código real cuenta la web legible como fuente útil, así que el scan termina **PARTIAL**. El FAILED de muscalaw vino de que falló la extracción: eso es `website: error`. `blocked` imita un sitio que bloquea el crawler (`ACCESS_BLOCKED`). |
+| `website` | `default`, `no_identity`, `blocked`, `error`, `timeout` | `default` es el fixture en mock y el crawler real en live-debug. `no_identity`: se leyó la web pero no hay firma ni abogados, así que la identidad sale INSUFFICIENT y Bar y Avvo quedan `skipped` (`INSUFFICIENT_IDENTITY`). El código real cuenta la web legible como fuente útil, así que el scan termina **PARTIAL**. El FAILED de muscalaw vino de que falló la extracción: eso es `website: error`. `blocked` imita un sitio que bloquea el crawler (`ACCESS_BLOCKED`). Desde el 2026-11-09 (DN-12) `blocked` es el único valor **definitivo** del eje: el scan termina **PARTIAL** con el resultado de alto riesgo (flag y override `WEBSITE_UNAVAILABLE`) y el assessment puede empezar. `error` (`PROVIDER_ERROR`) y `timeout` (`DEADLINE_REACHED`) son **transitorios**: si ninguna otra fuente sirve, y sin web no la hay, el scan termina FAILED. `no_identity` no es una web ilegible: se leyó. |
 | `bar`, `avvo` | `default`, `empty`, `apify_quota`, `error`, `timeout` | `apify_quota` devuelve **exactamente** el `SourceResult` que produce hoy `ApifyDirectorySource` al llegar al límite de uso: status `error`, code `PROVIDER_ERROR` y la misma `reason`. **No pasa por el `ApifyClient`**, porque su cortacircuitos de cuota es compartido por todo el proceso y bloquearía también los scans limpios. |
 | `latency` | `instant`, `normal` (~8 s), `slow` (~70 s) | Solo en mock. `slow` cruza los 60 s para ver el mensaje de "más lento de lo habitual". |
 | `http.start` | `none`, `rate_limited`, `server_error` | `POST /scan` responde 429 con `Retry-After`, o 500, sin crear el scan. |
@@ -168,6 +171,8 @@ Un scan **sin** escenario en `live-debug` se comporta exactamente como uno de pr
 
 Los scans inyectados se pierden al reiniciar el back. Es aceptable para pruebas.
 
+**La webapp simulada (DN-12 §7).** En `live-debug` las cuentas, organizaciones y el cobro viven en la memoria del proceso y nunca en Supabase. De Supabase solo se **leen** el scan y su assessment: reclamar un análisis no escribe nada allí. También se pierde al reiniciar el back.
+
 ### 5.6 Layer 2
 
 - El assessment de un scan inyectado usa el repositorio en memoria (§5.5).
@@ -193,7 +198,7 @@ Una franja fija arriba, sobre todo lo demás. Se mantiene dentro de la paleta de
 | Modo | Aspecto | Texto |
 |---|---|---|
 | `mock` | `oro` con rayas diagonales `marino` (patrón que no aparece en ningún otro sitio de la UI) | **MOCK** · no real APIs · in-memory data |
-| `live-debug` | `rojo` sólido con texto blanco (el rojo ya está reservado para alertas) | **LIVE DEBUG** · real APIs & real database |
+| `live-debug` | `rojo` sólido con texto blanco (el rojo ya está reservado para alertas) | **LIVE DEBUG** · real scans · simulated accounts & billing (desde DN-12 §7: los scans son reales y la webapp es simulada) |
 | Desalineado | `marino` sólido con texto `oro` e icono de alerta | **MODE MISMATCH** · front=`mock`, back=`live-debug` (o "back unreachable / production") |
 | Comprobando | `bruma` liso con texto `marino`, sin rayas ni icono: no pertenece a ningún modo | Checking the back's mode · front=`mock` |
 
@@ -369,7 +374,8 @@ O por separado: `npm run dev:live-debug` en Arca-back y `npm run dev:live-debug`
 
 - Por separado vale lo mismo que en la §11.2: si el `.env.local` del front apunta a otra API, pon antes `$env:NEXT_PUBLIC_API_URL = 'http://localhost:8080'` en la terminal del front. Si no, el front habla con esa otra API y la franja dice MODE MISMATCH.
 - El back no arranca si `SOURCE_MODE` y `STORAGE_BACKEND` no resuelven a `live` y `supabase`, y el error explica el conflicto. Con el `.env.local` de Jesús resuelven bien.
-- Línea de arranque: `[api] MODE=live-debug sources=live storage=supabase (debug routes on 127.0.0.1 only)`.
+- Línea de arranque: `[api] MODE=live-debug sources=live storage=supabase webapp=simulated-in-memory (debug routes on 127.0.0.1 only) spend guards: Apify ceiling USD 2 per 24 h, OpenAI cap 30 requests per scan`. Desde el 2026-11-09 nombra los dos guardas de gasto de este modo (DN-12 §5): si no aparecen, no están activos. `storage=supabase` habla de los scans; `webapp=simulated-in-memory` dice que las cuentas y el cobro no viven ahí (DN-12 §7).
+- El back atiende el registro de cuenta, la organización y el pago, pero **simulados y en memoria**: no hay Supabase Auth ni Stripe. Se pierde al reiniciar el back, y `POST /__debug/reset` (el botón "Reset limits") también lo borra.
 - Al arrancar recupera los scans y assessments interrumpidos contra la base compartida, igual que hoy `npm run dev`.
 - Un scan **sin** escenario es un scan real: escribe en Supabase y gasta crédito.
 - Un scan **con** escenario vive en memoria (§5.5). Aun así, sus fuentes en `default` (que el panel llama "real") llaman a las APIs reales.
@@ -379,7 +385,7 @@ O por separado: `npm run dev:live-debug` en Arca-back y `npm run dev:live-debug`
 
 1. **La franja de arriba del front:**
    - `MOCK · no real APIs · in-memory data` (oro a rayas): los dos en mock;
-   - `LIVE DEBUG · real APIs & real database` (rojo): los dos en live-debug;
+   - `LIVE DEBUG · real scans · simulated accounts & billing` (rojo): los dos en live-debug;
    - `MODE MISMATCH · front=<f>, back=<b>` o `MODE MISMATCH · front=<f>, back unreachable or production` (marino): no coinciden, el back no responde o está en producción;
    - mientras pregunta al back por primera vez dice `Checking the back's mode · front=<f>` sobre bruma liso, porque nunca afirma un modo que el back no confirmó;
    - si al final lleva `· next scan injects: …`, hay un escenario armado para el próximo scan;

@@ -1,4 +1,5 @@
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
+import { createRobotsCache } from '../../src/pipeline/robots.js';
 import { crawlWebsite } from '../../src/pipeline/crawler.js';
 import { createSiteAccess } from '../../src/pipeline/site-access.js';
 
@@ -23,3 +24,33 @@ it('fetches the page the agent asked for, not the home page', async () => {
   expect(result.pages[0]!.text).toContain('Profile at /carmen-gallardo');
   expect(result.calls).toEqual([{ tool: 'fetch_pages', target: 'https://fixture.example/carmen-gallardo', status: 'read', detail: null }]);
 }, 30_000);
+
+it('downloads robots.txt once for every tool call of a scan', async () => {
+  const pdf = Buffer.from('%PDF-1.7 fake');
+  const robots = vi.fn(async () => ({ status: 200, text: 'User-agent: *\nDisallow: /private/' }));
+  const access = createSiteAccess({
+    robots,
+    response: async (raw: string) => new URL(raw).pathname.endsWith('.pdf')
+      ? { status: 200, headers: { 'content-type': 'application/pdf' }, body: pdf }
+      : new URL(raw).pathname.endsWith('.xml') ? { status: 200, headers: { 'content-type': 'application/xml' },
+        body: Buffer.from('<urlset><url><loc>https://fixture.example/team</loc></url><url><loc>https://fixture.example/private/x</loc></url></urlset>') }
+        : await transport.response(raw),
+    extract: async () => ({ totalPages: 1, text: ['Privacy policy'] }),
+  }).withRobots!(createRobotsCache());
+  const signal = new AbortController().signal;
+  const pages = await access.fetchPages(['https://fixture.example/about', 'https://fixture.example/team', 'https://fixture.example/private/memo'], signal);
+  const documents = await access.readDocuments(['https://fixture.example/policy.pdf', 'https://fixture.example/private/fees.pdf'], signal);
+  const sitemap = await access.readSitemap('fixture.example', signal);
+  expect(pages.calls.map(call => [call.status, call.detail])).toEqual([['read', null], ['read', null], ['failed', 'ROBOTS_DISALLOWED']]);
+  expect(documents.calls.map(call => [call.status, call.detail])).toEqual([['read', 'complete'], ['failed', 'ROBOTS_DISALLOWED']]);
+  expect(sitemap.links).toEqual([{ url: 'https://fixture.example/team', kind: 'page' }]);
+  expect(robots).toHaveBeenCalledTimes(1);
+}, 60_000);
+
+it('keeps no robots answer between scans: an access without a scan cache asks every time', async () => {
+  const robots = vi.fn(async () => ({ status: 404, text: '' }));
+  const access = createSiteAccess({ ...transport, robots });
+  await access.fetchPages(['https://fixture.example/about'], new AbortController().signal);
+  await access.fetchPages(['https://fixture.example/team'], new AbortController().signal);
+  expect(robots).toHaveBeenCalledTimes(2);
+}, 60_000);

@@ -36,7 +36,7 @@ Esta nota hace que cada rol vea su propia webapp. También vuelve real lo que di
 | D6 | Renombrar la organización es real (`org.update`), sin exigir pago. El resto del perfil de la firma sigue de muestra | **[mía]** |
 | D7 | El rol se prueba entrando como usuarios reales de una organización de semilla. No hay "ver como" ni suplantación | **[mía]** |
 | D8 | El front no muestra primas ni decisión comercial (`CLAUDE.md` del front). El back sigue enviando la decisión en los análisis, como hoy. Quién las ve se decide con las DN de capa 1 y 2 | **[mía]** |
-| D9 | Alcance técnico como DN-10: el back funciona solo en mock, la migración se prueba en PGlite sin aplicarse, y no hay Supabase, Stripe ni email reales | **[mía]** |
+| D9 | Alcance técnico como DN-10: el back funciona solo en mock, la migración se prueba en PGlite sin aplicarse, y no hay Supabase, Stripe ni email reales. Desde el 2026-11-09 la webapp simulada corre también en `live-debug` (DN-12 §7); la semilla sigue solo en mock | **[mía]** |
 | D10 | Billing se abre para todos los roles: el owner gestiona y los demás ven el estado en solo lectura. Así, una organización sin pagar no deja sin salida al `member` ni al `viewer`. El ítem de la barra lo ven solo el owner y el admin | **[mía]** |
 | D11 | Solo se puede asignar una acción a quien puede marcarla: owner, admin o member | **[mía]** |
 | D12 | Cualquiera con `actions.update` cambia el estado de cualquier acción, asignada a quien sea. Cada cambio queda auditado | **[mía]** |
@@ -356,8 +356,8 @@ membresía ya no existe.
 | `GET /admin/organizations/:id`, `GET /admin/audit`, `GET /admin/metrics` | admin de plataforma |
 | `POST /__debug/seed` | solo mock (§4.6) |
 
-Las rutas de la webapp ya caen bajo `/orgs/*` y `/admin/*` de `WEBAPP_PATHS`, así que fuera de mock
-responden 501. `PATCH /orgs/:id` y la actividad se suman a las rutas exentas de pago de DN-10 §4.5 y
+Las rutas de la webapp ya caen bajo `/orgs/*` y `/admin/*` de `WEBAPP_PATHS`, así que en producción
+responden 501 (y, hasta DN-12 §7, también en live-debug). `PATCH /orgs/:id` y la actividad se suman a las rutas exentas de pago de DN-10 §4.5 y
 a su prueba en tabla.
 
 ## 5. Contratos 0.4.0
@@ -524,7 +524,8 @@ prueba para `member` y `viewer`.
 **Panel de debug.**
 
 - Un bloque nuevo aparece en todo `pathname.startsWith("/app")`, separado de `SECTIONS`, **solo en
-  mock**. En live-debug la webapp responde 501, así que no tiene efecto.
+  mock**. Cuando se escribió, en live-debug la webapp respondía 501; desde DN-12 §7 corre simulada, pero
+  la semilla que usa este bloque sigue solo en mock.
 - Trae "Seed demo organization", botones etiquetados por rol ("Sign in as owner" y los demás, sin
   emails a la vista), "Sign in as ARCA admin" y el interruptor "Show forbidden actions".
 - **Entrar como** hace `signOut()`, guarda la nueva sesión y navega a `/app` (o a `/app/admin`) con

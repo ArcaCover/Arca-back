@@ -52,7 +52,7 @@ export function buildOpenApiDocument() {
   };
   const invalid = { invalidRequest: { summary: 'Invalid request', value: { error: 'invalid_request', message: 'A valid email and a non-empty domain are required' } } };
   registry.registerPath({ method: 'post', path: '/scan', summary: 'Start a domain scan or reuse a cached domain result',
-    description: 'Cache identity is the normalized domain. A cache miss returns 202 RUNNING. A hit inside the cache window (SCAN_CACHE_TTL_MS, 7 days by default) returns 200 immediately with cached=true, a new scanId, a new sessionToken and status COMPLETED. A cached partial scan never gets the 200: it is repaired first, at most once per SCAN_PARTIAL_REPAIR_COOLDOWN_MS (1 hour by default), and inside that cooldown the last repair is served. Either way it returns 202 and arrives through polling, as PARTIAL.',
+    description: 'Cache identity is the normalized domain. A cache miss returns 202 RUNNING. A hit inside the cache window (SCAN_CACHE_TTL_MS, 7 days by default) returns 200 immediately with cached=true, a new scanId, a new sessionToken and status COMPLETED. A cached partial scan never gets the 200: it returns 202 and arrives through polling, as PARTIAL with cached=true. It is the answer for the whole window when a second scan would find the same gaps (a directory with nothing to look up or no match, a website that refuses to be read: robots.txt, HTTP 401/403 or a challenge page). When a source failed for a passing reason (a deadline, a provider, a website that could not be reached) the scan is run again instead, at most once per SCAN_PARTIAL_REPAIR_COOLDOWN_MS (1 hour by default), and inside that cooldown the last run is served.',
     request: { body: { required: true, content: json(ScanRequest, { lawFirm: { summary: 'Start a firm scan',
       value: { email: 'contact@smithlaw.com', domain: 'smithlaw.com' } } }) } },
     responses: {
@@ -71,7 +71,7 @@ export function buildOpenApiDocument() {
     } });
   registry.registerPath({ method: 'get', path: '/scan/{scanId}', summary: 'Poll scan status',
     security: [{ sessionToken: [] }], request: { params: z.object({ scanId: z.string() }) },
-    responses: { 200: { description: 'RUNNING, COMPLETED, PARTIAL or FAILED. All but RUNNING are terminal.', content: json(PollResponse, {
+    responses: { 200: { description: 'RUNNING, COMPLETED, PARTIAL or FAILED. All but RUNNING are terminal. A website that could not be read at all, for any cause on the side of the site (robots.txt, HTTP 401/403 or a challenge page, DNS, a refused connection, a timeout, a 5xx, robots.txt out of reach), ends PARTIAL: the result carries the flag WEBSITE_UNAVAILABLE with LOW confidence, and an assessment can start from it and score the answers alone. FAILED means a failure on our side, has no result, and the scan can be tried again.', content: json(PollResponse, {
       running: { summary: 'Scan still running', value: { scanId: 'sc_abc123', status: 'RUNNING', elapsed: 12400 } },
       completed: { summary: 'Completed scan', value: { scanId: 'sc_abc123', status: 'COMPLETED', cached: false, result } },
       partial: { summary: 'Partial scan: a source could not be repaired', value: { scanId: 'sc_abc123', status: 'PARTIAL', cached: false,
@@ -88,7 +88,7 @@ export function buildOpenApiDocument() {
       401: { description: 'Missing or invalid session', content: json(error) },
       404: { description: 'Scan not found', content: json(error) },
       409: { description: 'The scan is still running or failed, so there is no report (report_unavailable)', content: json(error) },
-      503: { description: 'Report rendering is not configured on this server', content: json(error) } } });
+      503: { description: 'The report could not be rendered in time, or rendering is not configured on this server (report_unavailable)', content: json(error) } } });
   const assessmentErrors = {
     401: { description: 'Missing, invalid, expired, or wrong-scan capability token', content: json(AssessmentError) },
     404: { description: 'Assessment not found', content: json(AssessmentError) },
@@ -121,6 +121,13 @@ export function buildOpenApiDocument() {
   registry.registerPath({ method: 'get', path: '/assessment/{assessmentId}/result', summary: 'Read the saved completed assessment result',
     security: [{ sessionToken: [] }], request: { params: assessmentParams },
     responses: { ...assessmentErrors, 200: { description: 'Immutable assessment result', content: json(AssessmentResult) } } });
+  registry.registerPath({ method: 'get', path: '/assessment/{assessmentId}/report.pdf', summary: 'Download the Assessment Report',
+    description: 'PDF of a COMPLETED assessment, built only from its stored record: the firm and domain, the completion date, the combined score and tier with its Layer 1 and Layer 2 parts, the six areas, the action plan, the answers as they were asked, and the bank and scoring versions. It carries one demo disclosure and no price, coverage promise or decision. Content-Disposition names the file arca-assessment-<domain>-<yyyy-mm-dd>.pdf. Like every assessment read, it works only during the 24-hour session.',
+    security: [{ sessionToken: [] }], request: { params: assessmentParams },
+    responses: { ...assessmentErrors,
+      200: { description: 'The report', content: { 'application/pdf': { schema: { type: 'string', format: 'binary' } } } },
+      409: { description: 'The assessment is not completed yet, so there is no report (incomplete)', content: json(AssessmentError) },
+      503: { description: 'The report could not be rendered, or rendering is not configured on this server (report_unavailable)', content: json(error) } } });
   return new OpenApiGeneratorV31(registry.definitions).generateDocument({ openapi: '3.1.0',
     info: { title: 'ARCA Layer 1 + Layer 2 API', version: '2.0.0', description: 'Domain evidence scoring. Unknown fields remain null while unavailable scoring rules contribute zero points. Tier and decision are separate.' } });
 }

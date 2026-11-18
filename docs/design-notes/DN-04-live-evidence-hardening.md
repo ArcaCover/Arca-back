@@ -9,6 +9,11 @@ Fecha: 12 de septiembre de 2026.
 - Sin firma ni abogados respaldados, las fuentes pagadas se omiten con `INSUFFICIENT_IDENTITY`.
 - JSON-LD y `og:site_name` pueden acreditar identidad; los abogados requieren `Person` y un cargo legal.
 - El bloqueo HTTP se conserva como `ACCESS_BLOCKED`, con sus incidencias en la evidencia cruda.
+  **Actualización 2026-11-09 (DN-12):** una web que se niega a ser leída (`ACCESS_BLOCKED`: robots.txt excluye el
+  sitio, 401/403 o página de desafío) ya no hace fallar el scan. Termina PARTIAL con el resultado completo, el flag
+  `WEBSITE_UNAVAILABLE` y un override que restringe la decisión a `REFERRAL_SENIOR`. Las fuentes pagadas se siguen
+  omitiendo: sin web no hay identidad, y el dominio sigue sin convertirse en nombre de firma. Un fallo transitorio o
+  nuestro (plazo, red, 429, 5xx, proveedor) sigue terminando FAILED.
 - `No lawyers matched` es una consulta exitosa vacía. Errores desconocidos y filas incompatibles se
   distinguen mediante `PROVIDER_ERROR` y `PROVIDER_CONTRACT_ERROR`.
 - Cada ejecución Apify conserva actor, run ID, fingerprint, estado, registros, aceptados y coste reportado.
@@ -20,6 +25,8 @@ Fecha: 12 de septiembre de 2026.
   scan y sesión, y `meta.reusedEvidence` informa la reutilización.
 - La falta de evidencia mantiene el score cuantitativo, pero marca `INSUFFICIENT_EVIDENCE` y bloquea la
   decisión automática con `UNKNOWN`. Overrides disciplinarios explícitos conservan precedencia.
+  Desde el 2026-11-09 hay un override que no es disciplinario, `WEBSITE_UNAVAILABLE` (DN-12). Como los demás, solo
+  restringe: nunca afloja un `DECLINE`.
 
 ## Extracción conservadora
 

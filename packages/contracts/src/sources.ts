@@ -113,7 +113,10 @@ export type DirectoryQuery = { canonicalDomain: string; names: string[]; firmNam
   aliases?: string[]; city: string | null; county?: string | null; addressStreet?: string | null;
   // Two-letter state of the licensing registry the attorneys are checked against, or null when
   // no state registry is wired. It scopes location-based directory searches.
-  phone?: string | null; state: string | null; scanId?: string };
+  phone?: string | null; state: string | null; scanId?: string;
+  // Cities of the firm's offices in the registry's state, as the website lists them. When present, a registry
+  // source searches the firm in each of them instead of looking up names one by one (DN-06 §10).
+  officeCities?: string[] };
 export interface WebsiteSource {
   run(domain: string, signal: AbortSignal): Promise<SourceResult<WebsiteData>>;
 }

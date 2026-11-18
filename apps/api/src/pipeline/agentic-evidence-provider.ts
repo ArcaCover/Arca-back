@@ -1,20 +1,29 @@
+import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import OpenAI from 'openai';
-import { SignalExtraction, SignalReview, WebsiteData, type Claim, type GroundingReport } from '@arca/contracts';
+import { SignalExtraction, SignalReview, WebsiteData, type Claim, type EvidenceReference, type GroundingReport } from '@arca/contracts';
+import { compareText } from '@arca/scoring';
 import { classifyRole, personEvidence } from './attorney-roles.js';
 import type { CrawledPage, CrawlResult } from './crawler.js';
+import { isCareersPath } from './crawl-order.js';
 import { buildCorpus, serializeCorpus, withLinks, withPassages, type EvidenceCorpus } from './evidence-corpus.js';
 import { acceptClaims, toWebsiteData } from './signal-grounding.js';
 import { groundNegativeSignals } from './negative-signal-grounding.js';
 import { createSiteAccess, type SiteAccess, type ToolCall } from './site-access.js';
+import { createRobotsCache, type RobotsCache } from './robots.js';
 import { findPassages } from './site-search.js';
 import { DERIVED_FIELDS, deriveTeamPageQuality, deriveWebsiteQuality, type TeamPageDerivation, type WebsiteDerivation } from './derived-signals.js';
-import { PAGE_CLASSIFICATION_PROMPT, PAGE_TYPE_VOTES, PageClassification, acquisitionFloor, majorityPageTypes, pageCandidates,
-  serializeCandidates, type PageCandidate, type PageType } from './page-types.js';
+import { PAGE_CLASSIFICATION_PROMPT, PAGE_TYPE_VOTES, PageClassification, acquisitionFloor, heuristicPageType, majorityPageTypes,
+  pageCandidates, serializeCandidates, type PageCandidate, type PageType } from './page-types.js';
+import { FLORIDA_OFFICES_KEY, LARGE_FIRM_ATTORNEYS, LARGE_FIRM_KEY, NEWS_ONLY_TEAM_KEY } from './firm-identity.js';
 import type { WebsiteEvidenceProvider } from './website-evidence-provider.js';
 import { DEFAULT_SIGNAL_LLM_MODEL, openAiEndpoint, type LlmEndpoint } from './llm-endpoint.js';
+import { scanMeter } from './scan-cost.js';
 
-export const EXTRACTION_VERSION = 'agentic-signals-v5';
+// v6: the fixed evidence steps (sitemap, AI, people and offices pages, AI search) run before the claim rounds.
+// v7: ai_blog_posts is derived from the firm's own AI publications the scan knows of when no claim was accepted, and a
+// careers page is never the people directory (DN-12 §13.8).
+export const EXTRACTION_VERSION = 'agentic-signals-v7';
 export const MAX_AGENT_ROUNDS = 3;
 /** Bounded so one flaky call cannot loop forever; each phase gets its own budget of attempts. */
 export const MAX_TRANSIENT_ATTEMPTS = 3;
@@ -94,6 +103,23 @@ from a single segment that contains that person's name and, when shown, the role
 Copy role and affiliation as the exact enums attorney|staff|unclear and current|former|unclear. attorney_count is allowed only
 when the supplied team page is complete and must equal the number of unique current attorneys listed. Always finish.`;
 
+/** Every prompt an extraction sends. */
+const PROMPTS: readonly string[] = [PAGE_CLASSIFICATION_PROMPT, SIGNAL_EXTRACTION_PROMPT, ROSTER_PROMPT, SIGNAL_REVIEW_PROMPT];
+/**
+ * What a stored website analysis is reused under: the workflow version, the endpoint, the model, the reasoning
+ * effort, and a hash of the prompts and request parameters. A prompt edit therefore ends the reuse of older
+ * analyses by itself. EXTRACTION_VERSION is still bumped by hand for a change the hash cannot see (the workflow,
+ * the grounding rules).
+ */
+export function extractionVersion(endpoint: LlmEndpoint, model: string, options: { planPages?: boolean } = {},
+  prompts: readonly string[] = PROMPTS): string {
+  const params = endpoint.requestParams(model);
+  const effort = typeof params.reasoning_effort === 'string' ? params.reasoning_effort : 'default';
+  const profile = createHash('sha256').update(JSON.stringify({ prompts, params, planPages: options.planPages !== false }))
+    .digest('hex').slice(0, 12);
+  return `${EXTRACTION_VERSION}:${endpoint.id}:${model}:${effort}:${profile}`;
+}
+
 type CompletionClient = { chat: { completions: { create(body: Record<string, unknown>, options?: { signal?: AbortSignal }): Promise<unknown> } } };
 export type Attempt = { phase: string; request: Record<string, unknown>; response: unknown; rawContent: string;
   durationMs: number; validationIssues?: string };
@@ -104,8 +130,25 @@ export class ExtractionFailure extends Error {
     this.name = 'ExtractionFailure';
   }
 }
+/**
+ * The extraction asked for more chat completions than one scan may make (DN-12 §5.2). Not an ExtractionFailure on
+ * its way out of `complete`: the page-type votes forgive those, and nothing may carry on past the cap.
+ */
+export class RequestCapReached extends Error {
+  constructor(readonly maxRequests: number) {
+    super(`OpenAI request cap reached: one scan may make ${maxRequests} chat completions`);
+    this.name = 'RequestCapReached';
+  }
+}
+/**
+ * Where the attorney names the model claimed were cited from: a team or profile page, other pages of the site, only
+ * news, press or blog pages, or nowhere. Names cited only from news pages are dropped when any other page names
+ * attorneys, and marked in the provenance when nothing else does (DN-06 §10).
+ */
+export type AttorneySource = 'roster' | 'site' | 'news_only' | 'none';
 export type ExtractionDiagnostics = { model: string; version: string; corpus: EvidenceCorpus; attempts: Attempt[];
   extraction: unknown; review: unknown; grounding: GroundingReport; toolCalls: ToolCall[]; rounds: number; stopReason: StopReason;
+  attorneySource: AttorneySource;
   pageTypes: Array<{ url: string; type: PageType }>; derived: { team: TeamPageDerivation; website: WebsiteDerivation } };
 export type DetailedExtraction = { websiteData: WebsiteData; diagnostics: ExtractionDiagnostics };
 
@@ -116,6 +159,22 @@ function responseText(response: unknown): string {
     throw new Error('The model returned an incomplete response');
   }
   return choice.message.content;
+}
+
+type Choice = { message?: { content?: unknown }; finish_reason?: string };
+const firstChoice = (response: unknown) => (response as { choices?: Choice[] } | null)?.choices?.[0];
+/** The model stopped at its completion limit: reasoning tokens count against it, so the answer may be empty. */
+const cutAtLimit = (response: unknown) => firstChoice(response)?.finish_reason === 'length';
+const partialContent = (response: unknown) => {
+  const content = firstChoice(response)?.message?.content;
+  return typeof content === 'string' ? content : '';
+};
+function lengthIssue(response: unknown, request: Record<string, unknown>): string {
+  const usage = (response as { usage?: { completion_tokens?: unknown; completion_tokens_details?: { reasoning_tokens?: unknown } } }).usage;
+  const used = typeof usage?.completion_tokens === 'number' ? ` after ${usage.completion_tokens} completion tokens` : '';
+  const reasoning = usage?.completion_tokens_details?.reasoning_tokens;
+  return `Incomplete response: finish_reason length${used}${typeof reasoning === 'number' ? ` (${reasoning} reasoning)` : ''}` +
+    ` with max_completion_tokens ${String(request.max_completion_tokens ?? 'unset')}`;
 }
 
 function json(text: string): unknown {
@@ -148,32 +207,183 @@ function normalizeClaims(claims: Claim[]): Claim[] {
   });
 }
 
-const TEAM_PATH = /attorney|lawyer|abogad|equipo|team/i;
+/** The path of a URL, decoded and lower case, without a trailing slash; '' when it does not parse. */
+const pathOf = (url: string) => {
+  try { return decodeURIComponent(new URL(url).pathname).toLowerCase().replace(/\/+$/, '') || '/'; } catch { return ''; }
+};
+const withoutSlash = (url: string) => url.replace(/\/$/, '');
+const segmentsOf = (url: string) => pathOf(url).split('/').filter(Boolean);
+// News, press, blog and event pages, and anything filed under a year and month: they mention people and topics in
+// passing, so they are never the firm's roster or its own AI page.
+const NEWS_PATH = /(^|\/)(news|press|press-?releases?|blogs?|insights?|publications?|events?|articles?|alerts?|podcasts?|webinars?|media|media-entities|noticias|eventos|category|tag|author)(\/|$)|\/(19|20)\d{2}\/(0?[1-9]|1[0-2])(\/|$)/;
+export const isNewsUrl = (url: string) => NEWS_PATH.test(pathOf(url)) || heuristicPageType(url) === 'blog';
+const TEAM_PATH = /attorney|lawyer|abogad|equipo|team|(^|\/)(people|professionals)(\/|$)/i;
+/**
+ * A page the roster pass reads: its path names the team, and it is not a news page whose title happens to, nor a careers
+ * page ("experienced attorneys", "join our team") that lists no one.
+ */
+const isTeamUrl = (url: string) => TEAM_PATH.test(pathOf(url)) && !isNewsUrl(url) && !isCareersPath(url);
+
+/** Pages the backend reads before the claim rounds, whatever the model would choose (DN-05, fixed evidence steps). */
+export const FIXED_FETCH_LIMIT = 4;
+// The firm's own AI, innovation or legal-technology page. Governance alone is a practice area (corporate governance).
+const AI_PATH = /(^|[/-])(ai|genai)([/-]|$)|artificial-intelligence|inteligencia-artificial|generative-ai|machine-learning|innovation|innovacion|legal-?tech/;
+const SERVICE_PATH = /(^|\/)(services?|practices?|practice-areas?|industries|servicios|areas-de-practica)(\/|$)/;
+const PEOPLE_INDEX = /^(people|our-people|professionals|attorneys|our-attorneys|lawyers|our-lawyers|team|our-team|abogados|nuestros-abogados|equipo|nuestro-equipo)$/;
+const OFFICE_SEGMENT = /^(offices?|our-offices|office-locations|locations?|oficinas|ubicaciones|sedes)$/;
+/** Searched over the enlarged corpus before the first round. No bare "AI": it is a substring of too many words. */
+export const AI_SEARCH_TERMS = ['artificial intelligence', 'generative ai', 'ai tools', 'ai policy', 'ai governance', 'use of ai',
+  'machine learning', 'large language model', 'inteligencia artificial'];
+const FIXED_SEARCH_PASSAGES = 8;
+
+/**
+ * The unread pages the fixed step fetches, in a fixed order: the firm's AI pages first (AI governance is 35 of 100
+ * points), then its people directory and its offices page, at most FIXED_FETCH_LIMIT. A practice page about AI is
+ * advice to clients, so it only fills an AI slot nothing better takes. News and event pages are never chosen.
+ */
+export function fixedTargets(links: Array<{ url: string; kind: 'page' | 'document' }>, done: Set<string>): string[] {
+  const seen = new Set<string>();
+  const pages = links.filter(link => {
+    const key = withoutSlash(link.url);
+    if (link.kind !== 'page' || seen.has(key) || done.has(key) || isNewsUrl(link.url)) return false;
+    seen.add(key); return true;
+  }).map(link => link.url);
+  const order = (a: string, b: string) => segmentsOf(a).length - segmentsOf(b).length || compareText(a, b);
+  const people = pages.filter(url => PEOPLE_INDEX.test(segmentsOf(url).at(-1) ?? '') && !isCareersPath(url)).sort(order)[0];
+  const offices = pages.filter(url => OFFICE_SEGMENT.test(segmentsOf(url).at(-1) ?? '')).sort(order)[0];
+  const ai = pages.filter(url => url !== people && url !== offices && AI_PATH.test(pathOf(url)))
+    .sort((a, b) => Number(SERVICE_PATH.test(pathOf(a))) - Number(SERVICE_PATH.test(pathOf(b))) || order(a, b));
+  const rest = [people, offices].filter((url): url is string => url !== undefined);
+  return [...ai.slice(0, FIXED_FETCH_LIMIT - rest.length), ...rest];
+}
+
+const foldCity = (value: string) => value.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().replace(/[.]/g, '')
+  .replace(/[-\s]+/g, ' ').trim();
+// Florida cities a law firm keeps offices in. Names shared with places abroad or in other states (Naples, Melbourne,
+// Hollywood, Panama City) count only where the page names the state next to them.
+const FLORIDA_CITIES = new Map(['Miami', 'Miami Beach', 'Tampa', 'Orlando', 'Jacksonville', 'Tallahassee', 'Fort Lauderdale',
+  'Ft Lauderdale', 'West Palm Beach', 'Palm Beach', 'Palm Beach Gardens', 'Boca Raton', 'Delray Beach', 'Boynton Beach',
+  'Jupiter', 'Stuart', 'Port St Lucie', 'Fort Pierce', 'Vero Beach', 'St Petersburg', 'Saint Petersburg', 'Clearwater',
+  'Sarasota', 'Bradenton', 'Lakeland', 'Fort Myers', 'Gainesville', 'Ocala', 'Pensacola', 'Destin', 'Daytona Beach',
+  'Coral Gables', 'Coral Springs', 'Doral', 'Aventura', 'Hialeah', 'Weston', 'Plantation', 'Sunrise', 'Kissimmee',
+  'Winter Park', 'Key West', 'Brandon', 'Lake Mary', 'Maitland', 'Melbourne', 'Naples', 'Hollywood', 'Panama City']
+  .map(city => [foldCity(city), city]));
+const AMBIGUOUS_CITIES = new Set(['melbourne', 'naples', 'hollywood', 'panama city']);
+const STREET_WORD = /^(street|st|avenue|ave|boulevard|blvd|road|rd|drive|dr|way|lane|ln|suite|ste|floor|fl|plaza|center|centre|tower|building|place|pl|court|ct|parkway|pkwy|highway|hwy|north|south|east|west|northeast|northwest|southeast|southwest|ne|nw|se|sw)$/i;
+const isOfficeUrl = (url: string) => segmentsOf(url).some(segment => OFFICE_SEGMENT.test(segment));
+const isOfficePage = (url: string) => isOfficeUrl(url) || /(^|\/)(contact|contact-us|contacto|contactenos)(\/|$)/.test(pathOf(url));
+
+/**
+ * Florida cities the site lists an office in, read by rule from what the backend fetched: links to an office page
+ * (any page's anchors, the sitemap's URLs) and "City, FL" or "City, Florida" on the offices and contact pages.
+ * One reference per city; the excerpt is the city as the page writes it, or the city a link's address names.
+ */
+export function floridaOfficeCities(pages: CrawledPage[], links: Array<{ url: string; kind: 'page' | 'document' }>):
+  Array<EvidenceReference & { city: string }> {
+  const found = new Map<string, EvidenceReference & { city: string }>();
+  const add = (city: string, reference: EvidenceReference) => {
+    const key = foldCity(city);
+    if (!found.has(key)) found.set(key, { ...reference, city });
+  };
+  const officeChild = (url: string) => {
+    const segments = segmentsOf(url);
+    return segments.length >= 2 && OFFICE_SEGMENT.test(segments.at(-2)!) ? segments.at(-1)! : null;
+  };
+  const fromLink = (url: string, label: string | null) => {
+    const slug = officeChild(url);
+    if (slug === null) return;
+    const named = label?.replace(/\b(office|oficina)\b/gi, '').replace(/,?\s*(fl|fla|florida)\.?\s*$/i, '').trim();
+    if (named && FLORIDA_CITIES.has(foldCity(named)) && !AMBIGUOUS_CITIES.has(foldCity(named))) {
+      add(named, { sourceUrl: url, excerpt: named, method: 'page_text' }); return;
+    }
+    const city = FLORIDA_CITIES.get(foldCity(slug));
+    if (city && !AMBIGUOUS_CITIES.has(foldCity(city))) add(city, { sourceUrl: url, excerpt: city, method: 'derived' });
+  };
+  for (const page of pages) {
+    const host = new URL(page.url).hostname.replace(/^www\./, '');
+    for (const match of page.html.matchAll(/<a\b[^>]*href\s*=\s*["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+      let target: URL;
+      try { target = new URL(match[1]!, page.url); } catch { continue; }
+      if (target.hostname.replace(/^www\./, '') !== host) continue;
+      target.hash = ''; target.search = '';
+      fromLink(target.href, match[2]!.replace(/<[^>]+>/g, ' ').replace(/&amp;/gi, '&').replace(/\s+/g, ' ').trim());
+    }
+    if (!isOfficePage(page.url)) continue;
+    for (const match of page.text.matchAll(/\b([A-Z][A-Za-z.'’-]*(?:[ \t]+[A-Z][A-Za-z.'’-]*){0,3}),[ \t]*(?:FL|Fla\.?|Florida)\b/g)) {
+      const words = match[1]!.split(/[ \t]+/);
+      // The longest ending of the capture that is a known city ("Brickell Avenue Miami" is Miami), else a short
+      // capture that is not part of a street address.
+      let city: string | null = null;
+      for (let start = 0; start < words.length && city === null; start++) {
+        if (FLORIDA_CITIES.has(foldCity(words.slice(start).join(' ')))) city = words.slice(start).join(' ');
+      }
+      if (city === null && words.length <= 3 && !words.some(word => STREET_WORD.test(word.replace(/\.$/, '')))) city = words.join(' ');
+      if (city) add(city, { sourceUrl: page.url, excerpt: city, method: 'page_text' });
+    }
+  }
+  for (const link of links) if (link.kind === 'page') fromLink(link.url, null);
+  return [...found.values()];
+}
+
 export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
   readonly id: string;
   readonly version: string;
   private readonly client: CompletionClient;
+  // Chat completions requested so far by each extraction in flight, keyed by its list of attempts: the provider
+  // is one object shared by every scan, and that list is the one thing an extraction hands to all of its calls.
+  private readonly requested = new WeakMap<Attempt[], number>();
+  /**
+   * `maxRequests` caps the chat completions of one extraction, retries and repairs included. Without it there is
+   * no cap. It is not part of the version: it changes when an extraction stops, never what one that finished says.
+   */
   constructor(apiKey: string, readonly model = DEFAULT_SIGNAL_LLM_MODEL, client?: CompletionClient,
     private readonly access: SiteAccess = createSiteAccess(), private readonly endpoint: LlmEndpoint = openAiEndpoint(),
-    private readonly options: { planPages?: boolean } = {}) {
+    private readonly options: { planPages?: boolean; maxRequests?: number } = {}) {
     this.id = 'openai-agentic';
-    // Keep this format stable: stored website analyses are reused only while it matches.
-    this.version = `${EXTRACTION_VERSION}:${endpoint.id}:${model}`;
+    // Stored website analyses are reused only while this matches.
+    this.version = extractionVersion(endpoint, model, options);
     this.client = client ?? new OpenAI({ apiKey, maxRetries: 0, timeout: 120_000 }) as unknown as CompletionClient;
   }
 
+  /**
+   * One model call of a phase. A transient provider error is retried within MAX_TRANSIENT_ATTEMPTS. An answer the
+   * model cut at its completion limit (finish_reason 'length') is sent once more, same messages, with the endpoint's
+   * larger budget (DN-12 §13.8), as `${phase}-length-retry` with its own transient budget; cut again, the call fails
+   * as before. Every request counts against the per-scan cap and every answer is kept in `attempts`.
+   */
   private async complete(phase: string, system: string, user: string, signal: AbortSignal, attempts: Attempt[]) {
-    const request = { model: this.model, stream: false, ...this.endpoint.requestParams(this.model),
+    let request: Record<string, unknown> = { model: this.model, stream: false, ...this.endpoint.requestParams(this.model),
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
       response_format: { type: 'json_object' } };
+    let stem = phase;
     for (let attempt = 1; ; attempt++) {
       const started = Date.now();
-      const label = attempt === 1 ? phase : `${phase}-attempt-${attempt}`;
+      const label = attempt === 1 ? stem : `${stem}-attempt-${attempt}`;
+      // Counted before it is sent: the page-type votes and the roster run side by side with other calls.
+      const requests = (this.requested.get(attempts) ?? 0) + 1;
+      const { maxRequests } = this.options;
+      if (maxRequests !== undefined && requests > maxRequests) {
+        if (requests === maxRequests + 1) console.error(`[openai] request cap reached: the website extraction asked for more than ${maxRequests} chat completions in one scan (OPENAI_MAX_REQUESTS_PER_SCAN); it stops and the website source fails`);
+        this.requested.set(attempts, requests);
+        throw new RequestCapReached(maxRequests);
+      }
+      this.requested.set(attempts, requests);
+      scanMeter()?.openAiRequested();
       try {
         const response = await this.client.chat.completions.create(request, { signal });
+        scanMeter()?.openAiAnswered(response);
         // Record the attempt before validating it: truncated or malformed answers are the ones worth auditing.
         const record: Attempt = { phase: label, request, response, rawContent: '', durationMs: Date.now() - started };
         attempts.push(record);
+        if (cutAtLimit(response)) {
+          record.rawContent = partialContent(response);
+          record.validationIssues = lengthIssue(response, request);
+          const larger = stem === phase ? this.endpoint.lengthRetryParams?.(this.model) : undefined;
+          if (larger && !signal.aborted) {
+            request = { ...request, ...larger }; stem = `${phase}-length-retry`; attempt = 0;
+            continue;
+          }
+        }
         record.rawContent = responseText(response);
         return json(record.rawContent);
       } catch (error) {
@@ -207,9 +417,11 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
     return parsed.data!;
   }
 
-  async extractDetailed(input: CrawlResult, signal: AbortSignal): Promise<DetailedExtraction> {
+  /** `context.robots` is the scan's robots cache: the tools then reuse the rules the crawl already fetched. */
+  async extractDetailed(input: CrawlResult, signal: AbortSignal, context: { robots?: RobotsCache } = {}): Promise<DetailedExtraction> {
     const attempts: Attempt[] = [], toolCalls: ToolCall[] = [];
-    try { return await this.runWorkflow(input, signal, attempts, toolCalls); }
+    const access = this.access.withRobots?.(context.robots ?? createRobotsCache()) ?? this.access;
+    try { return await this.runWorkflow(input, signal, attempts, toolCalls, access); }
     catch (error) {
       if (error instanceof ExtractionFailure) throw error;
       throw new ExtractionFailure(error instanceof Error ? error.message : 'Extraction failed', attempts, { cause: error });
@@ -217,7 +429,7 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
   }
 
   private async runWorkflow(input: CrawlResult, signal: AbortSignal, attempts: Attempt[],
-    toolCalls: ToolCall[]): Promise<DetailedExtraction> {
+    toolCalls: ToolCall[], access: SiteAccess): Promise<DetailedExtraction> {
     let crawl = input;
     let discovered: Array<{ url: string; kind: 'page' | 'document' }> = [];
     let passages: ReturnType<typeof findPassages> = [];
@@ -230,6 +442,17 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
     };
     // Page plan: the model only labels pages from a closed list, by majority vote; the backend then always reads the unread
     // team, about and contact pages and privacy documents, so the evidence floor never depends on what the agent picks.
+    // Fixed evidence steps (DN-05): they need no model, so they always run and in the same order, and two scans of the
+    // same site gather the same evidence whatever the model would ask for. They are part of the backend's plan and
+    // run with it. First the sitemap: its URLs join the candidates the page plan labels.
+    const fixedSteps = this.options.planPages !== false;
+    if (fixedSteps && domain) {
+      sitemapRead = true;
+      const result = await access.readSitemap(domain, signal);
+      toolCalls.push(...result.calls.map(call => ({ round: 0, ...call })));
+      discovered = [...discovered, ...result.links];
+      corpus = assemble();
+    }
     let candidates: PageCandidate[] = [];
     let pageTypes = new Map<string, PageType>();
     if (this.options.planPages !== false) {
@@ -240,21 +463,45 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
       pageTypes = majorityPageTypes(candidates, votes.filter((vote): vote is PageClassification => vote !== null));
       const floor = acquisitionFloor(candidates, pageTypes);
       if (floor.pages.length) {
-        const result = await this.access.fetchPages(floor.pages, signal);
+        const result = await access.fetchPages(floor.pages, signal);
         toolCalls.push(...result.calls.map(call => ({ round: 0, ...call })));
         merge(result.pages.map(page => ({ ...page, requested: true })));
       }
       if (floor.documents.length) {
-        const result = await this.access.readDocuments(floor.documents, signal);
+        const result = await access.readDocuments(floor.documents, signal);
         toolCalls.push(...result.calls.map(call => ({ round: 0, ...call })));
         merge(result.pages);
       }
       corpus = assemble();
     }
+    if (fixedSteps) {
+      // Then the firm's own AI pages, its people directory and its offices page, from the sitemap and from the links of
+      // the pages read: robots and the site's host are enforced by the same tool the model uses. No model call.
+      const done = new Set([...crawl.pages.map(page => withoutSlash(page.url)),
+        ...toolCalls.filter(call => call.status === 'failed').map(call => withoutSlash(call.target))]);
+      const targets = fixedTargets(corpus.links, done);
+      let fetched: CrawledPage[] = [];
+      if (targets.length) {
+        const result = await access.fetchPages(targets, signal);
+        toolCalls.push(...result.calls.map(call => ({ round: 0, ...call })));
+        fetched = result.pages;
+        // Requested pages rank ahead of news and practice pages in the corpus budget (buildCorpus).
+        merge(result.pages.map(page => ({ ...page, requested: true })));
+      }
+      // Last, the AI search over everything read, the pages just fetched first so their passages come before the
+      // incidental mentions in news pages. Bounded: the passages share the prompt with the corpus (DN-05 token limit).
+      const fetchedUrls = new Set(fetched.map(page => page.url));
+      const ordered = [...crawl.pages.filter(page => fetchedUrls.has(page.url)), ...crawl.pages.filter(page => !fetchedUrls.has(page.url))];
+      const found = findPassages(ordered, AI_SEARCH_TERMS, { maxPassages: FIXED_SEARCH_PASSAGES });
+      toolCalls.push({ round: 0, tool: 'find_in_site', target: AI_SEARCH_TERMS.join(' | '), status: found.length ? 'read' : 'failed',
+        detail: `${found.length} passages` });
+      passages = [...passages, ...found];
+      corpus = assemble();
+    }
     // The roster reads only team pages, which the page plan has already fetched, so it runs alongside the
     // extraction rounds instead of after them (about 15 s saved). If a round reads a new team page, the
     // roster runs once more on the final corpus.
-    const teamSegments = (current: EvidenceCorpus) => current.segments.filter(segment => TEAM_PATH.test(new URL(segment.url).pathname));
+    const teamSegments = (current: EvidenceCorpus) => current.segments.filter(segment => isTeamUrl(segment.url));
     const extractRoster = (phase: string, current: EvidenceCorpus) => this.parseWithRepair(phase, SignalExtraction, ROSTER_PROMPT,
       serializeCorpus({ ...current, segments: teamSegments(current), links: [] }), signal, attempts);
     const earlyTeam = teamSegments(corpus).map(segment => segment.id).join(',');
@@ -286,13 +533,13 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
       });
       if (action.type === 'fetch_pages') {
         const urls = [...new Set(resolve(action.linkIds, 'page'))].slice(0, 4);
-        if (urls.length) { const result = await this.access.fetchPages(urls, signal); record(result.calls); merge(result.pages.map(page => ({ ...page, requested: true }))); }
+        if (urls.length) { const result = await access.fetchPages(urls, signal); record(result.calls); merge(result.pages.map(page => ({ ...page, requested: true }))); }
       } else if (action.type === 'read_document') {
         const urls = [...new Set(resolve(action.linkIds, 'document'))].slice(0, 2);
-        if (urls.length) { const result = await this.access.readDocuments(urls, signal); record(result.calls); merge(result.pages); }
+        if (urls.length) { const result = await access.readDocuments(urls, signal); record(result.calls); merge(result.pages); }
       } else if (action.type === 'read_sitemap') {
         if (sitemapRead) record([{ tool: 'read_sitemap', target: `https://${domain}/`, status: 'skipped', detail: 'ALREADY_READ' }]);
-        else { sitemapRead = true; const result = await this.access.readSitemap(domain, signal); record(result.calls); discovered = [...discovered, ...result.links]; }
+        else { sitemapRead = true; const result = await access.readSitemap(domain, signal); record(result.calls); discovered = [...discovered, ...result.links]; }
       } else {
         const found = findPassages(crawl.pages, action.terms).filter(passage =>
           !passages.some(existing => existing.url === passage.url && existing.start === passage.start));
@@ -308,11 +555,32 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
     if (finalTeam) {
       const roster = finalTeam === earlyTeam ? await earlyRoster!
         : await extractRoster(earlyTeam ? 'extract-roster-refresh' : 'extract-roster', corpus);
-      extraction = { ...extraction, claims: [...extraction.claims.filter(claim =>
-        !['attorneys', 'attorney_count', 'team_page_quality'].includes(claim.field)), ...roster.claims.filter(claim =>
-        ['attorneys', 'attorney_count', 'team_page_quality'].includes(claim.field))] };
+      // The roster speaks for the team. A total the site states elsewhere ("2,200 attorneys" on the home page) stays
+      // unless the roster gives one: grounding still rejects it against an incomplete roster, and it is what tells a
+      // large firm apart (DN-06 §10).
+      const replaced = ['attorneys', 'team_page_quality', ...(roster.claims.some(claim => claim.field === 'attorney_count') ? ['attorney_count'] : [])];
+      extraction = { ...extraction, claims: [...extraction.claims.filter(claim => !replaced.includes(claim.field)),
+        ...roster.claims.filter(claim => ['attorneys', 'attorney_count', 'team_page_quality'].includes(claim.field))] };
     }
     extraction = { ...extraction, claims: normalizeClaims(extraction.claims).filter(claim => !DERIVED_FIELDS.includes(claim.field)) };
+    // Where each attorney name was cited from. Names that only news pages carry are dropped when any other page names
+    // attorneys; when nothing else does they stay, and the website data says so (DN-06 §10).
+    const urlOf = (segmentId: string) => corpus.segments.find(segment => segment.id === segmentId)?.url;
+    const typeOf = (url: string) => pageTypes.get(url) ?? heuristicPageType(url);
+    const newsOnly = (claim: Claim) => claim.citations.length > 0 && claim.citations.every(citation => {
+      const url = urlOf(citation.segmentId);
+      return url !== undefined && (isNewsUrl(url) || typeOf(url) === 'blog');
+    });
+    const fromRoster = (claim: Claim) => claim.citations.some(citation => {
+      const url = urlOf(citation.segmentId);
+      return url !== undefined && !isNewsUrl(url) && (isTeamUrl(url) || ['team', 'profile'].includes(typeOf(url)));
+    });
+    const named = extraction.claims.filter(claim => claim.field === 'attorneys');
+    const attorneySource: AttorneySource = !named.length ? 'none' : named.some(fromRoster) ? 'roster'
+      : named.some(claim => !newsOnly(claim)) ? 'site' : 'news_only';
+    if (attorneySource === 'roster' || attorneySource === 'site') {
+      extraction = { ...extraction, claims: extraction.claims.filter(claim => claim.field !== 'attorneys' || !newsOnly(claim)) };
+    }
     const attorneyClaims = extraction.claims.filter(claim => claim.field === 'attorneys');
     const generalClaims = extraction.claims.filter(claim => claim.field !== 'attorneys');
     const attorneyUrls = new Set(attorneyClaims.flatMap(claim => claim.citations)
@@ -332,7 +600,26 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
     // Every field the model proposed a claim for, accepted or rejected: a rejected claim means it saw
     // something ambiguous, which negative grounding must not treat the same as nothing proposed.
     const claimedFields = new Set(extraction.claims.map(claim => claim.field));
-    const accepted = groundNegativeSignals(toWebsiteData(grounded.accepted, corpus), crawl, pageTypes, claimedFields);
+    // corpus.links holds the links of the pages read and the sitemap's URLs: the posts the scan knows of besides those it read.
+    const accepted = groundNegativeSignals(toWebsiteData(grounded.accepted, corpus), crawl, pageTypes, claimedFields, corpus.links);
+    const references = (claim: Claim): EvidenceReference[] => claim.citations.flatMap(citation => {
+      const url = urlOf(citation.segmentId);
+      return url ? [{ sourceUrl: url, excerpt: citation.quote, method: 'provider' as const }] : [];
+    });
+    if (attorneySource === 'news_only' && accepted.team_members?.length) {
+      accepted.provenance[NEWS_ONLY_TEAM_KEY] = grounded.accepted.filter(claim => claim.field === 'attorneys').flatMap(references);
+    }
+    // A stated total above the threshold marks a large firm. Grounding rejects a total it cannot match to the roster,
+    // or one stated as "over N" (INCOMPLETE_SCOPE); its quotes are still literal and still give a lower bound.
+    const verdicts = new Map(review.verdicts.map(verdict => [verdict.claimId, verdict.verdict]));
+    const stated = extraction.claims.find(claim => {
+      if (claim.field !== 'attorney_count' || typeof claim.value !== 'number' || claim.value <= LARGE_FIRM_ATTORNEYS) return false;
+      const item = grounded.report.items.find(entry => entry.claimId === claim.id);
+      return item?.status === 'accepted' || (item?.reason === 'INCOMPLETE_SCOPE' && verdicts.get(claim.id) !== 'unsupported');
+    });
+    if (stated) accepted.provenance[LARGE_FIRM_KEY] = references(stated);
+    const offices = floridaOfficeCities(crawl.pages, discovered);
+    if (offices.length) accepted.provenance[FLORIDA_OFFICES_KEY] = offices.map(({ city: _city, ...reference }) => reference);
     const urls = [...new Set([...crawl.pages.map(page => page.url), ...corpus.links.map(link => link.url), ...candidates.map(item => item.url)])];
     const team = deriveTeamPageQuality(crawl, pageTypes, accepted.team_members);
     const website = deriveWebsiteQuality(urls, pageTypes, accepted, team.value);
@@ -340,7 +627,7 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
       provenance: { ...accepted.provenance, ...(team.value ? { team_page_quality: team.evidence } : {}),
         ...(website.value ? { website_quality: website.evidence } : {}) } });
     return { websiteData, diagnostics: { model: this.model, version: this.version, corpus, attempts,
-      extraction, review, grounding: grounded.report, toolCalls, rounds, stopReason,
+      extraction, review, grounding: grounded.report, toolCalls, rounds, stopReason, attorneySource,
       pageTypes: [...pageTypes].map(([url, type]) => ({ url, type })), derived: { team, website } } };
   }
 

@@ -7,8 +7,9 @@
       "status": "error",
       "dataStatus": "UNKNOWN",
       "durationMs": 1,
-      "code": "ACCESS_BLOCKED",
-      "reason": "The site refused every request"
+      "pagesCrawled": 6,
+      "code": "PROVIDER_ERROR",
+      "reason": "Website evidence extraction unavailable"
     },
     "bar": {
       "status": "error",

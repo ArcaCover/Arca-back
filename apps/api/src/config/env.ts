@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { DEFAULT_SIGNAL_LLM_MODEL } from '../pipeline/llm-endpoint.js';
 import { ARCA_MODES } from './mode.js';
+/** What live-debug guards its spend with unless the environment says otherwise (DN-12 §5). Production has neither. */
+export const LIVE_DEBUG_APIFY_SPEND_CEILING_USD = 2;
+export const LIVE_DEBUG_OPENAI_MAX_REQUESTS_PER_SCAN = 30;
+// An empty line in an env file means "not set", never zero: a ceiling of 0 starts no run at all.
+const blankAsUnset = (value: unknown) => typeof value === 'string' && value.trim() === '' ? undefined : value;
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
@@ -36,9 +41,22 @@ const EnvSchema = z.object({
   // directory run takes 1 GB: 16 lets Bar and Avvo each run 8 lookups at once, half the account.
   MAX_APIFY_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(16),
   APIFY_ACTOR_BUILD: z.string().min(1).default('latest'),
-  // Provisional figure the ledger reserves while a run is in flight, before Apify reports
-  // the real cost. Accounting only: spend is recorded, never capped.
+  // Provisional figure the ledger reserves for a run until Apify reports what it really cost.
+  // Accounting only unless a spend ceiling is set, which counts it for every run not settled yet.
   APIFY_EXPECTED_COST_USD_PER_RUN: z.coerce.number().positive().default(1),
+  // What a targeted lookup (a few named lawyers) reserves instead. A Florida Bar lookup of one lawyer settled at USD 0.045.
+  // The Avvo actor returns up to ten detailed lawyers per lookup and one such run settled at USD 0.385, so it reserves more.
+  // Firm searches, whole-registry or one per Florida office city, keep APIFY_EXPECTED_COST_USD_PER_RUN (DN-06 §10).
+  APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN: z.coerce.number().positive().default(0.1),
+  APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN: z.coerce.number().positive().default(0.4),
+  // USD of Apify runs the ledger may hold over its last 24 hours before a new run is refused (DN-12 §5).
+  // Unset means no ceiling: production records spend and never caps it. live-debug defaults to 2.
+  // 0 starts no run at all and still serves the queries already cached.
+  APIFY_SPEND_CEILING_USD: z.preprocess(blankAsUnset, z.coerce.number().finite().nonnegative().optional()),
+  // Chat completions the website extraction of one scan may request. Unset means no cap (production);
+  // live-debug defaults to 30. The largest recorded extraction (25 attorneys) made 12; it would have made
+  // 26 had every one of its phases needed a repair.
+  OPENAI_MAX_REQUESTS_PER_SCAN: z.preprocess(blankAsUnset, z.coerce.number().int().min(1).optional()),
   // Kept in step with SCAN_CACHE_TTL_MS. If this expires first, repairing a partial scan
   // re-pays the directory runs it was meant to reuse.
   APIFY_QUERY_CACHE_TTL_MS: z.coerce.number().int().positive().default(604_800_000),
@@ -46,14 +64,22 @@ const EnvSchema = z.object({
   APIFY_RUN_TIMEOUT_SECS: z.coerce.number().int().min(60).max(86_400).default(300),
   APIFY_BAR_TARGETED_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(25),
   APIFY_AVVO_TARGETED_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(10),
+  // Lawyers one office-city firm search of a large firm reads (DN-12 §13.9): a fixed sample, so the run ends on its own
+  // limit, under its reservation, and stays reusable.
+  APIFY_BAR_OFFICE_SAMPLE_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(20),
+  APIFY_AVVO_OFFICE_SAMPLE_MAX_RESULTS: z.coerce.number().int().min(1).max(1000).default(10),
   APIFY_MAX_CACHED_ITEMS: z.coerce.number().int().min(1).max(10_000).default(1000),
   PIPELINE_TIMEOUT_MS: z.coerce.number().int().min(10_000).max(3_600_000).default(600_000),
   // Domain scan cache window. Layer 1 evidence (a published AI policy, bar standing, an
   // Avvo rating) changes in weeks, not hours.
   SCAN_CACHE_TTL_MS: z.coerce.number().int().positive().default(604_800_000),
-  // A PARTIAL scan is re-run to repair its missing evidence at most once per this window;
-  // inside it the last repair is served. 0 repairs on every request.
+  // Only a PARTIAL scan with a passing failure (a deadline, a provider) is run again, at most once per
+  // this window; inside it the last run is served. 0 repairs it on every request. A PARTIAL whose gaps a
+  // second scan would find again is served for the whole cache window (DN-12 §4).
   SCAN_PARTIAL_REPAIR_COOLDOWN_MS: z.coerce.number().int().nonnegative().default(3_600_000),
+  // How old a stored website analysis may be and still stand in for a new extraction of the same
+  // evidence, counted from the day the model produced it: 30 days. 0 extracts on every scan.
+  WEBSITE_SIGNAL_REUSE_MAX_AGE_MS: z.coerce.number().int().nonnegative().default(2_592_000_000),
 });
 export function loadEnv(source = process.env) {
   const env = EnvSchema.parse(source);
@@ -73,6 +99,20 @@ export function loadEnv(source = process.env) {
   const sourceMode = mode === 'mock' ? 'mock' : inheritedSourceMode;
   const storageBackend = mode === 'mock' ? 'memory' : inheritedStorageBackend;
   const assessmentPlanner = mode === 'mock' ? 'rules' : env.ASSESSMENT_PLANNER;
+  // live-debug is the mode that pays real providers from a developer's machine, so it brings its own guards.
+  // An explicit value wins in every mode; production without one stays uncapped.
+  const apifySpendCeilingUsd = env.APIFY_SPEND_CEILING_USD ?? (mode === 'live-debug' ? LIVE_DEBUG_APIFY_SPEND_CEILING_USD : null);
+  const openAiMaxRequestsPerScan = env.OPENAI_MAX_REQUESTS_PER_SCAN
+    ?? (mode === 'live-debug' ? LIVE_DEBUG_OPENAI_MAX_REQUESTS_PER_SCAN : null);
+  // Every kind of run must fit under a ceiling on its own: one that only targeted lookups fit under would refuse every
+  // firm search while looking like a budget, and the other way round.
+  if (apifySpendCeilingUsd !== null && apifySpendCeilingUsd > 0) {
+    for (const name of ['APIFY_EXPECTED_COST_USD_PER_RUN', 'APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN', 'APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN'] as const) {
+      if (apifySpendCeilingUsd < env[name]) {
+        throw new Error(`APIFY_SPEND_CEILING_USD is below ${name}, so no such run could ever start; use 0 to serve cached queries only`);
+      }
+    }
+  }
   const overridden = [['SOURCE_MODE', inheritedSourceMode, sourceMode], ['STORAGE_BACKEND', inheritedStorageBackend, storageBackend], ['ASSESSMENT_PLANNER', env.ASSESSMENT_PLANNER, assessmentPlanner]]
     .filter(([, was, now]) => was !== now).map(([name, was, now]) => `${name}=${was}→${now}`);
   const supabaseKey = env.SUPABASE_SECRET_KEY?.trim() || env.SUPABASE_SERVICE_ROLE_KEY?.trim();
@@ -97,5 +137,6 @@ export function loadEnv(source = process.env) {
   if (env.APIFY_ACTIVE_RUN_TTL_MS < (env.APIFY_RUN_TIMEOUT_SECS + 60) * 1000) {
     throw new Error('APIFY_ACTIVE_RUN_TTL_MS must exceed the remote run timeout by at least 60 seconds');
   }
-  return { ...env, ASSESSMENT_PLANNER: assessmentPlanner, mode, overridden, sourceMode, storageBackend, supabaseKey, corsOrigins };
+  return { ...env, ASSESSMENT_PLANNER: assessmentPlanner, mode, overridden, sourceMode, storageBackend, supabaseKey, corsOrigins,
+    apifySpendCeilingUsd, openAiMaxRequestsPerScan };
 }

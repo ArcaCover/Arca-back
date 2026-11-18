@@ -43,7 +43,8 @@ los atajos del assessment.
 Los modos (`ARCA_MODE` aquí y `NEXT_PUBLIC_ARCA_MODE` en el front) son `mock`, `live-debug` y `production`.
 Si faltan, el modo es `production`. Los dos `.env.example` arrancan en `mock`, que no necesita ninguna
 credencial ni hace llamadas pagadas. Datos y caché viven en memoria y desaparecen al reiniciar. `live-debug`
-usa las APIs reales y Supabase, y necesita sus claves. Comandos, comprobaciones y reglas de seguridad:
+usa las APIs reales y Supabase, y necesita sus claves; su webapp (cuentas, organizaciones y cobro) es
+simulada y vive en memoria, como en `mock` (DN-12 §7). Comandos, comprobaciones y reglas de seguridad:
 [DN-09](docs/design-notes/DN-09-modos-mock-y-live-debug.md), §11 y §12.
 
 Cada repo también tiene `npm run dev:mock` y `npm run dev:live-debug` para arrancarlo por separado. Sin
@@ -70,9 +71,11 @@ Invoke-RestMethod "http://localhost:8080/scan/$($scan.scanId)" -Headers @{ Autho
 | minimal.arca.example | COMPLETED | Score 25, EXPOSED; evidencia incompleta |
 | sanctioned.arca.example | COMPLETED | Score 72, FORTIFIED; decisión REFERRAL_SENIOR por sanción reciente |
 | partial.arca.example | PARTIAL | Avvo caído; `INSUFFICIENT_EVIDENCE` y decisión `UNKNOWN` |
-| failed.arca.example | FAILED | Ninguna fuente utilizable; sin `result` en la respuesta |
+| blocked.arca.example | PARTIAL | La web se niega a ser leída (robots.txt, causa definitiva): flag `WEBSITE_UNAVAILABLE`, confianza LOW, decisión `UNKNOWN`; el assessment puntúa solo con las respuestas |
+| down.arca.example | PARTIAL | No se pudo llegar a la web (causa transitoria): lo mismo que `blocked`, pero la caché lo repara pasado el cooldown |
+| failed.arca.example | FAILED | Fallo nuestro: la extracción falló sobre páginas que sí se leyeron; sin `result` en la respuesta |
 
-Los dos últimos existen para que el frontend pueda desarrollar sus ramas de error sin
+Los cuatro últimos existen para que el frontend pueda desarrollar sus ramas de error sin
 desenchufar la red.
 
 Los fixtures están en `apps/api/mocks`; la sanción reciente se fecha al cargar el escenario.
@@ -101,15 +104,41 @@ La confianza HIGH/MEDIUM/LOW corresponde al número de fuentes técnicamente com
 `preScore.assessmentStatus=INSUFFICIENT_EVIDENCE` bloquea la decisión comercial automática y devuelve
 `decision=UNKNOWN`, salvo que evidencia disciplinaria conocida imponga una restricción explícita.
 
+Una web que no se puede leer no hace fallar el scan si la causa es del propio sitio (DN-12 §14):
+
+- **Ninguna página leída, por cualquier causa del sitio** (robots.txt excluye el sitio, 401/403 o una página de
+  desafío, DNS que no resuelve, conexión rechazada o cortada, plazo del crawl, 5xx, 429, robots.txt inalcanzable,
+  portada vacía o que redirige a otro dominio): el scan termina **PARTIAL** con el resultado, el flag
+  `WEBSITE_UNAVAILABLE` y confianza LOW. Sin override: la decisión queda `UNKNOWN` salvo una restricción
+  disciplinaria. El front y el PDF del Quick Scan no enseñan número ni tier (confianza baja, no alto riesgo). El
+  assessment puede empezar y puntúa solo con las respuestas: `layer1Score: null`, `compositeScore = layer2Score` y
+  el flag `LAYER1_UNAVAILABLE`.
+- **Fallo nuestro** (la fuente lanzó, el plazo del pipeline, la extracción del modelo falló sobre páginas que sí se
+  leyeron, el almacenamiento): sigue **FAILED**, sin `result`, y el visitante puede reintentar.
+
+La línea la marca `sources.website.pagesCrawled`: solo un crawl que no leyó ninguna página pone `0`
+(`isWebsiteUnavailable` en `@arca/scoring`). Definitiva o transitoria solo decide cuánto lo guarda la caché (abajo).
+La clase (definitiva o transitoria) está en un solo sitio, `classifyUnreadableWebsite` (`@arca/scoring`); la tabla de causas, en el DN-07 de crawl, §6.
+
 La caché dura `SCAN_CACHE_TTL_MS` por dominio canónico, 7 días por defecto, y nunca reutiliza FAILED.
-**Un cache hit siempre es COMPLETED.** Un scan que quedó PARTIAL sí entra en la caché, pero no se
-devuelve tal cual: se re-ejecuta reutilizando el análisis de website por hash de contenido y las
-consultas de directorio vigentes, de modo que solo se repara la evidencia que falta, y el solicitante
-recibe el resultado reparado. Devolverlo sin reparar congelaría el fallo durante toda la ventana.
-La reparación se intenta como mucho una vez por `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` (1 hora por defecto):
-dentro de ese intervalo se sirve la última reparación como PARTIAL con `cached=true`, siempre por
-polling (202 y después `GET /scan/:scanId`), nunca en el 200 rápido. Una fuente caída de forma
-permanente se sigue reintentando, pero no a costa de hacer esperar a cada visitante.
+**Mismo despacho, mismo score (DN-12 §4).** Dentro de la ventana, el resultado guardado es la respuesta:
+
+- Un COMPLETED se devuelve en el 200 rápido con `cached=true`.
+- Un PARTIAL cuyos huecos volvería a encontrar un segundo scan (un directorio omitido por
+  `INSUFFICIENT_IDENTITY`, `NO_MATCH`, `TRUNCATED`, la web que no se deja leer, un website leído hasta
+  donde el sitio permite) se sirve tal cual **toda la ventana**, siempre por polling (202 y después
+  `GET /scan/:scanId`), nunca en el 200 rápido.
+- Un PARTIAL con una causa transitoria (plazo, error del proveedor, límite de uso de Apify, crawl cortado
+  por el plazo, una web que no se pudo alcanzar) se sirve durante `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` (1 hora por defecto) y después se
+  re-ejecuta, una vez por intervalo: una fuente que sigue fallando se reintenta, pero no a costa de hacer
+  esperar a cada visitante.
+
+La tabla de causas está en un solo sitio, `apps/api/src/http/scan-cache.ts`. Una re-ejecución reutiliza
+el análisis de website guardado mientras el sitio diga lo mismo (clave: lo que lee el modelo, no el HTML;
+edad máxima `WEBSITE_SIGNAL_REUSE_MAX_AGE_MS`, 30 días) y las consultas de directorio vigentes, así que
+solo se repara la evidencia que falta. Para forzar una ejecución nueva de un despacho ya cacheado se
+arranca el back con `SCAN_CACHE_TTL_MS=1`, `SCAN_PARTIAL_REPAIR_COOLDOWN_MS=0` y, si además debe leer
+el modelo otra vez, `WEBSITE_SIGNAL_REUSE_MAX_AGE_MS=0` (DN-12 §4.4).
 Un scan solo queda PARTIAL después de que cada página recuperable agotó sus reintentos.
 `APIFY_QUERY_CACHE_TTL_MS` se mantiene acoplado a `SCAN_CACHE_TTL_MS`: si expirara antes, cada
 reparación volvería a pagar las consultas de directorio que debía reutilizar.
@@ -118,12 +147,31 @@ La caché vive en PostgreSQL/Supabase usando `scans`; no requiere Redis ni archi
 está respaldada por un índice parcial sobre dominio y fecha para scans reutilizables no cacheados.
 Los límites en memoria son 10 solicitudes por IP/hora y 3 por email/hora.
 
-El gasto de Apify se **registra pero no se limita**. El ledger (`apify_runs`, `scan_apify_runs`,
-`cost_usd`, `reserved_usd`, `accounting_complete`, `charged_to_scan`) queda intacto y atribuye el
-coste por scan; `APIFY_EXPECTED_COST_USD_PER_RUN` es la cifra provisional que se reserva mientras un
-run está en vuelo, antes de que Apify reporte el coste real. No hay tope por run, por scan ni por día,
-y tampoco `maxTotalChargeUsd` del lado del proveedor: lo único que acota un run individual es
+En producción el gasto de Apify se **registra pero no se limita**. El ledger (`apify_runs`, `scan_apify_runs`,
+`cost_usd`, `reserved_usd`, `accounting_complete`, `charged_to_scan`) atribuye el coste por scan;
+`APIFY_EXPECTED_COST_USD_PER_RUN` es la cifra provisional que se reserva por cada búsqueda por firma hasta que
+Apify liquida su coste real, minutos después de que termine; una búsqueda dirigida de unos pocos nombres reserva
+`APIFY_EXPECTED_COST_USD_PER_TARGETED_RUN` (0,10) o, en Avvo, `APIFY_AVVO_EXPECTED_COST_USD_PER_TARGETED_RUN`
+(0,40) (DN-06 §10.2). Sin techo no hay tope por run, por scan ni por
+día, y tampoco `maxTotalChargeUsd` del lado del proveedor: lo único que acota un run individual es
 `APIFY_RUN_TIMEOUT_SECS`.
+
+**Guardas de gasto (DN-12 §5).** Activas por defecto solo en `live-debug`; producción no las tiene si su
+entorno no las fija.
+
+- `APIFY_SPEND_CEILING_USD` (`live-debug`: 2): techo en USD sobre lo que el ledger tiene comprometido en
+  las últimas 24 horas, lo haya arrancado quien lo haya arrancado. Un run sin liquidar cuenta su reserva
+  entera. Si un run nuevo no cabe, se rechaza antes de enviar nada a Apify, el directorio informa
+  `PROVIDER_ERROR` (causa transitoria) y el scan queda PARTIAL. Las consultas cacheadas se siguen
+  sirviendo. `0` no arranca ningún run. Con techo, cada run lleva además `maxTotalChargeUsd` igual a su
+  reserva, así que los límites de los runs en vuelo nunca suman más que el techo; va en la URL, así que ni
+  el input ni el fingerprint cambian. Para que una búsqueda por firma pueda gastar más, se sube la reserva.
+- `OPENAI_MAX_REQUESTS_PER_SCAN` (`live-debug`: 30): máximo de chat completions de la extracción del
+  website de un scan. Si se pasa, la fuente falla por causa transitoria y el scan termina FAILED.
+
+Cada ejecución del pipeline deja una línea `[scan-cost] {...}` en el log, en todos los modos: runs de
+Apify arrancados, rechazados y servidos de caché, USD informados y reservados, peticiones y tokens de
+OpenAI. Nombra el scan solo por su id.
 
 ## Reglas
 
@@ -159,9 +207,13 @@ node apps/api/dist/server.js
 ```
 
 Website: Playwright, máximo 20 páginas y profundidad 2; robots y resolución pública fijada al socket.
+`robots.txt` sigue RFC 9309: un 4xx distinto de 429 significa que no hay reglas; un 429, un 5xx, un error de
+red o un timeout significan que no se lee nada de ese origen. Se descarga una vez por origen y scan.
 Una página que falla por transporte, error 5xx o 429 se reintenta hasta completar tres intentos antes de
-marcar el rastreo parcial; robots, 4xx y contenido ilegible no se reintentan. El rastreo tiene su propio
-plazo de 20 segundos, y al agotarse el resultado es parcial aunque queden reintentos disponibles.
+marcar el rastreo parcial; robots, 4xx y contenido ilegible no se reintentan. Un enlace excluido por robots,
+un 404/410 o un enlace a algo que no es HTML quedan anotados, pero no marcan el rastreo parcial
+(DN-07 de crawl, §6). El rastreo tiene su propio
+plazo de 30 segundos, y al agotarse el resultado es parcial aunque queden reintentos disponibles.
 La prioridad de rastreo reconoce vocabulario en inglés y en español, para que un sitio en español no empate
 todas sus páginas en la prioridad mínima y gaste el plazo en el blog.
 El nombre del despacho se toma de `JSON-LD` cuando existe; al recurrir a `og:site_name` se descarta la cola
@@ -232,7 +284,9 @@ Usar `SOURCE_MODE=mock`, `STORAGE_BACKEND=memory` y `ASSESSMENT_PLANNER=rules` p
 servicios externos. El modo memory pierde los datos al reiniciar el proceso; el adaptador Supabase
 usa una migración nueva con CAS y transacciones para persistencia durable.
 
-Las cinco rutas nuevas se documentan en Swagger y en
+Las seis rutas nuevas se documentan en Swagger y en
 [Layer 2: operación, persistencia y límites](docs/LAYER2_ASSESSMENT.md). Usan el mismo Bearer del scan,
 con una ventana de 24 horas, creación/completado idempotentes y registro de invalidaciones cuando
-una pregunta deja de ser visible. El informe PDF y los enlaces de reanudación quedan fuera de esta entrega.
+una pregunta deja de ser visible. Un assessment completado tiene su informe PDF
+(`GET /assessment/:assessmentId/report.pdf`, ver la sección "Assessment report" de
+[LAYER2_ASSESSMENT.md](docs/LAYER2_ASSESSMENT.md)). Los enlaces de reanudación quedan fuera de esta entrega.

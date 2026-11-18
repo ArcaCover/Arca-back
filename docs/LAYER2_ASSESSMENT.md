@@ -3,23 +3,26 @@
 This isolated implementation follows DN-07's fixed-bank, deterministic-score architecture.
 The bank and 30% Layer 1 / 70% Layer 2 composite are **engineering demo fixtures**, not approved
 underwriting policy. Every result carries `bankStatus: DEMO`, `commercialDecisionBlocked: true`,
-and demo flags. A questionnaire cannot erase a known Layer 1 disciplinary restriction or
-make missing public evidence sufficient. No pricing, binding, PDF report, or magic-link flow is implemented.
+and demo flags. A questionnaire cannot erase a known Layer 1 restriction (a disciplinary override, or
+`WEBSITE_UNAVAILABLE` when the firm website refused to be read: DN-12) or
+make missing public evidence sufficient. No pricing, binding, or magic-link flow is implemented.
+A completed assessment can be downloaded as a PDF report (see "Assessment report" below).
 
 ## Local operation
 
 Use `SOURCE_MODE=mock`, `STORAGE_BACKEND=memory`, and `ASSESSMENT_PLANNER=rules`.
 Start with the usual `npm ci`, `npm run build`, and `npm run dev`. Scan a documented mock domain,
 then keep the returned scan session token for every assessment request. Swagger at `/docs`
-contains the five new routes.
+contains the six assessment routes.
 
 1. `POST /scan/:scanId/assessment` starts planning, returning `202` and an assessment ID.
 2. Poll `GET /assessment/:assessmentId` until `READY`.
 3. `PUT /assessment/:assessmentId/answers/:questionId` with `{ "answer": ... }` saves immediately.
 4. `POST /assessment/:assessmentId/complete` with `{ "attestation": true }` stores the result.
 5. `GET /assessment/:assessmentId/result` reads that exact stored result.
+6. `GET /assessment/:assessmentId/report.pdf` downloads the report of that stored assessment.
 
-All five require `Authorization: Bearer <sessionToken>`. The token's scan ID and requester email
+All six require `Authorization: Bearer <sessionToken>`. The token's scan ID and requester email
 must match the original scan. Assessment views/results use `Cache-Control: no-store`.
 A scan that is `COMPLETED` or `PARTIAL` with a result can start an assessment. A running or failed
 scan cannot. Repeated create requests always return the same assessment, including after completion.
@@ -42,6 +45,48 @@ Changing an answer recalculates visibility and removes newly hidden answers in t
 write, adding invalidation events. Showing the question again requires a fresh answer. Completion
 requires every currently visible question to be answered with the correct answer kind, allowed
 options, exclusivity and numeric range/step, plus explicit truthfulness attestation.
+
+## Assessment report
+
+`GET /assessment/:assessmentId/report.pdf` renders a completed assessment with the Chromium renderer
+and the layout of the Quick Scan Report (`apps/api/src/report/`). It is built from the stored record
+alone: the Layer 1 snapshot for the firm name and domain, the frozen bank and plan to know which
+questions the firm ended on, the rendered questions for their exact wording, the answers and the
+stored result. Nothing is scored again and no provider is called.
+
+| Case | Answer |
+|---|---|
+| Completed assessment | `200 application/pdf`, `Cache-Control: no-store`, `Content-Disposition: attachment; filename="arca-assessment-<domain>-<yyyy-mm-dd>.pdf"` (the completion day in `America/New_York`, the day the report prints) |
+| Missing or invalid token, another scan's token, another email | `401 unauthorized` |
+| Unknown assessment | `404 not_found` |
+| Not completed yet | `409 incomplete` |
+| The 24-hour session ended | `410 expired` |
+| No renderer configured, the renderer failed or ran out of time, or an injected debug report fault | `503 report_unavailable` |
+
+The report states the firm and domain, the completion date, the combined score and tier, the
+Layer 1 and Layer 2 parts, the six areas with their weights, the action plan, the answers as they
+were asked (marking follow-ups that are context only), and the bank and scoring versions. It carries
+exactly one demo disclosure: "Demo assessment. The questions and the scoring are provisional, so
+these results are illustrative. This is not an insurance offer, a price or an underwriting decision."
+It never prints the decision, the overrides, the raw flags, the requester's email or a price. When
+the result carries `WEBSITE_UNAVAILABLE` it adds the results screen's notice in the third person: the
+website could not be read, the outlook needs a manual review whatever the answers show, and this is
+not a coverage decision or a price. It names the highest-risk group only when the tier is `CRITICAL`,
+so the sentence cannot contradict the tier printed above it, and it never says the group itself holds
+whatever the answers are: the tier follows the combined score (DN-12 sections 3.3 and 6.2). The
+combined score is printed as a whole number, as the results screen's gauge shows it, and the dates
+are the day in `America/New_York`.
+
+CORS exposes `Content-Disposition` for every route, so the browser can read the filename. In the
+debug modes the scenario axis `http.report: unavailable` applies to this route as it does to the
+scan report. Each render launches its own Chromium. Both reports share an in-process cap of two
+renders at once; further requests wait in order, and each request has 12 seconds in all, waiting
+included. Past that the render is aborted and the route answers `503 report_unavailable`. There is
+still no rate limit per token or address (DN-12 section 6.4).
+
+Action plan items carry only their own step (`Next step: <option>.`). The caveat that each gain is a
+provisional estimate on its own is said once by the screen and once by the report, not on every item.
+Results completed before this change keep the longer text they were stored with.
 
 ## Planning and recovery
 
@@ -87,6 +132,9 @@ limiter. The durable lifetime limit is enforced in PostgreSQL as well as the ser
 - `npm run build`: TypeScript project references and production imports.
 - `npx vitest run apps/api/tests/integration/assessment.test.ts`: local HTTP workflow, bearer scope,
   expiry, invalid answers, concurrency, hidden-answer invalidation, resume, failure recovery and limits.
+- `npx vitest run apps/api/tests/integration/assessment-report.test.ts`: the report route (download
+  headers, token scope, not completed, expiry, renderer failures) and the report's content, with an
+  injected renderer. No Chromium is launched.
 - `npx vitest run apps/api/tests/integration/assessment-database.test.ts`: PGlite schema/RLS,
   immutable snapshots, transactional audit rollback, CAS and durable write limits.
 - `npm test`: full backend regression suite. Browser integration tests require the matching

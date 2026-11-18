@@ -28,8 +28,9 @@ export type DebugTools = {
   reportFault(scanId: string): boolean;
   assessmentAgentFor(scanId: string): AssessmentAgent | undefined;
   /**
-   * True only in mock, with the webapp's mock pieces: only then does the demo seed exist (DN-11 §4.6), and only then does createApp
-   * build the scan runner it needs, which skips the scan limiter.
+   * True only in mock, with the simulated webapp: only then does the demo seed exist (DN-11 §4.6), and only then does createApp
+   * build the scan runner it needs, which skips the scan limiter. In live-debug that runner would scan a real site and write
+   * to the shared database, so the webapp runs there without a seed.
    */
   readonly seeds: boolean;
   /** `seed` carries the app's own scan runner and assessments, exactly when `seeds` is true. */
@@ -61,15 +62,16 @@ export function createDebugTools(options: {
   scans: RoutingScanRepository; assessments: RoutingAssessmentRepository; pipelineTimeoutMs: number;
   clearDurableMemory?: () => void;
   /**
-   * The mock login and payment of the webapp (DN-10 §4.1, §4.4) and its demo seed (DN-11 §4.6). Mock only: live-debug signs in
-   * with the real Supabase Auth.
+   * The simulated login and payment of the webapp (DN-10 §4.1, §4.4), in both debug modes: in live-debug the scans are real
+   * and the accounts, organizations and billing are these in-memory pieces (DN-12 §7). The demo seed (DN-11 §4.6) runs on
+   * them in mock only.
    */
   webapp?: { auth: MockAppAuth; billing: MockBillingProvider; service: WebappService; repository: InMemoryWebappRepository };
   /** How long a seed request waits before it answers 504; the run itself goes on. */
   seedTimeoutMs?: number;
 }): DebugTools {
   const { scans, assessments, sources, webapp } = options;
-  if (webapp && options.mode !== 'mock') throw new Error('The mock login and payment exist only in mock');
+  const seeds = webapp !== undefined && options.mode === 'mock';
   // Checked once, here: the mode route can only ever serve enums and booleans, never a key or a URL (DN-09 7).
   const description = DebugModeResponse.parse(options.describe);
   const scenarios = new Map<string, DebugScenario>();
@@ -136,10 +138,10 @@ export function createDebugTools(options: {
     },
     reportFault: scanId => scenarios.get(scanId)?.http.report === 'unavailable',
     assessmentAgentFor: scanId => scenarios.get(scanId)?.planner === 'timeout' ? stalledPlanner : undefined,
-    seeds: webapp !== undefined,
+    seeds,
     routes({ limiter, sessionSecret, seed: seedPieces }) {
       // Both ways round: no seed without its scan runner, and no scan runner where there is no seed to hand it to.
-      if (!webapp !== !seedPieces) throw new Error('The demo seed and its scan runner exist only in mock, and only together');
+      if (seeds !== (seedPieces !== undefined)) throw new Error('The demo seed and its scan runner exist only in mock, and only together');
       const app = new Hono();
       app.use('*', async (c, next) => { c.header('Cache-Control', 'no-store'); await next(); });
       app.get('/mode', c => c.json(description));
@@ -161,24 +163,26 @@ export function createDebugTools(options: {
           // Null while the scan runs, and for a failure no source reported on: a thrown pipeline, or one this process did not run.
           sources: scan.result?.sources ?? failedSources.get(scanId) ?? null }));
       });
-      // The limiter always; this process's memory only in mock (DN-09 5.2). Supabase is never touched. The isolated ids
-      // are never forgotten, so a wiped injected scan answers 404 and never falls through to durable storage.
+      // The limiter always, and the simulated webapp, which only ever lives in this process: forgetting it in live-debug lets
+      // the same real scan be claimed again instead of paying for another. The scans and assessments held in memory only in
+      // mock (DN-09 5.2). Supabase is never touched. The isolated ids are never forgotten, so a wiped injected scan answers
+      // 404 and never falls through to durable storage.
       app.post('/reset', c => {
         const refused = withoutDebugHeader(c, 'A debug reset');
         if (refused) return refused;
         limiter.clear();
+        webapp?.repository.clear();
         if (options.mode === 'mock') {
           scans.overlay.clear();
           assessments.overlay.clear();
           options.clearDurableMemory?.();
-          webapp?.repository.clear();
           seeded = null;
           seeding = null;
           resets++;
         }
         return c.json({ ok: true });
       });
-      if (!webapp || !seedPieces) return app;
+      if (!webapp) return app;
       // A token in the shape of a Supabase one, for any email; platformAdmin also makes that user an ARCA platform admin.
       app.post('/auth/login', async c => {
         const refused = withoutDebugHeader(c, 'A mock login');
@@ -189,6 +193,20 @@ export function createDebugTools(options: {
         if (body.data.platformAdmin) await webapp.repository.grantPlatformAdmin(session.user.userId, session.user.userId);
         return c.json(session);
       });
+      // Stands in for Stripe's checkout.session.completed webhook: the event goes through the same service method.
+      app.post('/billing/pay', async c => {
+        const refused = withoutDebugHeader(c, 'A mock payment');
+        if (refused) return refused;
+        const body = MockPayment.safeParse(await c.req.json().catch(() => null));
+        if (!body.success) return c.json({ error: 'invalid_request', message: 'A checkout session id is required' }, 400);
+        const event = webapp.billing.pay(body.data.sessionId);
+        // After a reset the session may name an organization that no longer exists.
+        if (!event || await webapp.service.applyBillingEvent(event) !== 'applied') {
+          return c.json({ error: 'conflict', message: 'Unknown or already paid checkout session' }, 409);
+        }
+        return c.json({ ok: true });
+      });
+      if (!seedPieces) return app;
       // The demo organization (DN-11 §4.6): a paid one with a user of each role, built through the real flow. Asking again
       // returns it as the demo left it; a new one is built only when there is none, it was deleted or a reset forgot it.
       app.post('/seed', async c => {
@@ -207,19 +225,6 @@ export function createDebugTools(options: {
         } finally {
           clearTimeout(timer);
         }
-      });
-      // Stands in for Stripe's checkout.session.completed webhook: the event goes through the same service method.
-      app.post('/billing/pay', async c => {
-        const refused = withoutDebugHeader(c, 'A mock payment');
-        if (refused) return refused;
-        const body = MockPayment.safeParse(await c.req.json().catch(() => null));
-        if (!body.success) return c.json({ error: 'invalid_request', message: 'A checkout session id is required' }, 400);
-        const event = webapp.billing.pay(body.data.sessionId);
-        // After a reset the session may name an organization that no longer exists.
-        if (!event || await webapp.service.applyBillingEvent(event) !== 'applied') {
-          return c.json({ error: 'conflict', message: 'Unknown or already paid checkout session' }, 409);
-        }
-        return c.json({ ok: true });
       });
       return app;
     },
