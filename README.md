@@ -71,10 +71,11 @@ Invoke-RestMethod "http://localhost:8080/scan/$($scan.scanId)" -Headers @{ Autho
 | minimal.arca.example | COMPLETED | Score 25, EXPOSED; evidencia incompleta |
 | sanctioned.arca.example | COMPLETED | Score 72, FORTIFIED; decisión REFERRAL_SENIOR por sanción reciente |
 | partial.arca.example | PARTIAL | Avvo caído; `INSUFFICIENT_EVIDENCE` y decisión `UNKNOWN` |
-| blocked.arca.example | PARTIAL | La web se niega a ser leída (robots.txt): score 0, CRITICAL, flag y override `WEBSITE_UNAVAILABLE`, decisión `REFERRAL_SENIOR` |
-| failed.arca.example | FAILED | No se pudo llegar a la web (causa transitoria); sin `result` en la respuesta |
+| blocked.arca.example | PARTIAL | La web se niega a ser leída (robots.txt, causa definitiva): flag `WEBSITE_UNAVAILABLE`, confianza LOW, decisión `UNKNOWN`; el assessment puntúa solo con las respuestas |
+| down.arca.example | PARTIAL | No se pudo llegar a la web (causa transitoria): lo mismo que `blocked`, pero la caché lo repara pasado el cooldown |
+| failed.arca.example | FAILED | Fallo nuestro: la extracción falló sobre páginas que sí se leyeron; sin `result` en la respuesta |
 
-Los tres últimos existen para que el frontend pueda desarrollar sus ramas de error sin
+Los cuatro últimos existen para que el frontend pueda desarrollar sus ramas de error sin
 desenchufar la red.
 
 Los fixtures están en `apps/api/mocks`; la sanción reciente se fecha al cargar el escenario.
@@ -103,17 +104,21 @@ La confianza HIGH/MEDIUM/LOW corresponde al número de fuentes técnicamente com
 `preScore.assessmentStatus=INSUFFICIENT_EVIDENCE` bloquea la decisión comercial automática y devuelve
 `decision=UNKNOWN`, salvo que evidencia disciplinaria conocida imponga una restricción explícita.
 
-Una web que no se puede leer no siempre falla el scan (DN-12):
+Una web que no se puede leer no hace fallar el scan si la causa es del propio sitio (DN-12 §14):
 
-- **Causa definitiva** (robots.txt excluye el sitio, sus páginas responden 401/403 o una página de desafío): el scan
-  termina **PARTIAL** con el resultado completo. Usa solo valores que ya existían en el contrato: score con lo que
-  se sabe (0 si no hay nada más), tier por las bandas de siempre, confianza LOW, `INSUFFICIENT_EVIDENCE`, el flag
-  `WEBSITE_UNAVAILABLE` y el override `{ id: 'WEBSITE_UNAVAILABLE', decision: 'REFERRAL_SENIOR' }`. El assessment
-  puede empezar desde ese resultado y no borra ni el flag ni la restricción.
-- **Causa transitoria o nuestra** (plazo, error de red, robots.txt inalcanzable, 429, 5xx, fallo del proveedor):
-  sigue **FAILED**, sin `result`. No se concluye nada sobre la firma y el visitante puede reintentar.
+- **Ninguna página leída, por cualquier causa del sitio** (robots.txt excluye el sitio, 401/403 o una página de
+  desafío, DNS que no resuelve, conexión rechazada o cortada, plazo del crawl, 5xx, 429, robots.txt inalcanzable,
+  portada vacía o que redirige a otro dominio): el scan termina **PARTIAL** con el resultado, el flag
+  `WEBSITE_UNAVAILABLE` y confianza LOW. Sin override: la decisión queda `UNKNOWN` salvo una restricción
+  disciplinaria. El front y el PDF del Quick Scan no enseñan número ni tier (confianza baja, no alto riesgo). El
+  assessment puede empezar y puntúa solo con las respuestas: `layer1Score: null`, `compositeScore = layer2Score` y
+  el flag `LAYER1_UNAVAILABLE`.
+- **Fallo nuestro** (la fuente lanzó, el plazo del pipeline, la extracción del modelo falló sobre páginas que sí se
+  leyeron, el almacenamiento): sigue **FAILED**, sin `result`, y el visitante puede reintentar.
 
-La clasificación está en un solo sitio, `classifyUnreadableWebsite` (`@arca/scoring`); la tabla de causas, en el DN-07 de crawl, §6.
+La línea la marca `sources.website.pagesCrawled`: solo un crawl que no leyó ninguna página pone `0`
+(`isWebsiteUnavailable` en `@arca/scoring`). Definitiva o transitoria solo decide cuánto lo guarda la caché (abajo).
+La clase (definitiva o transitoria) está en un solo sitio, `classifyUnreadableWebsite` (`@arca/scoring`); la tabla de causas, en el DN-07 de crawl, §6.
 
 La caché dura `SCAN_CACHE_TTL_MS` por dominio canónico, 7 días por defecto, y nunca reutiliza FAILED.
 **Mismo despacho, mismo score (DN-12 §4).** Dentro de la ventana, el resultado guardado es la respuesta:
@@ -124,7 +129,7 @@ La caché dura `SCAN_CACHE_TTL_MS` por dominio canónico, 7 días por defecto, y
   donde el sitio permite) se sirve tal cual **toda la ventana**, siempre por polling (202 y después
   `GET /scan/:scanId`), nunca en el 200 rápido.
 - Un PARTIAL con una causa transitoria (plazo, error del proveedor, límite de uso de Apify, crawl cortado
-  por el plazo) se sirve durante `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` (1 hora por defecto) y después se
+  por el plazo, una web que no se pudo alcanzar) se sirve durante `SCAN_PARTIAL_REPAIR_COOLDOWN_MS` (1 hora por defecto) y después se
   re-ejecuta, una vez por intervalo: una fuente que sigue fallando se reintenta, pero no a costa de hacer
   esperar a cada visitante.
 

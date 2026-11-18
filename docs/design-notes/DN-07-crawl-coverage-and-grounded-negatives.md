@@ -206,8 +206,9 @@ Lo mismo vale para una página vacía dentro de un crawl que sí leyó otras: el
 §4.2). Una portada 404/410 o que no es HTML también queda fuera, porque la decisión D3 no las incluye. Meterlas
 exigiría decidirlo antes y darles un código distinto del de la página vacía, porque la clase se lee solo del código.
 
-Qué hace cada clase con el scan está en DN-12 §3: DEFINITIVE termina PARTIAL con el resultado de alto riesgo
-(flag y override `WEBSITE_UNAVAILABLE`) y TRANSIENT sigue terminando FAILED.
+Qué hace cada clase con el scan está en DN-12 §14 (antes §3): desde el 2026-11-17 las dos terminan PARTIAL con el
+flag `WEBSITE_UNAVAILABLE` y confianza baja, sin override; la clase solo decide cuánto lo guarda la caché de scans
+(DEFINITIVE toda la ventana, TRANSIENT hasta el cooldown de reparación). FAILED queda para los fallos nuestros.
 
 **Redirecciones fuera del sitio.** Playwright no pasa por el manejador de peticiones los saltos de una
 redirección HTTP: Chromium los sigue con su propia red, fuera de `network.ts` (anti-SSRF con IP fijada).

@@ -3,7 +3,8 @@
 - **Fecha:** 2026-11-09
 - **Estado:** hecho en las dos ramas, sin publicar. Cada arreglo tiene su sección (§3 a §8); la verificación
   conjunta en mock está en §10. La §12 (2026-11-12) trata la evidencia insuficiente y la §13 los arreglos tras dos scans en vivo de una firma grande
-  que dieron scores distintos.
+  que dieron scores distintos. La §14 (2026-11-17) sustituye a D4: una web ilegible, por cualquier causa del sitio,
+  es confianza baja y no alto riesgo.
 - **Repos:** `Arca-back` y `Arca-front`, rama `fix/live-scan-findings` en ambos
 - **Parte de:** DN-07 de crawl (§6, robots y web ilegible), DN-09 (modos), DN-10 y DN-11 (webapp)
 
@@ -36,7 +37,7 @@ Los arreglos de robots de §3.1 son endurecimiento, no la causa de lo que vio.
 | D1 | `robots.txt` sigue RFC 9309: 2xx se interpreta; un 4xx distinto de 429 significa que no hay reglas; 429, 5xx, error de red, bucle de redirecciones o timeout significan inalcanzable (no se lee nada, causa transitoria). Nunca se suplanta el User-Agent de un navegador | **[mía]** |
 | D2 | Una página decidida o muerta (enlace excluido por robots, 404/410, contenido que no es HTML) y un subrecurso de terceros fallido se anotan, pero no dejan el crawl `partial`. `partial` queda para el plazo y para fallos del propio sitio que agotaron sus reintentos | **[mía]** |
 | D3 | Todo resultado de cero páginas se clasifica una vez, en un solo sitio: DEFINITIVE (robots excluye el sitio, 401/403 o página de desafío) o TRANSIENT (abort, plazo, error de red, robots inalcanzable, 429, 5xx, errores del proveedor) | **[mía]** |
-| D4 | Una web ilegible DEFINITIVE ya no hace fallar el scan: termina PARTIAL, con el resultado completo marcado de alto riesgo usando solo valores que el contrato ya tenía, el flag `WEBSITE_UNAVAILABLE` y un override `REFERRAL_SENIOR`. La Capa 2 puede empezar desde ahí. Lo transitorio y lo nuestro sigue FAILED ("try again") | **[mía]** |
+| D4 | Una web ilegible DEFINITIVE ya no hace fallar el scan: termina PARTIAL, con el resultado completo marcado de alto riesgo usando solo valores que el contrato ya tenía, el flag `WEBSITE_UNAVAILABLE` y un override `REFERRAL_SENIOR`. La Capa 2 puede empezar desde ahí. Lo transitorio y lo nuestro sigue FAILED ("try again"). **Sustituida el 2026-11-17 por §14** | **[mía]** |
 | D5 | Mismo despacho, mismo score: dentro de la ventana de caché (7 días) el resultado guardado es la respuesta, también un PARTIAL de causa estructural o definitiva. La reparación de 1 hora queda solo para causas transitorias. Para forzar otra ejecución se usan variables de entorno, sin cabecera nueva | **[mía]** |
 | D6 | Ningún cambio en `packages/contracts/src` que altere el formato, ninguna versión nueva, y `LAYER1_CONTRACT_VERSION` no se toca (la caché de scans filtra por ella). Flags, ids de override y motivos son texto libre y se usan | **[mía]** |
 | D7 | Solo en `live-debug`, la webapp corre sobre el repositorio en memoria con login y pago simulados, leyendo scans y assessments de los repositorios reales, y dice que es simulada. La semilla de demo sigue solo en mock. Producción no cambia: 501 y ningún control de registro | **[Jesús]** |
@@ -58,6 +59,9 @@ Hecho. `website-outcome.ts` elige el código según la causa y `classifyUnreadab
 demás es TRANSIENT. La tabla de causas está en el DN-07 de crawl, §6.
 
 ### 3.3 Scan PARTIAL de alto riesgo (D4)
+
+> **Sustituida por §14 (2026-11-17).** Lo que sigue es la historia de D4. Hoy cualquier causa del sitio termina
+> PARTIAL, sin override ni grupo de mayor riesgo, y la Capa 2 puntúa solo con las respuestas.
 
 Hecho en el back.
 
@@ -1027,7 +1031,8 @@ Back: `hasInsufficientEvidence` en `apps/api/src/report/quick-scan.ts`. Front: `
 `lib/api/adapt.ts`.
 
 **Excepción.** Con el flag `WEBSITE_UNAVAILABLE` la regla no se aplica: ese caso se muestra a propósito como el
-grupo de mayor riesgo con revisión manual (§3.3 y §8), y el aviso de la web nombra el tier. El front deja fuera,
+grupo de mayor riesgo con revisión manual (§3.3 y §8), y el aviso de la web nombra el tier. *Desde §14 la web
+ilegible tiene su propio estado hermano, también sin número ni tier (`scoreWithheld`).* El front deja fuera,
 además, todo resultado al que pinta el aviso de web ilegible, también una web caída sin el flag, para no
 esconder el tier que ese aviso nombra; el PDF solo pone ese aviso con el flag, así que con el flag le basta.
 
@@ -1307,3 +1312,152 @@ esperaba. Según el tiempo de red, la siembra llegaba o no.
 **Tests.** `sitemap-reader.test.ts` (índice con la forma del de hklaw: se leen los 11 hijos, oficinas y personas
 antes que noticias, mismo resultado con respuestas en otro orden) y `crawler.test.ts` (el desenlace del sitemap queda
 en el resultado: `read`, `failed`, `timeout`).
+
+## 14. Web ilegible: confianza baja, no alto riesgo (2026-11-17)
+
+Rama `feat/unreachable-website-layer2` en los dos repos, cortada de `fix/score-stability`. Decisión **[Jesús]**.
+**Sustituye a D4** (§3.3): una web que no se pudo leer ya no es "grupo de mayor riesgo" con el override
+`REFERRAL_SENIOR` y revisión manual. El texto de §3.3, §8 y §12 sobre ese tratamiento queda como historia.
+
+### 14.1 Qué se decidió
+
+1. **Cualquier causa del sitio termina PARTIAL.** Si la web de la firma no da ninguna página por algo del propio
+   sitio (robots.txt lo excluye, 401/403 o desafío, DNS que no resuelve, conexión rechazada o cortada, plazo del
+   crawl, 5xx, 429, robots.txt inalcanzable, portada vacía, 404 o que redirige a otro dominio), el scan ya no falla:
+   termina `PARTIAL` con el resultado, el flag `WEBSITE_UNAVAILABLE` y confianza `LOW`, y la Capa 2 puede empezar.
+   Antes solo lo hacían las causas DEFINITIVE; las TRANSIENT terminaban `FAILED`.
+2. **Se presenta como confianza baja.** En `/score` y en el PDF del Quick Scan no hay número ni tier: un estado
+   "No score from public evidence" con "Confidence: low" y un solo aviso. El assessment es la acción principal.
+   Se quitan el override `WEBSITE_UNAVAILABLE` → `REFERRAL_SENIOR` y los textos de "highest-risk group" y
+   "manual review".
+3. **Compuesto = Capa 2.** Con `WEBSITE_UNAVAILABLE` en la Capa 1, `AssessmentResult.layer1Score` es `null`,
+   `compositeScore` es el `layer2Score` y el resultado lleva el flag `LAYER1_UNAVAILABLE`. Antes era 0 × 0,3 +
+   Capa 2 × 0,7, así que no pasaba de 70.
+4. **Lo transitorio se puede reparar.** La caché de scans sirve ese PARTIAL solo hasta el cooldown de reparación
+   (1 hora) y después lo vuelve a ejecutar. Las negativas definitivas (robots.txt, 401/403, desafío) son
+   estructurales y se sirven toda la ventana.
+5. **Mock.** `blocked.arca.example` (negativa definitiva) y el nuevo `down.arca.example` (web inalcanzable,
+   transitoria) terminan PARTIAL con el flag y confianza baja. `failed.arca.example` sigue terminando FAILED,
+   ahora como fallo nuestro.
+
+Sin cambios en `packages/contracts/src` (D6): los dos flags son texto libre y `layer1Score` ya admitía `null`.
+
+### 14.2 Dónde está la línea entre el sitio y nosotros **[mía]**
+
+La línea la traza un dato que ya existía: `sources.website.pagesCrawled`. El website source solo pone
+`pagesCrawled: 0` cuando el crawl terminó sin leer ninguna página, sea cual sea la causa del sitio
+(`website-source.ts`, rama `!crawl.pages.length`). Lo comprueba `isWebsiteUnavailable` en `@arca/scoring`:
+`status` `error` o `timeout` **y** `pagesCrawled === 0`.
+
+| Qué pasó | Estado del website | Scan |
+|---|---|---|
+| El sitio no dio ninguna página, por cualquier causa suya (tabla del DN-07 de crawl, §6), también el plazo **propio del crawl** (30 s) sin nada leído | `error`/`timeout`, `pagesCrawled: 0` | **PARTIAL**, `WEBSITE_UNAVAILABLE`, `LOW` |
+| La extracción del modelo falló, o se quedó sin tiempo, **sobre páginas que sí se leyeron** | `error`/`timeout`, `pagesCrawled` > 0 | FAILED |
+| El website source lanzó (Chromium no arrancó, un error nuestro) | `error` sin `pagesCrawled` (lo pone `bounded()` del pipeline) | FAILED |
+| El plazo **del pipeline** (`PIPELINE_TIMEOUT_MS`) cortó la fuente | `timeout` sin `pagesCrawled` | FAILED |
+| Falló guardar la evidencia (almacenamiento) | el pipeline lanza antes de decidir | FAILED (lo guarda quien lo llama) |
+
+Por qué así:
+
+- **Ningún código nuevo.** El código (`ACCESS_BLOCKED`, `PROVIDER_ERROR`, `NO_READABLE_EVIDENCE`,
+  `DEADLINE_REACHED`) sigue diciendo la causa, y con ella si es definitiva o transitoria; pero `PROVIDER_ERROR` y
+  `DEADLINE_REACHED` los usan tanto el sitio como nosotros, así que el código solo no basta. El número de páginas sí
+  distingue, y todos los resultados guardados ya lo llevan.
+- **El plazo.** El crawl tiene su propio plazo de 30 s, muy por debajo del del pipeline (600 s por defecto). Un sitio
+  que no responde en 30 s es "timeout" del sitio y termina PARTIAL. Si alguna vez el plazo del pipeline llegara
+  antes (configurado por debajo de 30 s), `bounded()` resuelve sin `pagesCrawled` y el scan termina FAILED: no se
+  puede saber si el crawl había leído algo, y ante la duda se trata como nuestro.
+- **El eje `website` del panel de debug.** `blocked` (pone `pagesCrawled: 0`) termina PARTIAL; `error` (lanza) y
+  `timeout` (imita al `unavailable('timeout')` del pipeline) son fallos nuestros y terminan FAILED, como el preajuste
+  "Every source down". No hay un valor "sitio caído" en el eje porque vive en `@arca/contracts/debug` (D6); para eso
+  está `down.arca.example`.
+
+### 14.3 Qué cambia en cada pieza
+
+- **Pipeline** (`in-process-pipeline.ts`): sin ninguna fuente útil, PARTIAL si `isWebsiteUnavailable`, si no
+  FAILED. `website-outcome.ts` no cambia de tabla: sigue eligiendo código y clase por causa.
+- **Scoring** (`score.ts`): el flag `WEBSITE_UNAVAILABLE` sale de `isWebsiteUnavailable`, no de la clase
+  DEFINITIVE, y ya no añade override. `preScore` sigue llevando `total` 0 y tier `CRITICAL` (las bandas de
+  siempre): son datos del contrato y de la caché, no lo que se presenta. `decision` queda en `UNKNOWN` salvo una
+  restricción disciplinaria, que sale de los directorios.
+- **Capa 2** (`layer2.ts`): con el flag en la Capa 1, `layer1Score: null`, `compositeScore = layer2Score`, flag
+  `LAYER1_UNAVAILABLE` y tier por las bandas sobre ese compuesto. Los puntos de cada paso del plan de acción se
+  cuentan con peso 1 (antes × 0,7), porque el compuesto es la Capa 2 entera.
+- **Caché** (`scan-cache.ts`): la tabla de §4.2 ya clasificaba así; no cambió código, solo el comentario y los
+  tests. `error` + `ACCESS_BLOCKED` es ESTRUCTURAL (toda la ventana); cualquier otro website sin páginas es
+  TRANSITORIO (se repara pasado el cooldown).
+- **PDF del Quick Scan** (`quick-scan.ts`): `scoreWithheld` devuelve `WEBSITE_UNAVAILABLE`, `INSUFFICIENT_EVIDENCE`
+  o `null`; la web ilegible va primero. En el bloque del score: "No score from public evidence", "We could not read
+  the firm's website, so there is no public evidence to score. A full assessment gives a score based on the firm's
+  answers, marked as low confidence." y "Confidence: low". Sin número, sin tier y sin la nota de fuentes
+  incompletas; la de que no hay decisión de suscripción sigue. `hasInsufficientEvidence` no cambió (sigue
+  excluyendo el flag: tiene su estado hermano).
+- **PDF de la Capa 2** (`assessment.ts`): con `LAYER1_UNAVAILABLE`, la línea bajo el tier es "Based only on the
+  firm's answers; no public evidence could be verified (low confidence)." y "Public evidence · Layer 1" dice "Not
+  scored". Ya no hay aviso de web aparte.
+- **Front** (detalle en su `CLAUDE.md` y `docs/copy-deck.md`): `notRated` lleva `reason` (`website_unavailable`
+  o `thin_evidence`). `/score`: aviso "We could not read your firm's website, so we have no public evidence to
+  score. The assessment below gives you a score based on your answers, marked as low confidence. This is not a
+  coverage decision." y, en el lugar del gauge, "No score from public evidence" / "Confidence: low".
+  `/assessment/results` y la tarjeta de la webapp: "Based only on your answers; no public evidence could be
+  verified (low confidence)." La webapp enseña "—" y "NOT SCORED" para un scan solo de web ilegible.
+- **Mock**: `apps/api/mocks/down.json` (website `error` / `PROVIDER_ERROR`, `pagesCrawled: 0`, "The website
+  could not be reached"). `failed.json` pasa a ser una extracción fallida sobre 6 páginas leídas ("Website evidence
+  extraction unavailable"). La herramienta "Fill mock firm" del front solo escribe `robust.arca.example`: no hay
+  lista de dominios que tocar en el front.
+
+### 14.4 Tests
+
+Cada test nuevo se vio fallar antes del cambio, salvo los de la clasificación de la caché, que pasaron a la primera
+porque la tabla de §4.2 ya clasificaba así (los de `same-score.test.ts` sobre `down.arca.example` sí fallaron antes).
+
+- `packages/scoring/tests/website-outcome.test.ts`: `isWebsiteUnavailable` para cada causa del sitio y para cada
+  fallo nuestro.
+- `packages/scoring/tests/unreadable-website.test.ts`: flag, confianza baja y sin override para cada causa del
+  sitio; nada para los fallos nuestros; la restricción disciplinaria se mantiene; compuesto = Capa 2,
+  `layer1Score: null`, `LAYER1_UNAVAILABLE`, decisión `UNKNOWN`, plan de acción con peso 1, y el 30/70 intacto con
+  la web leída.
+- `apps/api/tests/unit/pipeline.test.ts`: la tabla de causas entera (17 casos, cada uno con su estado y código) →
+  PARTIAL; fuente que lanza, extracción sin tiempo sobre páginas leídas y fallo de almacenamiento → FAILED; los tres
+  dominios mock.
+- `apps/api/tests/unit/scan-cache.test.ts`: con el estado real de `unreadableWebsite`, las negativas se sirven
+  toda la ventana y DNS, plazo, 503, 429, robots.txt inalcanzable y portada vacía se reparan pasado el cooldown.
+- `apps/api/tests/integration/same-score.test.ts`: `down.arca.example` se sirve de caché dentro del cooldown y se
+  re-ejecuta después.
+- `apps/api/tests/unit/report.test.ts` y `apps/api/tests/integration/assessment-report.test.ts`: texto de los dos
+  PDF, sin número ni tier, sin grupo de riesgo ni revisión manual.
+- `apps/api/tests/integration/unreadable-website.test.ts`: por HTTP y con los esquemas estrictos de 0.4.0,
+  `blocked` y `down` de punta a punta (scan, PDF, assessment, resultado, PDF de la Capa 2); `failed` FAILED.
+- Actualizados: `mock-scenarios.test.ts`, `debug-mode.test.ts`, `debug-sources.test.ts`.
+- Front: `lib/api/adapt.test.ts`, `lib/scan-flow.test.tsx`, `lib/assessment-flow.test.tsx`,
+  `components/assessment/result-notes.test.ts`, `components/app/analyses-pages.test.tsx`.
+
+### 14.5 Verificación (2026-11-17)
+
+Solo mock: ninguna llamada a OpenAI, Apify, Supabase ni a webs reales (`/__debug/mode` dijo `inUse` todo `false`).
+
+| Comprobación | Resultado |
+|---|---|
+| Back `npm run typecheck` | Sin errores |
+| Back `npm test` | 1408 de 1408 en 73 ficheros |
+| Front `typecheck`, `lint` | Sin errores; los 6 avisos conocidos |
+| Front `npm test` | 965 de 965 en 48 ficheros |
+| Front `npm run build` sin `NEXT_PUBLIC_ARCA_MODE` | `[check-no-debug] 0 debug leak(s)` |
+| Recorrido en Chromium, pila mock (API 8080, front 3000), 1280×900 | Abajo |
+
+- `blocked.arca.example` y `down.arca.example`: `/score` con el aviso nuevo, "No score from public evidence",
+  "Confidence: low", sin gauge, sin `CRITICAL`, sin "highest-risk" ni "manual review"; PDF del Quick Scan igual.
+  Assessment completo: 85 (gauge) / 84,5 (Capa 2), FORTRESS, "Public evidence · Layer 1: Not scored" y la línea
+  "Based only on your answers…"; el PDF de la Capa 2 lo dice en tercera persona. Sin errores de página.
+- `failed.arca.example`: pantalla de "try again" ("Something went wrong on our side…", "Try another scan").
+
+### 14.6 Lo que queda fuera
+
+- **La pantalla de FAILED** sigue diciendo "Something went wrong on our side, or a source we rely on was temporarily
+  unavailable." Sigue siendo verdad (el modelo es una fuente de la que dependemos), así que no se tocó.
+- **Las barras de `/score` y del PDF** siguen enseñando 0 / 35… con "no evidence" / "not enough evidence" para la
+  web ilegible, como para cualquier categoría desconocida.
+- **El eje `website` del panel de debug** no tiene un valor "sitio caído" (D6); se usa `down.arca.example`.
+- **Resultados guardados con D4.** Ningún entorno desplegado tiene esta rama ni D4 (no están en `main`), así que no
+  hay assessments antiguos con el flag y el 30/70 que atender. Si los hubiera, la pantalla de resultados ya no
+  enseña el aviso de web para ellos (solo mira `LAYER1_UNAVAILABLE`).
