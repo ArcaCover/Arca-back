@@ -1,7 +1,8 @@
 # DN-13 · Cuentas y cobro reales: Supabase Auth y Stripe
 
 - **Fecha:** 2026-11-17
-- **Estado:** diseño para revisar. **No hay nada implementado ni aplicado**: ninguna migración, cuenta, clave ni webhook.
+- **Estado:** diseño para revisar, con la fase 2 empezada en el back: **T6 y T10 hechas** (§16, rama
+  `feat/real-accounts-auth`). No hay nada aplicado: ninguna migración, cuenta, clave ni webhook, y producción sigue en 501.
   Las migraciones de esta nota necesitan la aprobación del founder antes de tocar cualquier base (§5.2).
 - **Repos:** `Arca-back` (casi todo el peso) y `Arca-front`. La nota vive en la rama `docs/auth-billing-design`,
   creada desde `fix/score-stability`.
@@ -1092,11 +1093,11 @@ aprobaciones).
 | T3 | Migración nueva + RPC + tests de PGlite (§5.3, §5.4, §5.5) | 1 · datos | 3 | — |
 | T4 | `SupabaseWebappRepository` + suite de conformidad sobre Supabase local | 1 · datos | 4 | T3 |
 | T5 | Aplicar las tres migraciones a `Arca-dev` | 1 · datos | 0,25 | T3, T1 |
-| T6 | `SupabaseJwtAuth`, `WEBAPP_PROVIDERS`, guardas de arranque y línea de arranque (§4.4, §7.1) | 2 · auth | 1,5 | — |
+| T6 | `SupabaseJwtAuth`, `WEBAPP_PROVIDERS`, guardas de arranque y línea de arranque (§4.4, §7.1). **Hecha (§16.1)** | 2 · auth | 1,5 | — |
 | T7 | `POST /auth/enroll` con la API de administración de Supabase y límites (§4.2) | 2 · auth | 1,5 | T4 |
 | T8 | Configurar Auth en `Arca-dev`: alta cerrada, claves asimétricas, plantillas, URLs, SMTP (§9.4) | 2 · auth | 1 | T2 |
 | T9 | Front: `@supabase/ssr`, módulo de sesión, login, signup, confirm, invite (§8.1) | 2 · auth | 4 | T6, T7 |
-| T10 | `Mailer` + correo de invitación (§4.6) | 2 · auth | 1,5 | T2 |
+| T10 | `Mailer` + correo de invitación (§4.6). **Hecha en el back, sin el SDK de SES (§16.2)** | 2 · auth | 1,5 | T2 |
 | T11 | `DELETE /me` + RPC + pantalla en settings (§4.8) | 2 · auth | 1,5 | T4 |
 | T12 | Script `admin:grant` (§4.5) | 2 · auth | 0,5 | T4 |
 | T13 | Catálogo de Stripe en test; `plans` con `stripe_price_id`; cambio de precio desde `/admin` (§6.1) | 3 · cobro | 1,5 | T4 |
@@ -1179,3 +1180,131 @@ aprobaciones. El camino crítico es T3 → T4 → T7 → T9 → T14 → T15 → 
 - **DN-11:** la carrera de `setRole`/`removeMember` y la doble revisión de un borrado se cierran en las RPC (§5.4). La
   actividad nombra los eventos de cobro nuevos (§10.5).
 - **DN-12 §7.4:** `DebugModeResponse` gana `webapp` y `billing`, como esa nota anticipó (§7.6).
+
+## 16. Implementación
+
+### 16.1 T6: verificación de Supabase Auth, proveedores de la webapp y guardas (2026-11-18)
+
+**Hecho** en `feat/real-accounts-auth` (sale de `feat/real-accounts`), commit `5313a91`. Sin contratos
+nuevos: `packages/contracts/src` no cambia y ninguna respuesta que parsee el front cambia de forma.
+
+**Ficheros**
+
+| Fichero | Qué |
+|---|---|
+| `apps/api/src/webapp/auth.ts` | `SupabaseJwtAuth`, `AuthUnavailable`, `JwksFetcher`; `AppUser` gana `aal` y `sessionId` opcionales |
+| `apps/api/src/webapp/real-adapters.ts` | **nuevo**: `RealWebappAdapters` (la costura) y `REAL_WEBAPP_ADAPTERS`, hoy vacío |
+| `apps/api/src/config/env.ts` | `WEBAPP_ENABLED`, `WEBAPP_PROVIDERS`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_ALLOW_TEST_MODE`, `EMAIL_PROVIDER`, `EMAIL_FROM`; devuelve `webapp`, `stripeMode`, `emailProvider`, `emailFrom` |
+| `apps/api/src/compose.ts` | `realWebapp()` junto a `simulatedWebapp()`; tercer parámetro `adapters`; línea de arranque |
+| `apps/api/src/webapp/routes.ts` | `AuthUnavailable` → **503** `auth_unavailable` |
+| `apps/api/src/debug/tools.ts`, `apps/api/src/http/app.ts` | el buzón en memoria y el reset; comentarios |
+| `deploy/production.env` | `WEBAPP_ENABLED=false`, explícito (parte de T21) |
+| `.env.example` | las variables nuevas, comentadas |
+
+**Verificación del JWT** (§4.4). `jwtVerify` de `jose` (ya era dependencia, `^5.9.6`; no se añadió nada) con
+`issuer = ${SUPABASE_URL}/auth/v1`, `audience: 'authenticated'`, `algorithms: ['ES256', 'RS256']` y
+`requiredClaims: ['exp', 'sub', 'email']`; después, `role === 'authenticated'`, `is_anonymous !== true`, `sub` UUID y un
+email con forma de email. `userId` es el `sub` en minúsculas y el email va en minúsculas (§4.5). Ningún claim da permisos:
+el rol sigue saliendo de `memberships` en cada petición. No existe camino con `SUPABASE_JWT_SECRET`.
+
+**El JWKS.** Se lee de `${SUPABASE_URL}/auth/v1/.well-known/jwks.json` y solo se quedan las claves EC P-256 o RSA con
+`kid`, de firma y con un algoritmo permitido (una `oct` se descarta). Caché de 10 minutos; un `kid` desconocido vuelve a
+leerlo, como mucho una vez cada 30 s (la rotación con clave en espera verifica sin cortar sesiones, y un `kid` inventado
+no hace que la API martillee a Supabase). Si Supabase no responde, siguen valiendo las últimas claves leídas; si no hay
+ninguna, la ruta responde 503 `auth_unavailable` y no 401, para que el front no cierre la sesión por un fallo nuestro.
+`jose` comprueba el algoritmo antes de pedir la clave: un token HS256 o sin firma nunca llega al JWKS.
+
+**Al arrancar** (`checkSigningKeys`): un JWKS sin ninguna clave asimétrica detiene el arranque (el proyecto sigue con el
+secreto HS256 heredado); un Supabase que no responde no lo bloquea: se registra `[auth] …` y la primera petición lo lee.
+
+**Qué construye cada modo** (§3.2, §7.1), resuelto en `loadEnv` como `webapp: 'none' | 'simulated' | 'real'`:
+
+| | `webapp` | Línea de arranque |
+|---|---|---|
+| `production` (por defecto o `WEBAPP_ENABLED=false`) | `none`: 501 en las 22 rutas, como hoy | sin cambios |
+| `production` con `WEBAPP_ENABLED=true` | `real` | `webapp=real stripe=live email=ses` |
+| `mock`, `live-debug` (por defecto, o `WEBAPP_PROVIDERS=simulated`) | `simulated`: idéntico a hoy, más el buzón en memoria | sin cambios (`webapp=simulated-in-memory` en `live-debug`) |
+| `live-debug` con `WEBAPP_PROVIDERS=real` | `real`; `/__debug/auth/login`, `/__debug/billing/pay` y `/__debug/seed` dan 404 | `webapp=real stripe=test email=memory` |
+
+**Guardas de arranque** (todas con un mensaje que nombra la variable):
+- `production` con cualquier `WEBAPP_PROVIDERS` (producción siempre es real y se enciende con `WEBAPP_ENABLED`).
+- `mock` con `WEBAPP_PROVIDERS=real`.
+- Una clave live de Stripe (`sk_live_`/`rk_live_`) en **cualquier** modo de debug, aunque no use Stripe: una clave live
+  en `.env.local` se rechaza, no se ignora. `STRIPE_ALLOW_TEST_MODE` no lo cambia nunca.
+- `production` real con clave de test, salvo `STRIPE_ALLOW_TEST_MODE=true`.
+- Una clave que no sea `sk_`/`rk_` + `live_`/`test_` (una publicable `pk_…` incluida), y un secreto de webhook sin `whsec_`.
+- La webapp real sin `STORAGE_BACKEND=supabase` (y por tanto sin `SUPABASE_URL` y clave secreta), sin
+  `STRIPE_SECRET_KEY` o sin `STRIPE_WEBHOOK_SECRET`.
+- `production` real sin `EMAIL_FROM` explícito, con `EMAIL_PROVIDER=memory`, o con un `APP_BASE_URL` que no sea `https`
+  (el valor por defecto es el front local: los enlaces de invitación y las vueltas de Stripe irían a localhost).
+- `EMAIL_PROVIDER=ses` con la webapp simulada; un `EMAIL_FROM` que no sea una dirección o `Nombre <dirección>`.
+
+**La costura.** `compose(env, storage?, adapters = REAL_WEBAPP_ADAPTERS)`. `RealWebappAdapters` tiene `repository`
+(`client => WebappRepository`, el cliente de servicio de los scans), `billing` (`{ secretKey, webhookSecret, mode,
+appBaseUrl } => BillingProvider`), `sesSendEmail` y `fetchJwks`. Hoy `REAL_WEBAPP_ADAPTERS` está vacío: con la webapp real
+pedida, `compose` se niega a arrancar y nombra lo que falta ("the Supabase webapp repository (DN-13 T4)", "the Stripe
+billing provider (DN-13 T14)", "the SES sender"), **antes** de tocar Supabase. Nunca cae a una pieza simulada. T4 solo
+tiene que añadir `repository: client => new SupabaseWebappRepository(client)` en ese fichero, y T14 el `billing`.
+
+**Desviaciones respecto a la nota**
+1. **Caché propia sobre `createLocalJWKSet`** en vez de `createRemoteJWKSet`: `jose` 5 no deja inyectar el `fetch`, y los
+   tests tenían que servir el JWKS sin red. Mismos tiempos que los de `jose` (10 min, 30 s), y además conserva las claves
+   viejas si Supabase no responde.
+2. **503 `auth_unavailable`** también para un verificador sin claves, no solo en `enroll` (§7.3).
+3. **Sin bucle de reintentos** al arrancar: si Supabase no responde, se registra y la primera petición vuelve a leer.
+4. **`live-debug` real todavía no arranca**: exige Stripe (§3.2), y el proveedor de Stripe es T14. La guarda lo dice.
+5. La línea de arranque añade `email=<proveedor>` a lo que propone la §7.1.
+6. `WEBAPP_ENABLED` solo lo lee producción; en los modos de debug no hace nada (siempre hay webapp).
+7. `POST /billing/webhook` sigue en 501 también con la webapp real: es T15.
+8. **No hecho aquí:** el 401 para una cuenta con `deleted_at` (§4.4, es T11), `admin:grant` (T12), `/__debug/mode` con
+   `webapp` y `billing` (T19, contratos 0.5.0) y `render-env.py` con los secretos de Stripe (T21).
+
+### 16.2 T10: `Mailer` y correo de invitación (2026-11-18)
+
+**Hecho** en el mismo commit, salvo el SDK de SES.
+
+| Fichero | Qué |
+|---|---|
+| `apps/api/src/webapp/mailer.ts` | **nuevo**: `Mailer`, `EmailMessage`, `MemoryMailer`, `SesMailer` con un `SesSendEmail` inyectado |
+| `apps/api/src/webapp/invitation-email.ts` | **nuevo**: `invitationEmail()` y `MailingWebappService` |
+
+- **`EMAIL_PROVIDER`**: `memory` (por defecto en los modos de debug) o `ses` (por defecto en producción, y la única
+  opción allí). **`EMAIL_FROM`**: por defecto `ARCA <no-reply@arcacover.com>`; en producción, obligatorio.
+- **`MemoryMailer`** guarda los mensajes en el proceso. Lo usan la webapp simulada (ahora también "manda" sus
+  invitaciones ahí) y `live-debug` real con `EMAIL_PROVIDER=memory`. El reset de `/__debug/reset` lo vacía con el resto
+  de la memoria de la webapp. Ninguna ruta lo expone todavía: el panel lo leerá cuando exista su contrato (T19).
+- **`SesMailer`** traduce el mensaje a la entrada de `SendEmail` de SES v2 (un destinatario, texto y HTML en UTF-8,
+  `ConfigurationSetName` opcional para rebotes y quejas). `@aws-sdk/client-sesv2` **no** es dependencia y no se añadió:
+  el envío llega inyectado (`RealWebappAdapters.sesSendEmail`). El cableado (`new SESv2Client(...)` +
+  `SendEmailCommand`) está escrito en el comentario de `SesMailer`; con SES no hay credencial, el rol de la instancia
+  da `ses:SendEmail` (§9.1, §10.4). Mientras no esté, producción con `EMAIL_PROVIDER=ses` se niega a arrancar.
+- **El correo** (§4.6), en inglés. Asunto `You're invited to join <organización> on ARCA`. Cuerpo: quién invita (su email:
+  no hay nombre que mostrar), la organización, el rol ("as an admin", "a member", "a viewer"), el enlace
+  `${APP_BASE_URL}/app/invite/<token>` (el mismo `inviteUrl` de la respuesta), la fecha de caducidad y "If you weren't
+  expecting this invitation, you can ignore this email". Ningún otro dato personal. El nombre de la organización lo
+  escribe un cliente: se le quitan los saltos de línea y caracteres de control antes del asunto y se escapa en el HTML.
+- **Cuándo se manda**: después de que la invitación quede escrita (y auditada). Un fallo del envío no la deshace: se
+  registra `[mail] invitation <id> was created but its email was not sent (<nombre del error>)`, sin email ni enlace.
+
+**Desviaciones**
+1. **`MailingWebappService` extiende `WebappService`** y envuelve `invite()`, en vez de tocar `service.ts`, que está
+   cambiando en paralelo (T4). Para el nombre de la organización vuelve a leerla con `orgView` tras la escritura: una
+   lectura más por invitación. Cuando llegue `emailSent`, la lógica puede entrar en el servicio.
+2. **Sin `emailSent` en la respuesta**: `InvitationView` es estricto y el front lo parsea; el campo llega con los
+   contratos 0.5.0 (§7.6). `inviteUrl` sigue igual.
+3. El asunto no lleva el email de quien invita (solo el cuerpo), para que no salga en las vistas previas.
+
+### 16.3 Pruebas
+
+Sin red, sin Supabase, Stripe ni AWS reales. Se escribieron antes que el código y fallaron primero.
+
+| Fichero | Tests nuevos | Qué fija |
+|---|---|---|
+| `apps/api/tests/unit/supabase-jwt-auth.test.ts` | 10 | ES256 y RS256 válidos con claves generadas con `jose` y un JWKS inyectado; caducado; sin `exp`; otro emisor; otra audiencia; HS256, sin firma y token simulado rechazados sin pedir el JWKS; `role`, `is_anonymous`, sin email, `sub` no UUID; solo claves asimétricas; `kid` desconocido → rotación verificada, con un refetch por enfriamiento; caché de 10 min; Supabase caído con y sin claves (503); comprobación de arranque |
+| `apps/api/tests/unit/env.test.ts` | 11 | Las guardas de arriba, modo por modo |
+| `apps/api/tests/integration/compose.test.ts` | 7 | Cada modo: `mock` y `live-debug` simulados idénticos y sin tocar la costura; `live-debug` real (Supabase verifica, simulaciones en 404, token simulado 401); producción apagada (501, nada construido); producción encendida (repositorios durables, CORS exacto, invitación por SES); arranque negado sin adaptadores; JWKS vacío o caído |
+| `apps/api/tests/unit/mailer.test.ts` | 8 | `MemoryMailer`, la entrada de SES v2, el correo (contenido, cabeceras y HTML seguros) y el envío tras la escritura, con fallo y con invitación rechazada |
+| `apps/api/tests/unit/deploy-marker.test.ts` | 1 | `production.env` deja la webapp apagada y sin `WEBAPP_PROVIDERS` |
+
+`npm run typecheck` limpio. `npm test` completo: 1437 de 1438; fallaron `infra/aws/lib/arca-demo-stack.test.ts` (no hay
+`aws-cdk-lib` en un worktree, esperado) y, una vez, un test de `crawler.test.ts` por carga, que pasa solo (29 de 29).
