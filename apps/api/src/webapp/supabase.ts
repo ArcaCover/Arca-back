@@ -3,13 +3,13 @@ import { AUDIT_ACTOR_KINDS, type BillingStatus, type Role } from '@arca/contract
 import { IneligibleAssignee, MemberChangeRefused, WebappConflict, type ActionPatch, type AssessmentActionRecord, type AuditActor,
   type AuditPageQuery, type AuditRecord, type BillingApplyOutcome, type BillingStateRecord, type ClaimTicketRecord, type CustomActionRecord,
   type DeletionRequestRecord, type InvitationRecord, type MemberChange, type MembershipRecord, type NewAuditRecord, type OrgActionRecord,
-  type OrgAnalysisRecord, type OrganizationRecord, type PlanRecord, type ProfileRecord, type SubscriptionRecord, type WebappConflictReason,
+  type OrgAnalysisRecord, type OrganizationRecord, type PlanRecord, type ProfileRecord, type ProfileWrite, type SubscriptionRecord, type WebappConflictReason,
   type WebappRepository } from './types.js';
 
 // The columns each record reads, so a new column of a table (DN-13 §5.3) never leaks into a record, and the timestamps among them,
 // which Postgres prints its own way ('2026-10-25T12:00:00+00:00') and the records carry as ISO with Z, as the in-memory store does.
 const TABLES = {
-  profiles: { columns: ['user_id', 'email', 'full_name', 'last_org_id', 'created_at'], times: ['created_at'] },
+  profiles: { columns: ['user_id', 'email', 'full_name', 'last_org_id', 'created_at', 'deleted_at'], times: ['created_at', 'deleted_at'] },
   organizations: { columns: ['id', 'name', 'domain', 'billing_status', 'deleted_at', 'created_by', 'created_at'], times: ['deleted_at', 'created_at'] },
   memberships: { columns: ['org_id', 'user_id', 'role', 'invited_by', 'created_at'], times: ['created_at'] },
   invitations: { columns: ['id', 'org_id', 'email', 'role', 'token_hash', 'invited_by', 'expires_at', 'accepted_at', 'revoked_at', 'created_at'],
@@ -41,7 +41,7 @@ function record<T>(table: Table, row: Record<string, unknown>): T {
 const records = <T>(table: Table, rows: unknown): T[] => ((rows ?? []) as Array<Record<string, unknown>>).map(row => record<T>(table, row));
 
 const CONFLICTS: readonly WebappConflictReason[] = ['scan_claimed', 'last_owner', 'already_member', 'already_invited', 'deletion_pending',
-  'action_limit', 'already_reviewed', 'invitation_closed'];
+  'action_limit', 'already_reviewed', 'invitation_closed', 'sole_owner'];
 // The record names the RPC functions use (`webapp_missing:deletion_request`), as the in-memory store words them.
 const RECORD_NAMES: Readonly<Record<string, string>> = { organization: 'Organization', invitation: 'Invitation', analysis: 'Analysis',
   deletion_request: 'Deletion request', action: 'action', plan: 'Plan' };
@@ -99,13 +99,22 @@ export class SupabaseWebappRepository implements WebappRepository {
     return (data ?? []).length > 0;
   }
 
-  async upsertProfile(profile: ProfileRecord) {
-    const { error } = await this.client.from('profiles').upsert(profile, { onConflict: 'user_id' });
-    if (error) throw error.code === '23505' ? new Error('Duplicate profile email', { cause: error }) : translate(error, 'write profile');
+  async upsertProfile(profile: ProfileWrite) {
+    // deleted_at is never sent, so a tombstone keeps it and profiles_email_unless_deleted refuses the email (DN-13 §4.8).
+    const { user_id, email, full_name, last_org_id, created_at } = profile;
+    const { error } = await this.client.from('profiles').upsert({ user_id, email, full_name, last_org_id, created_at }, { onConflict: 'user_id' });
+    if (!error) return;
+    if (error.code === '23505') throw new Error('Duplicate profile email', { cause: error });
+    if (error.code === '23514') throw new Error('Deleted profile', { cause: error });
+    throw translate(error, 'write profile');
   }
   getProfile(userId: string) { return this.one<ProfileRecord>('profiles', 'read profile', { user_id: userId }); }
   // Every profile is written with its email in lower case (ensureProfile), and a deleted one has none.
   findProfileByEmail(email: string) { return this.one<ProfileRecord>('profiles', 'find profile', { email: email.toLowerCase() }); }
+  async deleteAccount(userId: string, at: string) {
+    const { orgs } = await this.rpc<{ orgs: string[] }>('delete_account', { p_user_id: userId, p_at: at }, 'delete account');
+    return { orgIds: orgs };
+  }
 
   async createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null) {
     await this.rpc('create_organization', { p_org: org, p_owner: owner, p_analysis: analysis }, 'create organization');

@@ -219,6 +219,15 @@ export const UpdateActionRequest = z.object({
 }).strict().refine(change => Object.values(change).some(value => value !== undefined), { message: 'Nothing to update' });
 // A detail that is null, or blank once trimmed, parses as null: "no detail" has one value, which the service stores, so the
 // plan never shows an empty detail. A detail left out stays out.
+// POST /auth/enroll (DN-13 §4.2): sign-up is closed, so the back creates the Supabase Auth user, and only for the email of a valid
+// claim of a scan or of a pending invitation: exactly one of the two. The answer is the email to ask a sign-in code for, the
+// same whether that email already had an account or not; a claim or invitation it cannot use is one 410 for every reason.
+const bearerSecret = z.string().min(1).max(512);
+export const EnrollRequest = z.union([
+  z.object({ claimId: bearerSecret }).strict(),
+  z.object({ invitationToken: bearerSecret }).strict(),
+]);
+export const EnrollResponse = z.object({ email: z.string().email() }).strict();
 export const CreateActionRequest = z.object({
   title: z.string().trim().min(1).max(200),
   detail: z.string().trim().max(2000).transform(detail => detail === '' ? null : detail).nullable().optional(),
@@ -256,3 +265,5 @@ export type UpdatePlanRequest = z.infer<typeof UpdatePlanRequest>;
 export type UpdateOrgRequest = z.infer<typeof UpdateOrgRequest>;
 export type UpdateActionRequest = z.infer<typeof UpdateActionRequest>;
 export type CreateActionRequest = z.infer<typeof CreateActionRequest>;
+export type EnrollRequest = z.infer<typeof EnrollRequest>;
+export type EnrollResponse = z.infer<typeof EnrollResponse>;

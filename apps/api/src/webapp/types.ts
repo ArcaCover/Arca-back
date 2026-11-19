@@ -1,9 +1,16 @@
 import type { ActionStatus, AuditActorKind, BillingStatus, DomainKey, Role } from '@arca/contracts';
 
 // Records of the private webapp (DN-10 §4.2), in snake_case like the rows they map to.
+/**
+ * `user_id` is the Supabase Auth user's id, the `sub` of its tokens (DN-13 §4.5). A closed account (DELETE /me, §4.8) stays as a
+ * tombstone: `deleted_at` set, and no email, name or last organization.
+ */
 export type ProfileRecord = {
-  user_id: string; email: string; full_name: string | null; last_org_id: string | null; created_at: string;
+  user_id: string; email: string | null; full_name: string | null; last_org_id: string | null; created_at: string;
+  deleted_at: string | null;
 };
+/** What upsertProfile writes: a live profile. Only deleteAccount closes one. */
+export type ProfileWrite = Omit<ProfileRecord, 'email' | 'deleted_at'> & { email: string };
 export type OrganizationRecord = {
   id: string; name: string; domain: string | null; billing_status: BillingStatus; deleted_at: string | null;
   created_by: string; created_at: string;
@@ -95,7 +102,7 @@ export const MAX_CUSTOM_ACTIONS = 100;
  * invitation per email and organization. The service revokes the old one before inviting again, so it only shows up in a race.
  */
 export type WebappConflictReason = 'scan_claimed' | 'last_owner' | 'already_member' | 'already_invited' | 'deletion_pending'
-  | 'action_limit' | 'already_reviewed' | 'invitation_closed';
+  | 'action_limit' | 'already_reviewed' | 'invitation_closed' | 'sole_owner';
 /** A rule of the data model that the write would break. The routes turn it into a 409. */
 export class WebappConflict extends Error {
   constructor(readonly reason: WebappConflictReason) {
@@ -153,11 +160,23 @@ export class MemberChangeRefused extends Error {
  * and revokePlatformAdmin. The Supabase repository runs each as one RPC function (supabase/migrations/*_real_accounts_billing.sql).
  */
 export interface WebappRepository {
-  /** One profile per email, in any case: another user's email is refused with a plain Error. */
-  upsertProfile(profile: ProfileRecord): Promise<void>;
+  /**
+   * One profile per email, in any case, among the live ones: another user's email is refused with a plain Error. A closed account's
+   * profile is never brought back: writing it is refused with a plain Error, so a request that raced DELETE /me fails instead.
+   */
+  upsertProfile(profile: ProfileWrite): Promise<void>;
   getProfile(userId: string): Promise<ProfileRecord | null>;
-  /** The profile of an email, in any case. A user has one once they signed in (ensureProfile). */
+  /** The live profile of an email, in any case. A user has one once they signed in (ensureProfile); a closed account has none. */
   findProfileByEmail(email: string): Promise<ProfileRecord | null>;
+  /**
+   * Closes an account in one step (DN-13 §4.8, the delete_account RPC): `sole_owner`, with nothing written, while the user is the
+   * only owner of an organization that is not deleted. Otherwise their memberships of organizations that are not deleted go (a
+   * deleted one keeps its history), with the actions they held there released and `account.deleted` audited in each, every
+   * pending invitation to their email is revoked (`invitation.revoked`, reason `account_deleted`), and the profile, if any,
+   * becomes a tombstone. The audit rows name the user as a member. Returns the organizations that lost the member; a second call
+   * finds nothing left to do and keeps the first deletion time.
+   */
+  deleteAccount(userId: string, at: string): Promise<{ orgIds: string[] }>;
   /** Atomic: the organization, its first owner and the claimed analysis go in together or not at all (`scan_claimed`). */
   createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null): Promise<void>;
   getOrganization(id: string): Promise<OrganizationRecord | null>;

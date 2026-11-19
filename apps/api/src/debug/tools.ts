@@ -5,12 +5,13 @@ import { DEBUG_REQUEST_HEADER, DebugModeResponse, DebugScanState, DebugScenario,
   type DebugSeedResponse } from '@arca/contracts/debug';
 import { verifySessionToken } from '../auth/session-token.js';
 import type { AssessmentAgent } from '../assessment/service.js';
-import type { ScanLimiter } from '../http/rate-limit.js';
+import type { ScanLimiter, WindowLimiter } from '../http/rate-limit.js';
 import { InProcessPipeline } from '../pipeline/in-process-pipeline.js';
 import type { MockAppAuth } from '../webapp/auth.js';
 import type { MockBillingProvider } from '../webapp/billing.js';
 import type { InMemoryWebappRepository } from '../webapp/in-memory.js';
 import type { MemoryMailer } from '../webapp/mailer.js';
+import type { InMemoryAuthAdmin } from '../webapp/auth-admin.js';
 import type { WebappService } from '../webapp/service.js';
 import type { RoutingAssessmentRepository, RoutingScanRepository } from './isolation.js';
 import { describeDemo, seedDemo, type SeedDeps, type SeededDemo } from './seed.js';
@@ -35,7 +36,8 @@ export type DebugTools = {
    */
   readonly seeds: boolean;
   /** `seed` carries the app's own scan runner and assessments, exactly when `seeds` is true. */
-  routes(context: { limiter: ScanLimiter; sessionSecret: string; seed?: Pick<SeedDeps, 'runScan' | 'assessments'> }): Hono;
+  routes(context: { limiter: ScanLimiter; webappLimiter?: WindowLimiter; sessionSecret: string;
+    seed?: Pick<SeedDeps, 'runScan' | 'assessments'> }): Hono;
 };
 
 // A server error or a hang spoils this many polls, then the scan answers again, so the front can be seen recovering.
@@ -69,7 +71,7 @@ export function createDebugTools(options: {
    * invitations the simulated webapp sent; a reset forgets them with the rest of its memory.
    */
   webapp?: { auth: MockAppAuth; billing: MockBillingProvider; service: WebappService; repository: InMemoryWebappRepository;
-    mailer?: MemoryMailer };
+    mailer?: MemoryMailer; authAdmin?: InMemoryAuthAdmin };
   /** How long a seed request waits before it answers 504; the run itself goes on. */
   seedTimeoutMs?: number;
 }): DebugTools {
@@ -142,7 +144,7 @@ export function createDebugTools(options: {
     reportFault: scanId => scenarios.get(scanId)?.http.report === 'unavailable',
     assessmentAgentFor: scanId => scenarios.get(scanId)?.planner === 'timeout' ? stalledPlanner : undefined,
     seeds,
-    routes({ limiter, sessionSecret, seed: seedPieces }) {
+    routes({ limiter, webappLimiter, sessionSecret, seed: seedPieces }) {
       // Both ways round: no seed without its scan runner, and no scan runner where there is no seed to hand it to.
       if (seeds !== (seedPieces !== undefined)) throw new Error('The demo seed and its scan runner exist only in mock, and only together');
       const app = new Hono();
@@ -174,8 +176,10 @@ export function createDebugTools(options: {
         const refused = withoutDebugHeader(c, 'A debug reset');
         if (refused) return refused;
         limiter.clear();
+        webappLimiter?.clear();
         webapp?.repository.clear();
         webapp?.mailer?.clear();
+        webapp?.authAdmin?.clear();
         if (options.mode === 'mock') {
           scans.overlay.clear();
           assessments.overlay.clear();
@@ -194,6 +198,11 @@ export function createDebugTools(options: {
         const body = MockLogin.safeParse(await c.req.json().catch(() => null));
         if (!body.success) return c.json({ error: 'invalid_request', message: 'A valid email is required' }, 400);
         const session = await webapp.auth.issue(body.data.email);
+        // The simulated login names a user by their email, so a closed account (DELETE /me) would come back as itself and be
+        // refused everywhere. Say so here instead; a reset forgets it.
+        if ((await webapp.repository.getProfile(session.user.userId))?.deleted_at) {
+          return c.json({ error: 'conflict', message: 'This simulated account was deleted; a debug reset forgets it' }, 409);
+        }
         if (body.data.platformAdmin) await webapp.repository.grantPlatformAdmin(session.user.userId, session.user.userId);
         return c.json(session);
       });

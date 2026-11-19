@@ -1,0 +1,9 @@
+<!-- DN-13 §4.9: the sign-in email of Supabase local, in English like the whole interface. The code is the way in; the link is a
+     fallback that only opens the front's confirm page, where a button verifies it, so a mail filter that opens links spends
+     nothing. The front always passes emailRedirectTo with ?next=..., hence the & before token_hash. -->
+<h2>Your ARCA sign-in code</h2>
+<p>Enter this code in the ARCA tab where you asked for it:</p>
+<p style="font-size: 32px; font-weight: bold; letter-spacing: 6px; font-family: monospace;">{{ .Token }}</p>
+<p>It expires in 10 minutes and can be used once.</p>
+<p>Reading this on another device? <a href="{{ .RedirectTo }}&token_hash={{ .TokenHash }}&type=email">Continue signing in</a> instead.</p>
+<p>If you didn't request this, ignore this email.</p>

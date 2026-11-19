@@ -3,7 +3,7 @@ import { PlanView } from '@arca/contracts';
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
 import type { AssessmentActionRecord, ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord, InvitationRecord, MembershipRecord,
-  NewAuditRecord, OrgAnalysisRecord, OrganizationRecord, ProfileRecord, SubscriptionRecord } from '../../src/webapp/types.js';
+  NewAuditRecord, OrgAnalysisRecord, OrganizationRecord, ProfileWrite, SubscriptionRecord } from '../../src/webapp/types.js';
 import { describeWebappRepository } from '../conformance/webapp-repository.js';
 
 // The contract every repository keeps lives in the conformance suite, which the Supabase repository runs too (DN-13 §11). What
@@ -16,7 +16,7 @@ describeWebappRepository('in memory', async () => {
 const NOW = '2026-10-25T12:00:00.000Z';
 const LATER = '2026-10-25T13:00:00.000Z';
 
-const profile = (userId: string): ProfileRecord => ({ user_id: userId, email: `${userId}@firm.com`, full_name: null, last_org_id: null, created_at: NOW });
+const profile = (userId: string): ProfileWrite => ({ user_id: userId, email: `${userId}@firm.com`, full_name: null, last_org_id: null, created_at: NOW });
 const org = (id: string, patch: Partial<OrganizationRecord> = {}): OrganizationRecord => ({ id, name: `Org ${id}`, domain: 'firm.com',
   billing_status: 'pending_payment', deleted_at: null, created_by: 'user_a', created_at: NOW, ...patch });
 const member = (orgId: string, userId: string, role: MembershipRecord['role'] = 'member'): MembershipRecord => ({ org_id: orgId,
@@ -105,7 +105,7 @@ describe('copies and reset', () => {
     expect(await repo.findInvitationByHash('hash_inv_1')).toEqual(invitation('inv_1'));
     expect(await repo.getPlan('monthly')).toEqual(DEFAULT_PLANS[0]);
     expect((await repo.listAudit('org_1', { limit: 1 }))[0]!.data).toEqual({ nested: { count: 1 } });
-    expect(await repo.getProfile('user_a')).toEqual(profile('user_a'));
+    expect(await repo.getProfile('user_a')).toEqual({ ...profile('user_a'), deleted_at: null });
     expect(await repo.listActions('org_1')).toEqual([custom('act_1'), tracked('act_2', 'scan_1', 'improve:D1.1')]);
   });
 

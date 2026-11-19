@@ -15,6 +15,7 @@ import { AVVO_ACTOR } from '../../src/pipeline/directories.js';
 import { DEFAULT_SIGNAL_LLM_MODEL } from '../../src/pipeline/llm-endpoint.js';
 import { OPENAI_EVIDENCE_MODEL } from '../../src/pipeline/website-evidence-provider.js';
 import { MockAppAuth, SupabaseJwtAuth } from '../../src/webapp/auth.js';
+import { InMemoryAuthAdmin } from '../../src/webapp/auth-admin.js';
 import { MockBillingProvider } from '../../src/webapp/billing.js';
 import { MailingWebappService } from '../../src/webapp/invitation-email.js';
 import { MemoryMailer } from '../../src/webapp/mailer.js';
@@ -221,7 +222,9 @@ describe('compose: the webapp providers', () => {
   function adapters(project: { fetchJwks: (url: URL) => Promise<unknown> }) {
     const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
     const billing = new MockBillingProvider('https://arcacover.com');
-    return { repository, billing, seam: { repository: vi.fn((_client: unknown) => repository), billing: vi.fn((_config: unknown) => billing),
+    const authAdmin = new InMemoryAuthAdmin();
+    return { repository, billing, authAdmin, seam: { repository: vi.fn((_client: unknown) => repository),
+      authAdmin: vi.fn((_client: unknown) => authAdmin), billing: vi.fn((_config: unknown) => billing),
       sesSendEmail: vi.fn(async (_input: unknown) => ({ MessageId: 'ses-1' })), fetchJwks: project.fetchJwks } };
   }
   const me = async (app: { request: (path: string, init?: RequestInit) => Response | Promise<Response> }, token: string) =>
@@ -237,7 +240,7 @@ describe('compose: the webapp providers', () => {
     // Invitations go to memory, for the tests and the debug panel; the response still carries the link.
     expect(tools.webapp!.mailer).toBeInstanceOf(MemoryMailer);
     expect(deps.webapp!.service).toBeInstanceOf(MailingWebappService);
-    for (const factory of [seam.repository, seam.billing, seam.sesSendEmail, project.fetchJwks]) expect(factory).not.toHaveBeenCalled();
+    for (const factory of [seam.repository, seam.authAdmin, seam.billing, seam.sesSendEmail, project.fetchJwks]) expect(factory).not.toHaveBeenCalled();
     expect(composed.banner).not.toContain('webapp=real');
     expect((await debugPost(composed.app, '/__debug/auth/login', { email: 'owner@firm.com' })).status).toBe(200);
     // A debug reset forgets the invitations held in memory with the rest of the simulated webapp.
@@ -293,7 +296,14 @@ describe('compose: the webapp providers', () => {
       const response = await me(composed.app, await project.accessToken());
       expect(response.status).toBe(501);
       expect(await response.json()).toEqual({ error: 'not_configured', message: expect.any(String) });
-      for (const factory of [seam.repository, seam.billing, seam.sesSendEmail, project.fetchJwks]) expect(factory).not.toHaveBeenCalled();
+      for (const factory of [seam.repository, seam.authAdmin, seam.billing, seam.sesSendEmail, project.fetchJwks]) expect(factory).not.toHaveBeenCalled();
+      // The routes of DN-13 T7 and T11 too.
+      for (const [method, path] of [['POST', '/auth/enroll'], ['DELETE', '/me']] as const) {
+        const off = await composed.app.request(path, { method, body: method === 'POST' ? '{"claimId":"x"}' : undefined,
+          headers: { Authorization: `Bearer ${await project.accessToken()}`, 'Content-Type': 'application/json' } });
+        expect(off.status, `${method} ${path}`).toBe(501);
+        expect(off.headers.get('Cache-Control')).toBe('no-store');
+      }
     }
   });
 
@@ -341,6 +351,7 @@ describe('compose: the webapp providers', () => {
       .rejects.toThrow(/Supabase webapp repository.*Stripe billing provider.*SES sender/);
     await expect(compose(loadEnv(launch), undefined, { ...seam, sesSendEmail: undefined })).rejects.toThrow(/SES sender/);
     await expect(compose(loadEnv(realLiveDebug), undefined, { ...seam, repository: undefined })).rejects.toThrow(/Supabase webapp repository/);
+    await expect(compose(loadEnv(realLiveDebug), undefined, { ...seam, authAdmin: undefined })).rejects.toThrow(/Supabase Auth admin/);
     // live-debug keeps the invitations in memory unless told otherwise, so it needs no SES sender.
     await expect(compose(loadEnv(realLiveDebug), undefined, { ...seam, sesSendEmail: undefined })).resolves.toBeDefined();
     // What ships today has the Supabase repository (T4) but no Stripe provider yet (T14): production with the switch on
@@ -371,5 +382,38 @@ describe('compose: the webapp providers', () => {
     // Once Supabase answers, the same process verifies again.
     project.state.fail = false;
     expect((await me(app, await project.accessToken())).status).toBe(200);
+  });
+  it('live-debug with WEBAPP_PROVIDERS=real enrolls and closes accounts through the Auth admin of the seam (DN-13 T7, T11)', async () => {
+    const project = await supabaseProject();
+    const { seam, authAdmin } = adapters(project);
+    const composed = await compose(loadEnv(realLiveDebug), undefined, seam);
+    expect(seam.authAdmin).toHaveBeenCalledTimes(1);
+    // The same service-role client as the repository's.
+    expect(seam.authAdmin.mock.calls[0]![0]).toBe(seam.repository.mock.calls[0]![0]);
+    const enroll = await composed.app.request('/auth/enroll', { method: 'POST', body: JSON.stringify({ claimId: 'unknown' }),
+      headers: { 'Content-Type': 'application/json' } });
+    expect(enroll.status).toBe(410);
+    const remove = vi.spyOn(authAdmin, 'deleteUser');
+    const token = await project.accessToken();
+    expect((await me(composed.app, token)).status).toBe(200);
+    expect((await composed.app.request('/me', { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } })).status).toBe(204);
+    expect(remove).toHaveBeenCalledWith(USER_ID);
+    // The token is still within its hour, but the account is closed.
+    expect((await me(composed.app, token)).status).toBe(401);
+  });
+
+  it('mock enrolls in memory, and the simulated login refuses an email whose account was closed until a debug reset', async () => {
+    const project = await supabaseProject();
+    const { seam } = adapters(project);
+    const composed = await compose(loadEnv({ ...base, ARCA_MODE: 'mock' }), undefined, seam);
+    const login = async () => debugPost(composed.app, '/__debug/auth/login', { email: 'owner@firm.com' });
+    const session = await (await login()).json() as { token: string };
+    expect((await composed.app.request('/me', { method: 'DELETE', headers: { Authorization: `Bearer ${session.token}` } })).status).toBe(204);
+    const refused = await login();
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toEqual({ error: 'conflict', message: expect.stringMatching(/reset/) });
+    expect((await composed.app.request('/__debug/reset', { method: 'POST', headers: { [DEBUG_REQUEST_HEADER]: '1' } })).status).toBe(200);
+    expect((await login()).status).toBe(200);
+    expect(seam.authAdmin).not.toHaveBeenCalled();
   });
 });

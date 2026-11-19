@@ -2,12 +2,14 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { can, canManageMember, hasPaidAccess, type ActionItemView, type ActionPlanResponse, type ActionStatus, type ActivityEventView,
   type ActivityPage, type AdminAuditPage, type AdminMetricsView, type AdminOrgDetailView, type AdminOrgView, type AnalysisView,
   type AssessmentResult, type AuditActorKind, type ClaimResponse, type CreateActionRequest, type CreateOrgRequest, type DeletionRequestView,
+  type EnrollRequest, type EnrollResponse,
   type InvitationView, type InviteRequest, type Layer1Result, type MeResponse, type MemberView, type OrgView, type Permission, type PlanView,
   type Role, type UpdateActionRequest, type UpdatePlanRequest } from '@arca/contracts';
 import type { AssessmentRepository } from '../assessment/repository.js';
 import { verifySessionToken } from '../auth/session-token.js';
 import type { ScanRecord, ScanRepository } from '../repositories/types.js';
 import type { AppUser } from './auth.js';
+import { AuthAdminUnavailable, type AuthAdmin } from './auth-admin.js';
 import type { BillingEvent, BillingProvider } from './billing.js';
 import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict, type ActionPatch, type AuditActor, type AuditRecord,
   type BillingApplyOutcome, type CustomActionRecord,
@@ -15,11 +17,12 @@ import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConf
   type PlanRecord, type WebappConflictReason, type WebappRepository } from './types.js';
 
 const STATUS = { invalid_request: 400, unauthorized: 401, payment_required: 402, forbidden: 403, not_found: 404, conflict: 409, gone: 410,
-  rate_limited: 429 } as const;
+  rate_limited: 429, auth_unavailable: 503 } as const;
 type FailureCode = keyof typeof STATUS;
 
 export class WebappFailure extends Error {
-  constructor(readonly code: FailureCode, message: string, readonly status: (typeof STATUS)[FailureCode]) {
+  /** `retryAfter`, in seconds, goes out as the Retry-After header of a 429. */
+  constructor(readonly code: FailureCode, message: string, readonly status: (typeof STATUS)[FailureCode], readonly retryAfter?: number) {
     super(message);
     this.name = 'WebappFailure';
   }
@@ -35,7 +38,11 @@ const CONFLICTS: Record<WebappConflictReason, string> = {
   action_limit: `An organization keeps at most ${MAX_CUSTOM_ACTIONS} actions of its own`,
   already_reviewed: 'This deletion request was already reviewed',
   invitation_closed: 'This invitation is no longer valid',
+  sole_owner: 'You are the only owner of an organization: make someone else an owner or request its deletion first',
 };
+// One answer for every claim or invitation POST /auth/enroll cannot use (DN-13 §4.2): unknown, expired, spent, revoked, accepted, or
+// of a deleted organization. The request names no email, so none is revealed either way.
+const ENROLL_REFUSED = 'This link is no longer valid; start again from your results or ask for a new invitation';
 /** The rules the repository enforces atomically come back as a 409. */
 async function orConflict<T>(write: Promise<T>): Promise<T> {
   try { return await write; } catch (error) {
@@ -133,7 +140,7 @@ const TARGETS: Readonly<Record<string, 'user' | 'email' | 'scan' | 'org' | 'acti
   'member.joined': 'user', 'member.role_changed': 'user', 'member.removed': 'user',
   'member.invited': 'email', 'invitation.revoked': 'email',
   'analysis.claimed': 'scan',
-  'org.created': 'org', 'org.renamed': 'org',
+  'org.created': 'org', 'org.renamed': 'org', 'account.deleted': 'user',
   'action.created': 'action', 'action.updated': 'action', 'action.deleted': 'action',
   'plan.updated': 'plan',
   'platform_admin.granted': 'user', 'platform_admin.revoked': 'user',
@@ -153,7 +160,7 @@ function changeOf({ action, data }: AuditRecord): Change | null {
   switch (action) {
     case 'member.role_changed': case 'org.renamed': return pair(data.from, data.to);
     case 'member.invited': case 'member.joined': return pair(null, data.role);
-    case 'member.removed': return pair(data.role, null);
+    case 'member.removed': case 'account.deleted': return pair(data.role, null);
     case 'org.created': return pair(null, data.name);
     case 'action.updated': {
       const [before, after] = [fields(data.before), fields(data.after)];
@@ -166,6 +173,11 @@ function changeOf({ action, data }: AuditRecord): Change | null {
 export type WebappServiceDeps = {
   repository: WebappRepository; scans: ScanRepository; assessments: AssessmentRepository; billing: BillingProvider;
   sessionSecret: string; appBaseUrl: string;
+  /**
+   * Creates and deletes Supabase Auth users (DN-13 §4.2, §4.8): the admin API in the real webapp, the in-memory one in the debug
+   * modes. Only POST /auth/enroll and DELETE /me need it; compose always passes one.
+   */
+  authAdmin?: AuthAdmin;
   /** False for a scan that lives only in memory (an injected fault, DN-09 §5.5): it can never be claimed. */
   isDurableScan?: (scanId: string) => boolean;
   now?: () => number;
@@ -241,6 +253,57 @@ export class WebappService {
       platformAdmin: await this.repo.isPlatformAdmin(user.userId) };
   }
 
+  /**
+   * Closed sign-up (DN-13 §4.2): the Supabase Auth user of a claim's email, or of a pending invitation's, is created here and
+   * nowhere else. The claim gets the checks of `redeemable` without being spent, and without a user to compare emails with: the
+   * code that reaches that mailbox is what proves the person owns it. Already enrolled is the same answer. Nothing is written
+   * before the Auth admin API answers, so its failure (503) leaves nothing half made.
+   */
+  async enroll(req: EnrollRequest): Promise<EnrollResponse> {
+    const email = 'claimId' in req ? await this.enrollableClaim(req.claimId) : await this.enrollableInvitation(req.invitationToken);
+    if (!email) throw fail('gone', ENROLL_REFUSED);
+    try {
+      await this.requireAuthAdmin().createUser(email);
+    } catch (error) {
+      if (error instanceof AuthAdminUnavailable) throw fail('auth_unavailable', 'Accounts cannot be created right now; try again in a minute');
+      throw error;
+    }
+    return { email };
+  }
+
+  /**
+   * A closed account is refused on every route (DN-13 §4.4): its access token stays valid until it expires, up to an hour, and
+   * its Auth user may outlive the deletion if the admin API failed.
+   */
+  async requireLiveAccount(user: AppUser): Promise<void> {
+    if ((await this.repo.getProfile(user.userId))?.deleted_at) throw fail('unauthorized', 'This account was deleted');
+  }
+
+  /**
+   * DELETE /me (DN-13 §4.8). The store closes the account in one step, refusing a sole owner (409); then the Auth user goes,
+   * which drops its sessions and refresh tokens. That second step is tried twice; if it still fails the account is closed already
+   * (every route answers 401 to it) and the answer is 503, so the front asks again with the same token: both steps are idempotent.
+   */
+  async deleteAccount(user: AppUser): Promise<void> {
+    const admin = this.requireAuthAdmin();
+    // A user who never reached a route that writes the profile gets one now, so the tombstone exists and their token is refused
+    // from here on.
+    if (!(await this.repo.getProfile(user.userId))) await this.ensureProfile(user);
+    await orConflict(this.repo.deleteAccount(user.userId, this.timestamp()));
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await admin.deleteUser(user.userId);
+        return;
+      } catch (error) {
+        if (!(error instanceof AuthAdminUnavailable)) throw error;
+        if (attempt === 2) {
+          console.error(`[auth] account ${user.userId} was closed but its Auth user was not deleted; DELETE /me again retries`);
+          throw fail('auth_unavailable', 'Your account was closed, but signing it out everywhere failed; try again');
+        }
+      }
+    }
+  }
+
   /** Step 2 of the claim: the organization, its owner and the analysis are written together, or nothing is. */
   async createOrganization(user: AppUser, req: CreateOrgRequest): Promise<OrgView> {
     const { idHash, scan, assessmentId } = await this.redeemable(user, req.claimId);
@@ -295,7 +358,7 @@ export class WebappService {
 
   /** `orgId` is the id `authorize` returned. */
   async listMembers(orgId: string): Promise<{ members: MemberView[]; invitations: InvitationView[] }> {
-    const members = await Promise.all((await this.repo.listMembers(orgId)).map(member => this.memberView(member)));
+    const members = await this.memberViews(await this.repo.listMembers(orgId));
     const invitations = (await this.repo.listInvitations(orgId)).filter(invitation => !this.expired(invitation.expires_at)).map(invitationView);
     return { members, invitations };
   }
@@ -552,7 +615,7 @@ export class WebappService {
     const org = orgId && await this.repo.getOrganization(orgId);
     if (!orgId || !org) throw fail('not_found', 'Organization not found');
     const pending = await this.repo.getPendingDeletionRequest(orgId);
-    const members = await Promise.all((await this.repo.listMembers(orgId)).map(member => this.memberView(member)));
+    const members = await this.memberViews(await this.repo.listMembers(orgId));
     return { id: org.id, name: org.name, domain: org.domain, billingStatus: org.billing_status, deleted: org.deleted_at !== null,
       createdAt: iso(org.created_at), planCode: (await this.repo.getSubscription(orgId))?.plan_code ?? null,
       analysisCount: (await this.repo.listAnalyses(orgId)).length, pendingDeletion: pending && deletionView(pending),
@@ -643,6 +706,28 @@ export class WebappService {
     return { idHash, scan, assessmentId: assessment?.id ?? null };
   }
 
+  /** The email of a claim that `redeemable` would take, read and not spent; null for any claim it would refuse. */
+  private async enrollableClaim(claimId: string): Promise<string | null> {
+    const ticket = await this.repo.getClaimTicket(sha256(claimId));
+    if (!ticket || this.expired(ticket.expires_at) || ticket.used_at !== null) return null;
+    const scan = await this.deps.scans.get(ticket.scan_id);
+    if (!scan || !isFinished(scan) || this.deps.isDurableScan?.(scan.scan_id) === false) return null;
+    return ticket.email.toLowerCase();
+  }
+
+  /** The email of an invitation that acceptInvitation would take; null for any invitation it would refuse. */
+  private async enrollableInvitation(token: string): Promise<string | null> {
+    const invitation = await this.repo.findInvitationByHash(sha256(token));
+    if (!invitation || invitation.accepted_at || invitation.revoked_at || this.expired(invitation.expires_at)) return null;
+    const org = await this.repo.getOrganization(invitation.org_id);
+    return org && org.deleted_at === null ? invitation.email.toLowerCase() : null;
+  }
+
+  private requireAuthAdmin(): AuthAdmin {
+    if (!this.deps.authAdmin) throw new Error('The webapp has no Auth admin');
+    return this.deps.authAdmin;
+  }
+
   private requireClaimable(scan: ScanRecord): asserts scan is FinishedScan {
     if (!isFinished(scan)) throw fail('conflict', 'Only a completed scan can be claimed');
     if (this.deps.isDurableScan?.(scan.scan_id) === false) throw fail('conflict', 'A scan with an injected fault cannot be claimed');
@@ -669,8 +754,16 @@ export class WebappService {
 
   private async memberView(member: MembershipRecord): Promise<MemberView> {
     const profile = await this.repo.getProfile(member.user_id);
-    if (!profile) throw new Error('Member without a profile');
+    if (!profile?.email) throw new Error('Member without a profile');
     return { userId: member.user_id, email: profile.email, role: member.role, joinedAt: iso(member.created_at) };
+  }
+  /**
+   * A closed account leaves no member in a live organization, but a deleted one keeps its memberships (DN-13 §4.8): those show
+   * nobody, since the person, and their email, are gone.
+   */
+  private async memberViews(members: MembershipRecord[]): Promise<MemberView[]> {
+    const live = await Promise.all(members.map(async member => (await this.repo.getProfile(member.user_id))?.deleted_at ? null : member));
+    return Promise.all(live.filter(member => member !== null).map(member => this.memberView(member)));
   }
 
   /**
@@ -699,6 +792,7 @@ export class WebappService {
   /** Members are listed with the email of their profile, so every path that adds a member writes the profile first. */
   private async ensureProfile(user: AppUser) {
     const current = await this.repo.getProfile(user.userId);
+    // Never deleted_at: a closed account's profile refuses this write (DN-13 §4.8).
     await this.repo.upsertProfile({ user_id: user.userId, email: user.email.toLowerCase(), full_name: current?.full_name ?? null,
       last_org_id: current?.last_org_id ?? null, created_at: current?.created_at ?? this.timestamp() });
   }
@@ -805,7 +899,7 @@ export class WebappService {
   /** An assignee is always a member, and every member has a profile. */
   private async profileEmail(userId: string): Promise<string> {
     const profile = await this.repo.getProfile(userId);
-    if (!profile) throw new Error('Member without a profile');
+    if (!profile?.email) throw new Error('Member without a profile');
     return profile.email;
   }
 

@@ -36,6 +36,9 @@ function userIdFor(email: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-8${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
+/** The user id the simulated login gives an email, in any case: the simulated Auth admin keeps its users under the same ids. */
+export const mockUserIdFor = (email: string) => userIdFor(email.trim().toLowerCase());
+
 export class MockAppAuth implements AppAuth {
   private readonly key: Uint8Array;
   constructor(secret: string, private readonly now: () => number = Date.now) {
@@ -45,7 +48,7 @@ export class MockAppAuth implements AppAuth {
 
   async issue(email: string): Promise<{ token: string; user: AppUser; expiresAt: string }> {
     const normalized = email.trim().toLowerCase();
-    const user = { userId: userIdFor(normalized), email: normalized };
+    const user = { userId: mockUserIdFor(normalized), email: normalized };
     const issuedAt = Math.floor(this.now() / 1000);
     const expiresAt = issuedAt + TTL_SECONDS;
     const token = await new SignJWT({ email: user.email }).setProtectedHeader({ alg: 'HS256' }).setSubject(user.userId)

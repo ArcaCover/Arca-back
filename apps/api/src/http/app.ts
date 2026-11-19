@@ -8,7 +8,7 @@ import { DEBUG_REQUEST_HEADER, DEBUG_SCENARIO_HEADER, type DebugScenario } from 
 import { issueSessionToken, verifySessionToken } from '../auth/session-token.js';
 import type { DebugTools } from '../debug/tools.js';
 import type { ScanRepository, ScanRecord } from '../repositories/types.js';
-import { ScanLimiter } from './rate-limit.js';
+import { ScanLimiter, WindowLimiter } from './rate-limit.js';
 import { answersFromCache } from './scan-cache.js';
 import { buildOpenApiDocument } from './openapi.js';
 import { renderQuickScanHtml, reportFilename } from '../report/quick-scan.js';
@@ -209,7 +209,9 @@ export function createApp(deps: AppDeps) {
     planningTimeoutMs: deps.assessmentPlanningTimeoutMs, maxWritesPerMinute: deps.assessmentMaxWritesPerMinute });
   app.route('/', assessmentRoutes({ scans: deps.repository, repository: assessmentRepository, service: assessments, sessionSecret: deps.sessionSecret,
     renderReport: deps.renderReport, reportFault: debug ? scanId => debug.reportFault(scanId) : undefined }));
-  app.route('/', deps.webapp ? webappRoutes(deps.webapp) : notConfiguredWebapp());
+  // The webapp's own limits (DN-13 §7.4), which the debug reset forgets with the scan limiter's.
+  const webappLimiter = new WindowLimiter(60 * 60 * 1000, now);
+  app.route('/', deps.webapp ? webappRoutes({ ...deps.webapp, clientIp: deps.clientIp, limiter: webappLimiter, now }) : notConfiguredWebapp());
   if (debug) {
     // The mock demo seed (DN-11 §4.6) runs this very scan, past the limiter, to its end, then the assessment through this service.
     // Built only where the seed exists, so no other mode ever holds a scan runner that skips the limiter.
@@ -221,7 +223,7 @@ export function createApp(deps: AppDeps) {
       if (!scan) throw new Error('The scan was not stored');
       return { scan, sessionToken: started.response.sessionToken };
     } } : undefined;
-    app.route('/__debug', debug.routes({ limiter, sessionSecret: deps.sessionSecret, seed }));
+    app.route('/__debug', debug.routes({ limiter, webappLimiter, sessionSecret: deps.sessionSecret, seed }));
   }
   return { app, drain: async () => { await Promise.all([...jobs]); await assessments.drain(); },
     recoverAssessments: () => assessments.recoverInterrupted() };

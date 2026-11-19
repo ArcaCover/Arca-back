@@ -1,12 +1,23 @@
+import { createHash } from 'node:crypto';
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
-import { AttachAnalysisRequest, CheckoutRequest, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, InviteRequest,
-  ReviewRequest, SetRoleRequest, UpdateActionRequest, UpdateOrgRequest, UpdatePlanRequest } from '@arca/contracts';
+import { AttachAnalysisRequest, CheckoutRequest, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, EnrollRequest,
+  InviteRequest, ReviewRequest, SetRoleRequest, UpdateActionRequest, UpdateOrgRequest, UpdatePlanRequest } from '@arca/contracts';
+import { WindowLimiter } from '../http/rate-limit.js';
 import { AuthUnavailable, type AppAuth, type AppUser } from './auth.js';
 import { WebappFailure, type WebappService } from './service.js';
 
-// Every path the private webapp answers on (DN-10 §4.7, DN-11 §4.9). Production answers 501 on all of them unless WEBAPP_ENABLED=true.
-const WEBAPP_PATHS = ['/me', '/claims', '/plans', '/orgs', '/orgs/*', '/invitations/*', '/admin/*', '/billing/*'] as const;
+// Every path the private webapp answers on (DN-10 §4.7, DN-11 §4.9, DN-13 §7.2). Production answers 501 on all of them unless
+// WEBAPP_ENABLED=true.
+const WEBAPP_PATHS = ['/me', '/claims', '/plans', '/auth/*', '/orgs', '/orgs/*', '/invitations/*', '/admin/*', '/billing/*'] as const;
+
+// DN-13 §7.4, per process, over an hour. Enrolling creates an Auth user and lets a code be mailed to that address; closing an account
+// deletes one.
+const HOUR_MS = 60 * 60 * 1000;
+const ENROLL_PER_ADDRESS = 10;
+const ENROLL_PER_LINK = 5;
+const ACCOUNT_DELETIONS_PER_USER = 3;
+const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 
 // A page of the audit log (DN-11 §4.3, §4.5): `before` is the seq the previous page ended on; a limit out of range is a 400.
 const auditPage = (max: number, fallback: number) => z.object({
@@ -14,27 +25,42 @@ const auditPage = (max: number, fallback: number) => z.object({
   limit: z.string().regex(/^\d{1,4}$/).transform(Number).pipe(z.number().int().min(1).max(max)).default(String(fallback)),
 });
 
-/** Accounts, organizations and billing of the private webapp. The service owns every rule; these routes only authenticate and parse. */
-export function webappRoutes(deps: { service: WebappService; auth: AppAuth }): Hono {
+/**
+ * Accounts, organizations and billing of the private webapp. The service owns every rule; these routes only authenticate, parse and
+ * count requests. `clientIp` is the caller's address as the server resolved it; `limiter` is shared with the debug reset.
+ */
+export function webappRoutes(deps: { service: WebappService; auth: AppAuth; clientIp?: (request: Request) => string;
+  limiter?: WindowLimiter; now?: () => number }): Hono {
   const { service } = deps;
+  const limiter = deps.limiter ?? new WindowLimiter(HOUR_MS, deps.now);
   const app = new Hono();
   for (const path of WEBAPP_PATHS) app.use(path, noStore);
   app.onError((error, c) => {
-    if (error instanceof WebappFailure) return c.json({ error: error.code, message: error.message }, error.status);
+    if (error instanceof WebappFailure) {
+      if (error.retryAfter) c.header('Retry-After', String(error.retryAfter));
+      return c.json({ error: error.code, message: error.message }, error.status);
+    }
     // The verifier holds no key yet (Supabase unreachable since the start): 503, never a 401 that would sign the user out.
     if (error instanceof AuthUnavailable) return c.json({ error: 'auth_unavailable', message: error.message }, 503);
     throw error;
   });
 
   // The app's session token: Supabase's, or the simulated issuer's in the debug modes, never both. A scan session token is refused
-  // here: its issuer and audience are not the app's.
-  async function user(c: Context): Promise<AppUser> {
+  // here: its issuer and audience are not the app's. A closed account is refused too (DN-13 §4.4), except by DELETE /me, which
+  // finishes a deletion whose Auth step failed.
+  async function user(c: Context, options: { closed?: boolean } = {}): Promise<AppUser> {
     const token = /^Bearer\s+(.+)$/i.exec(c.req.header('Authorization') ?? '')?.[1];
     const verified = token ? await deps.auth.verify(token) : null;
     if (!verified) throw new WebappFailure('unauthorized', 'Invalid or missing session token', 401);
+    if (!options.closed) await service.requireLiveAccount(verified);
     return verified;
   }
   const signedIn = (handler: (c: Context, user: AppUser) => Promise<Response>) => async (c: Context) => handler(c, await user(c));
+  /** Counts the request against every key it names; 429 with Retry-After once one of them is full. */
+  function limit(limits: ReadonlyArray<readonly [string, number]>) {
+    const { allowed, retryAfter } = limiter.check(limits);
+    if (!allowed) throw new WebappFailure('rate_limited', 'Too many requests; try again later', 429, retryAfter);
+  }
   const platformAdmin = (handler: (c: Context, user: AppUser) => Promise<Response>) => signedIn(async (c, admin) => {
     await service.requirePlatformAdmin(admin);
     return handler(c, admin);
@@ -43,7 +69,21 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth }): H
   app.get('/plans', async c => c.json(await service.listPlans()));
   // The scan token travels in the body, so CORS keeps allowing only Content-Type and Authorization.
   app.post('/claims', async c => c.json(await service.issueClaim((await body(c, CreateClaimRequest)).scanToken), 201));
+  // Closed sign-up (DN-13 §4.2): public, counted per address and per claim or invitation, which are kept here only as their hash.
+  app.post('/auth/enroll', async c => {
+    const req = await body(c, EnrollRequest);
+    limit([[`enroll:address:${deps.clientIp?.(c.req.raw) ?? 'unknown'}`, ENROLL_PER_ADDRESS],
+      [`enroll:link:${sha256('claimId' in req ? `claim:${req.claimId}` : `invitation:${req.invitationToken}`)}`, ENROLL_PER_LINK]]);
+    return c.json(await service.enroll(req));
+  });
   app.get('/me', signedIn(async (c, me) => c.json(await service.me(me))));
+  // Closing one's own account (DN-13 §4.8): 204, 409 for a sole owner, 503 when the Auth user could not be deleted (send it again).
+  app.delete('/me', async c => {
+    const me = await user(c, { closed: true });
+    limit([[`delete-account:${me.userId}`, ACCOUNT_DELETIONS_PER_USER]]);
+    await service.deleteAccount(me);
+    return c.body(null, 204);
+  });
   app.post('/orgs', signedIn(async (c, me) => c.json(await service.createOrganization(me, await body(c, CreateOrgRequest)), 201)));
   app.get('/orgs/:id', signedIn(async (c, me) => c.json(await service.orgView(me, param(c, 'id')))));
   app.patch('/orgs/:id', signedIn(async (c, me) =>

@@ -19,7 +19,8 @@ import { RoutingAssessmentRepository, RoutingScanRepository } from './debug/isol
 import { createDebugTools } from './debug/tools.js';
 import { createOpenAIPlanner } from '@arca/questions';
 import { renderPdf } from './report/pdf.js';
-import { MockAppAuth, SupabaseJwtAuth } from './webapp/auth.js';
+import { MockAppAuth, SupabaseJwtAuth, mockUserIdFor } from './webapp/auth.js';
+import { InMemoryAuthAdmin } from './webapp/auth-admin.js';
 import { MockBillingProvider } from './webapp/billing.js';
 import { InMemoryWebappRepository } from './webapp/in-memory.js';
 import { MailingWebappService } from './webapp/invitation-email.js';
@@ -37,11 +38,13 @@ function simulatedWebapp(env: ReturnType<typeof loadEnv>, scans: RoutingScanRepo
   const billing = new MockBillingProvider(env.APP_BASE_URL);
   // Invitations are kept in memory, for the tests and the debug panel; the response still carries the link (DN-13 §7.1).
   const mailer = new MemoryMailer();
+  // Enrolling and closing accounts act on a simulated Auth whose users have the simulated login's ids (DN-13 T7, T11).
+  const authAdmin = new InMemoryAuthAdmin(mockUserIdFor);
   const service = new MailingWebappService({ repository, scans, assessments, billing, sessionSecret: env.SESSION_TOKEN_SECRET,
-    appBaseUrl: env.APP_BASE_URL,
+    appBaseUrl: env.APP_BASE_URL, authAdmin,
     // A scan with an injected fault lives in memory only, so it can never belong to an organization.
     isDurableScan: scanId => !scans.isIsolated(scanId) }, { mailer, from: env.emailFrom });
-  return { repository, billing, service, mailer, auth: new MockAppAuth(env.SESSION_TOKEN_SECRET) };
+  return { repository, billing, service, mailer, authAdmin, auth: new MockAppAuth(env.SESSION_TOKEN_SECRET) };
 }
 
 /**
@@ -52,6 +55,7 @@ function simulatedWebapp(env: ReturnType<typeof loadEnv>, scans: RoutingScanRepo
 async function realWebapp(env: ReturnType<typeof loadEnv>, adapters: RealWebappAdapters, deps: { client: () => StorageClient;
   scans: ScanRepository; assessments: AssessmentRepository; isDurableScan?: (scanId: string) => boolean }) {
   const missing = [...(adapters.repository ? [] : ['the Supabase webapp repository (DN-13 T4)']),
+    ...(adapters.authAdmin ? [] : ['the Supabase Auth admin (DN-13 T7)']),
     ...(adapters.billing ? [] : ['the Stripe billing provider (DN-13 T14)']),
     ...(env.emailProvider === 'ses' && !adapters.sesSendEmail ? ['the SES sender (see SesMailer)'] : [])];
   if (missing.length) {
@@ -63,7 +67,9 @@ async function realWebapp(env: ReturnType<typeof loadEnv>, adapters: RealWebappA
   const billing = adapters.billing!({ secretKey: env.STRIPE_SECRET_KEY!, webhookSecret: env.STRIPE_WEBHOOK_SECRET!, mode: env.stripeMode!,
     appBaseUrl: env.APP_BASE_URL });
   const mailer = env.emailProvider === 'ses' ? new SesMailer(adapters.sesSendEmail!) : new MemoryMailer();
-  const service = new MailingWebappService({ repository: adapters.repository!(deps.client()), scans: deps.scans,
+  // One service-role client for the data and the Auth admin API.
+  const client = deps.client();
+  const service = new MailingWebappService({ repository: adapters.repository!(client), authAdmin: adapters.authAdmin!(client), scans: deps.scans,
     assessments: deps.assessments, billing, sessionSecret: env.SESSION_TOKEN_SECRET, appBaseUrl: env.APP_BASE_URL,
     isDurableScan: deps.isDurableScan }, { mailer, from: env.emailFrom });
   return { service, auth };

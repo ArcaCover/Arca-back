@@ -4,7 +4,7 @@ import type { Role } from '@arca/contracts';
 import {
   IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict, type ActionPatch, type AssessmentActionRecord, type AuditActor,
   type BillingStateRecord, type ClaimTicketRecord, type CustomActionRecord, type DeletionRequestRecord, type InvitationRecord,
-  type MemberChange, type MembershipRecord, type NewAuditRecord, type OrgAnalysisRecord, type OrganizationRecord, type ProfileRecord,
+  type MemberChange, type MembershipRecord, type NewAuditRecord, type OrgAnalysisRecord, type OrganizationRecord, type ProfileWrite,
   type SubscriptionRecord, type WebappConflictReason, type WebappRepository,
 } from '../../src/webapp/types.js';
 
@@ -38,7 +38,7 @@ const sorted = <T>(values: T[]) => [...values].sort();
 const member = (userId: string): AuditActor => ({ actor_kind: 'member', actor_user_id: userId });
 const change = (actorUserId: string, actorRole: Role, at = tick()): MemberChange => ({ actorUserId, actorRole, audit: member(actorUserId), at });
 
-const profileOf = (userId: string, patch: Partial<ProfileRecord> = {}): ProfileRecord => ({ user_id: userId, email: `${userId}@firm.example`,
+const profileOf = (userId: string, patch: Partial<ProfileWrite> = {}): ProfileWrite => ({ user_id: userId, email: `${userId}@firm.example`,
   full_name: null, last_org_id: null, created_at: tick(), ...patch });
 const orgOf = (id: string, createdBy: string, patch: Partial<OrganizationRecord> = {}): OrganizationRecord => ({ id, name: `Org ${id.slice(0, 8)}`,
   domain: 'firm.example', billing_status: 'pending_payment', deleted_at: null, created_by: createdBy, created_at: tick(), ...patch });
@@ -177,8 +177,8 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
         await repo.upsertProfile(created);
         const { id } = await organization();
         await repo.upsertProfile({ ...created, full_name: 'Ana', last_org_id: id });
-        expect(await repo.getProfile(userId)).toEqual({ ...created, full_name: 'Ana', last_org_id: id });
-        expect(await repo.findProfileByEmail(created.email.toUpperCase())).toEqual({ ...created, full_name: 'Ana', last_org_id: id });
+        expect(await repo.getProfile(userId)).toEqual({ ...created, full_name: 'Ana', last_org_id: id, deleted_at: null });
+        expect(await repo.findProfileByEmail(created.email.toUpperCase())).toEqual({ ...created, full_name: 'Ana', last_org_id: id, deleted_at: null });
         expect(await repo.findProfileByEmail(`${uuid()}@firm.example`)).toBeNull();
         await expect(repo.upsertProfile(profileOf(uuid(), { email: created.email }))).rejects.toThrow();
         expect(await repo.findProfileByEmail(created.email)).toMatchObject({ user_id: userId });
@@ -283,7 +283,7 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
         const { id, owner } = await organization();
         const other = await organization();
         const userId = await join(id);
-        const email = (await repo.getProfile(userId))!.email;
+        const email = (await repo.getProfile(userId))!.email!;
         const link = invitationOf(id, { email });
         const elsewhere = invitationOf(other.id, { email });
         await repo.createInvitation(link);
@@ -360,7 +360,7 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
         const { id } = await organization();
         const guest = uuid();
         await repo.upsertProfile(profileOf(guest));
-        const invitation = invitationOf(id, { role: 'admin', email: (await repo.getProfile(guest))!.email });
+        const invitation = invitationOf(id, { role: 'admin', email: (await repo.getProfile(guest))!.email! });
         await repo.createInvitation(invitation);
         const at = tick();
         expect(await repo.acceptInvitation(invitation.id, guest, at, member(guest))).toEqual({ joined: true, role: 'admin' });
@@ -375,7 +375,7 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
       it('closes the invitation of someone who already belongs and keeps their role', async () => {
         const { id } = await organization();
         const userId = await join(id, 'viewer');
-        const invitation = invitationOf(id, { role: 'admin', email: (await repo.getProfile(userId))!.email });
+        const invitation = invitationOf(id, { role: 'admin', email: (await repo.getProfile(userId))!.email! });
         await repo.createInvitation(invitation);
         expect(await repo.acceptInvitation(invitation.id, userId, tick(), member(userId))).toEqual({ joined: false, role: 'viewer' });
         expect(await roleOf(id, userId)).toBe('viewer');
@@ -757,6 +757,87 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
           .toMatchObject({ assignee_user_id: null });
         expect(await repo.upsertAssessmentAction(trackedOf(id, scanId, 'improve:D1.1'), { status: 'done', updated_by: owner, updated_at: tick() }))
           .toMatchObject({ status: 'done', assignee_user_id: viewer });
+      });
+    });
+
+    // DELETE /me (DN-13 §4.8): one step that closes the account, the delete_account RPC in SQL.
+    describe('closing an account', () => {
+      it('refuses the only owner of an organization that is not deleted, and changes nothing (sole_owner)', async () => {
+        const { id, owner } = await organization();
+        const other = await organization();
+        await join(other.id, 'member', owner);
+        const before = await repo.getProfile(owner);
+        await expectConflict(repo.deleteAccount(owner, tick()), 'sole_owner');
+        expect(await roleOf(id, owner)).toBe('owner');
+        expect(await roleOf(other.id, owner)).toBe('member');
+        expect(await repo.getProfile(owner)).toEqual(before);
+        expect(await auditOfOrg(id)).toEqual([]);
+        expect(await auditOfOrg(other.id)).toEqual([]);
+      });
+
+      it('closes the account: memberships of live organizations, the actions held there, pending links and the profile, audited', async () => {
+        const first = await organization();
+        const second = await organization();
+        const gone = await organization();
+        const third = await organization();
+        const userId = await join(first.id, 'member');
+        // An owner who is not the only one may leave.
+        await join(second.id, 'owner', userId);
+        await join(gone.id, 'viewer', userId);
+        await repo.markOrganizationDeleted(gone.id, tick());
+        const email = (await repo.getProfile(userId))!.email!;
+        await repo.upsertProfile({ ...profileOf(userId, { email }), full_name: 'Ana', last_org_id: first.id });
+        await repo.createCustomAction(customOf(first.id, { assignee_user_id: userId }));
+        const link = invitationOf(third.id, { email: email.toUpperCase() });
+        await repo.createInvitation(link);
+        const at = tick();
+
+        expect(sorted((await repo.deleteAccount(userId, at)).orgIds)).toEqual(sorted([first.id, second.id]));
+        expect(await roleOf(first.id, userId)).toBeNull();
+        expect(await roleOf(second.id, userId)).toBeNull();
+        expect(await roleOf(second.id, second.owner)).toBe('owner');
+        // A deleted organization keeps its history, its members included.
+        expect(await roleOf(gone.id, userId)).toBe('viewer');
+        expect(await holders(first.id)).toEqual([null]);
+        expect(await repo.findInvitationByHash(link.token_hash)).toMatchObject({ revoked_at: at });
+        expect(await repo.getProfile(userId)).toEqual({ user_id: userId, email: null, full_name: null, last_org_id: null,
+          created_at: expect.any(String), deleted_at: at });
+        expect(await repo.findProfileByEmail(email)).toBeNull();
+        const closed = { action: 'account.deleted', actor_kind: 'member', actor_user_id: userId, target: userId };
+        expect(await auditOfOrg(first.id)).toEqual([{ ...closed, data: { role: 'member' } }]);
+        expect(await auditOfOrg(second.id)).toEqual([{ ...closed, data: { role: 'owner' } }]);
+        expect(await auditOfOrg(gone.id)).toEqual([]);
+        expect(await auditOfOrg(third.id)).toEqual([{ action: 'invitation.revoked', actor_kind: 'member', actor_user_id: userId,
+          target: link.email, data: { invitationId: link.id, reason: 'account_deleted' } }]);
+      });
+
+      it('is idempotent, never brings the profile back, and frees the email for a new account', async () => {
+        const { id } = await organization();
+        const userId = await join(id);
+        const email = (await repo.getProfile(userId))!.email!;
+        const at = tick();
+        expect(await repo.deleteAccount(userId, at)).toEqual({ orgIds: [id] });
+        expect(await repo.deleteAccount(userId, tick())).toEqual({ orgIds: [] });
+        expect(await repo.getProfile(userId)).toMatchObject({ email: null, deleted_at: at });
+        expect((await auditOfOrg(id)).map(row => row.action)).toEqual(['account.deleted']);
+        // A late write for the closed account (a request that passed its check before the deletion) is refused.
+        await expect(repo.upsertProfile(profileOf(userId, { email }))).rejects.toThrow();
+        expect(await repo.getProfile(userId)).toMatchObject({ email: null, deleted_at: at });
+        // The same email may sign up again: a new Auth user, so a new profile.
+        const next = uuid();
+        await repo.upsertProfile(profileOf(next, { email }));
+        expect(await repo.findProfileByEmail(email)).toMatchObject({ user_id: next, deleted_at: null });
+      });
+
+      it('closes the account of the sole owner of a deleted organization, and of a user with no profile', async () => {
+        const { id, owner } = await organization();
+        await repo.markOrganizationDeleted(id, tick());
+        expect(await repo.deleteAccount(owner, tick())).toEqual({ orgIds: [] });
+        expect(await roleOf(id, owner)).toBe('owner');
+        expect(await repo.getProfile(owner)).toMatchObject({ email: null });
+        const stranger = uuid();
+        expect(await repo.deleteAccount(stranger, tick())).toEqual({ orgIds: [] });
+        expect(await repo.getProfile(stranger)).toBeNull();
       });
     });
 

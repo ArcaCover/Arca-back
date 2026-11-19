@@ -13,7 +13,7 @@ import { loadEnv } from '../../src/config/env.js';
 import { RoutingAssessmentRepository, RoutingScanRepository } from '../../src/debug/isolation.js';
 import { createDebugTools } from '../../src/debug/tools.js';
 import { createApp } from '../../src/http/app.js';
-import { ScanLimiter } from '../../src/http/rate-limit.js';
+import { ScanLimiter, WindowLimiter } from '../../src/http/rate-limit.js';
 import { PublicDomainResolver } from '../../src/pipeline/domain-resolution.js';
 import { InProcessPipeline } from '../../src/pipeline/in-process-pipeline.js';
 import { mockSources } from '../../src/pipeline/mock-sources.js';
@@ -1194,7 +1194,8 @@ describe('live-debug: real scans, a simulated webapp held in memory', () => {
     const routes = vi.spyOn(debug, 'routes');
     const { app } = build();
     expect(routes).toHaveBeenCalledTimes(1);
-    expect(routes.mock.calls[0]![0]).toEqual({ limiter: expect.any(ScanLimiter), sessionSecret: secret, seed: undefined });
+    expect(routes.mock.calls[0]![0]).toEqual({ limiter: expect.any(ScanLimiter), webappLimiter: expect.any(WindowLimiter), sessionSecret: secret,
+      seed: undefined });
     // Nor would the routes take one.
     expect(() => debug.routes({ limiter: new ScanLimiter(), sessionSecret: secret,
       seed: { runScan: vi.fn(), assessments: new AssessmentService({ repository: assessments }) } })).toThrow('only in mock');

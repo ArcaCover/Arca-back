@@ -3,7 +3,7 @@ import { AUDIT_ACTOR_KINDS, can, canManageMember, type BillingStatus, type Role 
 import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict } from './types.js';
 import type { ActionPatch, AssessmentActionRecord, AuditActor, AuditPageQuery, AuditRecord, BillingApplyOutcome, BillingStateRecord,
   ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord, InvitationRecord, MemberChange, MembershipRecord, NewAuditRecord,
-  OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, PlanRecord, ProfileRecord, SubscriptionRecord, WebappRepository } from './types.js';
+  OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, PlanRecord, ProfileRecord, ProfileWrite, SubscriptionRecord, WebappRepository } from './types.js';
 
 // updatePlan can change these and nothing else; the code is the identity of the plan.
 const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active'] as const;
@@ -14,7 +14,7 @@ const applyPatch = <T extends OrgActionRecord>(action: T, patch: ActionPatch): T
 
 // The audit order, created_at desc then seq desc: negative when `a` comes first.
 const newestFirst = (a: AuditRecord, b: AuditRecord) => (Date.parse(b.created_at) - Date.parse(a.created_at)) || b.seq - a.seq;
-const sameEmail = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+const sameEmail = (a: string | null, b: string) => a !== null && a.toLowerCase() === b.toLowerCase();
 const pending = (invitation: InvitationRecord) => invitation.accepted_at === null && invitation.revoked_at === null;
 
 /** Deliberately ephemeral, like the other in-memory repositories: reusing the object survives an app recreation, never a restart. */
@@ -52,16 +52,41 @@ export class InMemoryWebappRepository implements WebappRepository {
     for (const plan of this.seedPlans) this.plans.set(plan.code, structuredClone(plan));
   }
 
-  async upsertProfile(profile: ProfileRecord) {
-    // Like profiles_email_idx: one profile per email, in any case.
+  async upsertProfile(profile: ProfileWrite) {
+    // Like profiles_email_idx: one profile per email, in any case, among the live ones (a tombstone has no email).
     if ([...this.profiles.values()].some(p => p.user_id !== profile.user_id && sameEmail(p.email, profile.email))) {
       throw new Error('Duplicate profile email');
     }
-    this.profiles.set(profile.user_id, structuredClone(profile));
+    // Like profiles_email_unless_deleted: a closed account never gets an email back.
+    if (this.profiles.get(profile.user_id)?.deleted_at) throw new Error('Deleted profile');
+    this.profiles.set(profile.user_id, { ...structuredClone(profile), deleted_at: null });
   }
   async getProfile(userId: string) { return structuredClone(this.profiles.get(userId) ?? null); }
   async findProfileByEmail(email: string) {
     return structuredClone([...this.profiles.values()].find(p => sameEmail(p.email, email)) ?? null);
+  }
+  async deleteAccount(userId: string, at: string) {
+    // What delete_account does, with every check before the first write and no await in between.
+    const live = this.memberships.filter(m => m.user_id === userId && this.organizations.get(m.org_id)?.deleted_at === null)
+      .sort((a, b) => a.org_id.localeCompare(b.org_id));
+    if (live.some(m => m.role === 'owner' && this.ownerCount(m.org_id) === 1)) throw new WebappConflict('sole_owner');
+    const actor: AuditActor = { actor_kind: 'member', actor_user_id: userId };
+    for (const membership of live) {
+      this.memberships.splice(this.memberships.indexOf(membership), 1);
+      this.release(membership.org_id, userId);
+      this.audit(actor, membership.org_id, 'account.deleted', userId, { role: membership.role }, at);
+    }
+    const profile = this.profiles.get(userId);
+    if (profile?.email) {
+      const links = [...this.invitations.values()].filter(i => pending(i) && sameEmail(i.email, profile.email!))
+        .sort((a, b) => a.id.localeCompare(b.id));
+      for (const invitation of links) {
+        invitation.revoked_at = at;
+        this.audit(actor, invitation.org_id, 'invitation.revoked', invitation.email, { invitationId: invitation.id, reason: 'account_deleted' }, at);
+      }
+    }
+    if (profile) Object.assign(profile, { deleted_at: profile.deleted_at ?? at, email: null, full_name: null, last_org_id: null });
+    return { orgIds: live.map(m => m.org_id) };
   }
 
   async createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null) {
