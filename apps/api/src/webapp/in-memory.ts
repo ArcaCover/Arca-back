@@ -1,8 +1,9 @@
-import { AUDIT_ACTOR_KINDS, can, type BillingStatus, type Role } from '@arca/contracts';
-import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, WebappConflict } from './types.js';
-import type { ActionPatch, AssessmentActionRecord, AuditPageQuery, AuditRecord, ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord,
-  InvitationRecord, MembershipRecord, NewAuditRecord, OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, PlanRecord, ProfileRecord,
-  SubscriptionRecord, WebappRepository } from './types.js';
+import { randomUUID } from 'node:crypto';
+import { AUDIT_ACTOR_KINDS, can, canManageMember, type BillingStatus, type Role } from '@arca/contracts';
+import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict } from './types.js';
+import type { ActionPatch, AssessmentActionRecord, AuditActor, AuditPageQuery, AuditRecord, BillingApplyOutcome, BillingStateRecord,
+  ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord, InvitationRecord, MemberChange, MembershipRecord, NewAuditRecord,
+  OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, PlanRecord, ProfileRecord, SubscriptionRecord, WebappRepository } from './types.js';
 
 // updatePlan can change these and nothing else; the code is the identity of the plan.
 const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active'] as const;
@@ -13,6 +14,8 @@ const applyPatch = <T extends OrgActionRecord>(action: T, patch: ActionPatch): T
 
 // The audit order, created_at desc then seq desc: negative when `a` comes first.
 const newestFirst = (a: AuditRecord, b: AuditRecord) => (Date.parse(b.created_at) - Date.parse(a.created_at)) || b.seq - a.seq;
+const sameEmail = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+const pending = (invitation: InvitationRecord) => invitation.accepted_at === null && invitation.revoked_at === null;
 
 /** Deliberately ephemeral, like the other in-memory repositories: reusing the object survives an app recreation, never a restart. */
 export class InMemoryWebappRepository implements WebappRepository {
@@ -26,9 +29,10 @@ export class InMemoryWebappRepository implements WebappRepository {
   private readonly tickets = new Map<string, ClaimTicketRecord>();
   private readonly plans = new Map<string, PlanRecord>();
   private readonly subscriptions = new Map<string, SubscriptionRecord>();
-  private readonly billingEvents = new Map<string, string>();
+  // Seen events, and whether they were processed: only a processed one is a duplicate for applyBillingState (DN-13 §6.5).
+  private readonly billingEvents = new Map<string, { type: string; processed: boolean }>();
   private readonly deletionRequests = new Map<string, DeletionRequestRecord>();
-  private readonly platformAdmins = new Map<string, string>();
+  private readonly platformAdmins = new Map<string, string | null>();
   private readonly actions: OrgActionRecord[] = [];
   private readonly auditLog: AuditRecord[] = [];
   // Like the identity column, it is never reset: a page cursor from before a clear() names no row instead of a new one.
@@ -48,8 +52,17 @@ export class InMemoryWebappRepository implements WebappRepository {
     for (const plan of this.seedPlans) this.plans.set(plan.code, structuredClone(plan));
   }
 
-  async upsertProfile(profile: ProfileRecord) { this.profiles.set(profile.user_id, structuredClone(profile)); }
+  async upsertProfile(profile: ProfileRecord) {
+    // Like profiles_email_idx: one profile per email, in any case.
+    if ([...this.profiles.values()].some(p => p.user_id !== profile.user_id && sameEmail(p.email, profile.email))) {
+      throw new Error('Duplicate profile email');
+    }
+    this.profiles.set(profile.user_id, structuredClone(profile));
+  }
   async getProfile(userId: string) { return structuredClone(this.profiles.get(userId) ?? null); }
+  async findProfileByEmail(email: string) {
+    return structuredClone([...this.profiles.values()].find(p => sameEmail(p.email, email)) ?? null);
+  }
 
   async createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null) {
     // Every check comes before the first write, so a refusal leaves nothing behind.
@@ -77,25 +90,38 @@ export class InMemoryWebappRepository implements WebappRepository {
     if (this.membership(member.org_id, member.user_id)) throw new WebappConflict('already_member');
     this.memberships.push(structuredClone(member));
   }
-  async setRole(orgId: string, userId: string, role: Role) {
-    const membership = this.membership(orgId, userId);
-    if (!membership) return false;
-    if (membership.role === 'owner' && role !== 'owner' && this.ownerCount(orgId) === 1) throw new WebappConflict('last_owner');
+  async setRole(orgId: string, userId: string, role: Role, change: MemberChange) {
+    const membership = this.checkedChange(orgId, userId, role, change);
+    if (!membership) return null;
+    const before = membership.role;
+    if (before === role) return before;
     membership.role = role;
     if (!can(role, 'actions.update')) this.release(orgId, userId);
-    return true;
+    this.audit(change.audit, orgId, 'member.role_changed', userId, { from: before, to: role }, change.at);
+    return before;
   }
-  async removeMember(orgId: string, userId: string) {
-    const membership = this.membership(orgId, userId);
-    if (!membership) return false;
-    if (membership.role === 'owner' && this.ownerCount(orgId) === 1) throw new WebappConflict('last_owner');
+  async removeMember(orgId: string, userId: string, change: MemberChange) {
+    const membership = this.checkedChange(orgId, userId, null, change);
+    if (!membership) return null;
     this.memberships.splice(this.memberships.indexOf(membership), 1);
     this.release(orgId, userId);
-    return true;
+    this.audit(change.audit, orgId, 'member.removed', userId, { role: membership.role }, change.at);
+    // A link still pending for their email would let the removed member back in.
+    const email = this.profiles.get(userId)?.email;
+    for (const invitation of this.invitations.values()) {
+      if (email && invitation.org_id === orgId && pending(invitation) && sameEmail(invitation.email, email)) {
+        invitation.revoked_at = change.at;
+        this.audit(change.audit, orgId, 'invitation.revoked', invitation.email, { invitationId: invitation.id, reason: 'member_removed' }, change.at);
+      }
+    }
+    return membership.role;
   }
 
   async createInvitation(invitation: InvitationRecord) {
     if ([...this.invitations.values()].some(i => i.id === invitation.id || i.token_hash === invitation.token_hash)) throw new Error('Duplicate invitation');
+    // Like invitations_pending_email_idx: one pending invitation per email and organization.
+    if (pending(invitation) && [...this.invitations.values()].some(i => i.org_id === invitation.org_id && pending(i)
+      && sameEmail(i.email, invitation.email))) throw new WebappConflict('already_invited');
     this.invitations.set(invitation.id, structuredClone(invitation));
   }
   async findInvitationByHash(tokenHash: string) {
@@ -109,6 +135,29 @@ export class InMemoryWebappRepository implements WebappRepository {
     if (!invitation) throw new Error('Invitation not found');
     if (patch.accepted_at !== undefined) invitation.accepted_at = patch.accepted_at;
     if (patch.revoked_at !== undefined) invitation.revoked_at = patch.revoked_at;
+  }
+  async acceptInvitation(invitationId: string, userId: string, at: string, actor: AuditActor) {
+    const invitation = this.invitations.get(invitationId);
+    if (!invitation) throw new Error('Invitation not found');
+    if (!pending(invitation)) throw new WebappConflict('invitation_closed');
+    const existing = this.membership(invitation.org_id, userId);
+    if (!existing) this.memberships.push({ org_id: invitation.org_id, user_id: userId, role: invitation.role, invited_by: invitation.invited_by, created_at: at });
+    invitation.accepted_at = at;
+    for (const other of this.invitations.values()) {
+      if (other.org_id === invitation.org_id && other.id !== invitation.id && pending(other) && sameEmail(other.email, invitation.email)) {
+        other.revoked_at = at;
+        this.audit(actor, invitation.org_id, 'invitation.revoked', other.email, { invitationId: other.id, reason: 'accepted' }, at);
+      }
+    }
+    if (!existing) this.audit(actor, invitation.org_id, 'member.joined', userId, { role: invitation.role, invitationId: invitation.id }, at);
+    return { joined: !existing, role: existing?.role ?? invitation.role };
+  }
+  async revokeInvitation(orgId: string, invitationId: string, at: string, actor: AuditActor, reason: 'reinvited' | null) {
+    const invitation = this.invitations.get(invitationId);
+    if (!invitation || invitation.org_id !== orgId || !pending(invitation)) return false;
+    invitation.revoked_at = at;
+    this.audit(actor, orgId, 'invitation.revoked', invitation.email, reason === null ? { invitationId } : { invitationId, reason }, at);
+    return true;
   }
 
   async claimAnalysis(analysis: OrgAnalysisRecord) {
@@ -139,12 +188,39 @@ export class InMemoryWebappRepository implements WebappRepository {
   }
 
   async getSubscription(orgId: string) { return structuredClone(this.subscriptions.get(orgId) ?? null); }
-  async upsertSubscription(subscription: SubscriptionRecord) { this.subscriptions.set(subscription.org_id, structuredClone(subscription)); }
+  async upsertSubscription(subscription: SubscriptionRecord) { this.putSubscription(subscription); }
   async setBillingStatus(orgId: string, status: BillingStatus) { this.requireOrganization(orgId).billing_status = status; }
   async recordBillingEvent(id: string, type: string) {
     if (this.billingEvents.has(id)) return false;
-    this.billingEvents.set(id, type);
+    this.billingEvents.set(id, { type, processed: false });
     return true;
+  }
+  async applyBillingState(event: { id: string; type: string }, orgId: string, state: BillingStateRecord, at: string): Promise<BillingApplyOutcome> {
+    this.requireOrganization(orgId);
+    const seen = this.billingEvents.get(event.id) ?? { type: event.type, processed: false };
+    this.billingEvents.set(event.id, seen);
+    if (seen.processed) return 'duplicate';
+    const current = this.subscriptions.get(orgId);
+    // An old subscription never overwrites the stored one; a new one takes its place once the stored one is canceled.
+    if (current?.subscription_id && state.subscription_id && state.subscription_id !== current.subscription_id && current.status !== 'canceled') {
+      seen.processed = true;
+      if (state.status !== 'active' && state.status !== 'past_due') return 'stale_subscription';
+      this.audit({ actor_kind: 'system', actor_user_id: null }, orgId, 'billing.duplicate_subscription', event.id,
+        { type: event.type, subscriptionId: state.subscription_id, current: current.subscription_id }, at);
+      return 'duplicate_subscription';
+    }
+    const planCode = state.plan_code ?? current?.plan_code ?? null;
+    if (planCode) {
+      // No await from the check of the event to here, so two deliveries that race cannot both apply.
+      this.putSubscription({ org_id: orgId, plan_code: planCode, customer_id: state.customer_id ?? current?.customer_id ?? null,
+        subscription_id: state.subscription_id ?? current?.subscription_id ?? null, status: state.status,
+        current_period_end: state.current_period_end ?? current?.current_period_end ?? null, updated_at: at });
+    }
+    this.requireOrganization(orgId).billing_status = state.status;
+    seen.processed = true;
+    this.audit({ actor_kind: 'system', actor_user_id: null }, orgId, 'billing.event_applied', event.id,
+      { type: event.type, status: state.status, planCode }, at);
+    return 'applied';
   }
 
   async createDeletionRequest(request: DeletionRequestRecord) {
@@ -155,11 +231,14 @@ export class InMemoryWebappRepository implements WebappRepository {
   async getPendingDeletionRequest(orgId: string) { return structuredClone(this.pendingDeletion(orgId) ?? null); }
   async listDeletionRequests() { return structuredClone([...this.deletionRequests.values()]); }
   async getDeletionRequest(id: string) { return structuredClone(this.deletionRequests.get(id) ?? null); }
-  async reviewDeletionRequest(id: string, status: 'approved' | 'rejected', reviewedBy: string, note: string | null, at: string) {
+  async reviewDeletionRequest(id: string, status: 'approved' | 'rejected', reviewedBy: string, note: string | null, at: string,
+    actor: AuditActor) {
     const request = this.deletionRequests.get(id);
     if (!request) throw new Error('Deletion request not found');
-    if (request.status !== 'pending') throw new Error('Deletion request already reviewed');
+    if (request.status !== 'pending') throw new WebappConflict('already_reviewed');
     Object.assign(request, { status, reviewed_by: reviewedBy, reviewed_at: at, review_note: note });
+    if (status === 'approved') this.requireOrganization(request.org_id).deleted_at ??= at;
+    this.audit(actor, request.org_id, `org.deletion_${status}`, id, { note }, at);
   }
   async markOrganizationDeleted(orgId: string, at: string) {
     const org = this.requireOrganization(orgId);
@@ -167,8 +246,16 @@ export class InMemoryWebappRepository implements WebappRepository {
   }
 
   async isPlatformAdmin(userId: string) { return this.platformAdmins.has(userId); }
-  async grantPlatformAdmin(userId: string, grantedBy: string) {
-    if (!this.platformAdmins.has(userId)) this.platformAdmins.set(userId, grantedBy);
+  async grantPlatformAdmin(userId: string, grantedBy: string | null, audit?: { actor: AuditActor; at: string }) {
+    if (this.platformAdmins.has(userId)) return false;
+    this.platformAdmins.set(userId, grantedBy);
+    if (audit) this.audit(audit.actor, null, 'platform_admin.granted', userId, {}, audit.at);
+    return true;
+  }
+  async revokePlatformAdmin(userId: string, audit?: { actor: AuditActor; at: string }) {
+    if (!this.platformAdmins.delete(userId)) return false;
+    if (audit) this.audit(audit.actor, null, 'platform_admin.revoked', userId, {}, audit.at);
+    return true;
   }
 
   async listActions(orgId: string) { return structuredClone(this.actions.filter(a => a.org_id === orgId)); }
@@ -237,6 +324,29 @@ export class InMemoryWebappRepository implements WebappRepository {
     if (typeof assignee !== 'string') return;
     const membership = this.membership(orgId, assignee);
     if (!membership || !can(membership.role, 'actions.update')) throw new IneligibleAssignee();
+  }
+  /**
+   * What set_member_role and remove_member check under their locks (DN-13 §4.6), with no await in between: the actor still holds
+   * the role the service read, the target is a member, the actor's role can still act on the target's role, and an owner is left.
+   */
+  private checkedChange(orgId: string, userId: string, next: Role | null, change: MemberChange) {
+    if (this.membership(orgId, change.actorUserId)?.role !== change.actorRole) throw new MemberChangeRefused();
+    const membership = this.membership(orgId, userId);
+    if (!membership) return null;
+    if (!canManageMember(change.actorRole, membership.role, next ?? undefined)) throw new MemberChangeRefused();
+    if (membership.role === 'owner' && next !== 'owner' && this.ownerCount(orgId) === 1) throw new WebappConflict('last_owner');
+    return membership;
+  }
+  /** Like subscriptions_subscription_idx: a provider subscription belongs to one organization. */
+  private putSubscription(subscription: SubscriptionRecord) {
+    if (subscription.subscription_id !== null && [...this.subscriptions.values()].some(s => s.org_id !== subscription.org_id
+      && s.subscription_id === subscription.subscription_id)) throw new Error('Duplicate subscription');
+    this.subscriptions.set(subscription.org_id, structuredClone(subscription));
+  }
+  /** An audit row the store writes itself, as part of the write that names it. */
+  private audit(actor: AuditActor, orgId: string | null, action: string, target: string, data: Record<string, unknown>, at: string) {
+    this.auditLog.push({ id: randomUUID(), seq: ++this.auditSeq, actor_kind: actor.actor_kind, actor_user_id: actor.actor_user_id, org_id: orgId,
+      action, target, data, created_at: at });
   }
   /** Nothing else on the rows changes. */
   private release(orgId: string, userId: string) {

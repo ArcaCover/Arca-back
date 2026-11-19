@@ -2,6 +2,8 @@
 
 - **Fecha:** 2026-11-17
 - **Estado:** diseño para revisar. **No hay nada implementado ni aplicado**: ninguna migración, cuenta, clave ni webhook.
+  **Actualización (2026-11-18):** la fase 1 (datos: T3, T4 y T12) está implementada en la rama `feat/real-accounts-data`
+  (§12.1). Su migración solo se ha aplicado a Supabase local; a ninguna base real.
   Las migraciones de esta nota necesitan la aprobación del founder antes de tocar cualquier base (§5.2).
 - **Repos:** `Arca-back` (casi todo el peso) y `Arca-front`. La nota vive en la rama `docs/auth-billing-design`,
   creada desde `fix/score-stability`.
@@ -237,8 +239,8 @@ return { userId: payload.sub, email: payload.email.toLowerCase(), aal: payload.a
   petición (`ensureProfile`).
 - `ensureProfile` actualiza el email del perfil con el del JWT. Se desactiva el cambio de email en la interfaz (y se
   deja encendido "Secure email change" en Supabase); si algún día se permite, el perfil lo sigue solo.
-- **Admin de plataforma.** DN-10 §4.6 cita `npm run admin:grant -- <email>`, pero ese script **no existe** en
-  `package.json`. Se escribe en la fase 2: busca el perfil por email (la persona tiene que haber entrado una vez),
+- **Admin de plataforma.** DN-10 §4.6 cita `npm run admin:grant -- <email>`, pero ese script **no existía** en
+  `package.json`. **Hecho en la fase 1 (T12, §12.1):** busca el perfil por email (la persona tiene que haber entrado una vez),
   inserta en `platform_admins` y escribe `platform_admin.granted` en `audit_log` con `actor_kind = 'platform'`. Se
   corre en local contra `Arca-dev`; contra producción, solo con la aprobación del founder y desde el host (SSM), nunca
   copiando la clave de producción a un portátil.
@@ -362,7 +364,7 @@ se pausa deja fuera a quien paga. DN-09 §11.7 ya describe cómo crear `Arca-dev
 founder. Orden: `Arca-dev` → pruebas de §11 → aprobación → `supabase link` al proyecto de producción → `npm run db:push`
 → `npm run db:verify` → volver a enlazar `Arca-dev` (DN-09 §11.7 avisa de este cambio de enlace).
 
-### 5.3 Migración nueva (propuesta: `2026MMDDhhmmss_real_accounts_billing.sql`)
+### 5.3 Migración nueva (`20261118000000_real_accounts_billing.sql`, hecha en T3: §12.1)
 
 Lo que añade, en el estilo de las dos anteriores (comentarios en inglés, `begin`/`commit`, RLS y permisos al final):
 
@@ -1089,8 +1091,8 @@ aprobaciones).
 | T0 | Decisiones F1–F14 (§14) | 0 · founder | — | — |
 | T1 | Crear `Arca-dev`; pasar producción a plan de pago; activar la cuenta de Stripe (datos de empresa) | 0 · founder | 0,5 | F9, F10 |
 | T2 | Dominio de correo: SPF, DKIM, DMARC; alta del proveedor (salir del sandbox si es SES) | 0 · founder + 0,5 | 0,5 | F11 |
-| T3 | Migración nueva + RPC + tests de PGlite (§5.3, §5.4, §5.5) | 1 · datos | 3 | — |
-| T4 | `SupabaseWebappRepository` + suite de conformidad sobre Supabase local | 1 · datos | 4 | T3 |
+| T3 | ✅ Migración nueva + RPC + tests de PGlite (§5.3, §5.4, §5.5). Hecho: §12.1 | 1 · datos | 3 | — |
+| T4 | ✅ `SupabaseWebappRepository` + suite de conformidad sobre Supabase local. Hecho: §12.1 | 1 · datos | 4 | T3 |
 | T5 | Aplicar las tres migraciones a `Arca-dev` | 1 · datos | 0,25 | T3, T1 |
 | T6 | `SupabaseJwtAuth`, `WEBAPP_PROVIDERS`, guardas de arranque y línea de arranque (§4.4, §7.1) | 2 · auth | 1,5 | — |
 | T7 | `POST /auth/enroll` con la API de administración de Supabase y límites (§4.2) | 2 · auth | 1,5 | T4 |
@@ -1098,7 +1100,7 @@ aprobaciones).
 | T9 | Front: `@supabase/ssr`, módulo de sesión, login, signup, confirm, invite (§8.1) | 2 · auth | 4 | T6, T7 |
 | T10 | `Mailer` + correo de invitación (§4.6) | 2 · auth | 1,5 | T2 |
 | T11 | `DELETE /me` + RPC + pantalla en settings (§4.8) | 2 · auth | 1,5 | T4 |
-| T12 | Script `admin:grant` (§4.5) | 2 · auth | 0,5 | T4 |
+| T12 | ✅ Script `admin:grant` (§4.5). Hecho en la fase 1: §12.1 | 2 · auth | 0,5 | T4 |
 | T13 | Catálogo de Stripe en test; `plans` con `stripe_price_id`; cambio de precio desde `/admin` (§6.1) | 3 · cobro | 1,5 | T4 |
 | T14 | `StripeBillingProvider`: cliente, checkout, portal, sync, cancelar (§6.2–§6.4, §6.10) | 3 · cobro | 2 | T13 |
 | T15 | Webhook: firma, traductor, RPC `apply_billing_state`, cola por organización (§6.5, §6.6) | 3 · cobro | 2,5 | T14 |
@@ -1126,6 +1128,98 @@ aprobaciones. El camino crítico es T3 → T4 → T7 → T9 → T14 → T15 → 
 - Fin de la fase 3: un recorrido completo en `live-debug` real contra `Arca-dev` y Stripe test.
 - Fin de la fase 4: E2E y test clocks verdes, y la release `contracts-v0.5.0` publicada.
 - Antes de T25: el founder aprueba precios, términos y privacidad.
+
+### 12.1 Fase 1 hecha: T3, T4 y T12 (2026-11-18)
+
+Rama `feat/real-accounts-data` (desde `feat/real-accounts`). Nada se conecta todavía en `compose.ts`: producción sigue en 501
+y `mock`/`live-debug` siguen con `InMemoryWebappRepository`. El repositorio nuevo se registra en la fase 2 (el punto de
+enganche `apps/api/src/webapp/real-adapters.ts` de la rama de auth). `packages/contracts` no cambia.
+
+**T3 · Migración y RPC.** `supabase/migrations/20261118000000_real_accounts_billing.sql`:
+- Las tablas, columnas e índices de §5.3 tal cual.
+- Funciones, todas `security definer` con `search_path` fijo, ejecutables solo por `service_role` y revocadas a `public`,
+  `anon` y `authenticated`. Errores con `errcode P0001` y mensaje fijo (`webapp_conflict:<motivo>`, `webapp_refused:member_change`,
+  `webapp_ineligible_assignee`, `webapp_missing:<registro>`, `webapp_duplicate:<registro>`, `webapp_invalid:organization`):
+  `create_organization`, `claim_analysis`, `redeem_claim_ticket`, `accept_invitation`, `set_member_role`, `remove_member`,
+  `revoke_invitation`, `upsert_assessment_action`, `create_custom_action`, `update_action`, `apply_billing_state`,
+  `review_deletion_request`, `delete_account`, `grant_platform_admin`, `revoke_platform_admin` y `list_audit`.
+- Ayudantes internos, sin permiso para ningún rol cliente ni para `service_role`: `can_manage_member` (la matriz de
+  `canManageMember` en SQL), `can_hold_actions`, `append_audit`, `require_assignee`, `patched_action` y `lock_member_change`.
+- RLS activado en las dos tablas nuevas, sin políticas y con permisos solo para `service_role` (§5.5).
+- Tests: `apps/api/tests/integration/real-accounts-database.test.ts` (PGlite, 33 tests): cada función con sus conflictos; la
+  matriz `canManageMember` SQL contra TypeScript; `anon`/`authenticated` sin acceso a tablas ni funciones; la migración sobre
+  filas ya escritas; y los casos de concurrencia de §5.4 como intercalados: doble revisión → `already_reviewed` (409, no 500),
+  doble revocación → la segunda no escribe ni audita, cambio de rol que pierde contra una baja → `null` sin auditoría, admin que
+  degrada a alguien recién ascendido a owner → `webapp_refused`, el mismo evento de Stripe dos veces → `duplicate`.
+
+**T4 · Repositorio y conformidad.**
+- `apps/api/src/webapp/supabase.ts`: `SupabaseWebappRepository` sobre `supabase-js` con la clave de servicio. Lecturas y
+  escrituras de una fila van a las tablas; toda escritura de varias filas, a su RPC. Lee solo las columnas de cada registro y
+  devuelve las fechas en ISO con `Z`, como el repositorio en memoria.
+- Suite de conformidad compartida: `apps/api/tests/conformance/webapp-repository.ts` (43 tests). Corre contra el repositorio en
+  memoria (`apps/api/tests/unit/webapp-repository.test.ts`), contra `SupabaseWebappRepository` sobre PGlite a través de un
+  sustituto de PostgREST (`apps/api/tests/fixtures/pglite-postgrest.ts`, en
+  `apps/api/tests/integration/webapp-repository-database.test.ts`, dentro de `npm test`, sin red) y contra un Supabase real
+  (`apps/api/tests/integration/webapp-repository-supabase.test.ts`), que se salta salvo que existan
+  `ARCA_CONFORMANCE_SUPABASE_URL` y `ARCA_CONFORMANCE_SUPABASE_KEY`, y que solo acepta un host local salvo
+  `ARCA_CONFORMANCE_SUPABASE_ALLOW_REMOTE=1` (para `Arca-dev`, nunca producción). Los pasos para correrla están en la cabecera
+  de ese archivo: `supabase db reset` en local, la URL y la clave de servicio de `supabase status -o env` en esas dos
+  variables, y `npx vitest run` de ese archivo. La suite no supone una base vacía: ids nuevos en cada test, listas filtradas a lo
+  que escribió, y fechas de un reloj lejano en el futuro que avanza de una ejecución a la siguiente. Deja sus filas (el
+  `audit_log` es de solo añadir); `supabase db reset` las borra. Cambia una sola fila compartida, el plan `monthly`, y la deja
+  como estaba.
+- **Resultado contra Supabase local:** verde, 43 de 43, dos veces seguidas (la segunda con las filas de la primera), contra Supabase local
+  (CLI 2.122.1, Postgres 17, PostgREST v14.5) tras `supabase db reset`, que aplicó las ocho migraciones sin errores. Además, con
+  la clave publicable (`anon`) la API de datos responde 401 a las tablas de la webapp, a las dos tablas nuevas y a las funciones
+  (`list_audit`, `delete_account`), y `delete_account` probada a mano en esa base (único owner → `sole_owner`; un miembro → baja
+  y perfil sin email). Las pruebas de RPC de T3 corren en PGlite; en Supabase local las cubren la suite y esa prueba a mano.
+
+**T12 · `admin:grant`.** `npm run admin:grant -- <email> [--revoke] [--dry-run]` (`apps/api/scripts/admin-grant.ts`, lógica en
+`apps/api/src/webapp/admin-grant.ts`, tests en `apps/api/tests/unit/admin-grant.test.ts` contra el repositorio en memoria). Lee
+`SUPABASE_URL` y `SUPABASE_SECRET_KEY` (o `SUPABASE_SERVICE_ROLE_KEY`) del entorno o de `.env.local`, como `db:verify`. Imprime
+el host de destino, nunca la clave. Sin perfil para ese email, se niega: la persona tiene que haber entrado una vez. Concede o
+retira con `grant_platform_admin`/`revoke_platform_admin`, que auditan `platform_admin.granted`/`platform_admin.revoked` con
+`actor_kind = 'platform'` y sin usuario, en el mismo paso y solo si algo cambió. `--dry-run` no escribe nada. Las reglas de §4.5
+siguen: en local contra `Arca-dev`, y contra producción solo con el visto bueno del founder y desde el host.
+
+**Desviaciones respecto a §5.4 y por qué [mía]:**
+- **Firmas.** `set_member_role(p_org_id, p_user_id, p_role, p_actor_user_id, p_actor_role, p_audit, p_at)` y `remove_member`
+  igual sin rol nuevo. Además de `p_actor_role`, reciben al actor: la función comprueba bajo bloqueo que **el actor sigue teniendo
+  ese rol** (si lo degradaron mientras tanto, se niega) y que `canManageMember` sigue valiendo contra el rol del objetivo leído
+  con `for update`. `p_audit` es `{ actor_kind, actor_user_id }`: quién firma la auditoría lo decide el servicio (la semilla de
+  mock audita como `system`). Los cambios de dueño de una organización se serializan con el mismo candado consultivo que
+  `guard_last_owner`, así la comprobación del último owner es exacta.
+- **Funciones nuevas que §5.4 no listaba:** `revoke_invitation` (la doble revocación que pedía el encargo), `grant_platform_admin`
+  y `revoke_platform_admin` (T12) y `list_audit` (el orden por `(created_at, seq)` con cursor no se puede expresar con los
+  filtros de PostgREST).
+- **La auditoría va dentro de la transacción** en `accept_invitation`, `set_member_role`, `remove_member`, `revoke_invitation`,
+  `apply_billing_state`, `review_deletion_request`, `delete_account` y las de admin. `create_organization` y `claim_analysis` no
+  auditan: lo sigue haciendo el servicio después, como hoy.
+- **`apply_billing_state(p_event, p_org_id, p_state, p_at)`** inserta el evento si no estaba (no hace falta un paso previo), suma
+  un intento, y si ya estaba procesado devuelve `duplicate`. Aplica "una suscripción vieja no pisa a la nueva" (§6.5) dentro de
+  la transacción: devuelve `duplicate_subscription` (y audita `billing.duplicate_subscription`) si otra suscripción que da acceso
+  llega con la guardada viva, y `stale_subscription` si la otra no da acceso; las dos marcan el evento procesado con
+  `last_error = 'other_subscription'`. `p_state` llega ya traducido a `billing_status` (§6.6): la traducción es de T15. Un campo
+  nulo conserva lo guardado, como hoy.
+- **`delete_account`** conserva las membresías de las organizaciones **ya borradas** (su historia y su último owner; el trigger del
+  último owner impediría quitarlas). Revoca las invitaciones pendientes a su email en todas las organizaciones (motivo
+  `account_deleted`) y audita `account.deleted` en cada organización viva que pierde al miembro. Es idempotente.
+- **Interfaz del repositorio** (`apps/api/src/webapp/types.ts`), con el repositorio en memoria al mismo nivel: `setRole` y
+  `removeMember` reciben un `MemberChange` y devuelven el rol que encontraron (o `null`), y lanzan `MemberChangeRefused`;
+  nuevos `acceptInvitation`, `revokeInvitation`, `applyBillingState`, `findProfileByEmail` y `revokePlatformAdmin`;
+  `reviewDeletionRequest` marca el borrado y audita en el mismo paso y lanza `already_reviewed`; `grantPlatformAdmin` devuelve si
+  cambió. El repositorio en memoria impone además lo que ya imponían los índices SQL: una invitación pendiente por email y
+  organización, un perfil por email y una suscripción del proveedor por organización.
+- **Servicio** (`service.ts`): aceptar, cambiar rol, quitar, revocar, revisar un borrado y aplicar un evento de cobro pasan por
+  esas operaciones atómicas. Respuestas nuevas: 403 cuando la nueva comprobación del almacén niega el cambio, 409 en la segunda
+  revisión, 410 en la segunda aceptación, 404 en la segunda revocación. Esto cierra la carrera que `types.ts` dejaba anotada
+  (DN-11) y el fallo de §6.5 (registrar el evento antes de aplicarlo) también para el pago simulado. La actividad de ARCA nombra
+  el usuario de `platform_admin.*`.
+- **Orden de `listPlans` en SQL:** por importe y código, lo que mantiene el orden de la semilla (mensual y luego anual).
+
+**Pendiente, de otras tareas:** usar `delete_account` (T11, que también añade `deleted_at` y el email nulo a `ProfileRecord`),
+leer y escribir los campos nuevos de `subscriptions` desde el webhook real (T15), `billing_customers` y `checkout_sessions`
+(T14), registrar el repositorio en `compose.ts` (fase 2) y aplicar las tres migraciones a `Arca-dev` (T5).
 
 ## 13. Riesgos
 
