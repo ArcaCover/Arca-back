@@ -1,9 +1,10 @@
 # DN-13 · Cuentas y cobro reales: Supabase Auth y Stripe
 
 - **Fecha:** 2026-11-17
-- **Estado (2026-11-18):** en implementación en la rama `feat/real-accounts`. Fase 1 hecha (datos: T3, T4 y T12, §12.1)
-  y fase 2 empezada (T6 y T10, §16). La migración nueva solo se ha aplicado a Supabase local; a ninguna base real. No hay
-  cuentas, claves ni webhooks creados, y producción sigue en 501.
+- **Estado (2026-11-19):** en implementación en la rama `feat/real-accounts`. Fase 1 hecha (datos: T3, T4 y T12, §12.1).
+  De la fase 2, hechas T6 y T10 (§16) y la parte del back de T7 y T11 (§17); falta el front (T9) y la configuración de
+  `Arca-dev` (T8). La migración nueva solo se ha aplicado a Supabase local; a ninguna base real. No hay cuentas, claves ni
+  webhooks creados, y producción sigue en 501.
   Las migraciones de esta nota necesitan la aprobación del founder antes de tocar cualquier base (§5.2).
 - **Repos:** `Arca-back` (casi todo el peso) y `Arca-front`. La nota vive en la rama `docs/auth-billing-design`,
   creada desde `fix/score-stability`.
@@ -810,6 +811,11 @@ Cambios en `packages/contracts/src`:
 Los campos nuevos de vistas existentes son opcionales, para que un front con 0.4.0 siga leyendo un back nuevo (el
 front parsea estricto). `DebugModeResponse` gana campos obligatorios: solo afecta a los modos de debug en local.
 
+**Ya en `packages/contracts/src` (T7, §17), sin publicar:** `EnrollRequest` (unión estricta: `{ claimId }` o
+`{ invitationToken }`, cada uno de 1 a 512 caracteres) y `EnrollResponse` (`{ email }`), con sus tipos, como exportaciones
+nuevas de `webapp.ts`. `DELETE /me` no tiene cuerpo ni respuesta (204), así que no añade esquema. Ningún esquema que el
+front ya parsea cambió. Salen con 0.5.0 (T18).
+
 **Orden** (el de DN-11, guardado en la memoria del proyecto):
 1. Se fusiona el PR del back, con todo detrás de `WEBAPP_ENABLED=false`: producción sigue en 501.
 2. Se crea el tag `contracts-v0.5.0`; `contracts-release.yml` publica el `.tgz`.
@@ -959,6 +965,31 @@ comandos) vale igual para `STRIPE_SECRET_KEY`.
 | Secure email change | on | on |
 | Plan | de pago (F10) | gratuito |
 
+**Pasos en el panel de cada proyecto real** (`Arca-dev` en T8, producción en T24; nada de esto se ha hecho todavía):
+
+1. **Authentication → Sign In / Providers → "Allow new users to sign up": off.** Es el alta cerrada (§4.2). El back sigue
+   creando usuarios con la API de administración (que no mira este ajuste), y `signInWithOtp` con `shouldCreateUser: false`
+   sigue mandando códigos a los usuarios que ya existen.
+2. En la misma pantalla, el **proveedor Email sigue encendido** (es el que manda los códigos), con "Confirm email" encendido.
+   Ojo con la confusión de nombres: en el `config.toml` local, `[auth.email] enable_signup` es este interruptor del proveedor
+   (no el del alta) y tiene que quedarse en `true`; el alta cerrada es `[auth] enable_signup = false`.
+3. **Email OTP Expiration = 600** y **Email OTP Length = 6** (en Authentication → Providers → Email, o en "Auth" según la
+   versión del panel).
+4. **Project Settings → JWT Keys:** migrar a claves de firma asimétricas (ECC P-256) y rotar para que la nueva firme. Comprobar
+   que `https://<proyecto>.supabase.co/auth/v1/.well-known/jwks.json` lista una clave `ES256`; si sale vacío, el back no
+   arranca en `real` (§16.1).
+5. **Authentication → Email Templates → Magic Link:** asunto "Your ARCA sign-in code" y el cuerpo de §4.9, con `{{ .Token }}`
+   (el código) y el enlace de respaldo `{{ .RedirectTo }}&token_hash={{ .TokenHash }}&type=email`. El de Supabase local está en
+   `supabase/templates/magic_link.html` y sirve de modelo. "Confirm signup", "Invite user" y "Change email address" con un texto
+   neutro.
+6. **Authentication → URL Configuration:** Site URL y Redirect URLs de la tabla de §4.9.
+7. **SMTP propio** (F11) y, con él, subir el límite de correos por hora.
+
+**Supabase local** (`supabase/config.toml`, T7): alta cerrada (`[auth] enable_signup = false`), códigos de 10 minutos
+(`otp_expiry = 600`), la plantilla con el código (`[auth.email.template.magic_link]`) y las URLs de vuelta del front local
+(`http://localhost:3000/**`, `http://127.0.0.1:3000/**`). Se aplican al reiniciar el stack (`supabase stop` y `supabase start`);
+el stack que corrió las pruebas de §17 seguía con la configuración anterior.
+
 ### 9.5 Monitorización y alertas
 
 - **Logs estructurados** de cobro: `[billing] event <id> <type> applied|duplicate|ignored|failed`, sin emails ni
@@ -1095,11 +1126,11 @@ aprobaciones).
 | T4 | ✅ `SupabaseWebappRepository` + suite de conformidad sobre Supabase local. Hecho: §12.1 | 1 · datos | 4 | T3 |
 | T5 | Aplicar las tres migraciones a `Arca-dev` | 1 · datos | 0,25 | T3, T1 |
 | T6 | `SupabaseJwtAuth`, `WEBAPP_PROVIDERS`, guardas de arranque y línea de arranque (§4.4, §7.1). **Hecha (§16.1)** | 2 · auth | 1,5 | — |
-| T7 | `POST /auth/enroll` con la API de administración de Supabase y límites (§4.2) | 2 · auth | 1,5 | T4 |
+| T7 | ✅ `POST /auth/enroll` con la API de administración de Supabase y límites (§4.2). Hecho: §17 | 2 · auth | 1,5 | T4 |
 | T8 | Configurar Auth en `Arca-dev`: alta cerrada, claves asimétricas, plantillas, URLs, SMTP (§9.4) | 2 · auth | 1 | T2 |
 | T9 | Front: `@supabase/ssr`, módulo de sesión, login, signup, confirm, invite (§8.1) | 2 · auth | 4 | T6, T7 |
 | T10 | `Mailer` + correo de invitación (§4.6). **Hecha en el back, sin el SDK de SES (§16.2)** | 2 · auth | 1,5 | T2 |
-| T11 | `DELETE /me` + RPC + pantalla en settings (§4.8) | 2 · auth | 1,5 | T4 |
+| T11 | `DELETE /me` + RPC + pantalla en settings (§4.8). **Back hecho (§17)**; la pantalla va con el front (T9) | 2 · auth | 1,5 | T4 |
 | T12 | ✅ Script `admin:grant` (§4.5). Hecho en la fase 1: §12.1 | 2 · auth | 0,5 | T4 |
 | T13 | Catálogo de Stripe en test; `plans` con `stripe_price_id`; cambio de precio desde `/admin` (§6.1) | 3 · cobro | 1,5 | T4 |
 | T14 | `StripeBillingProvider`: cliente, checkout, portal, sync, cancelar (§6.2–§6.4, §6.10) | 3 · cobro | 2 | T13 |
@@ -1401,3 +1432,168 @@ Sin red, sin Supabase, Stripe ni AWS reales. Se escribieron antes que el código
 
 `npm run typecheck` limpio. `npm test` completo: 1437 de 1438; fallaron `infra/aws/lib/arca-demo-stack.test.ts` (no hay
 `aws-cdk-lib` en un worktree, esperado) y, una vez, un test de `crawler.test.ts` por carga, que pasa solo (29 de 29).
+
+## 17. Implementación de T7 y T11 en el back (2026-11-19)
+
+**Hecho** en `feat/real-accounts`, commit `421a773`. Producción sigue en 501 (las dos rutas nuevas también: `/auth/*` y
+`DELETE /me` están detrás de `WEBAPP_ENABLED`), y `live-debug` real sigue sin arrancar hasta que exista el proveedor de Stripe
+(T14).
+
+### 17.1 Ficheros
+
+| Fichero | Qué |
+|---|---|
+| `apps/api/src/webapp/auth-admin.ts` | **nuevo**: `AuthAdmin` (`createUser(email) → 'created' \| 'exists'`, `deleteUser(id) → 'deleted' \| 'missing'`), `AuthAdminUnavailable`, `SupabaseAuthAdmin` (`auth.admin` de supabase-js) e `InMemoryAuthAdmin` |
+| `apps/api/src/webapp/service.ts` | `enroll`, `deleteAccount`, `requireLiveAccount`; `authAdmin` en las dependencias; código `auth_unavailable` (503) y conflicto `sole_owner`; listas de miembros sin cuentas cerradas; `account.deleted` en la actividad |
+| `apps/api/src/webapp/routes.ts` | `POST /auth/enroll`, `DELETE /me`, el 401 de una cuenta cerrada, los límites de §7.4 y `/auth/*` entre las rutas que dan 501 |
+| `apps/api/src/webapp/types.ts` | `ProfileRecord` con `deleted_at` y `email` nulo; `ProfileWrite`; `WebappRepository.deleteAccount`; `sole_owner` |
+| `apps/api/src/webapp/in-memory.ts`, `supabase.ts` | `deleteAccount` (en memoria, igual que la RPC; en Supabase, la RPC `delete_account`); `upsertProfile` nunca resucita un perfil cerrado; `deleted_at` en las lecturas |
+| `apps/api/src/webapp/real-adapters.ts`, `apps/api/src/compose.ts` | `authAdmin` en la costura (`client => new SupabaseAuthAdmin(client)`, el mismo cliente de servicio que el repositorio); sin él, la webapp real no arranca y lo nombra |
+| `apps/api/src/http/rate-limit.ts`, `apps/api/src/http/app.ts` | `WindowLimiter` (ventana deslizante por clave, en memoria); la IP del cliente llega a las rutas |
+| `apps/api/src/debug/tools.ts`, `apps/api/src/webapp/auth.ts` | el reset de debug olvida también los límites y los usuarios simulados; `mockUserIdFor`; el login simulado responde 409 a una cuenta cerrada |
+| `packages/contracts/src/webapp.ts` | `EnrollRequest`, `EnrollResponse` (exportaciones nuevas, §7.6) |
+| `supabase/config.toml`, `supabase/templates/magic_link.html` | Supabase local: alta cerrada, códigos de 10 minutos, plantilla con el código, URLs de vuelta (§9.4) |
+
+### 17.2 `POST /auth/enroll` (§4.2)
+
+- **Pública.** Cuerpo: exactamente uno de `{ claimId }` o `{ invitationToken }` (cualquier otra forma: 400 `invalid_request`).
+- **Reclamo:** las comprobaciones de `redeemable` sin gastarlo y sin usuario con el que comparar: existe, no caducó, no se usó,
+  y su scan está terminado y no es uno aislado por un fallo inyectado. El email es el del ticket.
+- **Invitación:** existe, ni aceptada, ni revocada, ni caducada, y su organización no está borrada. El email es el de la
+  invitación.
+- Con eso, `auth.admin.createUser({ email, email_confirm: true })` con la clave de servicio. Si el email ya tiene usuario
+  (`email_exists`, o el mensaje "already registered" de versiones anteriores de GoTrue), es el mismo éxito.
+- **Respuesta: 200 `{ email }`**, la misma tenga o no cuenta ese email. No se escribe nada más: el perfil lo crea `ensureProfile`
+  en la primera petición con sesión, con `profiles.user_id = sub = auth.users.id` (§4.5; comprobado contra Supabase local).
+- **Un solo 410 `gone`** (mismo cuerpo, mismo mensaje) para todo reclamo o invitación que no sirve, sea cual sea el motivo.
+- **503 `auth_unavailable`** si la API de administración falla o no responde. Antes no se ha escrito nada y el reclamo sigue
+  sin gastar: reintentar es seguro.
+- **Límites (§7.4):** 10 por hora por IP y 5 por hora por reclamo o invitación (la clave del límite es el hash, nunca el
+  secreto). Pasado el límite, 429 `rate_limited` con `Retry-After` en segundos. Un cuerpo inválido (400) no cuenta.
+
+### 17.3 `DELETE /me` (§4.8)
+
+1. Si la persona no tiene perfil todavía (nunca pasó por una ruta que lo escriba), se crea primero, para que quede la lápida.
+2. `deleteAccount` → RPC `delete_account` en una transacción. Única owner de alguna organización no borrada: **409 `conflict`**
+   con un mensaje que lo explica, sin escribir nada. Es el único 409 de esta ruta.
+3. `auth.admin.deleteUser(id, false)`: borrado físico; GoTrue borra con el usuario sus sesiones, refresh tokens e
+   identidades. Así se revocan las sesiones (comprobado: tras el borrado, el refresh token ya no sirve). Un usuario que ya no
+   existe cuenta como hecho.
+4. **204** sin cuerpo.
+
+Si el paso 3 falla dos veces seguidas dentro de la misma petición, la cuenta ya está cerrada (el paso 2 se confirmó) y la
+respuesta es **503 `auth_unavailable`**. `DELETE /me` es la única ruta que acepta el token de una cuenta cerrada, precisamente
+para que el front (o la persona) repita la petición con el mismo token: los dos pasos son idempotentes. Se registra
+`[auth] account <id> was closed but its Auth user was not deleted` (sin email). Límite: 3 por hora por usuario (429).
+
+**Cuenta cerrada = 401.** Toda ruta con sesión, salvo `DELETE /me`, lee el perfil y responde **401 `unauthorized`** si tiene
+`deleted_at`, aunque el access token siga vivo hasta su `exp`. Cuesta una lectura de `profiles` por petición. Además,
+`upsertProfile` no reescribe nunca un perfil cerrado (en SQL lo impide `profiles_email_unless_deleted`, porque el upsert no
+manda `deleted_at`): una petición que pasó la comprobación justo antes del borrado falla en vez de devolver el email al perfil.
+
+**Lo que ve el resto:** los miembros de la organización dejan de verlo; la actividad muestra `account.deleted` con
+`actor.email: null`, `targetLabel: null` y `change: { from: <rol>, to: null }`; las invitaciones pendientes a su email se
+revocan (`invitation.revoked`, motivo `account_deleted`). En una organización **ya borrada** la membresía se conserva (§12.1),
+pero la ficha del admin de plataforma no la lista: `MemberView.email` es obligatorio en el contrato y la persona ya no existe.
+
+### 17.4 Modos simulados
+
+`mock` y `live-debug` simulado usan `InMemoryAuthAdmin` con los mismos ids que el login simulado (`mockUserIdFor`), así que
+`enroll` y `DELETE /me` funcionan igual sin red. Como el login simulado deriva el id del email, una cuenta cerrada volvería como
+ella misma y recibiría 401 en todo: `POST /__debug/auth/login` responde **409** a ese email hasta un `POST /__debug/reset`, que
+olvida también los límites de la webapp y los usuarios simulados.
+
+### 17.5 Desviaciones respecto a la nota
+
+1. **`enroll` responde 200 `{ email }`**, nunca 204 (§4.2 dejaba elegir), y **un reclamo ya usado también es 410** (en
+   `redeemable` es 409): todos los rechazos tienen la misma respuesta.
+2. **`enroll` no crea el perfil.** El enlace con `auth.users` lo hace `ensureProfile` con el `sub` del token, como ya hacía.
+3. **Reintento del borrado en Auth:** dos intentos dentro de la petición y, si fallan, 503 y reintento desde el cliente. No hay
+   cola en segundo plano. Si nadie reintenta, queda un usuario de Auth huérfano: puede pedir un código, pero todas las rutas le
+   dan 401, y ese email no puede volver a registrarse (`enroll` lo ve como "ya existe"). Pendiente para T27: un barrido que
+   borre en Auth los usuarios cuyo perfil está cerrado.
+4. **Sesiones:** se revocan con el borrado físico del usuario, sin una llamada aparte a `signOut`.
+5. **La 503 reutiliza `auth_unavailable`**, el código que T6 ya usa cuando el verificador no tiene claves (§16.1).
+6. **El 409 de `DELETE /me`** lleva un mensaje legible, no la palabra `sole_owner`: la ruta no tiene otro 409.
+7. **Privacidad (F13):** cerrar la cuenta vacía `profiles` y borra el usuario de Auth, pero el email sigue en
+   `invitations.email` y en el `target` de las filas `invitation.revoked` del `audit_log` (las escribe la RPC de la fase 1).
+   Queda para la política de retención.
+8. **Configuración local:** se cambió además la caducidad del código (`otp_expiry = 600`), la plantilla y las URLs de vuelta,
+   no solo el alta cerrada (§9.4).
+
+### 17.6 Pruebas
+
+Escritas antes que el código; fallaron primero (módulos y métodos inexistentes).
+
+| Fichero | Tests | Qué fija |
+|---|---|---|
+| `apps/api/tests/unit/auth-admin.test.ts` | 6 | La petición exacta a `/auth/v1/admin/users` (POST con `email_confirm`, DELETE con `should_soft_delete: false`); "ya existe" y "ya no existe" como éxito; 500, 502, 401 y fallo de red como `AuthAdminUnavailable`, sin el email en el log; el admin en memoria |
+| `apps/api/tests/integration/webapp-accounts.test.ts` | 13 | `enroll` por reclamo y por invitación, misma respuesta si ya existía, el reclamo sigue sin gastar; un único 410 para nueve motivos; 400; 503 sin nada escrito; límites con `Retry-After`. `DELETE /me`: 409 al único owner; cierre completo y 401 en todas las rutas; owner con otro owner; 503 y reintento; límite; ficha del admin de una organización borrada; sin sesión |
+| `apps/api/tests/conformance/webapp-repository.ts` | +4 (×3 destinos) | `deleteAccount`: `sole_owner` sin cambios; cierre de membresías vivas, acciones, enlaces y perfil con su auditoría; idempotente, el perfil no resucita y el email queda libre; único owner de una organización borrada y usuario sin perfil |
+| `apps/api/tests/integration/compose.test.ts` | +2 y ampliados | La costura entrega `authAdmin` con el mismo cliente; sin él no arranca; producción apagada da 501 en las dos rutas; `mock` simula y el login simulado da 409 tras cerrar la cuenta |
+| `apps/api/tests/integration/real-accounts-supabase.test.ts` | 2 | Contra Supabase local (ver abajo); se salta sin `ARCA_AUTH_SUPABASE_*` |
+
+`npm run typecheck` limpio. `npm test` completo una vez: 1564 pasan, 49 se saltan (la suite de conformidad sobre Supabase real y
+esta prueba, sin sus variables) y 1 falla: `infra/aws/lib/arca-demo-stack.test.ts` por tiempo bajo carga; sola pasa 7 de 7.
+
+### 17.7 Resultado contra Supabase local
+
+Stack local de la CLI 2.122.1 con GoTrue v2.196.0, las ocho migraciones aplicadas.
+
+- **Suite de conformidad** (`webapp-repository-supabase.test.ts`): **47 de 47**, con los cuatro casos nuevos de `deleteAccount`
+  sobre la RPC real.
+- **Prueba de punta a punta** (`real-accounts-supabase.test.ts`): **2 de 2**, dos veces. Arranca la webapp real de `live-debug`
+  con `compose` y los adaptadores que se entregan (el repositorio de Supabase y `SupabaseAuthAdmin`; el cobro simulado en lugar
+  de T14). Recorrido: scan terminado en la tabla `scans` → `POST /claims` → antes de `enroll`, `signInWithOtp` con
+  `shouldCreateUser: false` falla → `POST /auth/enroll` crea el usuario (confirmado) y repetirlo da la misma respuesta → inicio
+  de sesión con el correo que GoTrue dejó en Mailpit → **el token es ES256 y su `kid` está en el JWKS local**, y
+  `SupabaseJwtAuth` lo verifica → `GET /me` con `id = sub` y el perfil enlazado → `POST /orgs` → `DELETE /me` del owner: 409.
+  Después: invitación → `enroll` con el token de invitación → inicio de sesión → aceptar → `DELETE /me`: 204, `GET /me` con el
+  mismo token: 401, el refresh token ya no sirve, el usuario de Auth no existe, `signInWithOtp` vuelve a fallar, repetir el
+  borrado da 204, y el owner ve la baja en miembros y en la actividad.
+- **El proyecto local firma con clave asimétrica:** el JWKS publica una clave EC P-256 (`ES256`), y la CLI configura GoTrue con
+  `GOTRUE_JWT_KEYS`. No hizo falta tocar el verificador ni configurar nada.
+- **El código de 6 dígitos:** la plantilla por defecto de GoTrue v2.196 solo lleva el enlace (`token` = hash del código), no
+  `{{ .Token }}`. Como el stack no se podía reiniciar, la prueba usa lo que trae el correo: el código si la plantilla lo lleva y,
+  si no, el hash del enlace (`verifyOtp({ token_hash, type: 'email' })`, el camino del enlace de respaldo). Ambas veces entró por
+  el enlace. El camino del código se comprobó aparte con el mismo GoTrue: un código de 6 dígitos de `auth.admin.generateLink`
+  verificado con `verifyOtp({ email, token, type: 'email' })`, la llamada exacta del front, da una sesión del mismo usuario.
+  Con la plantilla nueva (`supabase/templates/magic_link.html`, tras reiniciar) el correo de Mailpit traerá el código.
+- **Alta pública:** el stack que corrió las pruebas seguía con `enable_signup = true` (lo dice la prueba al empezar); el
+  `config.toml` nuevo la apaga en el siguiente reinicio.
+
+Cómo correrla: la cabecera de `apps/api/tests/integration/real-accounts-supabase.test.ts` (URL, clave secreta y clave publicable
+de `supabase status -o env` en `ARCA_AUTH_SUPABASE_URL`, `ARCA_AUTH_SUPABASE_SECRET_KEY` y `ARCA_AUTH_SUPABASE_PUBLISHABLE_KEY`;
+solo hosts locales).
+
+### 17.8 Lo que necesita el front (T9)
+
+| Llamada | Petición | Respuestas |
+|---|---|---|
+| `POST /auth/enroll` (sin sesión) | `{ claimId }` o `{ invitationToken }` (`EnrollRequest`) | 200 `{ email }` (`EnrollResponse`); 400 `invalid_request`; 410 `gone` (el enlace ya no vale: volver a los resultados o pedir otra invitación); 429 `rate_limited` con `Retry-After`; 503 `auth_unavailable` (reintentar) |
+| `DELETE /me` (Bearer) | sin cuerpo | 204; 401 `unauthorized`; 409 `conflict` (único owner: transferir o pedir el borrado de la organización); 429; 503 `auth_unavailable` (la cuenta ya está cerrada: repetir la misma petición) |
+| Cualquier ruta con sesión | — | además, 401 `unauthorized` si la cuenta está cerrada |
+
+**Secuencia de alta y entrada** (`@supabase/ssr`, `createBrowserClient(url, publishableKey)`):
+
+1. Reclamo: `POST /claims { scanToken }` → `claimId` (como hoy, en `sessionStorage`). Invitación: el `token` de
+   `/app/invite/<token>`.
+2. `POST /auth/enroll` con uno de los dos → `{ email }`. La pantalla muestra ese email bloqueado. Una sola vez por flujo; para
+   reenviar el código no hace falta repetirlo.
+3. `supabase.auth.signInWithOtp({ email, options: { shouldCreateUser: false, emailRedirectTo:
+   '${origin}/app/auth/confirm?next=<ruta /app/...>' } })`. Un error aquí se muestra con el mensaje neutro de §4.2.
+4. La persona escribe el código: `supabase.auth.verifyOtp({ email, token, type: 'email' })` → sesión. Enlace de respaldo:
+   `/app/auth/confirm` pide un clic y llama a `verifyOtp({ token_hash, type: 'email' })`.
+5. Cada llamada a la API lleva `Authorization: Bearer ${(await supabase.auth.getSession()).data.session.access_token}`.
+6. Reclamo: `POST /orgs { name, claimId }`. Invitación: `POST /invitations/:token/accept`.
+7. **Login** de alguien con cuenta (`/app/login`): solo los pasos 3 a 5, sin `enroll`.
+8. **Borrar la cuenta** (`/app/settings`): `DELETE /me`; con 204, `supabase.auth.signOut({ scope: 'local' })`, `forgetOrg()`,
+   `clearPendingClaim()` y a la portada. Con 409, explicar lo de la propiedad. Con 503, ofrecer reintentar (el token sigue
+   valiendo para esa ruta).
+
+### 17.9 Pendiente
+
+- **T9** (front) y **T8** (configurar `Arca-dev`: los pasos de §9.4).
+- Reiniciar Supabase local para aplicar el `config.toml` nuevo, y entonces la prueba de §17.7 entra con el código del correo.
+- El barrido de usuarios de Auth huérfanos (§17.5, punto 3), con la limpieza de T27.
+- La pantalla "Delete my account" (parte de T11 en el front).
