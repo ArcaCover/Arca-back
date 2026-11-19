@@ -3,6 +3,7 @@ import type { JwksFetcher } from './auth.js';
 import type { BillingProvider } from './billing.js';
 import type { SesSendEmail } from './mailer.js';
 import type { WebappRepository } from './types.js';
+import { SupabaseWebappRepository } from './supabase.js';
 
 export type StorageClient = ReturnType<typeof createStorageClient>;
 
@@ -22,5 +23,7 @@ export type RealWebappAdapters = {
   fetchJwks?: JwksFetcher;
 };
 
-/** What ships today: none yet. The repository arrives with T4 and the billing provider with T14. */
-export const REAL_WEBAPP_ADAPTERS: Readonly<RealWebappAdapters> = Object.freeze({});
+/** What ships today: the Supabase repository (T4). The billing provider arrives with T14, so the real webapp still refuses to start. */
+export const REAL_WEBAPP_ADAPTERS: Readonly<RealWebappAdapters> = Object.freeze({
+  repository: client => new SupabaseWebappRepository(client),
+});

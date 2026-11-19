@@ -343,8 +343,10 @@ describe('compose: the webapp providers', () => {
     await expect(compose(loadEnv(realLiveDebug), undefined, { ...seam, repository: undefined })).rejects.toThrow(/Supabase webapp repository/);
     // live-debug keeps the invitations in memory unless told otherwise, so it needs no SES sender.
     await expect(compose(loadEnv(realLiveDebug), undefined, { ...seam, sesSendEmail: undefined })).resolves.toBeDefined();
-    // What ships today has none of them yet: production with the switch on refuses to start rather than fall back to memory.
-    await expect(compose(loadEnv(launch))).rejects.toThrow(/Supabase webapp repository/);
+    // What ships today has the Supabase repository (T4) but no Stripe provider yet (T14): production with the switch on
+    // still refuses to start rather than fall back to memory, and names what is missing.
+    await expect(compose(loadEnv(launch))).rejects.toThrow(/Stripe billing provider/);
+    await expect(compose(loadEnv(launch))).rejects.not.toThrow(/Supabase webapp repository/);
   });
 
   it('refuses to start against a project without asymmetric signing keys, and starts anyway while Supabase is unreachable', async () => {
