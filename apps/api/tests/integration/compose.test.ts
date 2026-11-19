@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DebugModeResponse } from '@arca/contracts/debug';
+import { DEBUG_REQUEST_HEADER, DebugModeResponse } from '@arca/contracts/debug';
+import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 import { loadEnv } from '../../src/config/env.js';
 import { compose } from '../../src/compose.js';
 import { createApp } from '../../src/http/app.js';
@@ -13,7 +14,11 @@ import { ApifyClient } from '../../src/pipeline/apify-client.js';
 import { AVVO_ACTOR } from '../../src/pipeline/directories.js';
 import { DEFAULT_SIGNAL_LLM_MODEL } from '../../src/pipeline/llm-endpoint.js';
 import { OPENAI_EVIDENCE_MODEL } from '../../src/pipeline/website-evidence-provider.js';
-import { MockAppAuth } from '../../src/webapp/auth.js';
+import { MockAppAuth, SupabaseJwtAuth } from '../../src/webapp/auth.js';
+import { MockBillingProvider } from '../../src/webapp/billing.js';
+import { MailingWebappService } from '../../src/webapp/invitation-email.js';
+import { MemoryMailer } from '../../src/webapp/mailer.js';
+import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 
 // Observed, not replaced: compose still builds the real app and tools.
@@ -182,5 +187,187 @@ describe('compose', () => {
       websiteEvidenceProvider: provider, assessmentPlanner: planner, signalLlmModel: model,
       inUse: { openai, apify: true, supabase: true } });
     for (const secret of ['sk-x', 'sb_secret_x', 'apify_x', 'x.supabase.co']) expect(JSON.stringify(body)).not.toContain(secret);
+  });
+});
+
+// DN-13 §3.2 and §7.1: which webapp each mode builds. The real adapters arrive through the factory seam, so no test here reaches
+// Supabase, Stripe or SES: the key set is served by an injected fetcher and the data lives in an in-memory repository.
+describe('compose: the webapp providers', () => {
+  const FROM = 'ARCA <no-reply@arcacover.com>';
+  const stripeTest = { STRIPE_SECRET_KEY: 'rk_test_fixture', STRIPE_WEBHOOK_SECRET: 'whsec_fixture' };
+  const launch = { ...base, ...live, STRIPE_SECRET_KEY: 'rk_live_fixture', STRIPE_WEBHOOK_SECRET: 'whsec_fixture', WEBAPP_ENABLED: 'true',
+    APP_BASE_URL: 'https://arcacover.com', EMAIL_FROM: FROM };
+  const realLiveDebug = { ...base, ...live, ...stripeTest, ARCA_MODE: 'live-debug', WEBAPP_PROVIDERS: 'real' };
+  const USER_ID = '7b5e2f0e-3c1a-4d8e-9f00-1a2b3c4d5e6f';
+  const debugPost = (app: { request: (path: string, init: RequestInit) => Response | Promise<Response> }, path: string,
+    body: unknown = { email: 'owner@firm.com', sessionId: 'cs_x' }) => app.request(path, { method: 'POST', body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json', [DEBUG_REQUEST_HEADER]: '1' } });
+
+  /** A Supabase project of the test's own: its key set and the access tokens it would issue. */
+  async function supabaseProject() {
+    const { publicKey, privateKey } = await generateKeyPair('ES256');
+    const keys: unknown[] = [{ ...(await exportJWK(publicKey)), kid: 'key-1', alg: 'ES256', use: 'sig' }];
+    const state = { keys, fail: false };
+    const fetchJwks = vi.fn(async (url: URL) => {
+      if (state.fail) throw new Error('connect ECONNREFUSED');
+      expect(url.href).toBe('https://x.supabase.co/auth/v1/.well-known/jwks.json');
+      return { keys: state.keys };
+    });
+    const accessToken = (email = 'owner@firm.com') => new SignJWT({ email, role: 'authenticated', aal: 'aal1' })
+      .setProtectedHeader({ alg: 'ES256', kid: 'key-1' }).setIssuer('https://x.supabase.co/auth/v1').setAudience('authenticated')
+      .setSubject(USER_ID).setIssuedAt().setExpirationTime('1h').sign(privateKey);
+    return { state, fetchJwks, accessToken };
+  }
+  function adapters(project: { fetchJwks: (url: URL) => Promise<unknown> }) {
+    const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
+    const billing = new MockBillingProvider('https://arcacover.com');
+    return { repository, billing, seam: { repository: vi.fn((_client: unknown) => repository), billing: vi.fn((_config: unknown) => billing),
+      sesSendEmail: vi.fn(async (_input: unknown) => ({ MessageId: 'ses-1' })), fetchJwks: project.fetchJwks } };
+  }
+  const me = async (app: { request: (path: string, init?: RequestInit) => Response | Promise<Response> }, token: string) =>
+    app.request('/me', { headers: { Authorization: `Bearer ${token}` } });
+
+  it.each(['mock', 'live-debug'] as const)('%s on the simulated providers keeps today\'s webapp and never touches the seam', async mode => {
+    const project = await supabaseProject();
+    const { seam } = adapters(project);
+    const composed = await compose(loadEnv({ ...base, ...live, ARCA_MODE: mode }), undefined, seam);
+    const deps = appDeps(), tools = toolOptions();
+    expect(deps.webapp!.auth).toBeInstanceOf(MockAppAuth);
+    expect(tools.webapp!.repository).toBeInstanceOf(InMemoryWebappRepository);
+    // Invitations go to memory, for the tests and the debug panel; the response still carries the link.
+    expect(tools.webapp!.mailer).toBeInstanceOf(MemoryMailer);
+    expect(deps.webapp!.service).toBeInstanceOf(MailingWebappService);
+    for (const factory of [seam.repository, seam.billing, seam.sesSendEmail, project.fetchJwks]) expect(factory).not.toHaveBeenCalled();
+    expect(composed.banner).not.toContain('webapp=real');
+    expect((await debugPost(composed.app, '/__debug/auth/login', { email: 'owner@firm.com' })).status).toBe(200);
+    // A debug reset forgets the invitations held in memory with the rest of the simulated webapp.
+    await tools.webapp!.mailer!.send({ from: 'ARCA <no-reply@arcacover.com>', to: 'new@firm.com', subject: 'x', text: 'x' });
+    expect((await composed.app.request('/__debug/reset', { method: 'POST', headers: { [DEBUG_REQUEST_HEADER]: '1' } })).status).toBe(200);
+    expect(tools.webapp!.mailer!.sent).toEqual([]);
+    // The simulated issuer is the only one: a Supabase token is refused.
+    expect((await me(composed.app, await project.accessToken())).status).toBe(401);
+  });
+
+  it('live-debug with WEBAPP_PROVIDERS=real verifies Supabase tokens, on the adapters of the seam, without the simulations', async () => {
+    const project = await supabaseProject();
+    const { repository, billing, seam } = adapters(project);
+    const composed = await compose(loadEnv(realLiveDebug), undefined, seam);
+    const deps = appDeps(), tools = toolOptions();
+    expect(deps.webapp!.auth).toBeInstanceOf(SupabaseJwtAuth);
+    expect(seam.repository).toHaveBeenCalledTimes(1);
+    expect(seam.repository.mock.calls[0]![0]).toBeDefined();
+    expect(seam.billing).toHaveBeenCalledWith({ secretKey: 'rk_test_fixture', webhookSecret: 'whsec_fixture', mode: 'test',
+      appBaseUrl: 'http://localhost:3000' });
+    const service = deps.webapp!.service as unknown as { deps: { repository: unknown; billing: unknown; scans: unknown; assessments: unknown } };
+    expect(service.deps.repository).toBe(repository);
+    expect(service.deps.billing).toBe(billing);
+    // The scans it claims are the routed ones, as in the simulated live-debug.
+    expect(service.deps.scans).toBe(deps.repository);
+    expect(service.deps.assessments).toBe(deps.assessmentRepository);
+    // No simulated login or payment: the debug tools know of no webapp, so those routes do not exist (DN-13 §3.2).
+    expect(tools.webapp).toBeUndefined();
+    for (const path of ['/__debug/auth/login', '/__debug/billing/pay', '/__debug/seed']) expect((await debugPost(composed.app, path)).status, path).toBe(404);
+    expect((await composed.app.request('/__debug/reset', { method: 'POST', headers: { [DEBUG_REQUEST_HEADER]: '1' } })).status).toBe(200);
+    expect(composed.banner).toBe('[api] MODE=live-debug sources=live storage=supabase webapp=real stripe=test email=memory '
+      + '(debug routes on 127.0.0.1 only) spend guards: Apify ceiling USD 2 per 24 h, OpenAI cap 30 requests per scan');
+
+    const signedIn = await me(composed.app, await project.accessToken('Owner@Firm.com'));
+    expect(signedIn.status).toBe(200);
+    expect(await signedIn.json()).toEqual({ user: { id: USER_ID, email: 'owner@firm.com' }, organizations: [], platformAdmin: false });
+    // A token of the simulated issuer is refused here.
+    const mockToken = (await new MockAppAuth(base.SESSION_TOKEN_SECRET).issue('owner@firm.com')).token;
+    expect((await me(composed.app, mockToken)).status).toBe(401);
+    // The key set was read once, at start, and kept.
+    expect(project.fetchJwks).toHaveBeenCalledTimes(1);
+  });
+
+  it('production keeps answering 501 while WEBAPP_ENABLED is not true, and builds nothing of the seam', async () => {
+    const project = await supabaseProject();
+    const { seam } = adapters(project);
+    const { WEBAPP_ENABLED: _on, ...off } = launch;
+    for (const env of [off, { ...off, WEBAPP_ENABLED: 'false' }]) {
+      vi.clearAllMocks();
+      const composed = await compose(loadEnv(env), undefined, seam);
+      expect(appDeps().webapp).toBeUndefined();
+      expect(composed.banner).toBe('[api] MODE=production sources=live storage=supabase');
+      const response = await me(composed.app, await project.accessToken());
+      expect(response.status).toBe(501);
+      expect(await response.json()).toEqual({ error: 'not_configured', message: expect.any(String) });
+      for (const factory of [seam.repository, seam.billing, seam.sesSendEmail, project.fetchJwks]) expect(factory).not.toHaveBeenCalled();
+    }
+  });
+
+  it('production with WEBAPP_ENABLED=true serves the real webapp on the durable repositories and sends invitations through SES', async () => {
+    const project = await supabaseProject();
+    const { repository, seam } = adapters(project);
+    const composed = await compose(loadEnv(launch), undefined, seam);
+    expect(createDebugTools).not.toHaveBeenCalled();
+    const deps = appDeps();
+    expect(deps.debug).toBeUndefined();
+    expect(deps.webapp!.auth).toBeInstanceOf(SupabaseJwtAuth);
+    const service = deps.webapp!.service as unknown as { deps: { scans: unknown; assessments: unknown; isDurableScan?: (id: string) => boolean } };
+    expect(service.deps.scans).toBe(deps.repository);
+    expect(deps.repository).toBeInstanceOf(SupabaseRepository);
+    expect(service.deps.assessments).toBe(deps.assessmentRepository);
+    expect(seam.billing).toHaveBeenCalledWith({ secretKey: 'rk_live_fixture', webhookSecret: 'whsec_fixture', mode: 'live',
+      appBaseUrl: 'https://arcacover.com' });
+    expect(composed.banner).toBe('[api] MODE=production sources=live storage=supabase webapp=real stripe=live email=ses');
+    for (const path of ['/__debug/auth/login', '/__debug/billing/pay', '/__debug/mode']) expect((await debugPost(composed.app, path)).status, path).toBe(404);
+    // CORS stays exact.
+    const preflight = await composed.app.request('/orgs', { method: 'OPTIONS', headers: { Origin: 'http://localhost:3000',
+      'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type, authorization' } });
+    expect(preflight.headers.get('Access-Control-Allow-Headers')).toBe('Content-Type,Authorization');
+
+    const token = await project.accessToken();
+    expect((await me(composed.app, token)).status).toBe(200);
+    // A paid organization of this owner, written straight to the repository the seam handed in.
+    const orgId = '0d9c1f9e-8b7a-4c6d-9e5f-4a3b2c1d0e0f', at = new Date().toISOString();
+    await repository.createOrganization({ id: orgId, name: 'Robust Law LLP', domain: 'robust.example', billing_status: 'active', deleted_at: null,
+      created_by: USER_ID, created_at: at }, { org_id: orgId, user_id: USER_ID, role: 'owner', invited_by: null, created_at: at }, null);
+    const invited = await composed.app.request(`/orgs/${orgId}/invitations`, { method: 'POST', body: JSON.stringify({ email: 'new@firm.com', role: 'member' }),
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
+    expect(invited.status).toBe(201);
+    const view = await invited.json() as { inviteUrl: string };
+    expect(view.inviteUrl).toMatch(/^https:\/\/arcacover\.com\/app\/invite\//);
+    expect(seam.sesSendEmail).toHaveBeenCalledTimes(1);
+    expect(seam.sesSendEmail.mock.calls[0]![0]).toMatchObject({ FromEmailAddress: FROM, Destination: { ToAddresses: ['new@firm.com'] } });
+    expect(JSON.stringify(seam.sesSendEmail.mock.calls[0]![0])).toContain(view.inviteUrl);
+  });
+
+  it('refuses to start the real webapp while an adapter of the seam is missing', async () => {
+    const project = await supabaseProject();
+    const { seam } = adapters(project);
+    await expect(compose(loadEnv(launch), undefined, { fetchJwks: project.fetchJwks }))
+      .rejects.toThrow(/Supabase webapp repository.*Stripe billing provider.*SES sender/);
+    await expect(compose(loadEnv(launch), undefined, { ...seam, sesSendEmail: undefined })).rejects.toThrow(/SES sender/);
+    await expect(compose(loadEnv(realLiveDebug), undefined, { ...seam, repository: undefined })).rejects.toThrow(/Supabase webapp repository/);
+    // live-debug keeps the invitations in memory unless told otherwise, so it needs no SES sender.
+    await expect(compose(loadEnv(realLiveDebug), undefined, { ...seam, sesSendEmail: undefined })).resolves.toBeDefined();
+    // What ships today has none of them yet: production with the switch on refuses to start rather than fall back to memory.
+    await expect(compose(loadEnv(launch))).rejects.toThrow(/Supabase webapp repository/);
+  });
+
+  it('refuses to start against a project without asymmetric signing keys, and starts anyway while Supabase is unreachable', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const project = await supabaseProject();
+    const { seam } = adapters(project);
+    const published = project.state.keys;
+    project.state.keys = [];
+    await expect(compose(loadEnv(realLiveDebug), undefined, seam)).rejects.toThrow(/asymmetric signing key/);
+    project.state.keys = published;
+
+    project.state.fail = true;
+    const { app } = await compose(loadEnv(realLiveDebug), undefined, seam);
+    expect(warn.mock.calls.flat().join(' ')).toContain('[auth]');
+    // With no key at all, a signed-in request is answered 503, not 401: the front must not sign the user out over it.
+    const unavailable = await me(app, await project.accessToken());
+    expect(unavailable.status).toBe(503);
+    expect(await unavailable.json()).toEqual({ error: 'auth_unavailable', message: expect.any(String) });
+    // Without a token it is still a plain 401.
+    expect((await app.request('/me')).status).toBe(401);
+    // Once Supabase answers, the same process verifies again.
+    project.state.fail = false;
+    expect((await me(app, await project.accessToken())).status).toBe(200);
   });
 });

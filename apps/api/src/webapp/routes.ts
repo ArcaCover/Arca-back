@@ -2,10 +2,10 @@ import { Hono, type Context } from 'hono';
 import { z } from 'zod';
 import { AttachAnalysisRequest, CheckoutRequest, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, InviteRequest,
   ReviewRequest, SetRoleRequest, UpdateActionRequest, UpdateOrgRequest, UpdatePlanRequest } from '@arca/contracts';
-import type { AppAuth, AppUser } from './auth.js';
+import { AuthUnavailable, type AppAuth, type AppUser } from './auth.js';
 import { WebappFailure, type WebappService } from './service.js';
 
-// Every path the private webapp answers on (DN-10 §4.7, DN-11 §4.9). In production they all answer 501 until the real adapters exist.
+// Every path the private webapp answers on (DN-10 §4.7, DN-11 §4.9). Production answers 501 on all of them unless WEBAPP_ENABLED=true.
 const WEBAPP_PATHS = ['/me', '/claims', '/plans', '/orgs', '/orgs/*', '/invitations/*', '/admin/*', '/billing/*'] as const;
 
 // A page of the audit log (DN-11 §4.3, §4.5): `before` is the seq the previous page ended on; a limit out of range is a 400.
@@ -21,10 +21,13 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth }): H
   for (const path of WEBAPP_PATHS) app.use(path, noStore);
   app.onError((error, c) => {
     if (error instanceof WebappFailure) return c.json({ error: error.code, message: error.message }, error.status);
+    // The verifier holds no key yet (Supabase unreachable since the start): 503, never a 401 that would sign the user out.
+    if (error instanceof AuthUnavailable) return c.json({ error: 'auth_unavailable', message: error.message }, 503);
     throw error;
   });
 
-  // The app's own session token. A scan session token is refused here: its issuer and audience are not the app's.
+  // The app's session token: Supabase's, or the simulated issuer's in the debug modes, never both. A scan session token is refused
+  // here: its issuer and audience are not the app's.
   async function user(c: Context): Promise<AppUser> {
     const token = /^Bearer\s+(.+)$/i.exec(c.req.header('Authorization') ?? '')?.[1];
     const verified = token ? await deps.auth.verify(token) : null;
@@ -109,7 +112,7 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth }): H
   return app;
 }
 
-/** What production serves for now: the webapp exists, but its real adapters (Supabase Auth, Stripe) do not yet. */
+/** What production serves while WEBAPP_ENABLED is not true (DN-13 §3.2). */
 export function notConfiguredWebapp(): Hono {
   const app = new Hono();
   for (const path of WEBAPP_PATHS) app.all(path, noStore, c => notConfigured(c));
