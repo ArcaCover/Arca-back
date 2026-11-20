@@ -1,5 +1,5 @@
 import { adaptScore, type Layer1Result } from '@arca/contracts';
-import { WEBSITE_UNAVAILABLE } from '@arca/scoring';
+import { ATTORNEYS_OUTSIDE_FLORIDA, WEBSITE_UNAVAILABLE, outsideBarState } from '@arca/scoring';
 import { BASE_STYLE, COLORS, escape, isoDay, longDate } from './layout.js';
 
 // The Quick Scan Report: the /score screen on one A4 page. Every sentence comes from adaptScore
@@ -19,6 +19,16 @@ const TIER_LINES: Record<string, string> = {
 // /score notice in the third person (DN-12 §14). Low confidence, not high risk: no number, no tier, no manual review.
 export const WEBSITE_UNREAD_NOTE = "We could not read the firm's website, so there is no public evidence to score. " +
   "A full assessment gives a score based on the firm's answers, marked as low confidence.";
+
+/**
+ * What the report says when some of the firm's attorneys are licensed outside Florida (flag ATTORNEYS_OUTSIDE_FLORIDA,
+ * DN-12 §15): the Bar rules counted only the others. The count comes from the B3 rule's reason; without it the sentence
+ * says the same without a number. /score says it in the second person (floridaOnlyNote in Arca-front lib/api/adapt.ts).
+ */
+export const FLORIDA_ONLY_NOTE = (count: { outside: number; total: number } | null) => count
+  ? `Professional Standing covers Florida only. ${count.outside} of the firm's ${count.total} attorneys are licensed outside ` +
+    'Florida, so they were not scored against the Florida Bar.'
+  : 'Professional Standing covers Florida only. Attorneys licensed outside Florida were not scored against the Florida Bar.';
 
 type PreScore = Pick<Layer1Result['preScore'], 'confidence' | 'categories' | 'flags'>;
 
@@ -78,8 +88,13 @@ export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 
   const facts = [place, view.firm.practice, view.firm.attorneys ? `${view.firm.attorneys} attorneys` : null].filter(Boolean) as string[];
   // When the firm name fell back to the domain, the title already is the domain: the line under it does not repeat it.
   const details = [...(view.firm.name === result.domain ? [] : [result.domain]), ...facts];
-  const helping = view.signals.filter(signal => signal.positive);
-  const holding = view.signals.filter(signal => !signal.positive);
+  // With attorneys licensed outside Florida, the bar-record share is of the Florida attorneys only.
+  const floridaOnly = result.preScore.flags.includes(ATTORNEYS_OUTSIDE_FLORIDA);
+  const signals = view.signals.map(signal => floridaOnly && signal.id === 'B3' && result.signals.bar.B3_consistency !== null
+    ? { ...signal, label: `${Math.round(result.signals.bar.B3_consistency * 100)}% of the firm's Florida attorneys matched a Florida Bar record` }
+    : signal);
+  const helping = signals.filter(signal => signal.positive);
+  const holding = signals.filter(signal => !signal.positive);
   const list = (items: typeof helping, mark: string) => items.length
     ? `<ul>${items.map(item => `<li><span class="dot" style="background:${mark}"></span><span>${escape(item.label)} <em>${escape(item.source)}</em></span></li>`).join('')}</ul>`
     : '<p class="none">Nothing observed.</p>';
@@ -90,6 +105,7 @@ export function renderQuickScanHtml(result: Layer1Result, status: 'COMPLETED' | 
     withheld === 'WEBSITE_UNAVAILABLE' ? null
       : view.incomplete ? `Some sources did not answer in full${withheld ? '.' : ', so this score rests on partial evidence.'}` : null,
     view.decisionWithheld ? 'There is not enough public evidence yet for an underwriting decision.' : null,
+    floridaOnly && withheld !== 'WEBSITE_UNAVAILABLE' ? FLORIDA_ONLY_NOTE(outsideBarState(result.preScore)) : null,
   ].filter(Boolean) as string[];
 
   return `<!doctype html>

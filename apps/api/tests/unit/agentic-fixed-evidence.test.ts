@@ -188,6 +188,28 @@ describe('where attorney names come from', () => {
     expect(result.diagnostics.attorneySource).toBe('news_only');
   });
 
+  it('records the states the site shows for each accepted attorney, never from news pages (DN-12 §15)', async () => {
+    const bio: CrawledPage = { url: `${ORIGIN}/en/bio/jane-doe`, html: '',
+      text: 'Jane Doe\nPartner\nJane Doe is admitted in New York and Georgia.' };
+    const story: CrawledPage = { url: news.url, html: '', text: 'Jane DoePartner TX received an award. John RoeAttorney FL' };
+    const create = model(user => ({ claims: [
+      claim('jane', 'attorneys', person('Jane Doe', 'Partner'), [{ segmentId: segmentId(user, bio.url, 'Jane Doe'), quote: 'Jane Doe\nPartner' }]),
+    ], action: finish }), types);
+    const provider = new AgenticEvidenceProvider('key', undefined, { chat: { completions: { create } } }, noFixed as never);
+    const result = await provider.extractDetailed({ pages: [home, story, bio], partial: false }, new AbortController().signal);
+    expect(result.websiteData.team_members).toEqual([{ full_name: 'Jane Doe', title: 'Partner' }]);
+    expect(result.websiteData.provenance.attorney_states).toEqual([{ sourceUrl: bio.url, excerpt: 'Jane Doe: GA, NY', method: 'page_text' }]);
+  });
+
+  it('records no attorney states when the site shows none', async () => {
+    const create = model(user => ({ claims: [
+      claim('jane', 'attorneys', person('Jane Doe', 'Partner'), [{ segmentId: segmentId(user, profile.url, 'Jane Doe'), quote: 'Jane Doe\nPartner' }]),
+    ], action: finish }), types);
+    const provider = new AgenticEvidenceProvider('key', undefined, { chat: { completions: { create } } }, noFixed as never);
+    const result = await provider.extractDetailed({ pages: [home, profile], partial: false }, new AbortController().signal);
+    expect(result.websiteData.provenance).not.toHaveProperty('attorney_states');
+  });
+
   it('never reads a press release as a team page, even when its address says attorneys', async () => {
     const release: CrawledPage = { url: `${ORIGIN}/en/news/pressreleases/2026/08/850-attorneys-recognized`, html: '',
       text: 'Partner Jane Doe was recognized.' };
