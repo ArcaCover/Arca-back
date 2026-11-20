@@ -190,6 +190,9 @@ export class StripeBillingProvider implements BillingProvider {
       billing_address_collection: 'required', customer_update: { name: 'auto', address: 'auto' },
       // Card only for now (DN-13 §6.2, F5): an asynchronous method would need the async_payment events and a state in between.
       allowed_payment_method_types: ['card'],
+      // ARCA is the seller (taxes are F3). An account can have Managed Payments (Stripe as merchant of record) on by default, and
+      // then Stripe refuses a payment method list; this session says so explicitly instead of taking the account's default.
+      managed_payments: { enabled: false },
       expires_at: nowS + CHECKOUT_TTL_S,
       // Taxes (F3), promotion codes and a trial (F4) wait for the founder's decisions.
     }, { idempotencyKey: `checkout:${input.orgId}:${input.plan.code}:${Math.floor(this.now() / 60_000)}${input.after ? `:${input.after}` : ''}` }));

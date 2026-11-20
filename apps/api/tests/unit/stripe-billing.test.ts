@@ -58,7 +58,7 @@ describe('StripeBillingProvider', () => {
       line_items: { 0: { price: plan.stripe_price_id, quantity: '1' } }, metadata: { org_id: ORG }, subscription_data: { metadata: { org_id: ORG } },
       success_url: `${APP}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancel_url: `${APP}/app/billing`,
       billing_address_collection: 'required', customer_update: { name: 'auto', address: 'auto' }, allowed_payment_method_types: { 0: 'card' },
-      expires_at: String(Math.floor(T0 / 1000) + 3600) });
+      managed_payments: { enabled: 'false' }, expires_at: String(Math.floor(T0 / 1000) + 3600) });
     // The same click in the same minute is the same session.
     expect(await provider.createCheckout({ orgId: ORG, customerId, plan,
       successUrl: `${APP}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${APP}/app/billing` })).toEqual(checkout);

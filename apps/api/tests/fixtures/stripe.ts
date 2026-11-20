@@ -95,6 +95,11 @@ export function fakeStripe(options: { now?: () => number; livemode?: boolean } =
         const items = (form.line_items ?? {}) as Record<string, { price: string }>;
         const price = items['0']?.price;
         if (!price || !priceOf(price)) return missing('price', String(price));
+        // Like the test account of the first real run (DN-13 §18.10): Managed Payments is on by default, and Stripe refuses a
+        // payment method list on a session that does not turn it off.
+        if (form.allowed_payment_method_types !== undefined && (form.managed_payments as { enabled?: string } | undefined)?.enabled !== 'false') {
+          return stripeError(400, 'invalid_request_error', 'allowed_payment_method_types cannot be used with Managed Payments, which is enabled by default on your account. Remove allowed_payment_method_types, or pass managed_payments[enabled]=false to disable it for this request.');
+        }
         const session = checkoutObject(form);
         sessions.set(session.id, session);
         return ok(session);
