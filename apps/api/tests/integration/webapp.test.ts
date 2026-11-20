@@ -862,7 +862,7 @@ describe('the demo seed', () => {
     const run = vi.fn(async (input: Parameters<InProcessPipeline['run']>[0]) => { await options.hold; return real.run(input); });
     const debug = createDebugTools({ mode: 'mock', sources: mockSources(), scans, assessments, pipelineTimeoutMs: 600_000,
       describe: { mode: 'mock', sourceMode: 'mock', storageBackend: 'memory', websiteEvidenceProvider: 'mock', assessmentPlanner: 'rules',
-        signalLlmModel: null, inUse: { openai: false, apify: false, supabase: false } },
+        signalLlmModel: null, inUse: { openai: false, apify: false, supabase: false }, webapp: 'simulated', billing: 'simulated' },
       webapp: { auth, billing, service, repository }, seedTimeoutMs: options.seedTimeoutMs });
     const { app } = createApp({ repository: scans, assessmentRepository: assessments, debug, webapp: { service, auth }, pipeline: { run },
       domainResolver: new PublicDomainResolver(async () => {}), sessionSecret: secret, corsOrigins: [origin], clientIp: () => '127.0.0.1' });
@@ -1027,7 +1027,8 @@ describe('live-debug: real scans, a simulated webapp held in memory', () => {
     SUPABASE_SECRET_KEY: 'sb_secret_x', OPENAI_API_KEY: 'sk-x', APIFY_API_TOKEN: 'apify_x', SESSION_TOKEN_SECRET: secret,
     CORS_ALLOWED_ORIGINS: origin };
   const description: DebugModeResponse = { mode: 'live-debug', sourceMode: 'live', storageBackend: 'supabase', websiteEvidenceProvider: 'agentic',
-    assessmentPlanner: 'rules', signalLlmModel: 'fixture-model', inUse: { openai: true, apify: true, supabase: true } };
+    assessmentPlanner: 'rules', signalLlmModel: 'fixture-model', inUse: { openai: true, apify: true, supabase: true },
+    webapp: 'simulated', billing: 'simulated' };
   const debugPost = (app: App, path: string, body: unknown = { email: OWNER, sessionId: 'cs_x' }) => app.request(path, { method: 'POST',
     body: JSON.stringify(body), headers: { 'Content-Type': 'application/json', [DEBUG_REQUEST_HEADER]: '1' } });
 
@@ -1073,7 +1074,7 @@ describe('live-debug: real scans, a simulated webapp held in memory', () => {
   it('walks from the simulated login to the listed analysis, and the webapp only ever reads the stored scan and assessment', async () => {
     const s = await liveDebugApp();
     expect(DebugModeResponse.parse((await s.call('GET', '/__debug/mode')).body)).toMatchObject({ mode: 'live-debug', sourceMode: 'live',
-      storageBackend: 'supabase' });
+      storageBackend: 'supabase', webapp: 'simulated', billing: 'simulated' });
     // The anonymous funnel wrote these two; from here on storage is only watched.
     const started = await s.storedScan();
     await completeAssessment(s.app, started);

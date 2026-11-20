@@ -56,6 +56,16 @@ export const DebugModeResponse = z.object({
   signalLlmModel: z.string().nullable(),
   /** Which external services this process built a client for. Booleans only, never a key or a URL. */
   inUse: z.object({ openai: z.boolean(), apify: z.boolean(), supabase: z.boolean() }).strict(),
+  /**
+   * Which webapp this process built (DN-13 §3.2, T19): `simulated` is the in-memory one behind the mock login and payment;
+   * `real` is Supabase Auth and the durable repository, live-debug with WEBAPP_PROVIDERS=real.
+   */
+  webapp: z.enum(['simulated', 'real']),
+  /**
+   * What bills that webapp: the simulated checkout, or Stripe in test mode. Never `live`: a live Stripe key stops every debug
+   * mode at start (DN-13 §16.1), so a debug back cannot say it. The mode word only, never the key or its prefix.
+   */
+  billing: z.enum(['simulated', 'test']),
 }).strict();
 export type DebugModeResponse = z.infer<typeof DebugModeResponse>;
 
