@@ -1,6 +1,7 @@
 import type { WebsiteData } from '@arca/contracts';
 import { category, observedBoolean } from './math.js';
-const rule = (id: string, points: number | null) => ({ id, points, reason: points === null ? 'Evidence unavailable or ambiguous' : 'Evaluated from observed evidence' });
+const rule = (id: string, points: number | null, reason?: string) => ({ id, points,
+  reason: reason ?? (points === null ? 'Evidence unavailable or ambiguous' : 'Evaluated from observed evidence') });
 
 export function aiGovernance(website: WebsiteData) {
   const depth = website.ai_policy.depth;
@@ -22,11 +23,12 @@ export function reputation(data: ReputationEvidence) {
   return category(20, [rule('A1', rating), rule('A3', reviews), rule('A6', observedBoolean(data.awards, 6))]);
 }
 
+/** `consistencyReason` replaces the default reason of B3, to say whom it was measured on (DN-12 §15). */
 export function professionalStanding(data: { allActive: boolean | null; cleanRecord: boolean | null;
-  consistency: number | null; experience: number | null; sanctionPenalty: number | null }) {
+  consistency: number | null; experience: number | null; sanctionPenalty: number | null; consistencyReason?: string }) {
   return category(30, [rule('B1', observedBoolean(data.allActive, 12)),
     rule('B2_clean', observedBoolean(data.cleanRecord, 10)),
-    rule('B3', data.consistency === null ? null : data.consistency > .8 ? 5 : data.consistency < .5 ? -5 : 0),
+    rule('B3', data.consistency === null ? null : data.consistency > .8 ? 5 : data.consistency < .5 ? -5 : 0, data.consistencyReason),
     rule('B4', data.experience === null ? null : data.experience > 10 ? 3 : data.experience < 3 ? -3 : 0),
     rule('B2_sanction', data.sanctionPenalty)]);
 }

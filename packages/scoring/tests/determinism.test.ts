@@ -1,13 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type { Layer1Evidence } from '@arca/contracts';
 import { evaluateLayer1Evidence, mean, scoreEvidence } from '../src/index.js';
-import { ambiguousDirectory, firmFallback, mockEvidence, OBSERVED_AT, ratingBoundary, reorder, reorderPeople, seeded, sevenAttorneys,
-  sharedSearchedName, shuffle } from './fixtures/determinism.js';
+import { ambiguousDirectory, firmFallback, mockEvidence, multiState, OBSERVED_AT, ratingBoundary, reorder, reorderPeople, seeded,
+  sevenAttorneys, sharedSearchedName, shuffle } from './fixtures/determinism.js';
 
 const MOCKS = ['robust', 'minimal', 'sanctioned', 'partial'] as const;
 const SYNTHETIC: [string, (observedAt?: string) => Layer1Evidence][] = [['seven attorneys averaging exactly 8.0', sevenAttorneys],
   ['three attorneys averaging exactly 7.0', ratingBoundary], ['cross-checked and ambiguous lookups', ambiguousDirectory],
-  ['firm-wide Bar roster', firmFallback], ['two Avvo lookups for one normalised name', sharedSearchedName]];
+  ['firm-wide Bar roster', firmFallback], ['two Avvo lookups for one normalised name', sharedSearchedName],
+  ['attorneys licensed in several states', multiState]];
 const FIXTURES: [string, (observedAt?: string) => Layer1Evidence][] = [...SYNTHETIC,
   ...MOCKS.map((name): [string, (observedAt?: string) => Layer1Evidence] => [`mock ${name}`, observedAt => mockEvidence(name, observedAt)])];
 const PERMUTATIONS = 500;
