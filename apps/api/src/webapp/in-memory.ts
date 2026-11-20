@@ -6,7 +6,8 @@ import type { ActionPatch, AssessmentActionRecord, AuditActor, AuditPageQuery, A
   OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, OrgProfileRecord, PlanRecord, ProfileRecord, ProfileWrite, SubscriptionRecord, WebappRepository } from './types.js';
 
 // updatePlan can change these and nothing else; the code is the identity of the plan.
-const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active', 'stripe_product_id', 'stripe_price_id'] as const;
+const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active', 'stripe_product_id', 'stripe_price_id', 'stripe_live_product_id',
+  'stripe_live_price_id'] as const;
 // What upsertAssessmentAction and updateAction may move on an existing row: the fields a patch names, nothing else.
 const TRACKED_FIELDS = ['status', 'assignee_user_id', 'due_date', 'updated_by', 'updated_at'] as const;
 const applyPatch = <T extends OrgActionRecord>(action: T, patch: ActionPatch): T =>
@@ -217,9 +218,11 @@ export class InMemoryWebappRepository implements WebappRepository {
   async updatePlan(code: string, patch: Partial<Omit<PlanRecord, 'code'>>) {
     const plan = this.plans.get(code);
     if (!plan) throw new Error('Plan not found');
-    // Like plans.stripe_price_id unique.
-    if (patch.stripe_price_id && [...this.plans.values()].some(other => other.code !== code && other.stripe_price_id === patch.stripe_price_id)) {
-      throw new Error('Duplicate plan price');
+    // Like plans.stripe_price_id and plans.stripe_live_price_id unique.
+    for (const field of ['stripe_price_id', 'stripe_live_price_id'] as const) {
+      if (patch[field] && [...this.plans.values()].some(other => other.code !== code && other[field] === patch[field])) {
+        throw new Error('Duplicate plan price');
+      }
     }
     Object.assign(plan, Object.fromEntries(PLAN_FIELDS.filter(field => patch[field] !== undefined).map(field => [field, patch[field]])));
   }

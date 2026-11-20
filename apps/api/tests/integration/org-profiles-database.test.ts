@@ -117,13 +117,14 @@ describe('the org profiles migration over the earlier schema', () => {
       await roles(db);
       const names = await migrations();
       const index = names.findIndex((name) => name.endsWith('_org_profiles.sql'));
-      expect(index).toBe(names.length - 1);
+      expect(index).toBeGreaterThan(0);
       for (const name of names.slice(0, index)) await db.exec(await readFile(new URL(name, directory), 'utf8'));
       const [org, owner] = [randomUUID(), randomUUID()];
       await db.query("insert into public.organizations (id,name,created_by) values ($1,'Firm LLP',$2)", [org, owner]);
       await db.query(`insert into public.checkout_sessions (id,org_id,plan_code,url,status,created_by,expires_at)
         values ('cs_test_old1',$1,'monthly','https://checkout.stripe.com/c/pay/old','open',$2,$3)`, [org, owner, T0]);
-      await db.exec(await readFile(new URL(names[index]!, directory), 'utf8'));
+      // It, and every migration after it, applies over those rows.
+      for (const name of names.slice(index)) await db.exec(await readFile(new URL(name, directory), 'utf8'));
       expect((await db.query('select id, ui_mode, url, status from public.checkout_sessions')).rows)
         .toEqual([{ id: 'cs_test_old1', ui_mode: 'hosted', url: 'https://checkout.stripe.com/c/pay/old', status: 'open' }]);
       expect((await db.query('select count(*)::int as n from public.org_profiles')).rows).toEqual([{ n: 0 }]);

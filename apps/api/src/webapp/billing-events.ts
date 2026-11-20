@@ -1,6 +1,7 @@
 import type { BillingStatus } from '@arca/contracts';
 import { randomUUID } from 'node:crypto';
 import type { BillingProvider, ProviderEvent, ProviderSubscription } from './billing.js';
+import { catalogIdsOf, catalogModeOf } from './plans.js';
 import type { BillingApplyOutcome, BillingStateRecord, OrganizationRecord, WebappRepository } from './types.js';
 
 /**
@@ -240,11 +241,15 @@ export class BillingEvents {
       && org.billing_status === state.status;
   }
 
-  /** The plan of the price: its `plan_code`, or the plan that charges that price, or the only active plan of its interval. */
+  /**
+   * The plan of the price: its `plan_code`, or the plan that charges that price in the key's mode (DN-13 §20), or the only active plan
+   * of its interval.
+   */
   private async planCodeOf(subscription: ProviderSubscription): Promise<string | null> {
     const plans = await this.deps.repository.listPlans();
     if (subscription.planCode && plans.some(plan => plan.code === subscription.planCode)) return subscription.planCode;
-    const byPrice = subscription.priceId ? plans.find(plan => plan.stripe_price_id === subscription.priceId) : undefined;
+    const mode = catalogModeOf(this.deps.billing.mode);
+    const byPrice = subscription.priceId ? plans.find(plan => catalogIdsOf(plan, mode).priceId === subscription.priceId) : undefined;
     if (byPrice) return byPrice.code;
     const byInterval = plans.filter(plan => plan.active && plan.interval === subscription.interval);
     return byInterval.length === 1 ? byInterval[0]!.code : null;

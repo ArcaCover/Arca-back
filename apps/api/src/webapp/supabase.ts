@@ -17,7 +17,8 @@ const TABLES = {
     times: ['expires_at', 'accepted_at', 'revoked_at', 'created_at'] },
   org_analyses: { columns: ['org_id', 'scan_id', 'assessment_id', 'claimed_by', 'claimed_at'], times: ['claimed_at'] },
   claim_tickets: { columns: ['id_hash', 'scan_id', 'email', 'expires_at', 'used_at'], times: ['expires_at', 'used_at'] },
-  plans: { columns: ['code', 'name', 'amount_cents', 'currency', 'interval', 'active', 'stripe_product_id', 'stripe_price_id'], times: [] },
+  plans: { columns: ['code', 'name', 'amount_cents', 'currency', 'interval', 'active', 'stripe_product_id', 'stripe_price_id',
+    'stripe_live_product_id', 'stripe_live_price_id'], times: [] },
   subscriptions: { columns: ['org_id', 'plan_code', 'customer_id', 'subscription_id', 'status', 'current_period_end', 'updated_at',
     'provider_status', 'price_id', 'cancel_at_period_end', 'current_period_start', 'livemode'],
     times: ['current_period_end', 'updated_at', 'current_period_start'] },
@@ -35,7 +36,8 @@ const TABLES = {
 } as const;
 type Table = keyof typeof TABLES;
 const select = (table: Table) => TABLES[table].columns.join(',');
-const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active', 'stripe_product_id', 'stripe_price_id'] as const;
+const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active', 'stripe_product_id', 'stripe_price_id', 'stripe_live_product_id',
+  'stripe_live_price_id'] as const;
 const TRACKED_FIELDS = ['status', 'assignee_user_id', 'due_date', 'updated_by', 'updated_at'] as const;
 
 /** One row as its record: only the record's columns, timestamps as ISO with Z, seq as a number. */
@@ -217,7 +219,7 @@ export class SupabaseWebappRepository implements WebappRepository {
     try {
       found = Object.keys(fields).length > 0 ? await this.patch('plans', { code }, fields, 'update plan') : (await this.getPlan(code)) !== null;
     } catch (error) {
-      // plans_stripe_price_id_key: a catalog price belongs to one plan.
+      // plans_stripe_price_id_key, plans_stripe_live_price_id_key: a catalog price belongs to one plan.
       if ((error as Error).cause && ((error as Error).cause as PostgrestError).code === '23505') throw new Error('Duplicate plan price', { cause: error });
       throw error;
     }

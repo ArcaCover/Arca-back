@@ -1,5 +1,6 @@
 import Stripe from 'stripe';
 import { BillingUnavailable, type BillingProvider, type CustomerDetails, type ProviderCheckout, type ProviderEvent, type ProviderSubscription } from './billing.js';
+import { catalogIdsOf } from './plans.js';
 import type { PlanRecord } from './types.js';
 
 /**
@@ -228,8 +229,9 @@ export class StripeBillingProvider implements BillingProvider {
   private async openSession(input: { orgId: string; customerId: string; plan: PlanRecord; prefilled?: boolean },
     page: Pick<Stripe.Checkout.SessionCreateParams, 'ui_mode' | 'success_url' | 'cancel_url' | 'return_url'>,
     idempotencyKey: string): Promise<Stripe.Checkout.Session> {
-    const price = input.plan.stripe_price_id;
-    if (!price) throw new Error(`The plan ${input.plan.code} has no Stripe price yet: run npm run stripe:catalog`);
+    // The price of this key's mode: a test id means nothing to a live account, nor a live id to a test one (DN-13 §20).
+    const price = catalogIdsOf(input.plan, this.mode).priceId;
+    if (!price) throw new Error(`The plan ${input.plan.code} has no Stripe price yet in ${this.mode} mode: run npm run stripe:catalog`);
     const nowS = Math.floor(this.now() / 1000);
     const session = await call(() => this.stripe.checkout.sessions.create({
       mode: 'subscription', ...(page.ui_mode ? { ui_mode: page.ui_mode } : {}), customer: input.customerId, client_reference_id: input.orgId,
@@ -328,11 +330,17 @@ export class StripeBillingProvider implements BillingProvider {
       interval: input.interval });
     // A retry after the plans table failed to change finds the price the first try made.
     if (match) return { priceId: match.id, productId: idOf(match.product)! };
-    const productId = input.plan.stripe_product_id ?? (await catalogProduct(this.stripe, true))!.productId;
+    const current = catalogIdsOf(input.plan, this.mode);
+    const productId = current.productId ?? (await catalogProduct(this.stripe, true))!.productId;
     const created = await createCatalogPrice(this.stripe, { planCode: input.plan.code, productId, amountCents: input.amountCents,
-      currency: input.currency, interval: input.interval, replaces: input.plan.stripe_price_id });
-    if (input.plan.stripe_price_id && input.plan.stripe_price_id !== created.id) await retirePrice(this.stripe, input.plan.stripe_price_id);
+      currency: input.currency, interval: input.interval, replaces: current.priceId });
+    if (current.priceId && current.priceId !== created.id) await retirePrice(this.stripe, current.priceId);
     return { priceId: created.id, productId };
+  }
+
+  async priceState(priceId: string) {
+    const price = await found(() => this.stripe.prices.retrieve(priceId));
+    return price && { active: price.active, livemode: price.livemode };
   }
 
   async recentSubscriptionIds(since: Date) {

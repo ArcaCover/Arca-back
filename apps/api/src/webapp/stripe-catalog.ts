@@ -1,5 +1,6 @@
 import type Stripe from 'stripe';
 import { CATALOG_PRODUCT_ID, catalogPrice, catalogProduct, createCatalogPrice, retirePrice } from './stripe.js';
+import { catalogIdsOf, catalogPatchOf, priceColumnOf } from './plans.js';
 import type { PlanRecord, WebappRepository } from './types.js';
 
 /** A refusal of `npm run stripe:catalog` that the script prints as it is: what to set or which flag to add. */
@@ -31,7 +32,8 @@ export type CatalogReport = { productId: string; product: 'exists' | 'created' |
  * the lookup key `arca_<code>`, `plan_code` in its metadata, and the amount, currency and interval the plans table holds (the
  * seed's example prices unless an admin changed them). A price that already matches is kept; one with another amount gets a new
  * price that takes the lookup key, and the old one is archived (its subscribers keep paying it, F2). Then the plans table points
- * each plan at its price.
+ * each plan at its price, in the slot of the key's mode (DN-13 §20): stripe_product_id and stripe_price_id with a test key,
+ * stripe_live_product_id and stripe_live_price_id with a live one. The other mode's ids are never read or written.
  *
  * A dry run (the default) only reads: it says what it would create and write. It refuses a live key without `allowLive`, and
  * `apply` without the plans table, before calling Stripe. It logs ids, amounts and the mode; never a key.
@@ -55,23 +57,24 @@ export async function syncStripeCatalog(input: { stripe: Stripe; mode: 'test' | 
     const plan = (repository && await repository.getPlan(seed.code)) || seed;
     const price = { planCode: plan.code, amountCents: plan.amount_cents, currency: plan.currency, interval: plan.interval };
     const { match, holder } = await catalogPrice(stripe, price);
+    const stored = catalogIdsOf(plan, input.mode);
     let priceId: string | null = match?.id ?? null;
     let priceAction: CatalogPlanReport['price'] = match ? 'exists' : 'would_create';
     if (!match && apply) {
-      const created = await createCatalogPrice(stripe, { ...price, productId, replaces: holder?.id ?? plan.stripe_price_id });
+      const created = await createCatalogPrice(stripe, { ...price, productId, replaces: holder?.id ?? stored.priceId });
       if (holder && holder.id !== created.id) await retirePrice(stripe, holder.id);
       [priceId, priceAction] = [created.id, 'created'];
     }
-    const current = priceId !== null && plan.stripe_price_id === priceId && plan.stripe_product_id === productId;
+    const current = priceId !== null && stored.priceId === priceId && stored.productId === productId;
     let planAction: CatalogPlanReport['plan'] = current ? 'unchanged' : 'would_write';
     if (!current && apply && priceId) {
-      await repository!.updatePlan(plan.code, { stripe_price_id: priceId, stripe_product_id: productId });
+      await repository!.updatePlan(plan.code, catalogPatchOf(input.mode, { priceId, productId }));
       planAction = 'written';
     }
     plans.push({ code: plan.code, priceId, price: priceAction, amountCents: plan.amount_cents, currency: plan.currency, interval: plan.interval,
       plan: planAction });
     log(`${plan.code}: ${plan.amount_cents} ${plan.currency}/${plan.interval}, price ${priceId ?? '(new)'} ${priceAction}; `
-      + `plans.${plan.code}.stripe_price_id ${planAction}`);
+      + `plans.${plan.code}.${priceColumnOf(input.mode)} ${planAction}`);
   }
   return { productId, product, plans };
 }

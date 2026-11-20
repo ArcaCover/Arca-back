@@ -12,6 +12,7 @@ import type { AppUser } from './auth.js';
 import { AuthAdminUnavailable, type AuthAdmin } from './auth-admin.js';
 import { BillingUnavailable, type BillingEvent, type BillingProvider, type CustomerDetails } from './billing.js';
 import { BillingEvents, type ReconcileReport, type WebhookOutcome } from './billing-events.js';
+import { catalogIdsOf, catalogModeOf, catalogPatchOf } from './plans.js';
 import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict, type ActionPatch, type AuditActor, type AuditRecord,
   type BillingApplyOutcome, type CheckoutSessionRecord, type CheckoutUiMode, type CustomActionRecord,
   type DeletionRequestRecord, type InvitationRecord, type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord, type OrgProfileRecord,
@@ -513,7 +514,8 @@ export class WebappService {
       if (hasPaidAccess(current.billing_status)) throw fail('conflict', ALREADY_PAID);
       const plan = await this.repo.getPlan(planCode);
       if (!plan?.active) throw fail('invalid_request', 'Unknown or inactive plan');
-      if (this.deps.billing.needsCatalogPrice && !plan.stripe_price_id) {
+      // The price of the key's mode (DN-13 §20): a live key does not sell a plan that only has a test price.
+      if (this.deps.billing.needsCatalogPrice && !catalogIdsOf(plan, catalogModeOf(this.deps.billing.mode)).priceId) {
         throw fail('conflict', 'This plan cannot be bought yet: it has no Stripe price (npm run stripe:catalog)');
       }
       const at = this.timestamp();
@@ -882,9 +884,9 @@ export class WebappService {
       interval: patch.interval ?? before.interval };
     const repriced = price.amountCents !== before.amount_cents || price.currency !== before.currency || price.interval !== before.interval;
     const catalog = repriced ? await orUnavailable(this.deps.billing.createPrice({ plan: before, ...price })) : null;
-    // A field left undefined is not changed.
+    // A field left undefined is not changed. The new price is written in the slot of the key's mode; the other mode's stays (DN-13 §20).
     await this.repo.updatePlan(code, { name: patch.name, amount_cents: patch.amountCents, currency: patch.currency, interval: patch.interval,
-      active: patch.active, stripe_price_id: catalog?.priceId, stripe_product_id: catalog?.productId });
+      active: patch.active, ...catalogPatchOf(catalogModeOf(this.deps.billing.mode), { priceId: catalog?.priceId, productId: catalog?.productId }) });
     const after = (await this.repo.getPlan(code))!;
     await this.audit(admin.userId, null, 'plan.updated', code, { before, after }, 'platform');
     return planView(after);

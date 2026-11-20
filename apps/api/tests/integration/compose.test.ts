@@ -24,6 +24,7 @@ import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 import { REAL_WEBAPP_ADAPTERS } from '../../src/webapp/real-adapters.js';
 import type { PlanRecord } from '../../src/webapp/types.js';
 import { StripeBillingProvider } from '../../src/webapp/stripe.js';
+import { fakeStripe } from '../fixtures/stripe.js';
 
 // Observed, not replaced: compose still builds the real app and tools.
 vi.mock('../../src/http/app.js', async importOriginal => {
@@ -222,8 +223,9 @@ describe('compose: the webapp providers', () => {
       .setSubject(USER_ID).setIssuedAt().setExpirationTime('1h').sign(privateKey);
     return { state, fetchJwks, accessToken };
   }
-  // The plans as stripe:catalog leaves them: each with its catalog price (DN-13 §6.1).
-  const PRICED_PLANS = DEFAULT_PLANS.map(plan => ({ ...plan, stripe_product_id: 'arca', stripe_price_id: `price_${plan.code}` }));
+  // The plans as stripe:catalog leaves them in both modes (DN-13 §20): the test ids of development and the live ids of production.
+  const PRICED_PLANS = DEFAULT_PLANS.map(plan => ({ ...plan, stripe_product_id: 'arca', stripe_price_id: `price_${plan.code}`,
+    stripe_live_product_id: 'arca', stripe_live_price_id: `price_live_${plan.code}` }));
   function adapters(project: { fetchJwks: (url: URL) => Promise<unknown> }, plans: PlanRecord[] = PRICED_PLANS) {
     const repository = new InMemoryWebappRepository(plans);
     const billing = new MockBillingProvider('https://arcacover.com');
@@ -433,17 +435,78 @@ describe('compose: the webapp providers', () => {
     expect([provider.mode, provider.webhooks, provider.needsCatalogPrice]).toEqual(['test', true, true]);
   });
 
-  it('refuses production while an active plan has no Stripe price, and only warns in live-debug (DN-13 §5.3)', async () => {
+  it('refuses production while an active plan has no price in the mode of its key, and only warns in live-debug (DN-13 §5.3, §20)', async () => {
     const project = await supabaseProject();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    await expect(compose(loadEnv(launch), undefined, adapters(project, [...DEFAULT_PLANS]).seam)).rejects.toThrow(/monthly, annual.*stripe:catalog/);
-    const composed = await compose(loadEnv(realLiveDebug), undefined, adapters(project, [...DEFAULT_PLANS]).seam);
-    expect(warn.mock.calls.flat().join(' ')).toMatch(/\[billing\] the active plans monthly, annual have no stripe_price_id/);
+    await expect(compose(loadEnv(launch), undefined, adapters(project, [...DEFAULT_PLANS]).seam))
+      .rejects.toThrow(/monthly has no live price \(plans\.stripe_live_price_id\).*annual has no live price.*npm run stripe:catalog -- --apply/);
+    // Test ids do not sell with a live key, nor live ids with a test key.
+    const testOnly = PRICED_PLANS.map(plan => ({ ...plan, stripe_live_product_id: null, stripe_live_price_id: null }));
+    await expect(compose(loadEnv(launch), undefined, adapters(project, testOnly).seam)).rejects.toThrow(/monthly has no live price/);
+    const liveOnly = PRICED_PLANS.map(plan => ({ ...plan, stripe_product_id: null, stripe_price_id: null }));
+    const composed = await compose(loadEnv(realLiveDebug), undefined, adapters(project, liveOnly).seam);
+    expect(warn.mock.calls.flat().join(' ')).toMatch(/\[billing\] .*monthly has no test price \(plans\.stripe_price_id\).*annual has no test price/);
     // A plan taken off sale needs none.
     await expect(compose(loadEnv(launch), undefined, adapters(project, [PRICED_PLANS[0]!, { ...DEFAULT_PLANS[1]!, active: false }]).seam))
       .resolves.toBeDefined();
     expect(composed.reconcileBilling).toEqual(expect.any(Function));
     warn.mockRestore();
+  });
+
+  describe('the catalog prices, checked at Stripe at start (DN-13 §20)', () => {
+    /** The real provider over a fake Stripe of the key's mode, holding the plans' prices of that mode. */
+    function stripeSeam(project: { fetchJwks: (url: URL) => Promise<unknown> }, mode: 'test' | 'live') {
+      const stripe = fakeStripe({ livemode: mode === 'live' });
+      stripe.addProduct();
+      for (const plan of PRICED_PLANS) {
+        stripe.addPrice({ id: mode === 'live' ? plan.stripe_live_price_id : plan.stripe_price_id, lookupKey: `arca_${plan.code}`,
+          amount: plan.amount_cents, interval: plan.interval, planCode: plan.code });
+      }
+      const { seam } = adapters(project);
+      return { stripe, seam: { ...seam, billing: (config: ConstructorParameters<typeof StripeBillingProvider>[0]) =>
+        new StripeBillingProvider(config, { fetch: stripe.fetch, maxNetworkRetries: 0 }) } };
+    }
+    const priceReads = (stripe: ReturnType<typeof fakeStripe>) => stripe.calls.filter(call => call.method === 'GET' && call.path.startsWith('/v1/prices/'))
+      .map(call => call.path).sort();
+
+    it('starts production when the live price of every active plan exists, is active and is live, reading each one once', async () => {
+      const project = await supabaseProject();
+      const { stripe, seam } = stripeSeam(project, 'live');
+      await expect(compose(loadEnv(launch), undefined, seam)).resolves.toBeDefined();
+      expect(priceReads(stripe)).toEqual(['/v1/prices/price_live_annual', '/v1/prices/price_live_monthly']);
+      expect(stripe.writes()).toEqual([]);
+    });
+
+    it('refuses production with a price Stripe does not know, an archived one, or one of the other mode, naming the plan', async () => {
+      const project = await supabaseProject();
+      const missing = stripeSeam(project, 'live');
+      missing.stripe.prices.delete('price_live_monthly');
+      await expect(compose(loadEnv(launch), undefined, missing.seam))
+        .rejects.toThrow(/monthly: its live price price_live_monthly does not exist in this Stripe account.*npm run stripe:catalog -- --apply/);
+      const archived = stripeSeam(project, 'live');
+      archived.stripe.prices.get('price_live_annual')!.active = false;
+      await expect(compose(loadEnv(launch), undefined, archived.seam)).rejects.toThrow(/annual: its live price price_live_annual is archived/);
+      const otherMode = stripeSeam(project, 'live');
+      otherMode.stripe.prices.get('price_live_monthly')!.livemode = false;
+      await expect(compose(loadEnv(launch), undefined, otherMode.seam)).rejects.toThrow(/monthly: its live price price_live_monthly is a test price/);
+    });
+
+    it('refuses production while Stripe cannot be asked; live-debug warns and starts in every case', async () => {
+      const project = await supabaseProject();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const down = stripeSeam(project, 'live');
+      down.stripe.failNext(call => call.path === '/v1/prices/price_live_monthly');
+      await expect(compose(loadEnv(launch), undefined, down.seam)).rejects.toThrow(/monthly: Stripe could not be asked for its live price price_live_monthly/);
+      const debug = stripeSeam(project, 'test');
+      debug.stripe.prices.get('price_annual')!.active = false;
+      debug.stripe.failNext(call => call.path === '/v1/prices/price_monthly');
+      const composed = await compose(loadEnv(realLiveDebug), undefined, debug.seam);
+      expect(composed.reconcileBilling).toEqual(expect.any(Function));
+      const warned = warn.mock.calls.flat().join(' ');
+      expect(warned).toMatch(/\[billing\] .*monthly: Stripe could not be asked.*annual: its test price price_annual is archived/);
+      expect(warned).not.toMatch(/(sk|rk)_(test|live)_/);
+      warn.mockRestore();
+    });
   });
 
   it('serves POST /billing/webhook only with a provider that signs webhooks: the simulated webapp keeps the 501', async () => {

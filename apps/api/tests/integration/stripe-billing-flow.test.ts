@@ -7,6 +7,7 @@ import { MockAppAuth } from '../../src/webapp/auth.js';
 import { billingStatusFor } from '../../src/webapp/billing-events.js';
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
+import type { PlanRecord } from '../../src/webapp/types.js';
 import { webappRoutes } from '../../src/webapp/routes.js';
 import { WebappService } from '../../src/webapp/service.js';
 import { StripeBillingProvider } from '../../src/webapp/stripe.js';
@@ -21,15 +22,21 @@ const T0 = Date.UTC(2026, 10, 20, 12);
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 
-async function scene(options: { mode?: 'test' | 'live' } = {}) {
+async function scene(options: { mode?: 'test' | 'live'; untaggedPrices?: boolean; plans?: PlanRecord[] } = {}) {
   let clock = T0;
   const now = () => clock;
-  const stripe = fakeStripe({ now, livemode: options.mode === 'live' });
+  const live = options.mode === 'live';
+  const stripe = fakeStripe({ now, livemode: live });
   stripe.addProduct();
-  const monthly = stripe.addPrice({ lookupKey: 'arca_monthly', amount: 49_900, interval: 'month', planCode: 'monthly' });
-  const annual = stripe.addPrice({ lookupKey: 'arca_annual', amount: 499_000, interval: 'year', planCode: 'annual' });
-  const repository = new InMemoryWebappRepository(DEFAULT_PLANS.map(plan => ({ ...plan, stripe_product_id: 'arca',
-    stripe_price_id: plan.code === 'monthly' ? monthly.id : annual.id })));
+  // untaggedPrices: prices without plan_code in their metadata, so a subscription's plan is found by its price id.
+  const tag = (planCode: string) => options.untaggedPrices ? undefined : planCode;
+  const monthly = stripe.addPrice({ lookupKey: 'arca_monthly', amount: 49_900, interval: 'month', planCode: tag('monthly') });
+  const annual = stripe.addPrice({ lookupKey: 'arca_annual', amount: 499_000, interval: 'year', planCode: tag('annual') });
+  // The catalog of the key's mode is this Stripe's; the other mode's slot holds ids it does not know (DN-13 §20).
+  const priceOf = (code: string) => code === 'monthly' ? monthly.id : code === 'annual' ? annual.id : null;
+  const repository = new InMemoryWebappRepository([...DEFAULT_PLANS, ...options.plans ?? []].map(plan => live
+    ? { ...plan, stripe_product_id: 'arca', stripe_price_id: `price_1Test${plan.code}`, stripe_live_product_id: 'arca', stripe_live_price_id: priceOf(plan.code) }
+    : { ...plan, stripe_product_id: 'arca', stripe_price_id: priceOf(plan.code) }));
   const scans = new InMemoryRepository();
   const billing = new StripeBillingProvider({ secretKey: options.mode === 'live' ? 'rk_live_fixture' : 'rk_test_fixture', webhookSecret: WEBHOOK_SECRET,
     mode: options.mode ?? 'test', appBaseUrl: APP }, { fetch: stripe.fetch, now, maxNetworkRetries: 0 });
@@ -462,5 +469,49 @@ describe('prices and deletions at Stripe (DN-13 §6.1, §6.9)', () => {
     expect(s.stripe.subscriptions.get(paid.subscription.id)!.status).toBe('canceled');
     await s.deliver(s.stripe.event('customer.subscription.deleted', s.stripe.subscriptions.get(paid.subscription.id)));
     expect((await s.repository.getOrganization(paid.org.id))).toMatchObject({ billing_status: 'canceled', deleted_at: expect.any(String) });
+  });
+});
+
+describe('the catalog of the mode of the key (DN-13 §20)', () => {
+  async function admin(s: Awaited<ReturnType<typeof scene>>) {
+    const session = await new MockAppAuth(secret, s.now).issue('ops@arca.example');
+    await s.repository.grantPlatformAdmin(session.user.userId, null);
+    return session;
+  }
+
+  it('with a live key charges the live price, and a plan with only a test price cannot be bought', async () => {
+    const s = await scene({ mode: 'live' });
+    const o = await s.owner();
+    const { sessionId } = await s.checkout(o.token, o.org.id);
+    expect(sessionId).toMatch(/^cs_live_/);
+    const created = s.stripe.calls.find(call => call.path === '/v1/checkout/sessions' && call.form.client_reference_id === o.org.id)!;
+    expect(created.form.line_items).toEqual({ 0: { price: s.monthly.id, quantity: '1' } });
+    const other = await s.owner('second@firm.com');
+    await s.repository.updatePlan('annual', { stripe_live_price_id: null });
+    expect(await s.call('POST', `/orgs/${other.org.id}/billing/checkout`, { token: other.token, body: { planCode: 'annual' } }))
+      .toMatchObject({ status: 409, body: { error: 'conflict' } });
+  });
+
+  it('with a live key a new price from /admin moves the live price and leaves the test one', async () => {
+    const s = await scene({ mode: 'live' });
+    const ops = await admin(s);
+    expect(await s.call('PUT', '/admin/plans/monthly', { token: ops.token, body: { amountCents: 59_900 } })).toMatchObject({ status: 200 });
+    const plan = (await s.repository.getPlan('monthly'))!;
+    expect(plan.stripe_price_id).toBe('price_1Testmonthly');
+    expect(plan.stripe_live_price_id).not.toBe(s.monthly.id);
+    expect(s.stripe.prices.get(plan.stripe_live_price_id!)).toMatchObject({ unit_amount: 59_900, livemode: true, active: true });
+  });
+
+  it('finds the plan of a subscription by the price of its own mode when the price names no plan', async () => {
+    // Two monthly plans, so the interval alone cannot tell them apart.
+    const extra: PlanRecord = { code: 'monthly_team', name: 'Team', amount_cents: 99_900, currency: 'usd', interval: 'month', active: true,
+      stripe_product_id: null, stripe_price_id: null, stripe_live_product_id: null, stripe_live_price_id: null };
+    for (const mode of ['test', 'live'] as const) {
+      const s = await scene({ mode, untaggedPrices: true, plans: [extra] });
+      s.stripe.addPrice({ id: 'price_1Teammonthly', amount: 99_900, interval: 'month' });
+      await s.repository.updatePlan('monthly_team', mode === 'live' ? { stripe_live_price_id: 'price_1Teammonthly' } : { stripe_price_id: 'price_1Teammonthly' });
+      const paid = await s.paidOrg();
+      expect((await s.repository.getSubscription(paid.org.id))?.plan_code, mode).toBe('monthly');
+    }
   });
 });

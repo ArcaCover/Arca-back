@@ -21,11 +21,11 @@ import { createOpenAIPlanner } from '@arca/questions';
 import { renderPdf } from './report/pdf.js';
 import { MockAppAuth, SupabaseJwtAuth, mockUserIdFor } from './webapp/auth.js';
 import { InMemoryAuthAdmin } from './webapp/auth-admin.js';
-import { MockBillingProvider } from './webapp/billing.js';
+import { MockBillingProvider, type BillingProvider } from './webapp/billing.js';
 import { InMemoryWebappRepository } from './webapp/in-memory.js';
 import { MailingWebappService } from './webapp/invitation-email.js';
 import { MemoryMailer, ResendMailer, SesMailer } from './webapp/mailer.js';
-import { DEFAULT_PLANS } from './webapp/plans.js';
+import { DEFAULT_PLANS, catalogIdsOf, priceColumnOf } from './webapp/plans.js';
 import { REAL_WEBAPP_ADAPTERS, type RealWebappAdapters, type StorageClient } from './webapp/real-adapters.js';
 import type { ReconcileReport } from './webapp/billing-events.js';
 import type { WebappRepository } from './webapp/types.js';
@@ -73,7 +73,7 @@ async function realWebapp(env: ReturnType<typeof loadEnv>, adapters: RealWebappA
   // One service-role client for the data and the Auth admin API.
   const client = deps.client();
   const repository = adapters.repository!(client);
-  await requireCatalogPrices(env, repository);
+  await requireCatalogPrices(env, repository, billing);
   const service = new MailingWebappService({ repository, authAdmin: adapters.authAdmin!(client), scans: deps.scans,
     assessments: deps.assessments, billing, sessionSecret: env.SESSION_TOKEN_SECRET, appBaseUrl: env.APP_BASE_URL,
     isDurableScan: deps.isDurableScan }, { mailer, from: env.emailFrom });
@@ -81,16 +81,35 @@ async function realWebapp(env: ReturnType<typeof loadEnv>, adapters: RealWebappA
 }
 
 /**
- * Every active plan must charge a catalog price (DN-13 §5.3): production with the webapp on refuses to start without one, rather than
- * answer 409 to the first customer; live-debug says so and starts, so the rest of the webapp can be tried before the catalog exists.
+ * Every active plan must charge a catalog price of the key's mode (DN-13 §5.3, §20), and Stripe must hold it: the price exists in the
+ * account of the key, is active, and its livemode is the key's. One read per plan at start. Production with the webapp on refuses to
+ * start otherwise (also when Stripe cannot be asked), rather than fail the first customer's checkout; live-debug says so and starts,
+ * so the rest of the webapp can be tried before the catalog exists. A provider that charges no catalog price (the simulated one) is
+ * asked nothing, but the ids must still be there.
  */
-async function requireCatalogPrices(env: ReturnType<typeof loadEnv>, repository: WebappRepository) {
-  const unpriced = (await repository.listPlans()).filter(plan => plan.active && !plan.stripe_price_id).map(plan => plan.code);
-  if (!unpriced.length) return;
-  const message = `the active plans ${unpriced.join(', ')} have no stripe_price_id: run npm run stripe:catalog (then --apply) against this `
-    + 'database and its Stripe account';
+async function requireCatalogPrices(env: ReturnType<typeof loadEnv>, repository: WebappRepository, billing: BillingProvider) {
+  const mode = env.stripeMode!;
+  const problems = await Promise.all((await repository.listPlans()).filter(plan => plan.active).map(async plan => {
+    const { priceId } = catalogIdsOf(plan, mode);
+    if (!priceId) return `${plan.code} has no ${mode} price (plans.${priceColumnOf(mode)})`;
+    if (!billing.needsCatalogPrice) return null;
+    let state: Awaited<ReturnType<BillingProvider['priceState']>>;
+    try {
+      state = await billing.priceState(priceId);
+    } catch (error) {
+      return `${plan.code}: Stripe could not be asked for its ${mode} price ${priceId} (${error instanceof Error ? error.name : 'unknown error'})`;
+    }
+    if (!state) return `${plan.code}: its ${mode} price ${priceId} does not exist in this Stripe account`;
+    if (state.livemode !== (mode === 'live')) return `${plan.code}: its ${mode} price ${priceId} is a ${state.livemode ? 'live' : 'test'} price`;
+    if (!state.active) return `${plan.code}: its ${mode} price ${priceId} is archived`;
+    return null;
+  }));
+  const found = problems.filter((problem): problem is string => problem !== null);
+  if (!found.length) return;
+  const message = `the Stripe catalog of this ${mode} key is not ready: ${found.join('; ')}. Run npm run stripe:catalog (a dry run), then `
+    + `npm run stripe:catalog -- --apply${mode === 'live' ? ' --allow-live' : ''}, against this database with this key`;
   if (env.mode === 'production') throw new Error(`The real webapp cannot start: ${message}`);
-  console.warn(`[billing] ${message}; until then their checkout answers 409`);
+  console.warn(`[billing] ${message}; until then those plans cannot be bought`);
 }
 
 /** A scan still RUNNING past this point outlived its pipeline budget: a restart cut it short. */
