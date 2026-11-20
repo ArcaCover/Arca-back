@@ -1905,12 +1905,12 @@ transacción que comprueba los ids y emails antes de borrar y apaga las guardas 
 script de Stripe en ensayo por defecto (`--apply` cancela, borra el cliente y el test clock; `--catalog` archiva además el catálogo y
 desactiva el portal).
 
-## 19. Pre-checkout con Checkout incrustado (2026-11-21)
+## 19. Pre-checkout con Checkout incrustado (2026-11-20)
 
 Diseño aprobado por el usuario (maqueta de cinco pasos): antes de pagar, la persona dice quién es y qué despacho paga, verifica su
 email con el código y paga dentro de la página de ARCA, con Stripe ya relleno con lo que dio. Rama `feat/real-accounts` en los dos
-repos. Producción sigue en 501 (`WEBAPP_ENABLED=false`). **La migración nueva no está aplicada a ninguna base**: la aplica el
-coordinador tras revisarla (el usuario autorizó aplicar las migraciones de DN-13 al proyecto compartido).
+repos. Producción sigue en 501 (`WEBAPP_ENABLED=false`). La migración nueva la aplicó el coordinador al proyecto compartido tras
+revisarla (el usuario autorizó aplicar las migraciones de DN-13); con ella se hizo el recorrido real de §19.9.
 
 ### 19.1 Flujo
 
@@ -1970,7 +1970,12 @@ Aditiva, sin tocar ninguna tabla de scans:
 - **Cliente relleno**: `name` = razón social, `email` = el de quien paga, `phone`, `address` (país `US`) y el EIN con `tax_id_data`
   `us_ein`. Si la organización ya tenía cliente (un intento anterior), `updateCustomer` lo pone al día antes de la sesión: actualiza
   los campos, lee sus tax ids, quita un `us_ein` distinto y crea el que falte (clave `tax_id:<cliente>:us_ein:<ein>`). Sin perfil, el
-  cliente de siempre (nombre de la organización y email). Lo comprobado en el iframe real es parte del recorrido pendiente (§19.8).
+  cliente de siempre (nombre de la organización y email).
+- **Dirección: no se pide dos veces.** Con un cliente hecho desde el perfil, la sesión va con `billing_address_collection: 'auto'`:
+  Stripe usa la dirección del cliente y pide solo lo que la tarjeta necesita (titular, país y ZIP). Sin perfil sigue en `'required'`
+  (§6.2). Lo decide `prefilled` en `createCheckout`/`createEmbeddedCheckout`.
+- **Sin Link**: `wallet_options: { link: { display: 'never' } }` en toda sesión. Link ofrecía su pago por banco al lado de la tarjeta,
+  y la regla es solo tarjeta (§6.2, F5).
 - `tax_id_collection` sigue apagado (F3): el EIN va al cliente porque el despacho lo dio, no porque Checkout lo pida.
 
 ### 19.5 Contratos (sin publicar, salen con 0.5.0)
@@ -1991,6 +1996,12 @@ El front las copia en `lib/app/checkout-contract.ts` hasta 0.5.0.
 2. `checkout_sessions` cambia (columna nueva y `url` nulo): hacía falta para la regla de una sesión abierta con dos tipos.
 3. El perfil no entra en la auditoría (`org.created` sigue con nombre y scan): la leen todos los owners y admins.
 4. El remitente que nombra la pantalla del código (`no-reply@arcacover.com`, §4.9) solo es cierto con el SMTP propio (F11).
+5. `billing_address_collection` pasa a `'auto'` cuando el cliente tiene la dirección del perfil (§6.2 decía `'required'` siempre), y
+   Link se apaga en todas las sesiones. Los dos salieron del recorrido real (§19.9).
+6. **Stripe no rellena el titular ni el ZIP desde el cliente.** Checkout solo rellena (y bloquea) el email del Customer; el nombre y
+   la dirección de facturación solo los rellena desde una tarjeta guardada. Lo que el perfil ya da no se pide (la dirección), pero
+   el titular de la tarjeta y el ZIP los pide Stripe para verificar la tarjeta. Rellenarlos exigiría `ui_mode: 'elements'` (Checkout
+   con Elements, valores por defecto propios): queda como opción para el founder.
 
 ### 19.7 Pruebas
 
@@ -2010,9 +2021,51 @@ falla (87 ficheros, 2 saltados).
 
 ### 19.8 Pendiente
 
-- **Aplicar `20261121000000_org_profiles.sql`** al proyecto compartido (el coordinador), y después **el recorrido real en modo
-  test**: scan simulado → resultados → pasos 1–3 → `enroll` → código del admin de Auth (`generateLink`, sin correo) → `POST /orgs`
-  con perfil → Checkout incrustado relleno (nombre, email, dirección en el iframe) → 4242 → webhook → `/app` activo. Hasta entonces el
-  back real no puede leer `checkout_sessions` (pide `ui_mode`).
-- Confirmar que la clave restringida `rk_test_` tiene escritura en los tax ids de Customers.
+- ~~Aplicar la migración y el recorrido real~~: hechos (§19.9). La clave `rk_test_` escribe tax ids (lo comprobó el coordinador).
+- Decidir si Checkout con Elements compensa para rellenar también el titular y el ZIP (§19.6, punto 6).
+- El nombre comercial de la cuenta de Stripe de test sale en el texto legal del formulario ("Entorno de prueba de Arca", en
+  español): se cambia en el panel de Stripe (Settings → Business), no en el código.
 - Publicar 0.5.0 (T18) con estas exportaciones.
+
+### 19.9 Recorrido real en modo test (2026-11-20)
+
+Con la migración aplicada. Back de scratch (no versionado) en `127.0.0.1:8090`: `compose()` en `live-debug`, `WEBAPP_PROVIDERS=real`,
+el repositorio, la auth JWT y el admin de Supabase del proyecto compartido, el `StripeBillingProvider` con la clave `rk_test_`, correo en
+memoria y **fuentes de scan simuladas** (sin Apify ni OpenAI). `stripe listen` (CLI 1.55.8, clave por `STRIPE_API_KEY`, nunca impresa)
+reenviando los eventos de §18.8 a ese puerto; su `whsec_` pasó al proceso sin imprimirse. Front con `next dev --webpack` en
+`localhost:3010`, `live-debug` y `NEXT_PUBLIC_WEBAPP_ENABLED=true`. Playwright sin cabeza; la petición del front a `/auth/v1/otp` se
+respondió en el propio script (**ningún correo enviado**) y el código salió de `auth.admin.generateLink`. Todos los logs pasan por un
+redactor (`sk_/rk_/pk_`, `whsec_`, `acct_`, `sb_secret_`, JWT).
+
+| Paso | Resultado |
+|---|---|
+| `/quote` → scan simulado de `robust.arca.example` → assessment (auto-respuesta del panel) → resultados | **Bien.** Tarjeta "Keep E2E…'s results" con 71 / FORTIFIED, 4 pasos y el precio de la API |
+| "Activate your account" → pasos 1–3 | **Bien.** Email bloqueado al del scan; perfil completo; plan Monthly |
+| Paso 4: `POST /auth/enroll` real, código del admin de Auth en las seis casillas | **Bien.** Sesión de Supabase; `POST /orgs` con el perfil → 201 |
+| Paso 5: Checkout incrustado | **Primera vez mal** (abajo); tras el arreglo, bien: email del cliente relleno y bloqueado, sin dirección, solo tarjeta |
+| Cliente de Stripe | **Bien.** Razón social, email, teléfono, dirección (100 Main St, Miami, FL 33101, US) y `us_ein 12-3456789` |
+| Pago con 4242 | **Bien.** Stripe vuelve a `/app/billing/return?session_id=cs_test_…`, `sync` → `active`, `/app?paid=1` ("Payment received. Your organization is active.") |
+| Webhooks | `checkout.session.completed`, `customer.subscription.created`, `invoice.paid` procesados sin error (más el `checkout.sync`) |
+| Base | `organizations.billing_status = active`; `org_profiles` con todo el perfil; `subscriptions` activa; `checkout_sessions` `embedded`, `url` nulo, `complete`; auditoría `org.created`, `billing.checkout_started`, `billing.event_applied` ×4, `billing.invoice_paid` |
+| Abandono y reanudación (móvil, 390×844) | **Bien.** Con el Checkout abierto en el paso 5 se va a `/app` → el paywall lleva a `/app/billing` → "Pay with Monthly" abre **la misma sesión** (mismo `cs_test_…`, el secreto se volvió a leer en Stripe) → 4242 → `/app` activo |
+| Fuera de la máquina | Solo el proyecto de Supabase y los dominios de Stripe; ningún host bloqueado, ningún error de página |
+
+**Lo que se rompió y su arreglo** (commit `4fc2040`, con los tests primero): (1) Checkout pedía la dirección de facturación entera,
+que el cliente ya tenía, y no dejaba pagar sin ella; (2) ofrecía Link y su pago por banco ("Bank — $5 back") junto a la tarjeta. Ahora
+`billing_address_collection: 'auto'` con perfil y `wallet_options.link.display: 'never'` (§19.4). Tras el arreglo, los campos visibles
+del formulario son número, caducidad, CVC, titular, país y ZIP.
+
+**Pruebas:** `npm run typecheck` limpio; `npm test` 1658 pasan, 54 se saltan, 1 falla por tiempo (`infra/aws`, sola pasa 7 de 7).
+
+**Datos creados** (se conservan para la demo; la lista completa con su nota, en el scratch del recorrido, `created.tsv`):
+
+- Supabase: organizaciones `fb72f0c4-2e4e-44c1-90a5-b66237ca56ed` y `3cf4824c-e39c-42fe-a39c-266c70343e00` (pagadas, con perfil) y
+  `a309b508-7678-4b33-903b-e652b0ae5c8e` y `916b4755-b88d-47b6-8cdf-8967b52d9026` (dos intentos cortados por el fallo, `pending_payment`);
+  usuarios de Auth `80f067cb-9396-4569-a85a-f9d1dbd66375`, `a2fb3ba0-b9c9-4b94-b06d-538d9c45a58d`, `789867dc-a6cd-4917-9cd9-ffa296f4af1a`
+  y `ab5104d5-70ab-422b-99c8-99fba048d814` (`e2e-1795190378086`, `…455708`, `…811171` y `…912801@arca.example`); scans
+  `sc_e7e12a5958b84d6f902c5bc4324f48ea`, `sc_5ab466b5132a4f088270c5fedc1240ef`, `sc_e309ce2c22764337a875af4a3d03e087` y
+  `sc_8ca9e74fa93e4e3ab2164b6b8c069629`, con sus assessments, perfiles, membresías, `org_profiles`, `claim_tickets`, `billing_customers`,
+  `checkout_sessions`, `subscriptions`, auditoría y 8 filas de `stripe_events`.
+- Stripe (test): clientes `cus_VfEiY9xU9G0JR9`, `cus_VfEjKmYd1kdRjz`, `cus_VfEpAGaKouF2T5` y `cus_VfEqLeQUb06Y0g` (los cuatro con
+  `us_ein`); suscripciones `sub_1UduLeEw83ixrW1L5oRinyBM` y `sub_1UduNUEw83ixrW1LF2TG39GG` (activas, renuevan el 2026-12-20); sesiones
+  `cs_test_a0KJ8ijs…` y `cs_test_a0RoXkzG…` (pagadas) y `cs_test_a0cyCIgr…` y `cs_test_a0Av2ear…` (abiertas, vencen a la hora).
