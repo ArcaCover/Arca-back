@@ -228,6 +228,13 @@ export const EnrollRequest = z.union([
   z.object({ invitationToken: bearerSecret }).strict(),
 ]);
 export const EnrollResponse = z.object({ email: z.string().email() }).strict();
+// GET /orgs/:id/billing (DN-13 §7.2): what every member sees of the organization's subscription (DN-11 D10). The plan and the period
+// are the ones the last applied Stripe state named; `manageable` says whether this member's role opens checkout and the portal.
+export const BillingView = z.object({
+  billingStatus, plan: PlanView.nullable(), currentPeriodEnd: timestamp.nullable(), cancelAtPeriodEnd: z.boolean(), manageable: z.boolean(),
+}).strict();
+// POST /orgs/:id/billing/sync (DN-13 §6.3): the Checkout Session id Stripe put in the return URL. The answer is the OrgView.
+export const BillingSyncRequest = z.object({ sessionId: z.string().regex(/^cs_(test|live)_[A-Za-z0-9]{1,255}$/) }).strict();
 export const CreateActionRequest = z.object({
   title: z.string().trim().min(1).max(200),
   detail: z.string().trim().max(2000).transform(detail => detail === '' ? null : detail).nullable().optional(),
@@ -267,3 +274,5 @@ export type UpdateActionRequest = z.infer<typeof UpdateActionRequest>;
 export type CreateActionRequest = z.infer<typeof CreateActionRequest>;
 export type EnrollRequest = z.infer<typeof EnrollRequest>;
 export type EnrollResponse = z.infer<typeof EnrollResponse>;
+export type BillingView = z.infer<typeof BillingView>;
+export type BillingSyncRequest = z.infer<typeof BillingSyncRequest>;

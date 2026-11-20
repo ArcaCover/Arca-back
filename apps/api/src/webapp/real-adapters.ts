@@ -4,6 +4,7 @@ import { SupabaseAuthAdmin, type AuthAdmin } from './auth-admin.js';
 import type { BillingProvider } from './billing.js';
 import type { SesSendEmail } from './mailer.js';
 import type { WebappRepository } from './types.js';
+import { StripeBillingProvider } from './stripe.js';
 import { SupabaseWebappRepository } from './supabase.js';
 
 export type StorageClient = ReturnType<typeof createStorageClient>;
@@ -27,10 +28,12 @@ export type RealWebappAdapters = {
 };
 
 /**
- * What ships today: the Supabase repository (T4) and the Auth admin (T7). The billing provider arrives with T14, so the real webapp
- * still refuses to start.
+ * What ships today: the Supabase repository (T4), the Auth admin (T7) and the Stripe provider (T14). The SES sender is still
+ * missing, so production with WEBAPP_ENABLED=true and EMAIL_PROVIDER=ses refuses to start; live-debug with WEBAPP_PROVIDERS=real
+ * (memory email by default) starts.
  */
 export const REAL_WEBAPP_ADAPTERS: Readonly<RealWebappAdapters> = Object.freeze({
   repository: client => new SupabaseWebappRepository(client),
   authAdmin: client => new SupabaseAuthAdmin(client),
+  billing: config => new StripeBillingProvider(config),
 });

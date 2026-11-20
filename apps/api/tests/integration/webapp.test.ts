@@ -179,8 +179,10 @@ const orgRoutes = ({ orgId, memberId, invitationId, actionKey }: OrgIds): Array<
   ['DELETE', `/orgs/${orgId}/invitations/${invitationId}`],
   ['PATCH', `/orgs/${orgId}/members/${memberId}`, { role: 'viewer' }],
   ['DELETE', `/orgs/${orgId}/members/${memberId}`],
+  ['GET', `/orgs/${orgId}/billing`],
   ['POST', `/orgs/${orgId}/billing/checkout`, { planCode: 'monthly' }],
   ['POST', `/orgs/${orgId}/billing/portal`],
+  ['POST', `/orgs/${orgId}/billing/sync`, { sessionId: 'cs_test_notthisorgs1' }],
   ['POST', `/orgs/${orgId}/deletion-request`, { reason: 'Closing the firm' }],
   ['GET', `/orgs/${orgId}/actions`],
   ['POST', `/orgs/${orgId}/actions`, { title: 'Name an AI lead' }],
@@ -369,8 +371,11 @@ describe('the webapp API in mock', () => {
     const { owner, org } = await s.ownedOrg(OWNER, { paid: false });
     // Paying is how an organization gets in, and asking for its deletion needs no payment either (DN-10 §4.4). Renaming it and
     // reading its activity need none (DN-11 D5, D6): the owner keeps their trail unpaid.
-    const exempt = new Set([`GET /orgs/${org.id}`, `PATCH /orgs/${org.id}`, `POST /orgs/${org.id}/billing/checkout`,
-      `POST /orgs/${org.id}/billing/portal`, `POST /orgs/${org.id}/deletion-request`, `GET /orgs/${org.id}/activity`]);
+    const exempt = new Set([`GET /orgs/${org.id}`, `PATCH /orgs/${org.id}`, `GET /orgs/${org.id}/billing`, `POST /orgs/${org.id}/billing/checkout`,
+      `POST /orgs/${org.id}/billing/portal`, `POST /orgs/${org.id}/billing/sync`, `POST /orgs/${org.id}/deletion-request`,
+      `GET /orgs/${org.id}/activity`]);
+    // The return from a checkout reaches the session lookup: one that is not this organization's is not found, never a 402.
+    const answers: Record<string, number> = { [`POST /orgs/${org.id}/billing/sync`]: 404 };
     const routes = orgRoutes({ orgId: org.id, memberId: owner.user.userId, invitationId: crypto.randomUUID(),
       actionKey: `c.${crypto.randomUUID()}` });
     expect(routes.filter(([method, path]) => exempt.has(`${method} ${path}`))).toHaveLength(exempt.size);
@@ -379,6 +384,10 @@ describe('the webapp API in mock', () => {
     }
     for (const [method, path, body] of routes.filter(([method, path]) => exempt.has(`${method} ${path}`))) {
       const reply = await s.call(method, path, { token: owner.token, body });
+      if (answers[`${method} ${path}`]) {
+        expect(reply.status, `${method} ${path}`).toBe(answers[`${method} ${path}`]);
+        continue;
+      }
       expect(reply.status, `${method} ${path}`).toBeGreaterThanOrEqual(200);
       expect(reply.status, `${method} ${path}`).toBeLessThan(300);
     }
@@ -454,6 +463,9 @@ describe('the webapp API in mock', () => {
       { name: 'remove the owner', method: 'DELETE', path: t => `/orgs/${t.orgId}/members/${t.ids.owner}`, expected: { ...nobody, owner: 409 } },
       { name: 'remove an unknown member', method: 'DELETE', path: t => `/orgs/${t.orgId}/members/${crypto.randomUUID()}`,
         expected: only(managers, 404) },
+      { name: 'read the billing', method: 'GET', path: orgPath('/billing'), expected: everyone(200) },
+      { name: 'return from a checkout that is not this organization\'s', method: 'POST', path: orgPath('/billing/sync'),
+        body: { sessionId: 'cs_test_notthisorgs1' }, expected: { ...nobody, owner: 404 } },
       // Already paid, so the owner is sent to the portal.
       { name: 'check out', method: 'POST', path: orgPath('/billing/checkout'), body: { planCode: 'monthly' }, expected: { ...nobody, owner: 409 } },
       { name: 'open the portal', method: 'POST', path: orgPath('/billing/portal'), expected: { ...nobody, owner: 200 } },
@@ -771,7 +783,7 @@ describe('the webapp API in mock', () => {
       members: 1, analyses: 1, pendingDeletionRequests: 0, actions: { todo: plan.items.length, in_progress: 0, done: 0 } });
 
     const audit = AdminAuditPage.parse((await s.call('GET', '/admin/audit', { token: ops.token })).body);
-    expect(audit.events.map(event => event.action)).toEqual(['billing.event_applied', 'org.created']);
+    expect(audit.events.map(event => event.action)).toEqual(['billing.event_applied', 'billing.checkout_started', 'org.created']);
     for (const orgId of [crypto.randomUUID(), 'org_missing']) {
       expect(await s.call('GET', `/admin/audit?orgId=${orgId}`, { token: ops.token }), orgId).toEqual({ status: 200,
         body: { events: [], nextBefore: null } });
@@ -880,7 +892,7 @@ describe('the demo seed', () => {
     const ops = await s.login(`ops@${DEMO}`);
     expect(MeResponse.parse((await s.call('GET', '/me', { token: ops.token })).body)).toMatchObject({ organizations: [], platformAdmin: true });
     const audit = AdminAuditPage.parse((await s.call('GET', `/admin/audit?orgId=${demo.organization.id}`, { token: ops.token })).body);
-    expect(audit.events.map(event => event.action).sort()).toEqual(['billing.event_applied', 'member.invited', 'member.invited',
+    expect(audit.events.map(event => event.action).sort()).toEqual(['billing.checkout_started', 'billing.event_applied', 'member.invited', 'member.invited',
       'member.invited', 'member.joined', 'member.joined', 'member.joined', 'org.created']);
     expect(audit.events.every(event => event.actorKind === 'system' && event.actorEmail === null)).toBe(true);
     const activity = ActivityPage.parse((await s.call('GET', `/orgs/${demo.organization.id}/activity`, { token: owner.token })).body);

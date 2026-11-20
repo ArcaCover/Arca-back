@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { AUDIT_ACTOR_KINDS, can, canManageMember, type BillingStatus, type Role } from '@arca/contracts';
 import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict } from './types.js';
-import type { ActionPatch, AssessmentActionRecord, AuditActor, AuditPageQuery, AuditRecord, BillingApplyOutcome, BillingStateRecord,
-  ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord, InvitationRecord, MemberChange, MembershipRecord, NewAuditRecord,
+import type { ActionPatch, AssessmentActionRecord, AuditActor, AuditPageQuery, AuditRecord, BillingApplyOutcome, BillingCustomerRecord,
+  BillingEventClosing, BillingStateRecord, CheckoutSessionRecord, ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord, InvitationRecord, MemberChange, MembershipRecord, NewAuditRecord,
   OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, PlanRecord, ProfileRecord, ProfileWrite, SubscriptionRecord, WebappRepository } from './types.js';
 
 // updatePlan can change these and nothing else; the code is the identity of the plan.
-const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active'] as const;
+const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active', 'stripe_product_id', 'stripe_price_id'] as const;
 // What upsertAssessmentAction and updateAction may move on an existing row: the fields a patch names, nothing else.
 const TRACKED_FIELDS = ['status', 'assignee_user_id', 'due_date', 'updated_by', 'updated_at'] as const;
 const applyPatch = <T extends OrgActionRecord>(action: T, patch: ActionPatch): T =>
@@ -31,6 +31,8 @@ export class InMemoryWebappRepository implements WebappRepository {
   private readonly subscriptions = new Map<string, SubscriptionRecord>();
   // Seen events, and whether they were processed: only a processed one is a duplicate for applyBillingState (DN-13 §6.5).
   private readonly billingEvents = new Map<string, { type: string; processed: boolean }>();
+  private readonly billingCustomers = new Map<string, BillingCustomerRecord>();
+  private readonly checkoutSessions = new Map<string, CheckoutSessionRecord>();
   private readonly deletionRequests = new Map<string, DeletionRequestRecord>();
   private readonly platformAdmins = new Map<string, string | null>();
   private readonly actions: OrgActionRecord[] = [];
@@ -47,6 +49,7 @@ export class InMemoryWebappRepository implements WebappRepository {
   clear(): void {
     this.profiles.clear(); this.organizations.clear(); this.memberships.length = 0; this.invitations.clear();
     this.analyses.clear(); this.tickets.clear(); this.subscriptions.clear(); this.billingEvents.clear();
+    this.billingCustomers.clear(); this.checkoutSessions.clear();
     this.deletionRequests.clear(); this.platformAdmins.clear(); this.actions.length = 0; this.auditLog.length = 0;
     this.plans.clear();
     for (const plan of this.seedPlans) this.plans.set(plan.code, structuredClone(plan));
@@ -209,6 +212,10 @@ export class InMemoryWebappRepository implements WebappRepository {
   async updatePlan(code: string, patch: Partial<Omit<PlanRecord, 'code'>>) {
     const plan = this.plans.get(code);
     if (!plan) throw new Error('Plan not found');
+    // Like plans.stripe_price_id unique.
+    if (patch.stripe_price_id && [...this.plans.values()].some(other => other.code !== code && other.stripe_price_id === patch.stripe_price_id)) {
+      throw new Error('Duplicate plan price');
+    }
     Object.assign(plan, Object.fromEntries(PLAN_FIELDS.filter(field => patch[field] !== undefined).map(field => [field, patch[field]])));
   }
 
@@ -236,16 +243,70 @@ export class InMemoryWebappRepository implements WebappRepository {
     }
     const planCode = state.plan_code ?? current?.plan_code ?? null;
     if (planCode) {
-      // No await from the check of the event to here, so two deliveries that race cannot both apply.
+      // No await from the check of the event to here, so two deliveries that race cannot both apply. A null keeps what is stored.
       this.putSubscription({ org_id: orgId, plan_code: planCode, customer_id: state.customer_id ?? current?.customer_id ?? null,
         subscription_id: state.subscription_id ?? current?.subscription_id ?? null, status: state.status,
-        current_period_end: state.current_period_end ?? current?.current_period_end ?? null, updated_at: at });
+        current_period_end: state.current_period_end ?? current?.current_period_end ?? null, updated_at: at,
+        provider_status: state.provider_status ?? current?.provider_status ?? null, price_id: state.price_id ?? current?.price_id ?? null,
+        cancel_at_period_end: state.cancel_at_period_end ?? current?.cancel_at_period_end ?? false,
+        current_period_start: state.current_period_start ?? current?.current_period_start ?? null,
+        livemode: state.livemode ?? current?.livemode ?? null });
     }
     this.requireOrganization(orgId).billing_status = state.status;
     seen.processed = true;
     this.audit({ actor_kind: 'system', actor_user_id: null }, orgId, 'billing.event_applied', event.id,
       { type: event.type, status: state.status, planCode }, at);
     return 'applied';
+  }
+
+  async isBillingEventProcessed(id: string) { return this.billingEvents.get(id)?.processed === true; }
+  async closeBillingEvent(event: { id: string; type: string }, orgId: string | null, closing: BillingEventClosing, at: string) {
+    if (orgId !== null) this.requireOrganization(orgId);
+    const seen = this.billingEvents.get(event.id) ?? { type: event.type, processed: false };
+    this.billingEvents.set(event.id, seen);
+    if (seen.processed) return 'duplicate' as const;
+    seen.processed = true;
+    if (orgId !== null && closing.audit) {
+      this.audit({ actor_kind: 'system', actor_user_id: null }, orgId, closing.audit.action, event.id, structuredClone(closing.audit.data), at);
+    }
+    return 'recorded' as const;
+  }
+
+  async getBillingCustomer(orgId: string) { return structuredClone(this.billingCustomers.get(orgId) ?? null); }
+  async findBillingCustomer(customerId: string) {
+    return structuredClone([...this.billingCustomers.values()].find(customer => customer.customer_id === customerId) ?? null);
+  }
+  async addBillingCustomer(customer: BillingCustomerRecord) {
+    this.requireOrganization(customer.org_id);
+    const stored = this.billingCustomers.get(customer.org_id);
+    if (stored) return structuredClone(stored);
+    // Like billing_customers.customer_id unique.
+    if ([...this.billingCustomers.values()].some(other => other.customer_id === customer.customer_id)) throw new Error('Duplicate billing customer');
+    this.billingCustomers.set(customer.org_id, structuredClone(customer));
+    return structuredClone(customer);
+  }
+  async getOpenCheckoutSession(orgId: string, at: string) {
+    return structuredClone([...this.checkoutSessions.values()].find(session => session.org_id === orgId && session.status === 'open'
+      && Date.parse(session.expires_at) > Date.parse(at)) ?? null);
+  }
+  async getCheckoutSession(id: string) { return structuredClone(this.checkoutSessions.get(id) ?? null); }
+  async addCheckoutSession(session: CheckoutSessionRecord, at: string) {
+    this.requireOrganization(session.org_id);
+    for (const stored of this.checkoutSessions.values()) {
+      if (stored.org_id === session.org_id && stored.status === 'open' && Date.parse(stored.expires_at) <= Date.parse(at)) stored.status = 'expired';
+    }
+    // Like checkout_sessions_open_idx: one open session per organization, whatever its expiry.
+    const open = [...this.checkoutSessions.values()].find(stored => stored.org_id === session.org_id && stored.status === 'open');
+    if (open) return structuredClone(open);
+    if (this.checkoutSessions.has(session.id)) throw new Error('Duplicate checkout session');
+    this.checkoutSessions.set(session.id, structuredClone(session));
+    return structuredClone(session);
+  }
+  async closeCheckoutSession(id: string, status: 'complete' | 'expired') {
+    const session = this.checkoutSessions.get(id);
+    if (!session || session.status === 'complete' || (status === 'expired' && session.status !== 'open')) return false;
+    session.status = status;
+    return true;
   }
 
   async createDeletionRequest(request: DeletionRequestRecord) {

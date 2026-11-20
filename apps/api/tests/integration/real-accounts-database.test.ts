@@ -15,7 +15,9 @@ const RPCS = ['create_organization(jsonb,jsonb,jsonb)', 'claim_analysis(jsonb)',
   'upsert_assessment_action(jsonb,jsonb)', 'create_custom_action(jsonb)', 'update_action(uuid,uuid,jsonb)',
   'apply_billing_state(jsonb,uuid,jsonb,timestamptz)', 'review_deletion_request(uuid,text,uuid,text,jsonb,timestamptz)',
   'delete_account(uuid,timestamptz)', 'grant_platform_admin(uuid,uuid,jsonb,timestamptz)', 'revoke_platform_admin(uuid,jsonb,timestamptz)',
-  'list_audit(uuid,boolean,bigint,integer)'] as const;
+  'list_audit(uuid,boolean,bigint,integer)',
+  // DN-13 T15 (20261120000000_billing_events.sql).
+  'close_billing_event(jsonb,uuid,text,jsonb,timestamptz)'] as const;
 const HELPERS = ['can_manage_member(text,text,text)', 'can_hold_actions(text)', 'append_audit(jsonb,uuid,text,text,jsonb,timestamptz)'] as const;
 
 const T0 = '2026-11-18T12:00:00.000Z';
@@ -673,14 +675,15 @@ describe('the real accounts migration over the DN-10 and DN-11 schema', () => {
       await db.exec(`create role anon; create role authenticated; create role service_role bypassrls;`);
       const names = await migrations();
       const index = names.findIndex((name) => name.endsWith('_real_accounts_billing.sql'));
-      expect(index).toBe(names.length - 1);
+      expect(index).toBeGreaterThan(0);
       for (const name of names.slice(0, index)) await db.exec(await readFile(new URL(name, directory), 'utf8'));
       const [org, owner] = [randomUUID(), randomUUID()];
       await db.query("insert into public.profiles (user_id,email) values ($1,'owner@firm.example')", [owner]);
       await db.query("insert into public.organizations (id,name,created_by) values ($1,'Firm LLP',$2)", [org, owner]);
       await db.query("insert into public.subscriptions (org_id,plan_code,status,subscription_id) values ($1,'monthly','active','sub_1')", [org]);
       await db.query("insert into public.stripe_events (id,type) values ('evt_1','checkout.completed')");
-      await db.exec(await readFile(new URL(names[index]!, directory), 'utf8'));
+      // It, and every migration after it, applies over those rows.
+      for (const name of names.slice(index)) await db.exec(await readFile(new URL(name, directory), 'utf8'));
       expect((await db.query('select email, deleted_at from public.profiles')).rows).toEqual([{ email: 'owner@firm.example', deleted_at: null }]);
       expect((await db.query('select cancel_at_period_end, provider_status from public.subscriptions')).rows)
         .toEqual([{ cancel_at_period_end: false, provider_status: null }]);

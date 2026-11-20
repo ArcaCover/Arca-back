@@ -41,7 +41,7 @@ const EnvSchema = z.object({
   // WEBAPP_PROVIDERS=real. Never a JWT secret: Supabase tokens verify against the project's JWKS, derived from SUPABASE_URL.
   WEBAPP_ENABLED: z.preprocess(blankAsUnset, z.enum(['true', 'false']).default('false')),
   WEBAPP_PROVIDERS: z.preprocess(blankAsUnset, z.enum(['simulated', 'real']).optional()),
-  // Stripe's mode comes from the key's prefix (DN-13 §6.7). Only the guards exist yet: the provider is phase 3.
+  // Stripe's mode comes from the key's prefix (DN-13 §6.7); StripeBillingProvider (webapp/stripe.ts) uses both with the real webapp.
   STRIPE_SECRET_KEY: z.preprocess(blankAsUnset, z.string().trim().optional()),
   STRIPE_WEBHOOK_SECRET: z.preprocess(blankAsUnset, z.string().trim().optional()),
   // Lets production run on a test key, for a rehearsal on the host before the launch. It never lets a live key run elsewhere.
@@ -169,7 +169,7 @@ function emailSender(value: string): string {
 }
 
 /** What the prefix of a Stripe secret or restricted key says (DN-13 §6.7). A publishable key, or anything else, is refused. */
-function stripeKeyMode(key: string): 'live' | 'test' {
+export function stripeKeyMode(key: string): 'live' | 'test' {
   const prefix = /^(?:sk|rk)_(live|test)_\S+$/.exec(key);
   if (!prefix) throw new Error('STRIPE_SECRET_KEY must be a Stripe secret (sk_) or restricted (rk_) key, live or test');
   return prefix[1] as 'live' | 'test';

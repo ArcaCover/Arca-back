@@ -21,6 +21,9 @@ import { MailingWebappService } from '../../src/webapp/invitation-email.js';
 import { MemoryMailer } from '../../src/webapp/mailer.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
+import { REAL_WEBAPP_ADAPTERS } from '../../src/webapp/real-adapters.js';
+import type { PlanRecord } from '../../src/webapp/types.js';
+import { StripeBillingProvider } from '../../src/webapp/stripe.js';
 
 // Observed, not replaced: compose still builds the real app and tools.
 vi.mock('../../src/http/app.js', async importOriginal => {
@@ -219,8 +222,10 @@ describe('compose: the webapp providers', () => {
       .setSubject(USER_ID).setIssuedAt().setExpirationTime('1h').sign(privateKey);
     return { state, fetchJwks, accessToken };
   }
-  function adapters(project: { fetchJwks: (url: URL) => Promise<unknown> }) {
-    const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
+  // The plans as stripe:catalog leaves them: each with its catalog price (DN-13 §6.1).
+  const PRICED_PLANS = DEFAULT_PLANS.map(plan => ({ ...plan, stripe_product_id: 'arca', stripe_price_id: `price_${plan.code}` }));
+  function adapters(project: { fetchJwks: (url: URL) => Promise<unknown> }, plans: PlanRecord[] = PRICED_PLANS) {
+    const repository = new InMemoryWebappRepository(plans);
     const billing = new MockBillingProvider('https://arcacover.com');
     const authAdmin = new InMemoryAuthAdmin();
     return { repository, billing, authAdmin, seam: { repository: vi.fn((_client: unknown) => repository),
@@ -354,10 +359,45 @@ describe('compose: the webapp providers', () => {
     await expect(compose(loadEnv(realLiveDebug), undefined, { ...seam, authAdmin: undefined })).rejects.toThrow(/Supabase Auth admin/);
     // live-debug keeps the invitations in memory unless told otherwise, so it needs no SES sender.
     await expect(compose(loadEnv(realLiveDebug), undefined, { ...seam, sesSendEmail: undefined })).resolves.toBeDefined();
-    // What ships today has the Supabase repository (T4) but no Stripe provider yet (T14): production with the switch on
-    // still refuses to start rather than fall back to memory, and names what is missing.
-    await expect(compose(loadEnv(launch))).rejects.toThrow(/Stripe billing provider/);
-    await expect(compose(loadEnv(launch))).rejects.not.toThrow(/Supabase webapp repository/);
+    await expect(compose(loadEnv(realLiveDebug), undefined, { ...seam, billing: undefined })).rejects.toThrow(/Stripe billing provider/);
+    // What ships today has the Supabase repository (T4), the Auth admin (T7) and the Stripe provider (T14), but no SES sender:
+    // production with the switch on still refuses to start rather than drop its emails, and names only what is missing.
+    await expect(compose(loadEnv(launch))).rejects.toThrow(/SES sender/);
+    await expect(compose(loadEnv(launch))).rejects.not.toThrow(/Supabase webapp repository|Stripe billing provider|Auth admin/);
+  });
+
+  it('ships the Stripe provider in the seam, built with the key and mode loadEnv resolved', () => {
+    const provider = REAL_WEBAPP_ADAPTERS.billing!({ secretKey: 'rk_test_fixture', webhookSecret: 'whsec_fixture', mode: 'test',
+      appBaseUrl: 'http://localhost:3000' });
+    expect(provider).toBeInstanceOf(StripeBillingProvider);
+    expect([provider.mode, provider.webhooks, provider.needsCatalogPrice]).toEqual(['test', true, true]);
+  });
+
+  it('refuses production while an active plan has no Stripe price, and only warns in live-debug (DN-13 §5.3)', async () => {
+    const project = await supabaseProject();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await expect(compose(loadEnv(launch), undefined, adapters(project, [...DEFAULT_PLANS]).seam)).rejects.toThrow(/monthly, annual.*stripe:catalog/);
+    const composed = await compose(loadEnv(realLiveDebug), undefined, adapters(project, [...DEFAULT_PLANS]).seam);
+    expect(warn.mock.calls.flat().join(' ')).toMatch(/\[billing\] the active plans monthly, annual have no stripe_price_id/);
+    // A plan taken off sale needs none.
+    await expect(compose(loadEnv(launch), undefined, adapters(project, [PRICED_PLANS[0]!, { ...DEFAULT_PLANS[1]!, active: false }]).seam))
+      .resolves.toBeDefined();
+    expect(composed.reconcileBilling).toEqual(expect.any(Function));
+    warn.mockRestore();
+  });
+
+  it('serves POST /billing/webhook only with a provider that signs webhooks: the simulated webapp keeps the 501', async () => {
+    const project = await supabaseProject();
+    const simulated = await compose(loadEnv({ ...base, ...live, ARCA_MODE: 'live-debug' }), undefined, adapters(project).seam);
+    expect((await simulated.app.request('/billing/webhook', { method: 'POST', body: '{}' })).status).toBe(501);
+    expect(simulated.reconcileBilling).toBeNull();
+    // The real webapp with the shipped provider verifies the signature: none is a 400, and nothing reaches Stripe.
+    const { seam } = adapters(project);
+    const real = await compose(loadEnv(realLiveDebug), undefined, { ...seam, billing: REAL_WEBAPP_ADAPTERS.billing });
+    const refused = await real.app.request('/billing/webhook', { method: 'POST', body: '{"id":"evt_1"}' });
+    expect(refused.status).toBe(400);
+    expect(await refused.json()).toEqual({ error: 'invalid_signature', message: expect.any(String) });
+    expect(refused.headers.get('Cache-Control')).toBe('no-store');
   });
 
   it('refuses to start against a project without asymmetric signing keys, and starts anyway while Supabase is unreachable', async () => {

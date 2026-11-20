@@ -28,13 +28,36 @@ export type OrgAnalysisRecord = {
 export type ClaimTicketRecord = {
   id_hash: string; scan_id: string; email: string; expires_at: string; used_at: string | null;
 };
+/**
+ * `stripe_price_id` is the catalog Price a checkout of the plan charges, and `stripe_product_id` its Product (DN-13 §6.1). Both are
+ * null until `npm run stripe:catalog -- --apply` (or a price change from /admin) writes them; the amount, currency and interval mirror
+ * that Price for display.
+ */
 export type PlanRecord = {
   code: string; name: string; amount_cents: number; currency: string; interval: 'month' | 'year'; active: boolean;
+  stripe_product_id: string | null; stripe_price_id: string | null;
 };
+/**
+ * The subscription an organization holds, one row per organization (DN-10 §4.2). `status` is the mapped billing status (§6.6);
+ * `provider_status` and the rest are what Stripe last said, raw, for support and the reconciliation (§5.3).
+ */
 export type SubscriptionRecord = {
   org_id: string; plan_code: string; customer_id: string | null; subscription_id: string | null; status: BillingStatus;
-  current_period_end: string | null; updated_at: string;
+  current_period_end: string | null; updated_at: string; provider_status: string | null; price_id: string | null;
+  cancel_at_period_end: boolean; current_period_start: string | null; livemode: boolean | null;
 };
+/** The Stripe customer of an organization (DN-13 §6.2): one per organization, created by the back on the first checkout. */
+export type BillingCustomerRecord = { org_id: string; customer_id: string; livemode: boolean; created_at: string };
+/** A Stripe Checkout Session the back opened (DN-13 §6.2). At most one `open` per organization. */
+export type CheckoutSessionRecord = {
+  id: string; org_id: string; plan_code: string; url: string; status: 'open' | 'complete' | 'expired'; created_by: string; expires_at: string;
+  created_at: string;
+};
+/**
+ * How closeBillingEvent leaves an event that moves no subscription: why it was not applied (`unknown_org`), and the audit row, as the
+ * system, that it leaves in its organization.
+ */
+export type BillingEventClosing = { error: string | null; audit: { action: string; data: Record<string, unknown> } | null };
 export type DeletionRequestRecord = {
   id: string; org_id: string; requested_by: string; reason: string; status: 'pending' | 'approved' | 'rejected';
   reviewed_by: string | null; reviewed_at: string | null; review_note: string | null; created_at: string;
@@ -236,7 +259,7 @@ export interface WebappRepository {
   /** True only for the call that spends it; false when it was already used or does not exist. */
   markClaimTicketUsed(idHash: string, at: string): Promise<boolean>;
 
-  /** Every plan, inactive ones included: the public list filters on `active`. */
+  /** Every plan, inactive ones included: the public list filters on `active`. A Stripe price id belongs to one plan at most. */
   listPlans(): Promise<PlanRecord[]>;
   getPlan(code: string): Promise<PlanRecord | null>;
   updatePlan(code: string, patch: Partial<Omit<PlanRecord, 'code'>>): Promise<void>;
@@ -254,6 +277,35 @@ export interface WebappRepository {
    */
   applyBillingState(event: { id: string; type: string; livemode?: boolean | null }, orgId: string, state: BillingStateRecord,
     at: string): Promise<BillingApplyOutcome>;
+  /** True once an event was processed (applied or closed), not when it was only seen. */
+  isBillingEventProcessed(id: string): Promise<boolean>;
+  /**
+   * Marks an event that moves no subscription as processed, in one step with its audit row (as the system) when it names one and
+   * an organization (DN-13 §6.5): a refund, a dispute, an expired checkout, or an event of no organization (`error`). `duplicate`
+   * when it was processed already, and then nothing is written.
+   */
+  closeBillingEvent(event: { id: string; type: string; livemode?: boolean | null }, orgId: string | null, closing: BillingEventClosing,
+    at: string): Promise<'recorded' | 'duplicate'>;
+
+  getBillingCustomer(orgId: string): Promise<BillingCustomerRecord | null>;
+  /** The organization of a Stripe customer, through the customer the back created for it. */
+  findBillingCustomer(customerId: string): Promise<BillingCustomerRecord | null>;
+  /**
+   * Keeps the first customer of an organization: returns the one stored, which is this one unless another request stored its own
+   * first. A customer id already stored for another organization is refused with a plain Error.
+   */
+  addBillingCustomer(customer: BillingCustomerRecord): Promise<BillingCustomerRecord>;
+  /** The organization's open session that has not expired by `at`, if any. */
+  getOpenCheckoutSession(orgId: string, at: string): Promise<CheckoutSessionRecord | null>;
+  getCheckoutSession(id: string): Promise<CheckoutSessionRecord | null>;
+  /**
+   * Stores an open session (DN-13 §6.2): the organization's open sessions whose time passed by `at` become `expired` first. Returns
+   * the open session the organization holds afterwards: this one, or the one another request stored first, and then this one is
+   * not kept (checkout_sessions_open_idx).
+   */
+  addCheckoutSession(session: CheckoutSessionRecord, at: string): Promise<CheckoutSessionRecord>;
+  /** Open or expired to complete, or open to expired. True when it changed the row; a completed session never changes again. */
+  closeCheckoutSession(id: string, status: 'complete' | 'expired'): Promise<boolean>;
 
   /** `deletion_pending` when the organization already has a pending request. */
   createDeletionRequest(request: DeletionRequestRecord): Promise<void>;

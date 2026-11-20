@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
-import { AttachAnalysisRequest, CheckoutRequest, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, EnrollRequest,
+import { AttachAnalysisRequest, BillingSyncRequest, CheckoutRequest, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, EnrollRequest,
   InviteRequest, ReviewRequest, SetRoleRequest, UpdateActionRequest, UpdateOrgRequest, UpdatePlanRequest } from '@arca/contracts';
 import { WindowLimiter } from '../http/rate-limit.js';
 import { AuthUnavailable, type AppAuth, type AppUser } from './auth.js';
+import { WebhookRejected } from './billing-events.js';
 import { WebappFailure, type WebappService } from './service.js';
 
 // Every path the private webapp answers on (DN-10 §4.7, DN-11 §4.9, DN-13 §7.2). Production answers 501 on all of them unless
@@ -17,6 +18,9 @@ const HOUR_MS = 60 * 60 * 1000;
 const ENROLL_PER_ADDRESS = 10;
 const ENROLL_PER_LINK = 5;
 const ACCOUNT_DELETIONS_PER_USER = 3;
+// Checkout and the portal each open a Stripe session; the return reads Stripe twice. Counted per organization (DN-13 §7.4).
+const BILLING_SESSIONS_PER_ORG = 10;
+const BILLING_SYNCS_PER_ORG = 30;
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 
 // A page of the audit log (DN-11 §4.3, §4.5): `before` is the seq the previous page ended on; a limit out of range is a 400.
@@ -112,9 +116,26 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth; clie
     return c.body(null, 204);
   }));
   app.post('/invitations/:token/accept', signedIn(async (c, me) => c.json(await service.acceptInvitation(me, param(c, 'token')))));
-  app.post('/orgs/:id/billing/checkout', signedIn(async (c, me) =>
-    c.json(await service.checkout(me, param(c, 'id'), (await body(c, CheckoutRequest)).planCode))));
-  app.post('/orgs/:id/billing/portal', signedIn(async (c, me) => c.json(await service.portal(me, param(c, 'id')))));
+  // Billing (DN-13 §6.2–§6.4, §7.2). The limits count an organization's sessions once its owner is authorized, so nobody else can
+  // spend them.
+  app.get('/orgs/:id/billing', signedIn(async (c, me) => c.json(await service.billingView(me, param(c, 'id')))));
+  app.post('/orgs/:id/billing/checkout', signedIn(async (c, me) => {
+    const { planCode } = await body(c, CheckoutRequest);
+    const { org } = await service.authorize(me, param(c, 'id'), 'billing.manage', { payment: false });
+    limit([[`billing:checkout:${org.id}`, BILLING_SESSIONS_PER_ORG]]);
+    return c.json(await service.checkout(me, org.id, planCode));
+  }));
+  app.post('/orgs/:id/billing/portal', signedIn(async (c, me) => {
+    const { org } = await service.authorize(me, param(c, 'id'), 'billing.manage', { payment: false });
+    limit([[`billing:portal:${org.id}`, BILLING_SESSIONS_PER_ORG]]);
+    return c.json(await service.portal(me, org.id));
+  }));
+  app.post('/orgs/:id/billing/sync', signedIn(async (c, me) => {
+    const { sessionId } = await body(c, BillingSyncRequest);
+    const { org } = await service.authorize(me, param(c, 'id'), 'billing.manage', { payment: false });
+    limit([[`billing:sync:${org.id}`, BILLING_SYNCS_PER_ORG]]);
+    return c.json(await service.syncCheckout(me, org.id, sessionId));
+  }));
   app.post('/orgs/:id/deletion-request', signedIn(async (c, me) =>
     c.json(await service.requestDeletion(me, param(c, 'id'), (await body(c, DeletionRequestBody)).reason), 201)));
   // The action plan (DN-11 §4.2). Hono decodes the key, which the front sends through encodeURIComponent.
@@ -147,8 +168,19 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth; clie
   app.put('/admin/plans/:code', platformAdmin(async (c, admin) =>
     c.json(await service.updatePlan(admin, param(c, 'code'), await body(c, UpdatePlanRequest)))));
 
-  // Stripe comes after the demo (DN-10 §10): without a signature to verify, no event is accepted, in the debug modes either.
-  app.post('/billing/webhook', c => notConfigured(c));
+  // Stripe's webhook (DN-13 §6.5): public, with no CORS and no session; the signature over the raw body is the only defence. 400 for
+  // a signature that does not verify or an event of the other mode, 200 once the event is applied, recorded, a duplicate or of a type
+  // the back ignores, 500 for anything else so Stripe retries. The simulated provider signs nothing, so its webapp keeps the 501.
+  app.post('/billing/webhook', async c => {
+    if (!service.acceptsBillingWebhooks) return notConfigured(c);
+    const raw = new Uint8Array(await c.req.arrayBuffer());
+    try {
+      return c.json({ received: true, outcome: await service.billingWebhook(raw, c.req.header('Stripe-Signature')) });
+    } catch (error) {
+      if (error instanceof WebhookRejected) return c.json({ error: error.reason, message: error.message }, 400);
+      return c.json({ error: 'internal_error', message: 'The event was not processed; Stripe retries it' }, 500);
+    }
+  });
   return app;
 }
 

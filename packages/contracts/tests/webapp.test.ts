@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ACTION_STATUSES, AUDIT_ACTOR_KINDS, ActionItemView, ActionPlanResponse, ActivityActor, ActivityEventView, ActivityPage,
   AdminAuditEventView, AdminAuditPage, AdminMetricsView, AdminOrgDetailView, AdminOrgView, AnalysisView, AttachAnalysisRequest, BILLING_STATUSES,
+  BillingSyncRequest, BillingView,
   CheckoutRequest, ClaimResponse, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, DeletionRequestView,
   InvitationView, InviteRequest, MeResponse, MemberView, OrgView, PERMISSIONS, PlanView, ROLES, ROLE_PERMISSIONS, ReviewRequest,
   SetRoleRequest, UpdateActionRequest, UpdateOrgRequest, UpdatePlanRequest, UrlResponse,
@@ -554,5 +555,27 @@ describe('the platform admin views', () => {
   it('AdminMetricsView counts every billing status, with the deleted organizations apart', () => {
     expect(Object.keys(AdminMetricsView.shape.organizations.shape)).toEqual([...BILLING_STATUSES, 'deleted']);
     expect(AdminMetricsView.safeParse({ ...metrics, organizations: { ...metrics.organizations, trialing: 0 } }).success).toBe(false);
+  });
+});
+
+describe('billing with Stripe (DN-13 §7.6, new in 0.5.0)', () => {
+  const plan = { code: 'monthly', name: 'Monthly', amountCents: 49_900, currency: 'usd', interval: 'month' };
+  const view = { billingStatus: 'active', plan, currentPeriodEnd: '2026-12-20T12:00:00.000Z', cancelAtPeriodEnd: false, manageable: true };
+
+  it('BillingView says what every member sees of the subscription, strictly', () => {
+    expect(BillingView.parse(view)).toEqual(view);
+    expect(BillingView.parse({ ...view, billingStatus: 'pending_payment', plan: null, currentPeriodEnd: null })).toMatchObject({ plan: null });
+    expect(BillingView.safeParse({ ...view, billingStatus: 'trialing' }).success).toBe(false);
+    expect(BillingView.safeParse({ ...view, customerId: 'cus_1' }).success).toBe(false);
+    expect(BillingView.safeParse({ ...view, currentPeriodEnd: 'tomorrow' }).success).toBe(false);
+  });
+
+  it('BillingSyncRequest takes only a Checkout Session id', () => {
+    expect(BillingSyncRequest.parse({ sessionId: 'cs_test_a1B2c3' })).toEqual({ sessionId: 'cs_test_a1B2c3' });
+    expect(BillingSyncRequest.safeParse({ sessionId: 'cs_live_a1B2c3' }).success).toBe(true);
+    for (const sessionId of ['', 'sub_123', 'cs_test_', 'cs_test_a/b', 'cs_other_a1']) {
+      expect(BillingSyncRequest.safeParse({ sessionId }).success, sessionId).toBe(false);
+    }
+    expect(BillingSyncRequest.safeParse({ sessionId: 'cs_test_a1', orgId: 'x' }).success).toBe(false);
   });
 });

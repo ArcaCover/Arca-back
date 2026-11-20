@@ -2,12 +2,17 @@
 	admin off
 }
 
+# The API behind Caddy, with the health checks Caddy uses to stop sending to an unhealthy container.
+(api) {
+	reverse_proxy api:8080 {
+		health_uri /health
+		health_interval 15s
+		health_timeout 3s
+	}
+}
+
 {$DEMO_HOSTNAME} {
 	encode zstd gzip
-
-	request_body {
-		max_size 32KB
-	}
 
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
@@ -23,9 +28,19 @@
 		{$DOCS_AUTH_USER} {$DOCS_AUTH_HASH}
 	}
 
-	reverse_proxy api:8080 {
-		health_uri /health
-		health_interval 15s
-		health_timeout 3s
+	# Stripe's webhook (DN-13 §9.2): an event with a long invoice or an expanded object can pass
+	# 32 KB, and a 413 would have Stripe retry it for days. Its signature is its defence.
+	handle /billing/webhook {
+		request_body {
+			max_size 1MB
+		}
+		import api
+	}
+
+	handle {
+		request_body {
+			max_size 32KB
+		}
+		import api
 	}
 }

@@ -27,6 +27,8 @@ import { MailingWebappService } from './webapp/invitation-email.js';
 import { MemoryMailer, SesMailer } from './webapp/mailer.js';
 import { DEFAULT_PLANS } from './webapp/plans.js';
 import { REAL_WEBAPP_ADAPTERS, type RealWebappAdapters, type StorageClient } from './webapp/real-adapters.js';
+import type { ReconcileReport } from './webapp/billing-events.js';
+import type { WebappRepository } from './webapp/types.js';
 
 /**
  * The webapp of the debug modes: accounts, organizations and billing in memory, behind the simulated login and payment. Its
@@ -69,10 +71,25 @@ async function realWebapp(env: ReturnType<typeof loadEnv>, adapters: RealWebappA
   const mailer = env.emailProvider === 'ses' ? new SesMailer(adapters.sesSendEmail!) : new MemoryMailer();
   // One service-role client for the data and the Auth admin API.
   const client = deps.client();
-  const service = new MailingWebappService({ repository: adapters.repository!(client), authAdmin: adapters.authAdmin!(client), scans: deps.scans,
+  const repository = adapters.repository!(client);
+  await requireCatalogPrices(env, repository);
+  const service = new MailingWebappService({ repository, authAdmin: adapters.authAdmin!(client), scans: deps.scans,
     assessments: deps.assessments, billing, sessionSecret: env.SESSION_TOKEN_SECRET, appBaseUrl: env.APP_BASE_URL,
     isDurableScan: deps.isDurableScan }, { mailer, from: env.emailFrom });
   return { service, auth };
+}
+
+/**
+ * Every active plan must charge a catalog price (DN-13 §5.3): production with the webapp on refuses to start without one, rather than
+ * answer 409 to the first customer; live-debug says so and starts, so the rest of the webapp can be tried before the catalog exists.
+ */
+async function requireCatalogPrices(env: ReturnType<typeof loadEnv>, repository: WebappRepository) {
+  const unpriced = (await repository.listPlans()).filter(plan => plan.active && !plan.stripe_price_id).map(plan => plan.code);
+  if (!unpriced.length) return;
+  const message = `the active plans ${unpriced.join(', ')} have no stripe_price_id: run npm run stripe:catalog (then --apply) against this `
+    + 'database and its Stripe account';
+  if (env.mode === 'production') throw new Error(`The real webapp cannot start: ${message}`);
+  console.warn(`[billing] ${message}; until then their checkout answers 409`);
 }
 
 /** A scan still RUNNING past this point outlived its pipeline budget: a restart cut it short. */
@@ -90,7 +107,9 @@ export async function compose(env: ReturnType<typeof loadEnv>,
   storage?: { scans: ScanRepository; assessments: AssessmentRepository },
   adapters: RealWebappAdapters = REAL_WEBAPP_ADAPTERS): Promise<{ app: Hono; drain: () => Promise<void>;
   recoverAssessments: () => Promise<void>; repository: ScanRepository; apify: ApifyClient | null; banner: string;
-  clientIps: WeakMap<Request, string> }> {
+  clientIps: WeakMap<Request, string>;
+  /** The real webapp's daily Stripe reconciliation (DN-13 §9.5), for the process to schedule; null without the real webapp. */
+  reconcileBilling: (() => Promise<ReconcileReport>) | null }> {
   const mode = env.mode;
   const storageClient = !storage && env.storageBackend === 'supabase' ? createStorageClient(env.SUPABASE_URL!, env.supabaseKey!) : null;
   const durable = storage?.scans ?? (storageClient ? new SupabaseRepository(storageClient) : new InMemoryRepository());
@@ -175,5 +194,6 @@ export async function compose(env: ReturnType<typeof loadEnv>,
     + (mode === 'production' ? '' : ` (debug routes on ${listenHostname(mode)} only)`)
     + (guards.length ? ` spend guards: ${guards.join(', ')}` : '')
     + (env.overridden.length ? ` overrides: ${env.overridden.join(', ')}` : '');
-  return { app, drain, recoverAssessments, repository, apify, banner, clientIps };
+  const reconcileBilling = env.webapp === 'real' && webapp ? () => webapp.service.reconcileBilling() : null;
+  return { app, drain, recoverAssessments, repository, apify, banner, clientIps, reconcileBilling };
 }

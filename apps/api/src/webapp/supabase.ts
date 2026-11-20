@@ -1,7 +1,8 @@
 import type { PostgrestError, SupabaseClient } from '@supabase/supabase-js';
 import { AUDIT_ACTOR_KINDS, type BillingStatus, type Role } from '@arca/contracts';
 import { IneligibleAssignee, MemberChangeRefused, WebappConflict, type ActionPatch, type AssessmentActionRecord, type AuditActor,
-  type AuditPageQuery, type AuditRecord, type BillingApplyOutcome, type BillingStateRecord, type ClaimTicketRecord, type CustomActionRecord,
+  type AuditPageQuery, type AuditRecord, type BillingApplyOutcome, type BillingCustomerRecord, type BillingEventClosing, type BillingStateRecord,
+  type CheckoutSessionRecord, type ClaimTicketRecord, type CustomActionRecord,
   type DeletionRequestRecord, type InvitationRecord, type MemberChange, type MembershipRecord, type NewAuditRecord, type OrgActionRecord,
   type OrgAnalysisRecord, type OrganizationRecord, type PlanRecord, type ProfileRecord, type ProfileWrite, type SubscriptionRecord, type WebappConflictReason,
   type WebappRepository } from './types.js';
@@ -16,9 +17,13 @@ const TABLES = {
     times: ['expires_at', 'accepted_at', 'revoked_at', 'created_at'] },
   org_analyses: { columns: ['org_id', 'scan_id', 'assessment_id', 'claimed_by', 'claimed_at'], times: ['claimed_at'] },
   claim_tickets: { columns: ['id_hash', 'scan_id', 'email', 'expires_at', 'used_at'], times: ['expires_at', 'used_at'] },
-  plans: { columns: ['code', 'name', 'amount_cents', 'currency', 'interval', 'active'], times: [] },
-  subscriptions: { columns: ['org_id', 'plan_code', 'customer_id', 'subscription_id', 'status', 'current_period_end', 'updated_at'],
-    times: ['current_period_end', 'updated_at'] },
+  plans: { columns: ['code', 'name', 'amount_cents', 'currency', 'interval', 'active', 'stripe_product_id', 'stripe_price_id'], times: [] },
+  subscriptions: { columns: ['org_id', 'plan_code', 'customer_id', 'subscription_id', 'status', 'current_period_end', 'updated_at',
+    'provider_status', 'price_id', 'cancel_at_period_end', 'current_period_start', 'livemode'],
+    times: ['current_period_end', 'updated_at', 'current_period_start'] },
+  billing_customers: { columns: ['org_id', 'customer_id', 'livemode', 'created_at'], times: ['created_at'] },
+  checkout_sessions: { columns: ['id', 'org_id', 'plan_code', 'url', 'status', 'created_by', 'expires_at', 'created_at'],
+    times: ['expires_at', 'created_at'] },
   deletion_requests: { columns: ['id', 'org_id', 'requested_by', 'reason', 'status', 'reviewed_by', 'reviewed_at', 'review_note', 'created_at'],
     times: ['reviewed_at', 'created_at'] },
   org_actions: { columns: ['id', 'org_id', 'source', 'scan_id', 'action_key', 'title', 'detail', 'domain', 'status', 'assignee_user_id',
@@ -27,7 +32,7 @@ const TABLES = {
 } as const;
 type Table = keyof typeof TABLES;
 const select = (table: Table) => TABLES[table].columns.join(',');
-const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active'] as const;
+const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active', 'stripe_product_id', 'stripe_price_id'] as const;
 const TRACKED_FIELDS = ['status', 'assignee_user_id', 'due_date', 'updated_by', 'updated_at'] as const;
 
 /** One row as its record: only the record's columns, timestamps as ISO with Z, seq as a number. */
@@ -199,7 +204,14 @@ export class SupabaseWebappRepository implements WebappRepository {
   getPlan(code: string) { return this.one<PlanRecord>('plans', 'read plan', { code }); }
   async updatePlan(code: string, patch: Partial<Omit<PlanRecord, 'code'>>) {
     const fields = Object.fromEntries(PLAN_FIELDS.filter(field => patch[field] !== undefined).map(field => [field, patch[field]]));
-    const found = Object.keys(fields).length > 0 ? await this.patch('plans', { code }, fields, 'update plan') : (await this.getPlan(code)) !== null;
+    let found: boolean;
+    try {
+      found = Object.keys(fields).length > 0 ? await this.patch('plans', { code }, fields, 'update plan') : (await this.getPlan(code)) !== null;
+    } catch (error) {
+      // plans_stripe_price_id_key: a catalog price belongs to one plan.
+      if ((error as Error).cause && ((error as Error).cause as PostgrestError).code === '23505') throw new Error('Duplicate plan price', { cause: error });
+      throw error;
+    }
     if (!found) throw new Error('Plan not found');
   }
 
@@ -219,6 +231,61 @@ export class SupabaseWebappRepository implements WebappRepository {
   applyBillingState(event: { id: string; type: string; livemode?: boolean | null }, orgId: string, state: BillingStateRecord, at: string) {
     return this.rpc<BillingApplyOutcome>('apply_billing_state', { p_event: { id: event.id, type: event.type, livemode: event.livemode ?? null },
       p_org_id: orgId, p_state: state, p_at: at }, 'apply billing state');
+  }
+
+  async isBillingEventProcessed(id: string) {
+    const { data, error } = await this.client.from('stripe_events').select('processed_at').eq('id', id).maybeSingle();
+    if (error) throw translate(error, 'read billing event');
+    return (data as { processed_at: string | null } | null)?.processed_at != null;
+  }
+  closeBillingEvent(event: { id: string; type: string; livemode?: boolean | null }, orgId: string | null, closing: BillingEventClosing, at: string) {
+    return this.rpc<'recorded' | 'duplicate'>('close_billing_event', { p_event: { id: event.id, type: event.type, livemode: event.livemode ?? null },
+      p_org_id: orgId, p_error: closing.error, p_audit: closing.audit, p_at: at }, 'close billing event');
+  }
+
+  getBillingCustomer(orgId: string) { return this.one<BillingCustomerRecord>('billing_customers', 'read billing customer', { org_id: orgId }); }
+  findBillingCustomer(customerId: string) {
+    return this.one<BillingCustomerRecord>('billing_customers', 'find billing customer', { customer_id: customerId });
+  }
+  async addBillingCustomer(customer: BillingCustomerRecord) {
+    const { error } = await this.client.from('billing_customers').insert(customer);
+    if (error) {
+      // billing_customers_pkey: another request stored the organization's customer first, and that one stays.
+      if (!(error.code === '23505' && constraintOf(error) === 'billing_customers_pkey')) {
+        throw error.code === '23505' ? new Error('Duplicate billing customer', { cause: error }) : translate(error, 'add billing customer');
+      }
+    }
+    const stored = await this.getBillingCustomer(customer.org_id);
+    if (!stored) throw new Error('Billing customer not found');
+    return stored;
+  }
+  async getOpenCheckoutSession(orgId: string, at: string) {
+    const [session] = await this.list<CheckoutSessionRecord>('checkout_sessions', 'read checkout session', query => query.eq('org_id', orgId)
+      .eq('status', 'open').gt('expires_at', at).limit(1));
+    return session ?? null;
+  }
+  getCheckoutSession(id: string) { return this.one<CheckoutSessionRecord>('checkout_sessions', 'read checkout session', { id }); }
+  async addCheckoutSession(session: CheckoutSessionRecord, at: string) {
+    // The open sessions whose time passed are expired first, so the unique index of open sessions frees their place.
+    const { error: expireError } = await this.client.from('checkout_sessions').update({ status: 'expired' }).eq('org_id', session.org_id)
+      .eq('status', 'open').lte('expires_at', at);
+    if (expireError) throw translate(expireError, 'expire checkout sessions');
+    const { error } = await this.client.from('checkout_sessions').insert(session);
+    if (error && !(error.code === '23505' && constraintOf(error) === 'checkout_sessions_open_idx')) {
+      throw error.code === '23505' ? new Error('Duplicate checkout session', { cause: error }) : translate(error, 'add checkout session');
+    }
+    // Ours, or the one another request stored first.
+    const [open] = await this.list<CheckoutSessionRecord>('checkout_sessions', 'read checkout session', query => query.eq('org_id', session.org_id)
+      .eq('status', 'open').limit(1));
+    if (!open) throw new Error('Checkout session not found');
+    return open;
+  }
+  async closeCheckoutSession(id: string, status: 'complete' | 'expired') {
+    // Open or expired to complete; only open to expired. A completed session never changes again.
+    const { data, error } = await this.client.from('checkout_sessions').update({ status }).eq('id', id)
+      .in('status', status === 'complete' ? ['open', 'expired'] : ['open']).select('id');
+    if (error) throw translate(error, 'close checkout session');
+    return (data ?? []).length > 0;
   }
 
   async createDeletionRequest(request: DeletionRequestRecord) {

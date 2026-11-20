@@ -50,6 +50,9 @@ def main():
     # name the missing key here instead of leaving an unhealthy container to explain it.
     if settings.get("WEBSITE_EVIDENCE_PROVIDER", "agentic") != "rules":
         required.append("OPENAI_API_KEY")
+    # The real webapp (DN-13 §9.1) refuses to start without Stripe's key and webhook secret.
+    if settings.get("WEBAPP_ENABLED", "false") == "true":
+        required += ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"]
     missing = [key for key in required if not secrets.get(key)]
     if missing:
         fail("Missing parameters under /arca/prod: " + ", ".join(missing))

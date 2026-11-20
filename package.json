@@ -25,6 +25,7 @@
     "db:push": "supabase db push"
     ,"db:verify": "tsx --conditions=arca-source apps/api/scripts/verify-supabase.ts",
     "admin:grant": "tsx --conditions=arca-source apps/api/scripts/admin-grant.ts",
+    "stripe:catalog": "tsx --conditions=arca-source apps/api/scripts/stripe-catalog.ts",
     "demo:signals": "tsx --conditions=arca-source apps/api/scripts/demo-signals.ts",
     "eval:signals": "tsx --conditions=arca-source apps/api/scripts/eval-signals.ts"
   },

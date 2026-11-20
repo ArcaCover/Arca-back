@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Role } from '@arca/contracts';
 import {
   IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict, type ActionPatch, type AssessmentActionRecord, type AuditActor,
-  type BillingStateRecord, type ClaimTicketRecord, type CustomActionRecord, type DeletionRequestRecord, type InvitationRecord,
+  type BillingStateRecord, type CheckoutSessionRecord, type ClaimTicketRecord, type CustomActionRecord, type DeletionRequestRecord, type InvitationRecord,
   type MemberChange, type MembershipRecord, type NewAuditRecord, type OrgAnalysisRecord, type OrganizationRecord, type ProfileWrite,
   type SubscriptionRecord, type WebappConflictReason, type WebappRepository,
 } from '../../src/webapp/types.js';
@@ -460,9 +460,17 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
           await repo.updatePlan('monthly', {});
           expect(await repo.getPlan('monthly')).toEqual({ ...before, amount_cents: before.amount_cents + 100, active: false });
           expect(await repo.getPlan('annual')).toEqual(annual);
+          // The catalog price a plan charges (DN-13 §6.1): unique among the plans, and cleared with null.
+          const priceId = `price_conf${randomBytes(6).toString('hex')}`;
+          await repo.updatePlan('monthly', { stripe_product_id: 'prod_conf', stripe_price_id: priceId });
+          expect(await repo.getPlan('monthly')).toMatchObject({ stripe_product_id: 'prod_conf', stripe_price_id: priceId, amount_cents: before.amount_cents + 100 });
+          await expect(repo.updatePlan('annual', { stripe_price_id: priceId })).rejects.toThrow();
+          expect(await repo.getPlan('annual')).toEqual(annual);
+          await repo.updatePlan('monthly', { stripe_price_id: null });
+          expect((await repo.getPlan('monthly'))?.stripe_price_id).toBeNull();
         } finally {
           await repo.updatePlan('monthly', { name: before.name, amount_cents: before.amount_cents, currency: before.currency,
-            interval: before.interval, active: before.active });
+            interval: before.interval, active: before.active, stripe_product_id: before.stripe_product_id, stripe_price_id: before.stripe_price_id });
         }
         expect(await repo.getPlan('monthly')).toEqual(before);
         expect(await repo.getPlan(`weekly_${uuid()}`)).toBeNull();
@@ -475,7 +483,8 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
         expect(await repo.getSubscription(id)).toBeNull();
         const sub = subscriptionId();
         const record: SubscriptionRecord = { org_id: id, plan_code: 'monthly', customer_id: 'cus_Conf2', subscription_id: sub, status: 'active',
-          current_period_end: plus(tick(), 30 * DAY), updated_at: tick() };
+          current_period_end: plus(tick(), 30 * DAY), updated_at: tick(), provider_status: 'active', price_id: 'price_Conf2',
+          cancel_at_period_end: true, current_period_start: tick(), livemode: false };
         await repo.upsertSubscription({ ...record, status: 'pending_payment', subscription_id: null });
         await repo.upsertSubscription(record);
         expect(await repo.getSubscription(id)).toEqual(record);
@@ -515,6 +524,8 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
           current_period_end: null }, tick())).toBe('applied');
         expect(await repo.getSubscription(id)).toMatchObject({ plan_code: 'monthly', customer_id: 'cus_Conf1', subscription_id: sub,
           status: 'past_due', current_period_end: subscription.current_period_end });
+        expect(await repo.isBillingEventProcessed(event.id)).toBe(true);
+        expect(await repo.isBillingEventProcessed(eventOf().id)).toBe(false);
         expect((await repo.getOrganization(id))!.billing_status).toBe('past_due');
         const audit = await auditOfOrg(id);
         expect(audit.map(({ action, actor_kind, actor_user_id, target: t }) => [action, actor_kind, actor_user_id, t]))
@@ -538,6 +549,96 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
         expect(await repo.getSubscription(id)).toMatchObject({ subscription_id: third, status: 'active' });
         expect((await auditOfOrg(id)).map(row => row.action)).toEqual(['billing.event_applied', 'billing.event_applied',
           'billing.duplicate_subscription', 'billing.event_applied', 'billing.event_applied']);
+      });
+
+      it('keeps what Stripe last said of a subscription beside its status, and a null keeps what is stored', async () => {
+        const { id } = await organization();
+        const sub = subscriptionId();
+        const [start, end] = [tick(), plus(tick(), 30 * DAY)];
+        await repo.applyBillingState(eventOf(), id, stateOf(sub, { provider_status: 'past_due', status: 'past_due', price_id: 'price_Conf9',
+          cancel_at_period_end: true, current_period_start: start, current_period_end: end, livemode: false }), tick());
+        expect(await repo.getSubscription(id)).toMatchObject({ provider_status: 'past_due', status: 'past_due', price_id: 'price_Conf9',
+          cancel_at_period_end: true, current_period_start: start, current_period_end: end, livemode: false });
+        await repo.applyBillingState(eventOf(), id, { status: 'active', plan_code: null, customer_id: null, subscription_id: null,
+          current_period_end: null, provider_status: 'active' }, tick());
+        expect(await repo.getSubscription(id)).toMatchObject({ provider_status: 'active', status: 'active', price_id: 'price_Conf9',
+          cancel_at_period_end: true, current_period_start: start, current_period_end: end });
+      });
+
+      it('keeps the first Stripe customer of an organization, and finds the organization of a customer', async () => {
+        const { id } = await organization();
+        const other = await organization();
+        expect(await repo.getBillingCustomer(id)).toBeNull();
+        const customer = { org_id: id, customer_id: `cus_Conf${randomBytes(6).toString('hex')}`, livemode: false, created_at: tick() };
+        expect(await repo.addBillingCustomer(customer)).toEqual(customer);
+        expect(await repo.getBillingCustomer(id)).toEqual(customer);
+        // A second one, as from a request that raced the first, is not stored: the first stays and is returned.
+        const late = { ...customer, customer_id: `cus_Conf${randomBytes(6).toString('hex')}`, created_at: tick() };
+        expect(await repo.addBillingCustomer(late)).toEqual(customer);
+        expect(await repo.findBillingCustomer(customer.customer_id)).toEqual(customer);
+        expect(await repo.findBillingCustomer(late.customer_id)).toBeNull();
+        // A customer belongs to one organization.
+        await expect(repo.addBillingCustomer({ ...customer, org_id: other.id })).rejects.toThrow();
+        expect(await repo.getBillingCustomer(other.id)).toBeNull();
+      });
+
+      it('keeps one open checkout session per organization, until it expires or closes', async () => {
+        const { id, owner } = await organization();
+        const sessionOf = (patch: Partial<CheckoutSessionRecord> = {}): CheckoutSessionRecord => {
+          const createdAt = tick();
+          const sessionId = `cs_test_Conf${randomBytes(8).toString('hex')}`;
+          return { id: sessionId, org_id: id, plan_code: 'monthly', url: `https://checkout.stripe.com/c/pay/${sessionId}`, status: 'open',
+            created_by: owner, expires_at: plus(createdAt, 60 * 60 * 1000), created_at: createdAt, ...patch };
+        };
+        const first = sessionOf();
+        expect(await repo.getOpenCheckoutSession(id, first.created_at)).toBeNull();
+        expect(await repo.addCheckoutSession(first, first.created_at)).toEqual(first);
+        expect(await repo.getOpenCheckoutSession(id, plus(first.created_at, 1000))).toEqual(first);
+        // Another while it is open: the open one is returned and the new one is not kept.
+        const second = sessionOf({ plan_code: 'annual' });
+        expect(await repo.addCheckoutSession(second, second.created_at)).toEqual(first);
+        expect(await repo.getCheckoutSession(second.id)).toBeNull();
+        // Past its expiry it no longer counts as open, and the next one takes its place.
+        const later = plus(first.expires_at, 1000);
+        expect(await repo.getOpenCheckoutSession(id, later)).toBeNull();
+        const third = sessionOf({ created_at: later, expires_at: plus(later, 60 * 60 * 1000) });
+        expect(await repo.addCheckoutSession(third, later)).toEqual(third);
+        expect((await repo.getCheckoutSession(first.id))?.status).toBe('expired');
+        // Closing: once, and a completed session never goes back to expired.
+        expect(await repo.closeCheckoutSession(third.id, 'complete')).toBe(true);
+        expect(await repo.closeCheckoutSession(third.id, 'complete')).toBe(false);
+        expect(await repo.closeCheckoutSession(third.id, 'expired')).toBe(false);
+        expect(await repo.getCheckoutSession(third.id)).toEqual({ ...third, status: 'complete' });
+        // An expired one can still complete: Stripe is the judge of whether it was paid.
+        expect(await repo.closeCheckoutSession(first.id, 'complete')).toBe(true);
+        expect(await repo.closeCheckoutSession(`cs_test_Conf${randomBytes(8).toString('hex')}`, 'complete')).toBe(false);
+        expect(await repo.getOpenCheckoutSession(id, later)).toBeNull();
+      });
+
+      it('records an event that moves no subscription in one step with its audit, once', async () => {
+        const { id } = await organization();
+        const refund = eventOf('charge.refunded');
+        expect(await repo.isBillingEventProcessed(refund.id)).toBe(false);
+        const at = tick();
+        const audit = { action: 'billing.refunded', data: { amountCents: 1000, currency: 'usd' } };
+        const results = await Promise.all([repo.closeBillingEvent(refund, id, { error: null, audit }, at),
+          repo.closeBillingEvent(refund, id, { error: null, audit }, at)]);
+        expect(results.sort()).toEqual(['duplicate', 'recorded']);
+        expect(await repo.isBillingEventProcessed(refund.id)).toBe(true);
+        expect(await auditOfOrg(id)).toEqual([{ action: 'billing.refunded', actor_kind: 'system', actor_user_id: null, target: refund.id,
+          data: { amountCents: 1000, currency: 'usd' } }]);
+        // Processed, it is a duplicate for applyBillingState too, and nothing changes.
+        expect(await repo.applyBillingState(refund, id, stateOf(subscriptionId()), tick())).toBe('duplicate');
+        expect(await repo.getSubscription(id)).toBeNull();
+        // No organization, and no audit: only the event, with why.
+        const stray = eventOf();
+        expect(await repo.closeBillingEvent(stray, null, { error: 'unknown_org', audit: null }, tick())).toBe('recorded');
+        expect(await repo.isBillingEventProcessed(stray.id)).toBe(true);
+        // An event seen by an earlier attempt that failed is still recorded.
+        const seen = eventOf('checkout.session.expired');
+        await repo.recordBillingEvent(seen.id, seen.type);
+        expect(await repo.closeBillingEvent(seen, id, { error: null, audit: null }, tick())).toBe('recorded');
+        expect((await auditOfOrg(id)).map(row => row.action)).toEqual(['billing.refunded']);
       });
     });
 

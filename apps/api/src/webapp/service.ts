@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { can, canManageMember, hasPaidAccess, type ActionItemView, type ActionPlanResponse, type ActionStatus, type ActivityEventView,
   type ActivityPage, type AdminAuditPage, type AdminMetricsView, type AdminOrgDetailView, type AdminOrgView, type AnalysisView,
-  type AssessmentResult, type AuditActorKind, type ClaimResponse, type CreateActionRequest, type CreateOrgRequest, type DeletionRequestView,
+  type AssessmentResult, type AuditActorKind, type BillingView, type ClaimResponse, type CreateActionRequest, type CreateOrgRequest, type DeletionRequestView,
   type EnrollRequest, type EnrollResponse,
   type InvitationView, type InviteRequest, type Layer1Result, type MeResponse, type MemberView, type OrgView, type Permission, type PlanView,
   type Role, type UpdateActionRequest, type UpdatePlanRequest } from '@arca/contracts';
@@ -10,14 +10,15 @@ import { verifySessionToken } from '../auth/session-token.js';
 import type { ScanRecord, ScanRepository } from '../repositories/types.js';
 import type { AppUser } from './auth.js';
 import { AuthAdminUnavailable, type AuthAdmin } from './auth-admin.js';
-import type { BillingEvent, BillingProvider } from './billing.js';
+import { BillingUnavailable, type BillingEvent, type BillingProvider } from './billing.js';
+import { BillingEvents, type ReconcileReport, type WebhookOutcome } from './billing-events.js';
 import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict, type ActionPatch, type AuditActor, type AuditRecord,
-  type BillingApplyOutcome, type CustomActionRecord,
+  type BillingApplyOutcome, type CheckoutSessionRecord, type CustomActionRecord,
   type DeletionRequestRecord, type InvitationRecord, type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord,
   type PlanRecord, type WebappConflictReason, type WebappRepository } from './types.js';
 
 const STATUS = { invalid_request: 400, unauthorized: 401, payment_required: 402, forbidden: 403, not_found: 404, conflict: 409, gone: 410,
-  rate_limited: 429, auth_unavailable: 503 } as const;
+  rate_limited: 429, billing_unavailable: 502, auth_unavailable: 503 } as const;
 type FailureCode = keyof typeof STATUS;
 
 export class WebappFailure extends Error {
@@ -43,6 +44,14 @@ const CONFLICTS: Record<WebappConflictReason, string> = {
 // One answer for every claim or invitation POST /auth/enroll cannot use (DN-13 §4.2): unknown, expired, spent, revoked, accepted, or
 // of a deleted organization. The request names no email, so none is revealed either way.
 const ENROLL_REFUSED = 'This link is no longer valid; start again from your results or ask for a new invitation';
+const ALREADY_PAID = 'This organization is already paid; use billing/portal';
+/** Stripe did not answer: nothing was written (DN-13 §7.3). */
+async function orUnavailable<T>(work: Promise<T>): Promise<T> {
+  try { return await work; } catch (error) {
+    if (error instanceof BillingUnavailable) throw fail('billing_unavailable', 'Payments are unavailable right now; try again in a minute');
+    throw error;
+  }
+}
 /** The rules the repository enforces atomically come back as a 409. */
 async function orConflict<T>(write: Promise<T>): Promise<T> {
   try { return await write; } catch (error) {
@@ -127,7 +136,8 @@ const trackedData = (tracked: Tracked, fields: ReadonlyArray<keyof Tracked>) =>
 // corrects the rows DN-10 wrote with the same list.
 export const ACTOR_KIND_OF_ACTION: Readonly<Record<string, Exclude<AuditActorKind, 'member'>>> = Object.freeze({
   'org.deletion_approved': 'platform', 'org.deletion_rejected': 'platform', 'plan.updated': 'platform',
-  'billing.event_applied': 'system',
+  'billing.event_applied': 'system', 'billing.duplicate_subscription': 'system', 'billing.invoice_paid': 'system',
+  'billing.payment_failed': 'system', 'billing.payment_action_required': 'system', 'billing.refunded': 'system', 'billing.dispute': 'system',
 });
 // An action is a string from a row, so the tables below are read by own key only: one named like a property every object has
 // ('constructor', '__proto__') names no entry.
@@ -195,11 +205,14 @@ export class WebappService {
   private readonly now: () => number;
   // When each user wrote to an action plan in the last minute. Per process, like the assessment's answer limit.
   private readonly actionWrites = new Map<string, number[]>();
+  // Stripe's events, the return from Checkout and the reconciliation, one organization at a time (DN-13 §6.5).
+  private readonly billingEvents: BillingEvents;
 
   constructor(private readonly deps: WebappServiceDeps) {
     this.repo = deps.repository;
     this.appBaseUrl = deps.appBaseUrl.replace(/\/+$/, '');
     this.now = deps.now ?? Date.now;
+    this.billingEvents = new BillingEvents({ repository: deps.repository, billing: deps.billing, now: this.now });
   }
 
   /**
@@ -447,23 +460,123 @@ export class WebappService {
     if (before === null) throw fail('not_found', 'Member not found');
   }
 
-  /** Paying is how an organization gets in, so checkout and portal ask for billing.manage but not for a payment. */
+  /**
+   * Paying is how an organization gets in, so checkout and portal ask for billing.manage but not for a payment. One open Checkout
+   * Session per organization (DN-13 §6.2): while Stripe holds it open for the same plan, every click, of any owner, gets its URL; for
+   * another plan it is expired first; one Stripe says was paid is applied (the return's path) instead of opening a second. The
+   * organization's billing work runs one at a time, so two clicks never open two sessions. 502 when Stripe does not answer.
+   */
   async checkout(actor: AppUser, orgId: string, planCode: string): Promise<{ url: string }> {
     const { org } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
-    // A second checkout would start a second subscription; changing plan or card is the portal's job.
-    if (hasPaidAccess(org.billing_status)) throw fail('conflict', 'This organization is already paid; use billing/portal');
-    const plan = await this.repo.getPlan(planCode);
-    if (!plan?.active) throw fail('invalid_request', 'Unknown or inactive plan');
-    const { url } = await this.deps.billing.createCheckout({ orgId: org.id, plan, successUrl: `${this.appBaseUrl}/app?paid=1`,
-      cancelUrl: `${this.appBaseUrl}/app/billing` });
+    return this.billingEvents.forOrg(org.id, async () => {
+      // Read again in the organization's turn: a webhook or a return may have paid it meanwhile. A second checkout would start a
+      // second subscription; changing plan or card is the portal's job.
+      const current = (await this.repo.getOrganization(org.id)) ?? org;
+      if (hasPaidAccess(current.billing_status)) throw fail('conflict', ALREADY_PAID);
+      const plan = await this.repo.getPlan(planCode);
+      if (!plan?.active) throw fail('invalid_request', 'Unknown or inactive plan');
+      if (this.deps.billing.needsCatalogPrice && !plan.stripe_price_id) {
+        throw fail('conflict', 'This plan cannot be bought yet: it has no Stripe price (npm run stripe:catalog)');
+      }
+      const at = this.timestamp();
+      const open = await this.repo.getOpenCheckoutSession(org.id, at);
+      if (open) {
+        const reused = await this.reuseCheckout(org.id, open, plan.code);
+        if (reused) return { url: reused };
+      }
+      const customerId = await this.billingCustomer(current, actor);
+      // What came before this session keeps its idempotency key apart from a session closed in the same minute (DN-13 §6.2).
+      const after = open?.id ?? (await this.repo.getSubscription(org.id))?.subscription_id ?? null;
+      const created = await orUnavailable(this.deps.billing.createCheckout({ orgId: org.id, customerId, plan, after,
+        successUrl: `${this.appBaseUrl}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${this.appBaseUrl}/app/billing` }));
+      const stored = await this.repo.addCheckoutSession({ id: created.sessionId, org_id: org.id, plan_code: plan.code, url: created.url,
+        status: 'open', created_by: actor.userId, expires_at: created.expiresAt, created_at: at }, at);
+      if (stored.id !== created.sessionId) {
+        // Another process stored its session first: that one is the organization's, and this one must not be paid.
+        await this.deps.billing.expireCheckout(created.sessionId).catch(() => undefined);
+        return { url: stored.url };
+      }
+      await this.audit(actor.userId, org.id, 'billing.checkout_started', created.sessionId, { planCode: plan.code }, 'member');
+      return { url: created.url };
+    });
+  }
+
+  /**
+   * The open session's URL while Stripe still holds it open for this plan. Otherwise it is closed here as Stripe says and null comes
+   * back, so a new one opens; or, when it was paid, its subscription is applied and an organization that now pays gets the 409.
+   */
+  private async reuseCheckout(orgId: string, open: CheckoutSessionRecord, planCode: string): Promise<string | null> {
+    let checkout = await orUnavailable(this.deps.billing.checkoutState(open.id));
+    if (checkout?.status === 'open') {
+      if (open.plan_code === planCode) return open.url;
+      // Another plan: the open one is closed first, so the organization never holds two that could both be paid.
+      if (await orUnavailable(this.deps.billing.expireCheckout(open.id)) === 'expired') {
+        await this.repo.closeCheckoutSession(open.id, 'expired');
+        return null;
+      }
+      checkout = await orUnavailable(this.deps.billing.checkoutState(open.id));
+    }
+    if (!checkout || checkout.status !== 'complete') {
+      await this.repo.closeCheckoutSession(open.id, 'expired');
+      return null;
+    }
+    const subscription = await orUnavailable(this.billingEvents.applyCheckout(orgId, checkout));
+    const now = await this.repo.getOrganization(orgId);
+    if (now && hasPaidAccess(now.billing_status)) throw fail('conflict', ALREADY_PAID);
+    // Paid but still being confirmed (3-D Secure): a second checkout now could become a second subscription.
+    if (subscription?.status === 'incomplete') throw fail('conflict', 'A payment of this organization is still being confirmed; try again in a few minutes');
+    return null;
+  }
+
+  /** The organization's Stripe customer: the one stored, or a new one named after the organization, with the payer's email. */
+  private async billingCustomer(org: OrganizationRecord, payer: AppUser): Promise<string> {
+    const stored = await this.repo.getBillingCustomer(org.id);
+    if (stored) return stored.customer_id;
+    const { customerId } = await orUnavailable(this.deps.billing.ensureCustomer({ orgId: org.id, name: org.name, email: payer.email }));
+    return (await this.repo.addBillingCustomer({ org_id: org.id, customer_id: customerId, livemode: this.deps.billing.mode === 'live',
+      created_at: this.timestamp() })).customer_id;
+  }
+
+  /** 409 until the organization is a Stripe customer, which its first checkout makes it (DN-13 §6.4). */
+  async portal(actor: AppUser, orgId: string): Promise<{ url: string }> {
+    const { org } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
+    const customer = await this.repo.getBillingCustomer(org.id);
+    if (!customer) throw fail('conflict', 'This organization has no billing customer yet: start with a checkout');
+    const { url } = await orUnavailable(this.deps.billing.createPortal({ customerId: customer.customer_id, returnUrl: `${this.appBaseUrl}/app/billing` }));
     return { url };
   }
 
-  async portal(actor: AppUser, orgId: string): Promise<{ url: string }> {
-    const { org } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
-    const { url } = await this.deps.billing.createPortal({ orgId: org.id, returnUrl: `${this.appBaseUrl}/app/billing` });
-    return { url };
+  /**
+   * The return from Checkout (DN-13 §6.3): the session is read at Stripe and, when it belongs to this organization, its subscription
+   * is applied by the webhook's path, before the webhook arrives. Answers the organization as it is now. A session of another
+   * organization, or one Stripe does not know, is not found.
+   */
+  async syncCheckout(actor: AppUser, orgId: string, sessionId: string): Promise<OrgView> {
+    const { org, role } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
+    const checkout = await orUnavailable(this.deps.billing.checkoutState(sessionId));
+    if (!checkout || checkout.orgId?.toLowerCase() !== org.id) throw fail('not_found', 'Checkout session not found');
+    await orUnavailable(this.billingEvents.syncCheckout(org.id, checkout));
+    return this.view((await this.repo.getOrganization(org.id)) ?? org, role);
   }
+
+  /** What every member sees of the subscription (DN-13 §7.2, DN-11 D10), with no payment needed. */
+  async billingView(user: AppUser, orgId: string): Promise<BillingView> {
+    const { org, role } = await this.authorize(user, orgId, null, { payment: false });
+    const subscription = await this.repo.getSubscription(org.id);
+    const plan = subscription && await this.repo.getPlan(subscription.plan_code);
+    return { billingStatus: org.billing_status, plan: plan ? planView(plan) : null,
+      currentPeriodEnd: subscription?.current_period_end ? iso(subscription.current_period_end) : null,
+      cancelAtPeriodEnd: subscription?.cancel_at_period_end ?? false, manageable: can(role, 'billing.manage') };
+  }
+
+  /** Whether POST /billing/webhook is served: only a provider that signs its webhooks (Stripe), never the simulated one. */
+  get acceptsBillingWebhooks(): boolean { return this.deps.billing.webhooks; }
+  /** POST /billing/webhook (DN-13 §6.5): throws WebhookRejected for a 400; any other error is a 500 so Stripe retries. */
+  billingWebhook(raw: string | Uint8Array, signature: string | undefined): Promise<WebhookOutcome> {
+    return this.billingEvents.webhook(raw, signature);
+  }
+  /** The daily reconciliation (DN-13 §9.5). The process that runs it schedules it. */
+  reconcileBilling(options: { windowMs?: number } = {}): Promise<ReconcileReport> { return this.billingEvents.reconcile(options); }
 
   /**
    * Moves the subscription and billing_status, never the deletion state (DN-10 §4.4). Each event id counts once. An event names
@@ -473,6 +586,8 @@ export class WebappService {
     const orgId = asUuid(event.orgId);
     const org = orgId && await this.repo.getOrganization(orgId);
     if (!org) return 'unknown_org';
+    // The simulated checkout that was paid closes, so the next checkout opens a new one.
+    if (event.checkoutSessionId) await this.repo.closeCheckoutSession(event.checkoutSessionId, 'complete');
     // Recorded and applied in one step (DN-13 §6.5): a crash in between can no longer leave an event seen but never applied. An
     // event that names no plan, for an organization that never subscribed, only moves billing_status.
     return this.repo.applyBillingState({ id: event.id, type: event.type }, org.id, { status: event.status, plan_code: event.planCode,
@@ -670,8 +785,24 @@ export class WebappService {
     const at = this.timestamp();
     // The review, the deletion mark and the audit are one step; the second of two reviews that race is the same 409 (DN-13 §5.4).
     await orConflict(this.repo.reviewDeletionRequest(request.id, status, admin.userId, note ?? null, at, this.actor(admin.userId, 'platform')));
-    if (status === 'approved') await this.deps.billing.cancel(request.org_id);
+    if (status === 'approved') await this.cancelSubscription(request.org_id);
     return deletionView({ ...request, status, reviewed_by: admin.userId, reviewed_at: at, review_note: note ?? null });
+  }
+
+  /**
+   * An approved deletion stops the charges (DN-13 §6.9): the live subscription is canceled at once at the provider; the webhook that
+   * follows moves billing_status. The review is already written, so a provider failure does not undo it: it is logged for a person to
+   * cancel from the dashboard.
+   */
+  private async cancelSubscription(orgId: string) {
+    const subscription = await this.repo.getSubscription(orgId);
+    if (!subscription?.subscription_id || subscription.status === 'canceled') return;
+    try {
+      await this.deps.billing.cancel({ orgId, subscriptionId: subscription.subscription_id });
+    } catch (error) {
+      console.error(`[billing] failed to cancel subscription ${subscription.subscription_id} of deleted organization ${orgId} `
+        + `(${error instanceof Error ? error.name : 'unknown error'}); cancel it in the Stripe dashboard`);
+    }
   }
 
   /** Inactive plans included; the caller runs requirePlatformAdmin first. */
@@ -679,14 +810,22 @@ export class WebappService {
     return (await this.repo.listPlans()).map(planView);
   }
 
-  /** The price lives only in the plans table, so the next checkout already charges the new one (DN-10 §4.4). */
+  /**
+   * The price lives in the plans table and in a catalog price (DN-13 §6.1): a new amount, currency or interval first creates the new
+   * price at the provider (502, with the table untouched, when it does not answer), then points the plan at it, so the next checkout
+   * charges it. Subscribers keep the price they pay (F2).
+   */
   async updatePlan(admin: AppUser, code: string, patch: UpdatePlanRequest): Promise<PlanView> {
     await this.requirePlatformAdmin(admin);
     const before = await this.repo.getPlan(code);
     if (!before) throw fail('not_found', 'Plan not found');
+    const price = { amountCents: patch.amountCents ?? before.amount_cents, currency: patch.currency ?? before.currency,
+      interval: patch.interval ?? before.interval };
+    const repriced = price.amountCents !== before.amount_cents || price.currency !== before.currency || price.interval !== before.interval;
+    const catalog = repriced ? await orUnavailable(this.deps.billing.createPrice({ plan: before, ...price })) : null;
     // A field left undefined is not changed.
     await this.repo.updatePlan(code, { name: patch.name, amount_cents: patch.amountCents, currency: patch.currency, interval: patch.interval,
-      active: patch.active });
+      active: patch.active, stripe_price_id: catalog?.priceId, stripe_product_id: catalog?.productId });
     const after = (await this.repo.getPlan(code))!;
     await this.audit(admin.userId, null, 'plan.updated', code, { before, after }, 'platform');
     return planView(after);

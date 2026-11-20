@@ -95,31 +95,50 @@ describe('mock app auth', () => {
 });
 
 describe('mock billing', () => {
-  const urls = { successUrl: `${APP}/app?paid=1`, cancelUrl: `${APP}/app/billing` };
+  const urls = { successUrl: `${APP}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${APP}/app/billing` };
 
-  it('a checkout is paid once', async () => {
+  it('a checkout is paid once, and Stripe\'s reads of it answer like Stripe\'s would', async () => {
     const billing = new MockBillingProvider(APP, () => T0);
-    const first = await billing.createCheckout({ orgId: 'org_1', plan: monthly, ...urls });
-    const second = await billing.createCheckout({ orgId: 'org_2', plan: annual, ...urls });
+    expect([billing.mode, billing.webhooks, billing.needsCatalogPrice]).toEqual(['simulated', false, false]);
+    const { customerId } = await billing.ensureCustomer({ orgId: 'org_1', name: 'Smith & Co', email: 'owner@firm.com' });
+    const first = await billing.createCheckout({ orgId: 'org_1', customerId, plan: monthly, ...urls });
+    const second = await billing.createCheckout({ orgId: 'org_2', customerId: 'cus_mock_2', plan: annual, ...urls });
     expect(first.sessionId).not.toBe(second.sessionId);
     expect(first.url).toBe(`${APP}/app/billing/mock-checkout?session=${first.sessionId}`);
+    expect(first.expiresAt).toBe('2026-10-25T13:00:00.000Z');
+    expect(await billing.checkoutState(first.sessionId)).toEqual({ sessionId: first.sessionId, orgId: 'org_1', customerId, subscriptionId: null,
+      status: 'open', livemode: false });
 
     const paid = billing.pay(first.sessionId);
     expect(paid).toEqual({ id: expect.any(String), type: 'checkout.completed', orgId: 'org_1', status: 'active', planCode: 'monthly',
-      customerId: expect.any(String), subscriptionId: expect.any(String), currentPeriodEnd: '2026-11-25T12:00:00.000Z' });
+      customerId, subscriptionId: expect.any(String), currentPeriodEnd: '2026-11-25T12:00:00.000Z', checkoutSessionId: first.sessionId });
     expect(billing.pay(first.sessionId)).toBeNull();
     expect(billing.pay('cs_unknown')).toBeNull();
+    expect(await billing.checkoutState(first.sessionId)).toMatchObject({ status: 'complete', subscriptionId: paid!.subscriptionId });
+    expect(await billing.subscriptionState(paid!.subscriptionId!)).toMatchObject({ status: 'active', orgId: 'org_1', planCode: 'monthly',
+      currentPeriodEnd: '2026-11-25T12:00:00.000Z' });
+    expect(await billing.expireCheckout(first.sessionId)).toBe('complete');
 
     const yearly = billing.pay(second.sessionId);
     expect(yearly).toMatchObject({ orgId: 'org_2', planCode: 'annual', currentPeriodEnd: '2027-10-25T12:00:00.000Z' });
     expect(yearly!.id).not.toBe(paid!.id);
+    const third = await billing.createCheckout({ orgId: 'org_3', customerId: 'cus_mock_3', plan: monthly, ...urls });
+    expect(await billing.expireCheckout(third.sessionId)).toBe('expired');
+    expect(billing.pay(third.sessionId)).toBeNull();
   });
 
-  it('the portal returns to billing and a cancellation is recorded', async () => {
-    const billing = new MockBillingProvider(`${APP}/`);
-    expect(await billing.createPortal({ orgId: 'org_1', returnUrl: `${APP}/app/billing` })).toEqual({ url: `${APP}/app/billing` });
+  it('the portal returns to billing, a cancellation is recorded, and no webhook is ever accepted', async () => {
+    const billing = new MockBillingProvider(`${APP}/`, () => T0);
+    expect(await billing.createPortal({ customerId: 'cus_mock_1', returnUrl: `${APP}/app/billing` })).toEqual({ url: `${APP}/app/billing` });
     expect(billing.canceled).toEqual([]);
-    await billing.cancel('org_1');
+    const { sessionId } = await billing.createCheckout({ orgId: 'org_1', customerId: 'cus_mock_1', plan: monthly, ...urls });
+    const { subscriptionId } = billing.pay(sessionId)!;
+    await billing.cancel({ orgId: 'org_1', subscriptionId: subscriptionId! });
     expect(billing.canceled).toEqual(['org_1']);
+    expect(await billing.subscriptionState(subscriptionId!)).toMatchObject({ status: 'canceled' });
+    expect(await billing.parseWebhook()).toBeNull();
+    expect(await billing.recentSubscriptionIds()).toEqual([]);
+    expect(await billing.createPrice({ plan: monthly, amountCents: 1, currency: 'usd', interval: 'month' }))
+      .toEqual({ priceId: expect.stringMatching(/^price_mock_/), productId: 'prod_mock' });
   });
 });

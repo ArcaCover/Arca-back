@@ -560,7 +560,11 @@ describe('billing', () => {
     expect(await s.service.applyBillingEvent(s.billing.pay(new URL(url).searchParams.get('session')!)!)).toBe('applied');
     expect(await s.service.orgView(owner, org.id)).toMatchObject({ billingStatus: 'active', paidAccess: true });
     expect(await s.repository.getSubscription(org.id)).toEqual({ org_id: org.id, plan_code: 'monthly', customer_id: expect.any(String),
-      subscription_id: expect.any(String), status: 'active', current_period_end: '2026-11-25T12:00:00.000Z', updated_at: iso(T0) });
+      subscription_id: expect.any(String), status: 'active', current_period_end: '2026-11-25T12:00:00.000Z', updated_at: iso(T0),
+      provider_status: null, price_id: null, cancel_at_period_end: false, current_period_start: null, livemode: null });
+    // The simulated checkout that was paid is closed, and its customer is the organization's.
+    expect(await s.repository.getOpenCheckoutSession(org.id, iso(T0))).toBeNull();
+    expect(await s.repository.getBillingCustomer(org.id)).toMatchObject({ customer_id: (await s.repository.getSubscription(org.id))!.customer_id });
 
     await s.service.requestDeletion(owner, org.id, 'Closing the firm');
     const canceled: BillingEvent = { id: 'evt_canceled', type: 'subscription.canceled', orgId: org.id, status: 'canceled', planCode: null,
@@ -657,8 +661,11 @@ describe('deletion and the platform admin', () => {
 
     const createCheckout = vi.spyOn(s.billing, 'createCheckout');
     await s.service.checkout(owner, org.id, 'monthly');
-    expect(createCheckout).toHaveBeenCalledWith({ orgId: org.id, plan: { code: 'monthly', name: 'Monthly (example price)',
-      amount_cents: 1000, currency: 'usd', interval: 'month', active: true }, successUrl: `${APP}/app?paid=1`, cancelUrl: `${APP}/app/billing` });
+    // The new amount is a new catalog price (DN-13 §6.1), here the simulated provider's.
+    expect(createCheckout).toHaveBeenCalledWith({ orgId: org.id, customerId: expect.stringMatching(/^cus_mock_/), after: null,
+      plan: { code: 'monthly', name: 'Monthly (example price)', amount_cents: 1000, currency: 'usd', interval: 'month', active: true,
+        stripe_product_id: 'prod_mock', stripe_price_id: expect.stringMatching(/^price_mock_/) },
+      successUrl: `${APP}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${APP}/app/billing` });
 
     await s.service.updatePlan(ops, 'annual', { active: false });
     expect((await s.service.listPlans()).map(plan => plan.code)).toEqual(['monthly']);
@@ -670,6 +677,7 @@ describe('deletion review races', () => {
   it('the second of two racing reviews is a 409, not a 500, and the first decision stands with one audit row', async () => {
     const s = await scene();
     const { owner, org } = await s.ownedOrg();
+    await s.pay(owner, org.id);
     const request = await s.service.requestDeletion(owner, org.id, 'Closing the firm');
     const [first, second] = [await s.platformAdmin(), await s.user('ops2@arca.example')];
     await s.repository.grantPlatformAdmin(second.userId, null);
@@ -734,6 +742,7 @@ describe('audit', () => {
     const log = rows.map(record => [record.action, record.actor_user_id, record.org_id, record.actor_kind]);
     expect(log).toEqual([
       ['org.created', owner.userId, org.id, 'member'],
+      ['billing.checkout_started', owner.userId, org.id, 'member'],
       ['billing.event_applied', null, org.id, 'system'],
       ...[admin, member, viewer].flatMap(joined => [['member.invited', owner.userId, org.id, 'member'],
         ['member.joined', joined.userId, org.id, 'member']]),
@@ -764,7 +773,8 @@ describe('audit', () => {
     expect(await roleOf(s, org.id, admin.userId)).toBe('admin');
     await s.service.renameOrganization(owner, org.id, 'Robust Law');
     expect((await s.repository.listAllAudit({ limit: 50 })).reverse().map(record => [record.action, record.actor_user_id, record.actor_kind])).toEqual([
-      ['org.created', null, 'system'], ['billing.event_applied', null, 'system'], ['member.invited', null, 'system'],
+      ['org.created', null, 'system'], ['billing.checkout_started', owner.userId, 'member'], ['billing.event_applied', null, 'system'],
+      ['member.invited', null, 'system'],
       ['member.joined', null, 'system'], ['org.renamed', owner.userId, 'member']]);
   });
 });
@@ -1247,6 +1257,7 @@ describe('activity', () => {
       ['org.deletion_rejected', { kind: 'arca', email: null }],
       ['org.deletion_requested', { kind: 'member', email: OWNER }],
       ['billing.event_applied', { kind: 'system', email: null }],
+      ['billing.checkout_started', { kind: 'member', email: OWNER }],
       ['org.created', { kind: 'member', email: OWNER }],
     ]);
     const json = JSON.stringify(page);
@@ -1325,6 +1336,7 @@ describe('activity', () => {
     const { events } = ActivityPage.parse(await s.service.activity(owner, org.id, { limit: 200 }));
     expect(events.map(({ action, targetLabel, change }) => ({ action, targetLabel, change })).reverse()).toEqual([
       { action: 'org.created', targetLabel: 'Smith & Partners', change: { from: null, to: 'Smith & Co' } },
+      { action: 'billing.checkout_started', targetLabel: null, change: null },
       { action: 'billing.event_applied', targetLabel: null, change: null },
       ...['admin', 'member', 'viewer'].flatMap(role => [
         { action: 'member.invited', targetLabel: `${role}@firm.com`, change: { from: null, to: role } },
@@ -1351,15 +1363,15 @@ describe('activity', () => {
     const { owner, org } = await s.team();
     const all = (await s.service.activity(owner, org.id, { limit: 200 })).events;
     expect(all.map(event => event.action)).toEqual(['member.joined', 'member.invited', 'member.joined', 'member.invited', 'member.joined',
-      'member.invited', 'billing.event_applied', 'org.created']);
+      'member.invited', 'billing.event_applied', 'billing.checkout_started', 'org.created']);
     const first = await s.service.activity(owner, org.id, { limit: 3 });
     expect(first.events).toEqual(all.slice(0, 3));
     const second = await s.service.activity(owner, org.id, { limit: 3, before: first.nextBefore! });
     expect(second.events).toEqual(all.slice(3, 6));
     expect(await s.service.activity(owner, org.id, { limit: 3, before: second.nextBefore! })).toEqual({ events: all.slice(6), nextBefore: null });
     // A page that ends on the last event says so.
-    expect((await s.service.activity(owner, org.id, { limit: 8 })).nextBefore).toBeNull();
-    expect((await s.service.activity(owner, org.id, { limit: 7 })).nextBefore).toEqual(expect.any(Number));
+    expect((await s.service.activity(owner, org.id, { limit: 9 })).nextBefore).toBeNull();
+    expect((await s.service.activity(owner, org.id, { limit: 8 })).nextBefore).toEqual(expect.any(Number));
   });
 });
 
@@ -1445,15 +1457,16 @@ describe('the platform admin panel', () => {
     expect(all.events.map(event => [event.action, event.orgId, event.orgName, event.actorKind, event.actorEmail, event.targetLabel])).toEqual([
       ['plan.updated', null, null, 'platform', 'ops@arca.example', 'monthly'],
       ['billing.event_applied', a.org.id, 'Smith & Co', 'system', null, null],
+      ['billing.checkout_started', a.org.id, 'Smith & Co', 'member', OWNER, null],
       ['org.created', b.org.id, 'Boss LLP', 'member', 'boss@b.com', 'Boss LLP'],
       ['org.created', a.org.id, 'Smith & Co', 'member', OWNER, 'Smith & Co'],
     ]);
     expect(all.nextBefore).toBeNull();
     expect((await s.service.adminAudit({ orgId: b.org.id, limit: 100 })).events.map(event => event.action)).toEqual(['org.created']);
     expect(await s.service.adminAudit({ orgId: randomUUID(), limit: 100 })).toEqual({ events: [], nextBefore: null });
-    const first = await s.service.adminAudit({ limit: 2 });
-    expect(first.events).toEqual(all.events.slice(0, 2));
-    expect(await s.service.adminAudit({ limit: 2, before: first.nextBefore! })).toEqual({ events: all.events.slice(2), nextBefore: null });
+    const first = await s.service.adminAudit({ limit: 3 });
+    expect(first.events).toEqual(all.events.slice(0, 3));
+    expect(await s.service.adminAudit({ limit: 3, before: first.nextBefore! })).toEqual({ events: all.events.slice(3), nextBefore: null });
   });
 
   it('never gives a system row an email in ARCA\'s audit, even one that names a user', async () => {
@@ -1537,7 +1550,7 @@ describe('ids of the store', () => {
     expect(await s.repository.listInvitations(org.id)).toEqual([]);
     const portal = vi.spyOn(s.billing, 'createPortal');
     await s.service.portal(owner, ORG);
-    expect(portal).toHaveBeenCalledWith({ orgId: org.id, returnUrl: `${APP}/app/billing` });
+    expect(portal).toHaveBeenCalledWith({ customerId: (await s.repository.getBillingCustomer(org.id))!.customer_id, returnUrl: `${APP}/app/billing` });
     const request = await s.service.requestDeletion(owner, ORG, 'Closing the firm');
     expect(request.orgId).toBe(org.id);
     expect(await s.service.reviewDeletion(await s.platformAdmin(), request.id.toUpperCase(), 'reject')).toMatchObject({ id: request.id,
