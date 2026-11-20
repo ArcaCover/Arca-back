@@ -1904,3 +1904,115 @@ El borrado está preparado y **sin ejecutar** en dos scripts de scratch (no vers
 transacción que comprueba los ids y emails antes de borrar y apaga las guardas de solo-añadir y de último owner solo dentro de ella, y un
 script de Stripe en ensayo por defecto (`--apply` cancela, borra el cliente y el test clock; `--catalog` archiva además el catálogo y
 desactiva el portal).
+
+## 19. Pre-checkout con Checkout incrustado (2026-11-21)
+
+Diseño aprobado por el usuario (maqueta de cinco pasos): antes de pagar, la persona dice quién es y qué despacho paga, verifica su
+email con el código y paga dentro de la página de ARCA, con Stripe ya relleno con lo que dio. Rama `feat/real-accounts` en los dos
+repos. Producción sigue en 501 (`WEBAPP_ENABLED=false`). **La migración nueva no está aplicada a ninguna base**: la aplica el
+coordinador tras revisarla (el usuario autorizó aplicar las migraciones de DN-13 al proyecto compartido).
+
+### 19.1 Flujo
+
+| Paso | Front | Back |
+|---|---|---|
+| 1. You | Email del reclamo bloqueado, nombre, rol (Managing partner / Partner / Office manager / Other), teléfono opcional | — |
+| 2. Your firm | Razón social, EIN opcional, dirección de facturación (calle, ciudad, estado, ZIP), abogados (1 / 2–5 / 6–20 / 21–50 / 50+), estados donde ejerce | — |
+| 3. Plan | Planes de `GET /plans` | — |
+| 4. Verify email | `POST /auth/enroll` + código (§17.8); con el código, `POST /orgs` con el perfil | `CreateOrgWithProfileRequest`; organización, owner, análisis y perfil en una transacción |
+| 5. Payment | Checkout incrustado (`@stripe/react-stripe-js` `EmbeddedCheckoutProvider`/`EmbeddedCheckout`) | `POST /orgs/:id/billing/checkout { planCode, uiMode: 'embedded' }` → `{ clientSecret, sessionId }` |
+
+Nada se escribe antes del código: los pasos 1–3 viven en la pestaña. Quien abandona en el paso 5 ya tiene cuenta y organización
+(`pending_payment`) y termina el pago en `/app/billing`, con el mismo Checkout incrustado. Al pagar, Stripe lleva a
+`${APP_BASE_URL}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, que llama a `POST /orgs/:id/billing/sync` (§6.3) y entra en
+`/app`. Los modos simulados muestran los mismos cuatro primeros pasos y pagan en el checkout simulado, sin Stripe.js.
+
+### 19.2 Ficheros
+
+| Fichero | Qué |
+|---|---|
+| `supabase/migrations/20261121000000_org_profiles.sql` | **nueva**: tabla `org_profiles`, función `create_organization_with_profile`, `checkout_sessions.ui_mode` (§19.3) |
+| `packages/contracts/src/webapp.ts` | Exportaciones nuevas (§19.5) |
+| `apps/api/src/webapp/types.ts` | `OrgProfileRecord`, `CheckoutUiMode`; `CheckoutSessionRecord` con `ui_mode` y `url` nulo; `createOrganization(…, profile?)`, `getOrgProfile` |
+| `apps/api/src/webapp/in-memory.ts`, `supabase.ts` | El perfil en la misma escritura atómica; con perfil, la RPC nueva; sin él, `create_organization` como antes |
+| `apps/api/src/webapp/billing.ts` | `CustomerDetails`; `updateCustomer`, `createEmbeddedCheckout`; `ProviderCheckout` con `uiMode` y `clientSecret`; el simulado los implementa |
+| `apps/api/src/webapp/stripe.ts` | Cliente relleno con el perfil y el EIN como `us_ein`; `updateCustomer`; sesión incrustada; parámetros comunes en `openSession` |
+| `apps/api/src/webapp/service.ts` | `createOrganization` guarda el perfil; `embeddedCheckout`; una sola regla de sesión abierta para los dos tipos (`openCheckout`); `billingCustomer` crea o actualiza el cliente con el perfil |
+| `apps/api/src/webapp/routes.ts` | `POST /orgs` lee `CreateOrgWithProfileRequest`; el checkout lee `CheckoutSessionRequest` |
+
+### 19.3 Migración `20261121000000_org_profiles.sql`
+
+Aditiva, sin tocar ninguna tabla de scans:
+
+- **`org_profiles`** (una fila por organización, `org_id` FK a `organizations`): `contact_name`, `contact_role`, `contact_phone`,
+  `legal_name`, `ein` (`^\d{2}-\d{7}$`), `address_line1`, `address_city`, `address_state` (dos mayúsculas), `address_postal_code`
+  (ZIP o ZIP+4), `address_country` (siempre `US`), `attorney_range`, `practice_states` (`text[]`, de 1 a 51, sin nulos),
+  `created_by`, `created_at`, `updated_at`. Cada columna con su `check`, como el contrato.
+- **`create_organization_with_profile(p_org, p_owner, p_analysis, p_profile)`**: llama a `create_organization` (mismos errores) y
+  después inserta el perfil, todo en la misma transacción; un perfil de otra organización es `webapp_invalid:organization`.
+  `security definer`, `search_path` fijo, solo `service_role`.
+- **`checkout_sessions`**: columna `ui_mode` (`hosted` por defecto, o `embedded`), `url` pasa a admitir nulo y una restricción
+  `checkout_sessions_url_of_hosted` exige `url` en las alojadas. Las filas que ya existen quedan `hosted` con su URL (probado). Es
+  el único cambio a una tabla existente, y relaja una restricción sin perder datos.
+- RLS encendida sin políticas, sin permisos para `anon` ni `authenticated`, como §5.5.
+
+### 19.4 Stripe
+
+- **`ui_mode: 'embedded_page'`**, no `'embedded'`: la versión fijada (`2026-10-28.endive`) renombró los modos (`hosted_page`,
+  `embedded_page`, `elements`). Sin `success_url` ni `cancel_url` (Stripe los rechaza en una sesión incrustada); `return_url` con
+  `{CHECKOUT_SESSION_ID}`; `redirect_on_completion` por defecto (`always`). El resto, igual que la alojada: solo tarjeta,
+  `managed_payments` y `adaptive_pricing` apagados, `billing_address_collection: 'required'`, `customer_update` `auto`, una hora.
+- **Clave de idempotencia** propia: `checkout:<org>:<plan>:embedded:<minuto>[:<anterior>]`, para que una alojada y una incrustada del
+  mismo minuto no se confundan. La de la alojada no cambia.
+- **El secreto del cliente no se guarda.** Al reutilizar una sesión abierta se vuelve a leer en Stripe (`checkout.sessions.retrieve`
+  lo devuelve en las incrustadas); si no viene, se expira y se abre otra.
+- **Una sesión abierta por organización, de cualquier tipo.** Pedir la otra (o otro plan) expira la abierta antes (§18.4 punto 4).
+- **Cliente relleno**: `name` = razón social, `email` = el de quien paga, `phone`, `address` (país `US`) y el EIN con `tax_id_data`
+  `us_ein`. Si la organización ya tenía cliente (un intento anterior), `updateCustomer` lo pone al día antes de la sesión: actualiza
+  los campos, lee sus tax ids, quita un `us_ein` distinto y crea el que falte (clave `tax_id:<cliente>:us_ein:<ein>`). Sin perfil, el
+  cliente de siempre (nombre de la organización y email). Lo comprobado en el iframe real es parte del recorrido pendiente (§19.8).
+- `tax_id_collection` sigue apagado (F3): el EIN va al cliente porque el despacho lo dio, no porque Checkout lo pida.
+
+### 19.5 Contratos (sin publicar, salen con 0.5.0)
+
+Exportaciones nuevas de `webapp.ts`; ningún esquema que el front parsea con 0.4.0 cambió:
+
+- `ORG_CONTACT_ROLES`, `ATTORNEY_RANGES`, `US_STATES` (50 estados y DC) y sus tipos.
+- `OrgProfileInput`: estricto; recorta textos; teléfono y EIN opcionales (en blanco = `null`); teléfono de 10 a 15 dígitos y como
+  mucho 20 caracteres (el límite de Stripe); EIN de 9 dígitos normalizado a `12-3456789`; dirección de EE. UU.; estados sin repetir.
+- `CreateOrgWithProfileRequest` = `CreateOrgRequest` + `profile` opcional (`CreateOrgRequest` no cambia).
+- `CheckoutSessionRequest` = `{ planCode, uiMode?: 'hosted' | 'embedded' }`; `EmbeddedCheckoutResponse` = `{ clientSecret, sessionId }`.
+
+El front las copia en `lib/app/checkout-contract.ts` hasta 0.5.0.
+
+### 19.6 Desviaciones respecto a lo pedido
+
+1. `ui_mode` es `embedded_page` (§19.4).
+2. `checkout_sessions` cambia (columna nueva y `url` nulo): hacía falta para la regla de una sesión abierta con dos tipos.
+3. El perfil no entra en la auditoría (`org.created` sigue con nombre y scan): la leen todos los owners y admins.
+4. El remitente que nombra la pantalla del código (`no-reply@arcacover.com`, §4.9) solo es cierto con el SMTP propio (F11).
+
+### 19.7 Pruebas
+
+Escritas antes que el código; fallaron primero.
+
+| Fichero | Tests | Qué fija |
+|---|---|---|
+| `packages/contracts/tests/webapp.test.ts` | +6 | Listas, normalización, opcionales, 20 rechazos, compatibilidad de `CreateOrgRequest`, tipos de checkout |
+| `apps/api/tests/unit/stripe-billing.test.ts` | +3 | Cliente con perfil y `tax_id_data`; `updateCustomer` (una vez, sustituye un EIN viejo, 502 si Stripe cae); parámetros exactos de la sesión incrustada, clave de idempotencia, secreto, `checkoutState` |
+| `apps/api/tests/integration/embedded-checkout.test.ts` | 12 | `POST /orgs` con perfil normalizado y sin datos en la auditoría; sin perfil; 400 sin crear nada ni gastar el reclamo; cliente relleno y `us_ein`; `return_url`; misma sesión a dos clics; una abierta entre tipos; reanudar tras vencer con el mismo cliente actualizado; `sync` aplica el pago; sin perfil; 400/401/404; 502 sin guardar; proveedor simulado |
+| `apps/api/tests/integration/org-profiles-database.test.ts` | 5 | La RPC sobre PGlite, cada `check`, perfil de otra organización, `ui_mode` y su restricción, RLS y permisos, y la migración sobre filas existentes |
+| `apps/api/tests/conformance/webapp-repository.ts` | +1 y 1 ampliado (×3 destinos) | Perfil atómico con la organización; sesión incrustada sin URL |
+| `apps/api/tests/fixtures/stripe.ts` | — | Clientes con teléfono, dirección y tax ids; actualizar; tax ids; sesiones incrustadas con las reglas de Stripe (`return_url` sí, `success_url` no) |
+
+`npm run typecheck` limpio. `npm test`: **1659 pasan, 54 se saltan** (las suites contra un Supabase real, sin sus variables), ninguno
+falla (87 ficheros, 2 saltados).
+
+### 19.8 Pendiente
+
+- **Aplicar `20261121000000_org_profiles.sql`** al proyecto compartido (el coordinador), y después **el recorrido real en modo
+  test**: scan simulado → resultados → pasos 1–3 → `enroll` → código del admin de Auth (`generateLink`, sin correo) → `POST /orgs`
+  con perfil → Checkout incrustado relleno (nombre, email, dirección en el iframe) → 4242 → webhook → `/app` activo. Hasta entonces el
+  back real no puede leer `checkout_sessions` (pide `ui_mode`).
+- Confirmar que la clave restringida `rk_test_` tiene escritura en los tax ids de Customers.
+- Publicar 0.5.0 (T18) con estas exportaciones.
