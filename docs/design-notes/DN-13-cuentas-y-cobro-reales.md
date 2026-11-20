@@ -6,6 +6,7 @@
   `Arca-dev` (T8). De la fase 3 (2026-11-20), hechas en el back T13 (el código), T14, T15 y T17 (§18); faltan el front (T16) y la
   prueba real en modo test. Las migraciones nuevas solo se han aplicado a Supabase local y a PGlite; a ninguna base real. No hay
   cuentas, claves, productos, precios ni webhooks creados en Stripe, y producción sigue en 501.
+  Rama `feat/billing-ops` (2026-11-20): catálogo de Stripe por modo, comprobado al arrancar, y T26 (§20); su migración está sin aplicar.
   Las migraciones de esta nota necesitan la aprobación del founder antes de tocar cualquier base (§5.2).
 - **Repos:** `Arca-back` (casi todo el peso) y `Arca-front`. La nota vive en la rama `docs/auth-billing-design`,
   creada desde `fix/score-stability`.
@@ -433,7 +434,8 @@ Notas:
   convive con columnas propias del plan. **[mía]**
 - La semilla de planes de DN-10 (precios de ejemplo) se queda. En producción, antes de encender la webapp, los dos
   planes se actualizan con los precios reales y sus `stripe_price_id` (§12, T20). Con `WEBAPP_ENABLED=true`, el back no
-  arranca si un plan activo no tiene `stripe_price_id`. **[mía]**
+  arranca si un plan activo no tiene `stripe_price_id`. **[mía]** (Desde §20: el precio del modo de la clave, test o live, y
+  comprobado en Stripe al arrancar.)
 - `organizations.billing_status` sigue siendo **el** derecho de acceso (la "entitlement"): no hace falta una tabla
   aparte, porque hoy solo hay un derecho (entrar o no). Solo lo escribe la RPC de cobro. Si mañana hay planes con
   funciones distintas, se añade `plans.features jsonb` y una vista.
@@ -1006,7 +1008,8 @@ el stack que corrió las pruebas de §17 seguía con la configuración anterior.
   webhook.
 - **Alertas:** hoy solo hay alarmas de estado del EC2 hacia el tema SNS `alerts`. Se propone mandar los logs de Docker a
   CloudWatch Logs (driver `awslogs`) con filtros de métricas sobre `[billing] failed`, `reconcile mismatch`,
-  `duplicate_subscription` y `dispute`, cada uno con una alarma al mismo tema SNS.
+  `duplicate_subscription` y `dispute`, cada uno con una alarma al mismo tema SNS. (Hecho en §20.4, con un tema propio sin
+  suscripciones en vez del de `alerts`, y alguna línea más.)
 - **Correo:** rebotes y quejas del proveedor a SNS; un rebote de un código de login se ve en los logs de Auth de
   Supabase.
 
@@ -1140,7 +1143,7 @@ aprobaciones).
 | T12 | ✅ Script `admin:grant` (§4.5). Hecho en la fase 1: §12.1 | 2 · auth | 0,5 | T4 |
 | T13 | Catálogo de Stripe en test; `plans` con `stripe_price_id`; cambio de precio desde `/admin` (§6.1). **Código hecho (§18)**; falta correr `stripe:catalog -- --apply` con la aprobación | 3 · cobro | 1,5 | T4 |
 | T14 | ✅ `StripeBillingProvider`: cliente, checkout, portal, sync, cancelar (§6.2–§6.4, §6.10). Hecho: §18 | 3 · cobro | 2 | T13 |
-| T15 | ✅ Webhook: firma, traductor, RPC `apply_billing_state`, cola por organización (§6.5, §6.6), reconciliación sin programar. Hecho: §18 | 3 · cobro | 2,5 | T14 |
+| T15 | ✅ Webhook: firma, traductor, RPC `apply_billing_state`, cola por organización (§6.5, §6.6), reconciliación (programada en T26, §20). Hecho: §18 | 3 · cobro | 2,5 | T14 |
 | T16 | Front: `GET /orgs/:id/billing`, `/app/billing` real, `/app/billing/return`, portal (§8.1) | 3 · cobro | 1,5 | T14 |
 | T17 | ✅ Caddy: ruta del webhook con su límite de cuerpo (§9.2). Hecho: §18 | 3 · cobro | 0,5 | — |
 | T18 | Contratos 0.5.0 y publicación (§7.6) | 4 · integración | 0,5 | T6–T16 |
@@ -1151,7 +1154,7 @@ aprobaciones).
 | T23 | Stripe live: producto, precios reales, portal, reintentos, correos, endpoint del webhook | 5 · founder + 0,5 | 0,5 | F1–F8 |
 | T24 | Supabase de producción: ajustes de §9.4 | 5 · producción | 0,5 | T22 |
 | T25 | Encender back y después front; compra real de prueba y reembolso (§11) | 5 · producción | 0,5 | T22–T24 |
-| T26 | Monitorización: logs a CloudWatch, filtros, alarmas, reconciliación diaria (§9.5) | 5 · producción | 2 | T15 |
+| T26 | Monitorización: logs a CloudWatch, filtros, alarmas, reconciliación diaria (§9.5). **Código hecho en `feat/billing-ops` (§20)**; falta `cdk deploy` y suscribir el email | 5 · producción | 2 | T15 |
 | T27 | Limpieza programada (§5.6) | 6 · endurecer | 1 | T4 |
 | T28 | MFA (TOTP) obligatoria para admins de plataforma, opcional para owners (§4.1) | 6 · endurecer | 1,5 | T9 |
 | T29 | CAPTCHA en `enroll` y login si hay abuso | 6 · endurecer | 1 | T9 |
@@ -1858,7 +1861,8 @@ claves leídas con `Read-Host -AsSecureString` (§9.3), nunca escritas en la lí
 - **T19:** `/__debug/mode` con `webapp` y `billing`; panel y franja.
 - ~~La prueba real en modo test~~: hecha el 2026-11-20 (§18.10). Queda la suite de conformidad contra Supabase local en cuanto Docker
   vuelva, y las decisiones que abrió esa prueba (§18.10.4).
-- Programar la reconciliación diaria y las alarmas de los logs `[billing]` (T26); encontrar la organización de una disputa leyendo el cargo.
+- ~~Programar la reconciliación diaria y las alarmas de los logs `[billing]` (T26)~~: hecho en `feat/billing-ops` (§20). Queda encontrar la
+  organización de una disputa leyendo el cargo.
 - ~~El remitente de SES (`RealWebappAdapters.sesSendEmail`), sin el cual producción con la webapp encendida no arranca.~~ Ya no
   bloquea: producción manda con Resend (§16.4); el remitente de SES solo hace falta si se vuelve a SES.
 
@@ -1916,7 +1920,8 @@ Una primera pasada dio un fallo suelto que no se repitió en las dos siguientes 
    live); desde ese momento el `live-debug` real sobre la misma base deja de poder cobrar en test. Opciones: (a) la base de desarrollo
    aparte de §5.2 (`Arca-dev`), que es lo que la nota pedía; (b) columnas por modo (`stripe_price_id_test`/`_live`) o resolver el precio
    por `lookup_key` en el modo de la clave; (c) como mínimo, que la guarda de arranque compruebe en Stripe que cada `stripe_price_id`
-   existe en el modo de la clave. `subscriptions`, `billing_customers` y los eventos ya llevan `livemode`.
+   existe en el modo de la clave. `subscriptions`, `billing_customers` y los eventos ya llevan `livemode`. **Resuelto con (b) y (c)
+   en `feat/billing-ops` (§20)**: columnas live junto a las de test y comprobación en Stripe al arrancar.
 2. **Adaptive Pricing está activado en la cuenta.** Desde Colombia, Checkout ofreció pagar en **COP** (1.777.400,27 COP al mes, con el
    cambio de Stripe) y lo dejó seleccionado; la sesión y la factura quedan en USD (49900) y el portal dice "Charged in COP". Para despachos
    de EE. UU. no cambia nada, pero es una decisión del founder: dejarlo, apagarlo en el panel o pasar `adaptive_pricing: { enabled: false }`
@@ -2110,3 +2115,154 @@ del formulario son número, caducidad, CVC, titular, país y ZIP.
 - Stripe (test): clientes `cus_VfEiY9xU9G0JR9`, `cus_VfEjKmYd1kdRjz`, `cus_VfEpAGaKouF2T5` y `cus_VfEqLeQUb06Y0g` (los cuatro con
   `us_ein`); suscripciones `sub_1UduLeEw83ixrW1L5oRinyBM` y `sub_1UduNUEw83ixrW1LF2TG39GG` (activas, renuevan el 2026-12-20); sesiones
   `cs_test_a0KJ8ijs…` y `cs_test_a0RoXkzG…` (pagadas) y `cs_test_a0cyCIgr…` y `cs_test_a0Av2ear…` (abiertas, vencen a la hora).
+
+## 20. Catálogo de Stripe por modo y operación del cobro: T26 (2026-11-20)
+
+Rama `feat/billing-ops`, creada desde `feat/real-accounts`, sin publicar ni fusionar. Resuelve el punto 1 de §18.10.4 (un solo
+modo de Stripe por base) y hace T26 (§9.5): la reconciliación diaria programada, los logs del back en CloudWatch y sus alarmas.
+**No se aplicó ninguna migración a una base real, no se ejecutó ningún comando de AWS que cree o cambie recursos** (solo
+`cdk synth` y los tests de `infra/aws`) y no se usó ninguna clave de Stripe: todo corre contra el Stripe falso de las pruebas.
+
+### 20.1 Catálogo por modo (test y live en la misma base)
+
+El proyecto "Arca-base" lo usan a la vez el desarrollo local (clave de test) y producción (clave live en el lanzamiento). Un id de
+Price o de Product pertenece a un modo, así que cada plan guarda los dos:
+
+| Modo de la clave | Product | Price |
+|---|---|---|
+| test (`sk_test_`/`rk_test_`) | `plans.stripe_product_id` | `plans.stripe_price_id` |
+| live (`sk_live_`/`rk_live_`) | `plans.stripe_live_product_id` | `plans.stripe_live_price_id` |
+
+Los ids que hay hoy (los que escribió `npm run stripe:catalog -- --apply` con la `rk_test_`) **se quedan donde están** como el par
+de test. **[mía]** Se eligió no renombrar ni añadir un par `stripe_test_*`: así la migración es solo aditiva y el código de
+`feat/real-accounts` que aún corre contra la base compartida sigue leyendo y escribiendo los ids de test sin cambios. El coste es
+que el nombre del par de test no dice "test"; lo dicen los comentarios de columna de la migración y la función
+`catalogIdsOf(plan, modo)` de `apps/api/src/webapp/plans.ts`, que es la única forma en que el código los lee.
+
+Quién usa el par del modo de la clave (`env.stripeMode`, o `catalogModeOf(billing.mode)`; el proveedor simulado usa el de test):
+
+- **Repositorios** (en memoria y Supabase): `PlanRecord` lleva los cuatro campos; cada precio es único entre planes en su modo.
+- **`npm run stripe:catalog`**: lee y escribe solo el par de su modo; el otro ni se lee. Con `--allow-live` (T23) escribe el par live
+  y deja los ids de test. El informe nombra la columna (`plans.monthly.stripe_live_price_id written`).
+- **Checkout** (`service.ts`, `stripe.ts`): cobra el precio del modo; un plan sin precio en ese modo responde 409, aunque tenga el del
+  otro.
+- **Precio desde `/admin`**: crea el Price nuevo en la cuenta de la clave, archiva el anterior **de ese modo** y escribe ese par.
+- **Webhook y reconciliación** (`billing-events.ts`): el plan de una suscripción cuyo Price no lleva `plan_code` se busca por el
+  precio del modo de la clave.
+
+**Migración a aplicar: `supabase/migrations/20261122000000_plan_catalog_modes.sql`.** Añade `plans.stripe_live_product_id` y
+`plans.stripe_live_price_id` (`unique`), ambas nulas, y comentarios en las cuatro columnas. No borra, renombra ni reescribe nada, no
+toca ninguna tabla de scans, assessments ni otra de la webapp, y los permisos de `plans` no cambian (solo `service_role`). Probada en
+PGlite sobre las migraciones anteriores con ids de test ya escritos: quedan como test y el par live queda vacío. **Hay que aplicarla
+antes de correr este código contra la base**: el repositorio de Supabase lee las columnas nuevas y, sin ellas, `listPlans` falla.
+
+### 20.2 Comprobación al arrancar
+
+Con la webapp real (producción con `WEBAPP_ENABLED=true`, o `live-debug` con `WEBAPP_PROVIDERS=real`), `requireCatalogPrices`
+(`compose.ts`) mira cada plan activo:
+
+1. que tenga precio en el modo de la clave;
+2. que ese precio exista en la cuenta de Stripe de la clave, esté activo y su `livemode` sea el de la clave: **un `prices.retrieve`
+   por plan**, en paralelo, al arrancar. Sin escrituras.
+
+Si algo falla, **producción no arranca** y el mensaje nombra cada plan y su problema ("monthly has no live price
+(plans.stripe_live_price_id)", "its live price price_… does not exist in this Stripe account", "is archived", "is a test price",
+"Stripe could not be asked for …") y manda a `npm run stripe:catalog` y a `npm run stripe:catalog -- --apply --allow-live`.
+**`live-debug` avisa** (`[billing] the Stripe catalog of this test key is not ready: …`) y arranca, como antes. Un Stripe caído al
+arrancar también para producción **[mía]**: un precio que no se ha podido comprobar no se da por bueno; Docker reintenta el
+arranque (`restart: unless-stopped`) y la alarma `WebappStartRefused` (§20.4) lo avisa. Un plan inactivo no necesita precio. Con el
+proveedor simulado no se pregunta a nadie, pero los ids tienen que estar.
+
+### 20.3 Reconciliación diaria programada
+
+`apps/api/src/webapp/reconcile-schedule.ts`, llamado desde `server.ts` solo cuando `compose` devuelve `reconcileBilling` (webapp
+real): la primera pasada **5 minutos después de arrancar** y después **cada 24 horas**, contadas desde el final de la anterior, así
+dos pasadas nunca se solapan por mucho que tarde una. Una pasada que falla (rechazo o excepción) se registra y no llega al proceso;
+el temporizador no retiene el proceso (`unref`) y se para con `SIGTERM`. Una línea por pasada:
+
+- `[billing] reconcile done checked=<n> mismatched=<n> applied=<n> failed=<n> duration_ms=<n>`
+- `[billing] reconcile failed (<nombre del error>); next run in 24 h` (solo el nombre del error: un mensaje de Stripe puede citar
+  una clave enmascarada)
+
+La línea con los contadores que antes escribía `reconcile()` la escribe ahora el programador. Una suscripción que la reconciliación
+no puede leer se registra como `[billing] reconcile failed for subscription <id> (<error>)` (antes
+`reconcile of subscription <id> failed`), para que la misma alarma cubra los dos casos.
+
+### 20.4 Logs en CloudWatch y alarmas (T26)
+
+Hasta ahora los logs del contenedor se quedaban en el host (`json-file`) y las únicas alarmas eran las de estado del EC2. Con esta
+rama:
+
+- **Stack (`infra/aws`):** el grupo de logs `/arca/api` (tres meses), permiso del rol del host para escribir en él
+  (`logs:CreateLogStream`, `logs:PutLogEvents`) y consultarlo (`logs:DescribeLogStreams`), solo sobre ese grupo; filtros de métrica
+  en el espacio `ARCA/Billing`; una alarma por métrica (suma ≥ 1 en 5 minutos, sin datos = sin alarma) hacia un tema SNS **nuevo y
+  sin suscripciones** (`BillingAlertTopicArn`, salida del stack), aparte del tema `alerts` del host. Nada de facturación de AWS,
+  presupuestos ni costes.
+- **Host:** `deploy/compose.cloudwatch.yaml` cambia el log del contenedor `api` al driver `awslogs` (`mode: non-blocking`, búfer de
+  4 MB; Caddy sigue en `json-file`). `deploy/activate.sh` comprueba si el host llega al grupo (`aws logs describe-log-streams`) y solo
+  entonces pasa ese fichero a compose con `-f`; si no, lo quita y sigue como antes. Nunca se llama `compose.override.yaml`, así una
+  vuelta atrás a una imagen anterior no lo recoge. La región va en `.env.demo` (`ARCA_AWS_REGION`). `docker compose logs` sigue
+  funcionando.
+
+| Alarma (métrica) | Líneas que cuenta |
+|---|---|
+| `ReconcileFailed` | `[billing] reconcile failed …` (la pasada, o una suscripción) |
+| `ReconcileMismatch` | `[billing] reconcile mismatch …` |
+| `WebhookFailed` | `[billing] event … failed (…)` y `[billing] event … refused: livemode=…` |
+| `DuplicateSubscription` | `[billing] duplicate_subscription …` |
+| `Dispute` | `[billing] dispute …` |
+| `UnknownOrg` | `[billing] event … unknown_org` y `[billing] reconcile: subscription … names no organization …` (una disputa también, §18.4 punto 8) |
+| `CancelFailed` | `[billing] failed to cancel subscription …` |
+| `WebappStartRefused` | `The real webapp cannot start …` (§20.2) |
+
+Un test de `infra/aws` comprueba, con las líneas tal como las escribe el back, que cada una sube exactamente su métrica y que las
+normales (`reconcile done`, `event … applied`, `event … duplicate`) no suben ninguna. Coste aproximado: ocho alarmas estándar y
+ocho métricas personalizadas, unos pocos USD al mes, más la ingesta de logs (poca).
+
+### 20.5 Lo que no hace un `push` a `main`
+
+El workflow de despliegue solo se dispara con cambios en `apps/`, `packages/`, `deploy/` y compañía, **no en `infra/`**, y no ejecuta
+`cdk deploy`. Los cambios del stack necesitan, en este orden (§9 de `docs/deployment/AWS_DEMO_RUNBOOK.md`):
+
+1. **Un administrador** sube la versión nueva de la política `ArcaCdkExecution` (`infra/aws/cdk-execution-policy.json` permite ahora
+   `logs:*` sobre `/arca/api` y `logs:DescribeLogGroups`): `aws iam create-policy-version … --set-as-default`. Sin ella, el
+   `cdk deploy` falla al crear el grupo de logs.
+2. `cdk diff` y `cdk deploy` con `alertEmails` como siempre. No reemplaza el EC2 (no cambia el user data).
+3. El **siguiente** despliegue de la API (fusionar en `main`, o el workflow con el SHA ya desplegado) encuentra el grupo y empieza a
+   mandar los logs. Fusionar antes del `cdk deploy` no rompe nada: el despliegue dice "API logs: kept on the host".
+
+### 20.6 Pruebas
+
+Escritas antes que el código; fallaron primero (los 13 de la parte A, la prueba nueva de la reconciliación, el programador, los del
+stack y los del despliegue). El test de la parte A "con clave de test no toca el live" ya pasaba: fija lo que había.
+
+| Fichero | Qué fija |
+|---|---|
+| `apps/api/tests/integration/plan-catalog-modes-database.test.ts` (nuevo, 3) | La migración sobre el esquema anterior con ids de test: quedan como test, par live vacío; los dos modos conviven, únicos por modo, sin acceso para `anon`/`authenticated`; solo toca `public.plans`, sin `drop`/`rename`/`delete` |
+| `apps/api/tests/conformance/webapp-repository.ts` (+1, ×3 destinos) | Escribir un modo deja el otro; precio live único; limpiar con `null` |
+| `apps/api/tests/unit/stripe-catalog.test.ts` (+2) | Con clave live y `--allow-live` escribe el par live y deja los ids de test (idempotente); con clave de test no toca el live |
+| `apps/api/tests/unit/stripe-billing.test.ts` (+3) | Clave live: cobra el precio live, rechaza un plan solo con precio de test (alojado e incrustado), sustituye el precio live sin mandar el id de test a la cuenta live; `priceState` (activo, archivado, inexistente, Stripe caído, live) |
+| `apps/api/tests/integration/stripe-billing-flow.test.ts` (+4) | De punta a punta con clave live: checkout, 409 sin precio live, precio desde `/admin`; plan de una suscripción por el precio de su modo; la reconciliación cuenta como fallida una suscripción ilegible con la línea de la alarma y no escribe la línea resumen |
+| `apps/api/tests/integration/compose.test.ts` (1 reescrito, +3) | Producción sin precio en el modo de la clave no arranca, `live-debug` avisa; con el proveedor real sobre el Stripe falso: arranca leyendo una vez cada precio, se niega con un precio inexistente, archivado, de otro modo o con Stripe caído, y `live-debug` avisa sin imprimir claves |
+| `apps/api/tests/unit/reconcile-schedule.test.ts` (nuevo, 6) | 5 minutos y cada 24 h; la línea con contadores; sin solapes; fallos registrados por nombre y el calendario sigue; `stop`; `unref` |
+| `apps/api/tests/unit/deploy-logs.test.ts` (nuevo, 4) | El override (`!override`, solo `api`, `/arca/api`, no bloqueante); `compose.yaml` sigue en `json-file`; `activate.sh` lo pasa con `-f` solo si llega al grupo, nunca como `compose.override.yaml`; va en la imagen |
+| `infra/aws/lib/arca-demo-stack.test.ts` (+5) | Grupo y permisos del host solo sobre él; cada línea, su métrica; una alarma por métrica al tema sin suscripciones; la política de ejecución; nada de presupuestos ni alarmas de facturación de AWS |
+| Ajustados | `org-profiles-database` (ya no es la última migración), `webapp-database` y `webapp-service` (los campos nuevos del plan) |
+
+Además: `docker compose -f compose.yaml -f deploy/compose.cloudwatch.yaml config` (sin demonio) da el bloque `logging` sustituido
+entero, sin las opciones de `json-file`, y falla con un mensaje claro sin `ARCA_AWS_REGION`; `cdk synth --strict` limpio.
+
+`npm run typecheck` limpio. `npm test` completo: **1708 pasan, 55 se saltan** (las suites contra un Supabase real, sin sus
+variables), ninguno falla (90 ficheros, 2 saltados); el de `infra/aws` pasó en la misma pasada.
+
+### 20.7 Pendiente para el founder
+
+- **Aplicar la migración** `20261122000000_plan_catalog_modes.sql` a "Arca-base" tras revisarla (y no correr esta rama contra esa
+  base antes).
+- **Lanzamiento (T23):** con la clave `rk_live_`, `npm run stripe:catalog` (ensayo) y `npm run stripe:catalog -- --apply --allow-live`.
+  Escribe el par live y deja el de test; el `live-debug` real sobre la misma base sigue cobrando en test.
+- **AWS:** actualizar `ArcaCdkExecution` (administrador), `cdk deploy` y el siguiente despliegue de la API (§20.5).
+- **Suscribir un email** al tema `BillingAlertTopicArn` y confirmar el correo de AWS (consola de SNS o `aws sns subscribe` con un
+  perfil de administrador; `arca-deploy` no puede). Hasta entonces las alarmas saltan sin avisar a nadie.
+- Sigue pendiente encontrar la organización de una disputa leyendo el cargo (§18.4 punto 8): hasta entonces cada disputa sube
+  también `UnknownOrg`.
