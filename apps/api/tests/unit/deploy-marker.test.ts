@@ -23,9 +23,12 @@ describe('deploy/production.env', () => {
     expect(env.has('ARCA_MODE')).toBe(false);
   });
 
-  it('keeps the webapp switched off until the launch, and never on the simulated providers (DN-13 §7.6)', () => {
-    expect(env.get('WEBAPP_ENABLED')).toBe('false');
+  it('runs the real webapp with Stripe in test mode, never on the simulated providers (DN-13 §7.6, founder decision 2026-11-20)', () => {
+    expect(env.get('WEBAPP_ENABLED')).toBe('true');
+    expect(env.get('STRIPE_ALLOW_TEST_MODE')).toBe('true');
+    expect(env.get('APP_BASE_URL')).toBe('https://arcacover.com');
     expect(env.has('WEBAPP_PROVIDERS')).toBe(false);
+    expect(env.has('STRIPE_SECRET_KEY') || env.has('STRIPE_WEBHOOK_SECRET')).toBe(false);
   });
 
   it('sends the webapp\'s invitations through Resend from the verified domain, with the key kept in SSM (DN-13 §9.1)', () => {
