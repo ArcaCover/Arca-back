@@ -1,13 +1,12 @@
 # DN-13 · Cuentas y cobro reales: Supabase Auth y Stripe
 
 - **Fecha:** 2026-11-17
-- **Estado (2026-11-19):** en implementación en la rama `feat/real-accounts`. Fase 1 hecha (datos: T3, T4 y T12, §12.1).
-  De la fase 2, hechas T6 y T10 (§16) y la parte del back de T7 y T11 (§17); falta el front (T9) y la configuración de
-  `Arca-dev` (T8). De la fase 3 (2026-11-20), hechas en el back T13 (el código), T14, T15 y T17 (§18); faltan el front (T16) y la
-  prueba real en modo test. Las migraciones nuevas solo se han aplicado a Supabase local y a PGlite; a ninguna base real. No hay
-  cuentas, claves, productos, precios ni webhooks creados en Stripe, y producción sigue en 501.
-  Rama `feat/billing-ops` (2026-11-20): catálogo de Stripe por modo, comprobado al arrancar, y T26 (§21); su migración está sin aplicar.
-  Las migraciones de esta nota necesitan la aprobación del founder antes de tocar cualquier base (§5.2).
+- **Estado (2026-11-20):** desplegado en producción **apagado** (`WEBAPP_ENABLED=false`, rutas de la webapp en 501): PR #20
+  (`feat/real-accounts`, con Resend, T19 y `feat/billing-ops`), contratos 0.5.0 publicados (#21, tag `contracts-v0.5.0`) y #22.
+  Las 11 migraciones están aplicadas a Supabase "Arca-base" (aprobado por el founder: un solo proyecto para desarrollo y
+  producción). Prueba real en modo test hecha (§18.10, §19.9). El front está en el PR #34 (borrador): no se fusiona mientras
+  Vercel tenga `NEXT_PUBLIC_WEBAPP_ENABLED=true` y el back la webapp apagada. Pendiente: `cdk deploy` de las alarmas y suscribir
+  un email (§21.7), las decisiones del founder (§14) y encender la webapp.
 - **Repos:** `Arca-back` (casi todo el peso) y `Arca-front`. La nota vive en la rama `docs/auth-billing-design`,
   creada desde `fix/score-stability`.
 - **Parte de:** DN-10 §10, pasos 1 a 3 (repositorios de Supabase, Supabase Auth real y Stripe real) y una parte del
@@ -1146,15 +1145,15 @@ aprobaciones).
 | T15 | ✅ Webhook: firma, traductor, RPC `apply_billing_state`, cola por organización (§6.5, §6.6), reconciliación (programada en T26, §21). Hecho: §18 | 3 · cobro | 2,5 | T14 |
 | T16 | Front: `GET /orgs/:id/billing`, `/app/billing` real, `/app/billing/return`, portal (§8.1) | 3 · cobro | 1,5 | T14 |
 | T17 | ✅ Caddy: ruta del webhook con su límite de cuerpo (§9.2). Hecho: §18 | 3 · cobro | 0,5 | — |
-| T18 | Contratos 0.5.0 y publicación (§7.6) | 4 · integración | 0,5 | T6–T16 |
-| T19 | `/__debug/mode` con `webapp` y `billing`; panel y franja (§8.4). **Hecha (§20)**, sin publicar contratos | 4 · integración | 1 | T18 |
+| T18 | ✅ Contratos 0.5.0 y publicación (§7.6). Hecha: `contracts-v0.5.0`, el front la instala (PR #34) | 4 · integración | 0,5 | T6–T16 |
+| T19 | `/__debug/mode` con `webapp` y `billing`; panel y franja (§8.4). **Hecha (§20)**, en contratos 0.5.0 | 4 · integración | 1 | T18 |
 | T20 | E2E en `live-debug` real + suite de Stripe con test clocks (§11) | 4 · integración | 3 | T9–T19 |
 | T21 | SSM (`STRIPE_*`), `render-env.py`, `production.env` con `WEBAPP_ENABLED=false`, CDK si SES (§9.1) | 5 · producción | 0,5 | T20 |
 | T22 | **Aprobación del founder** y aplicación de las migraciones a producción (§5.2) | 5 · founder | 0,5 | T21 |
 | T23 | Stripe live: producto, precios reales, portal, reintentos, correos, endpoint del webhook | 5 · founder + 0,5 | 0,5 | F1–F8 |
 | T24 | Supabase de producción: ajustes de §9.4 | 5 · producción | 0,5 | T22 |
 | T25 | Encender back y después front; compra real de prueba y reembolso (§11) | 5 · producción | 0,5 | T22–T24 |
-| T26 | Monitorización: logs a CloudWatch, filtros, alarmas, reconciliación diaria (§9.5). **Código hecho en `feat/billing-ops` (§21)**; falta `cdk deploy` y suscribir el email | 5 · producción | 2 | T15 |
+| T26 | Monitorización: logs a CloudWatch, filtros, alarmas, reconciliación diaria (§9.5). **Código desplegado (#20, §21)**; falta `cdk deploy` y suscribir el email | 5 · producción | 2 | T15 |
 | T27 | Limpieza programada (§5.6) | 6 · endurecer | 1 | T4 |
 | T28 | MFA (TOTP) obligatoria para admins de plataforma, opcional para owners (§4.1) | 6 · endurecer | 1,5 | T9 |
 | T29 | CAPTCHA en `enroll` y login si hay abuso | 6 · endurecer | 1 | T9 |
