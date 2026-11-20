@@ -1,0 +1,15 @@
+# The API's logs to CloudWatch Logs (DN-13 §9.5, T26), where the metric filters and alarms of infra/aws read its [billing] lines.
+# Only on the host: activate.sh installs it next to compose.yaml and passes both with -f once the host can reach the log group
+# (the stack was deployed); otherwise it removes it and the logs stay in json-file as compose.yaml says. `docker compose logs`
+# keeps working through Docker's local cache. ARCA_AWS_REGION is written into .env.demo by activate.sh.
+services:
+  api:
+    logging: !override
+      driver: awslogs
+      options:
+        awslogs-region: ${ARCA_AWS_REGION:?activate.sh writes ARCA_AWS_REGION into .env.demo}
+        awslogs-group: /arca/api
+        awslogs-create-group: "false"
+        # A slow CloudWatch drops lines from this buffer instead of blocking the API's stdout.
+        mode: non-blocking
+        max-buffer-size: 4m

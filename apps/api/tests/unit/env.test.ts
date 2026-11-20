@@ -215,3 +215,144 @@ describe('ARCA_MODE', () => {
     expect(listenHostname('production')).toBeUndefined();
   });
 });
+describe('webapp providers (DN-13 §7.1)', () => {
+  const liveKeys = { APIFY_API_TOKEN: 'test', OPENAI_API_KEY: 'sk-test' };
+  const production = { ...base, ...database, ...liveKeys, SOURCE_MODE: 'live', STORAGE_BACKEND: 'supabase' };
+  const liveDebug = { ...production, ARCA_MODE: 'live-debug' };
+  const stripeTest = { STRIPE_SECRET_KEY: 'rk_test_fixture', STRIPE_WEBHOOK_SECRET: 'whsec_fixture' };
+  const stripeLive = { STRIPE_SECRET_KEY: 'rk_live_fixture', STRIPE_WEBHOOK_SECRET: 'whsec_fixture' };
+  const launch: Record<string, string> = { ...production, ...stripeLive, WEBAPP_ENABLED: 'true', APP_BASE_URL: 'https://arcacover.com',
+    EMAIL_PROVIDER: 'ses', EMAIL_FROM: 'ARCA <no-reply@arcacover.com>' };
+  const without = (name: string) => { const env = { ...launch }; delete env[name]; return env; };
+
+  it('keeps production without a webapp unless WEBAPP_ENABLED=true, whatever else is set', () => {
+    expect(loadEnv(production)).toMatchObject({ webapp: 'none', stripeMode: null });
+    expect(loadEnv({ ...production, WEBAPP_ENABLED: 'false' }).webapp).toBe('none');
+    expect(loadEnv({ ...production, WEBAPP_ENABLED: '' }).webapp).toBe('none');
+    // Keys that sit in the environment do not switch it on.
+    expect(loadEnv({ ...production, ...stripeLive, EMAIL_PROVIDER: 'ses' }).webapp).toBe('none');
+    expect(() => loadEnv({ ...production, WEBAPP_ENABLED: 'yes' })).toThrow();
+  });
+
+  it('runs the debug modes on the simulated webapp by default', () => {
+    expect(loadEnv({ ...base, ARCA_MODE: 'mock' })).toMatchObject({ webapp: 'simulated', stripeMode: null, emailProvider: 'memory' });
+    expect(loadEnv(liveDebug)).toMatchObject({ webapp: 'simulated', stripeMode: null, emailProvider: 'memory' });
+    expect(loadEnv({ ...liveDebug, WEBAPP_PROVIDERS: 'simulated' }).webapp).toBe('simulated');
+    expect(() => loadEnv({ ...liveDebug, WEBAPP_PROVIDERS: 'stripe' })).toThrow();
+  });
+
+  it('switches production on with every real piece configured', () => {
+    expect(loadEnv(launch)).toMatchObject({ webapp: 'real', stripeMode: 'live', emailProvider: 'ses',
+      emailFrom: 'ARCA <no-reply@arcacover.com>' });
+    // SES is what production sends with when nothing else is said.
+    expect(loadEnv(without('EMAIL_PROVIDER')).emailProvider).toBe('ses');
+  });
+
+  it('refuses to switch production on without a real piece', () => {
+    expect(() => loadEnv(without('STRIPE_SECRET_KEY'))).toThrow('STRIPE_SECRET_KEY');
+    expect(() => loadEnv(without('STRIPE_WEBHOOK_SECRET'))).toThrow('STRIPE_WEBHOOK_SECRET');
+    expect(() => loadEnv(without('EMAIL_FROM'))).toThrow('EMAIL_FROM');
+    // The default APP_BASE_URL is the local front: invitation links and Stripe return URLs would point at localhost.
+    expect(() => loadEnv(without('APP_BASE_URL'))).toThrow('APP_BASE_URL');
+    expect(() => loadEnv({ ...launch, APP_BASE_URL: 'http://arcacover.com' })).toThrow('APP_BASE_URL');
+    // Invitations kept in memory would vanish: production never sends to it.
+    expect(() => loadEnv({ ...launch, EMAIL_PROVIDER: 'memory' })).toThrow('EMAIL_PROVIDER');
+    expect(() => loadEnv({ ...launch, EMAIL_PROVIDER: 'memory', RESEND_API_KEY: 're_fixture_123' })).toThrow('EMAIL_PROVIDER');
+    // The webapp's data lives in Supabase, next to the scans it claims.
+    expect(() => loadEnv({ ...launch, STORAGE_BACKEND: 'memory' })).toThrow('STORAGE_BACKEND=supabase');
+    expect(() => loadEnv({ ...launch, SUPABASE_SECRET_KEY: 'sb_publishable_fixture' })).toThrow('server secret');
+  });
+
+  it('never runs the simulated providers in production, and leaves WEBAPP_PROVIDERS to live-debug', () => {
+    expect(() => loadEnv({ ...production, WEBAPP_PROVIDERS: 'simulated' })).toThrow('WEBAPP_PROVIDERS');
+    expect(() => loadEnv({ ...launch, WEBAPP_PROVIDERS: 'simulated' })).toThrow('WEBAPP_PROVIDERS');
+    expect(() => loadEnv({ ...production, WEBAPP_PROVIDERS: 'real' })).toThrow('WEBAPP_ENABLED');
+  });
+
+  it('refuses a Stripe test key in production unless STRIPE_ALLOW_TEST_MODE=true', () => {
+    expect(() => loadEnv({ ...launch, ...stripeTest })).toThrow('STRIPE_ALLOW_TEST_MODE');
+    expect(() => loadEnv({ ...launch, STRIPE_SECRET_KEY: 'sk_test_fixture' })).toThrow('STRIPE_ALLOW_TEST_MODE');
+    expect(loadEnv({ ...launch, ...stripeTest, STRIPE_ALLOW_TEST_MODE: 'true' })).toMatchObject({ webapp: 'real', stripeMode: 'test' });
+    expect(loadEnv({ ...launch, STRIPE_SECRET_KEY: 'sk_live_fixture' }).stripeMode).toBe('live');
+  });
+
+  it('runs live-debug on the real providers with a Stripe test key only', () => {
+    expect(loadEnv({ ...liveDebug, ...stripeTest, WEBAPP_PROVIDERS: 'real' }))
+      .toMatchObject({ webapp: 'real', stripeMode: 'test', emailProvider: 'memory', emailFrom: 'ARCA <no-reply@arcacover.com>' });
+    expect(loadEnv({ ...liveDebug, ...stripeTest, WEBAPP_PROVIDERS: 'real', EMAIL_PROVIDER: 'ses' }).emailProvider).toBe('ses');
+    expect(() => loadEnv({ ...liveDebug, WEBAPP_PROVIDERS: 'real' })).toThrow('STRIPE_SECRET_KEY');
+    expect(() => loadEnv({ ...liveDebug, ...stripeTest, WEBAPP_PROVIDERS: 'real', STRIPE_WEBHOOK_SECRET: '' })).toThrow('STRIPE_WEBHOOK_SECRET');
+    // A live key never loads outside production, flag or no flag.
+    for (const flag of ['false', 'true']) {
+      expect(() => loadEnv({ ...liveDebug, ...stripeLive, WEBAPP_PROVIDERS: 'real', STRIPE_ALLOW_TEST_MODE: flag })).toThrow('live Stripe key');
+    }
+  });
+
+  it('refuses a live Stripe key in any debug mode, even one that never calls Stripe', () => {
+    expect(() => loadEnv({ ...liveDebug, STRIPE_SECRET_KEY: 'sk_live_fixture' })).toThrow('live Stripe key');
+    expect(() => loadEnv({ ...base, ARCA_MODE: 'mock', STRIPE_SECRET_KEY: 'rk_live_fixture' })).toThrow('live Stripe key');
+    expect(loadEnv({ ...base, ARCA_MODE: 'mock', ...stripeTest }).webapp).toBe('simulated');
+  });
+
+  it('refuses what is not a Stripe secret or restricted key, or a webhook secret', () => {
+    for (const key of ['pk_live_fixture', 'pk_test_fixture', 'sk_fixture', 'whsec_fixture', 'secret']) {
+      expect(() => loadEnv({ ...launch, STRIPE_SECRET_KEY: key }), key).toThrow('STRIPE_SECRET_KEY');
+    }
+    expect(() => loadEnv({ ...launch, STRIPE_WEBHOOK_SECRET: 'sk_live_fixture' })).toThrow('STRIPE_WEBHOOK_SECRET');
+  });
+
+  it('keeps mock and the simulated webapp off every real service', () => {
+    expect(() => loadEnv({ ...base, ARCA_MODE: 'mock', WEBAPP_PROVIDERS: 'real' })).toThrow('ARCA_MODE=mock');
+    expect(() => loadEnv({ ...base, ARCA_MODE: 'mock', EMAIL_PROVIDER: 'ses' })).toThrow('EMAIL_PROVIDER');
+    expect(() => loadEnv({ ...liveDebug, EMAIL_PROVIDER: 'ses' })).toThrow('EMAIL_PROVIDER');
+    expect(loadEnv({ ...liveDebug, EMAIL_PROVIDER: 'memory' }).emailProvider).toBe('memory');
+  });
+
+  it('sends production\'s invitations through Resend with its API key (F11)', () => {
+    const resend = { ...launch, EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' };
+    expect(loadEnv(resend)).toMatchObject({ webapp: 'real', emailProvider: 'resend', RESEND_API_KEY: 're_fixture_123',
+      emailFrom: 'ARCA <no-reply@arcacover.com>' });
+    expect(loadEnv({ ...resend, RESEND_API_KEY: ' re_fixture_123 ' }).RESEND_API_KEY).toBe('re_fixture_123');
+    // The production guards still hold with Resend.
+    const { EMAIL_FROM: _from, ...noFrom } = resend;
+    expect(() => loadEnv(noFrom)).toThrow('EMAIL_FROM');
+    expect(() => loadEnv({ ...resend, APP_BASE_URL: 'http://arcacover.com' })).toThrow('APP_BASE_URL');
+    // SES stays the alternative, and the default when nothing is said.
+    expect(loadEnv({ ...launch, RESEND_API_KEY: 're_fixture_123' }).emailProvider).toBe('ses');
+    expect(() => loadEnv({ ...launch, EMAIL_PROVIDER: 'postmark' })).toThrow();
+  });
+
+  it('refuses Resend without its key, or with something that is not a Resend key, never printing it', () => {
+    const resend = { ...launch, EMAIL_PROVIDER: 'resend' };
+    expect(() => loadEnv(resend)).toThrow('RESEND_API_KEY is required');
+    expect(() => loadEnv({ ...resend, RESEND_API_KEY: '' })).toThrow('RESEND_API_KEY is required');
+    for (const key of ['sk_live_fixture', 'whsec_fixture', 're_', 're_with space', 'RE_fixture']) {
+      let failure: unknown;
+      try { loadEnv({ ...resend, RESEND_API_KEY: key }); } catch (error) { failure = error; }
+      expect(failure, key).toBeInstanceOf(Error);
+      expect((failure as Error).message, key).toContain('RESEND_API_KEY');
+      if (key.length > 3) expect((failure as Error).message, key).not.toContain(key);
+    }
+    // A key sitting in the environment while another provider sends is not checked, and not used.
+    expect(loadEnv({ ...liveDebug, RESEND_API_KEY: 'whatever' }).emailProvider).toBe('memory');
+  });
+
+  it('keeps the debug modes on memory, and lets only live-debug on the real providers opt into Resend', () => {
+    const real = { ...liveDebug, ...stripeTest, WEBAPP_PROVIDERS: 'real' };
+    expect(loadEnv({ ...real, RESEND_API_KEY: 're_fixture_123' }).emailProvider).toBe('memory');
+    expect(loadEnv({ ...real, EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' }).emailProvider).toBe('resend');
+    expect(() => loadEnv({ ...real, EMAIL_PROVIDER: 'resend' })).toThrow('RESEND_API_KEY');
+    expect(() => loadEnv({ ...liveDebug, EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' })).toThrow('EMAIL_PROVIDER');
+    expect(() => loadEnv({ ...base, ARCA_MODE: 'mock', EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' })).toThrow('EMAIL_PROVIDER');
+  });
+
+  it('takes a sender with or without a display name, never a header in disguise', () => {
+    const real = { ...liveDebug, ...stripeTest, WEBAPP_PROVIDERS: 'real' };
+    expect(loadEnv({ ...real, EMAIL_FROM: 'no-reply@arcacover.com' }).emailFrom).toBe('no-reply@arcacover.com');
+    expect(loadEnv({ ...real, EMAIL_FROM: ' ARCA <no-reply@arcacover.com> ' }).emailFrom).toBe('ARCA <no-reply@arcacover.com>');
+    expect(loadEnv({ ...real, EMAIL_FROM: '' }).emailFrom).toBe('ARCA <no-reply@arcacover.com>');
+    for (const from of ['ARCA', 'ARCA <no-reply>', 'ARCA <no-reply@arcacover.com>\r\nBcc: x@y.co', 'a@b.co, c@d.co', '"A" <a@b.co> <c@d.co>']) {
+      expect(() => loadEnv({ ...real, EMAIL_FROM: from }), from).toThrow('EMAIL_FROM');
+    }
+  });
+});

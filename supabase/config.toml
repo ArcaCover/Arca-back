@@ -159,7 +159,8 @@ site_url = "http://127.0.0.1:3000"
 # The public URL that Auth serves on. Defaults to the API external URL with `/auth/v1` appended.
 # external_url = ""
 # A list of *exact* URLs that auth providers are permitted to redirect to post authentication.
-additional_redirect_urls = ["https://127.0.0.1:3000"]
+# DN-13 §4.9: the fallback link of the sign-in email goes back to the front's /app/auth/confirm, on either local host name.
+additional_redirect_urls = ["https://127.0.0.1:3000", "http://localhost:3000/**", "http://127.0.0.1:3000/**"]
 # How long tokens are valid for, in seconds. Defaults to 3600 (1 hour), maximum 604,800 (1 week).
 jwt_expiry = 3600
 # JWT issuer URL. If not set, defaults to auth.external_url.
@@ -172,7 +173,10 @@ enable_refresh_token_rotation = true
 # Requires enable_refresh_token_rotation = true.
 refresh_token_reuse_interval = 10
 # Allow/disallow new user signups to your project.
-enable_signup = true
+# DN-13 §4.2: sign-up is closed. Only the API creates users, through the Auth admin API in POST /auth/enroll, so a publishable key
+# cannot create accounts or send codes to any address. Hosted projects set the same in the dashboard: Authentication > Sign In /
+# Providers > "Allow new users to sign up" off (DN-13 §9.4). Takes effect on the next `supabase stop` / `supabase start`.
+enable_signup = false
 # Allow/disallow anonymous sign-ins to your project.
 enable_anonymous_sign_ins = false
 # Allow/disallow testing manual linking of accounts
@@ -217,6 +221,8 @@ web3 = 30
 
 [auth.email]
 # Allow/disallow new user signups via email to your project.
+# This one switches the email provider itself (GOTRUE_EXTERNAL_EMAIL_ENABLED), which the sign-in codes need: it stays on. The
+# closed sign-up is `enable_signup = false` under [auth].
 enable_signup = true
 # If enabled, a user will be required to confirm any email change on both the old, and new email
 # addresses. If disabled, only the new email is required to confirm.
@@ -230,7 +236,8 @@ max_frequency = "1s"
 # Number of characters used in the email OTP.
 otp_length = 6
 # Number of seconds before the email OTP expires (defaults to 1 hour).
-otp_expiry = 3600
+# DN-13 §4.1, §9.4: ten minutes is plenty for a 6-digit code.
+otp_expiry = 600
 
 # Use a production-ready SMTP server
 # [auth.email.smtp]
@@ -241,6 +248,12 @@ otp_expiry = 3600
 # pass = "env(SENDGRID_API_KEY)"
 # admin_email = "admin@email.com"
 # sender_name = "Admin"
+
+# DN-13 §4.9: the sign-in email carries the 6-digit code (signInWithOtp for an existing user sends this template), with a fallback
+# link that only opens the front's confirm page. GoTrue's default carries a link alone.
+[auth.email.template.magic_link]
+subject = "Your ARCA sign-in code"
+content_path = "./supabase/templates/magic_link.html"
 
 # Uncomment to customize email template
 # [auth.email.template.invite]

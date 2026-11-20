@@ -153,3 +153,46 @@ aws ssm send-command --profile arca-deploy --region us-east-1 --instance-ids <In
   --document-name AWS-RunShellScript \
   --parameters 'commands=["/opt/arca/deploy/deploy-image.sh <EcrRepositoryUri>:<sha> us-east-1"]'
 ```
+
+## 9. API logs and billing alarms
+
+The stack keeps the API container's logs in the CloudWatch Logs group `/arca/api` (three months) and
+counts the payment lines of DN-13 §9.5 with metric filters in the namespace `ARCA/Billing`: a failed
+or partial daily reconciliation, a reconciliation mismatch, a webhook that failed or came from the
+other Stripe mode, a duplicate subscription, a dispute, an event with no organization, a deletion
+whose subscription could not be canceled, and a start refused by the real webapp. One such line in
+five minutes raises its alarm on the SNS topic `BillingAlertTopicArn` (an output of the stack),
+which is separate from the host alerts and has **no subscription** until someone adds one. Nothing
+here touches AWS billing, budgets or cost settings.
+
+The stack change is not deployed by a merge to `main`; it needs, in this order:
+
+1. **An administrator** updates the scoped execution policy, which now allows the `/arca/api` log
+   group (step 1). IAM keeps at most five versions of a policy; delete the oldest first if needed.
+
+   ```bash
+   aws iam create-policy-version --policy-arn arn:aws:iam::194633188202:policy/ArcaCdkExecution \
+     --policy-document file://infra/aws/cdk-execution-policy.json --set-as-default
+   ```
+
+2. `cdk diff` and `cdk deploy` as in step 3. They add the log group, the host's permission to
+   write to it, the filters, the alarms and the topic; the host is not replaced.
+3. The **next** activation of the API (a merge to `main`, or the workflow with `image_tag` set to
+   the SHA already deployed) finds the log group and passes `deploy/compose.cloudwatch.yaml` to
+   compose: from then on the API logs to CloudWatch. Until the group is reachable, `activate.sh`
+   keeps the logs on the host as before and says so in the deploy output, so a merge before
+   `cdk deploy` is harmless.
+
+To receive the billing alarms, subscribe an address and confirm the email AWS sends. In the console:
+SNS → Topics → the topic of `BillingAlertTopicArn` → Create subscription → Email. Or with an
+administrator profile (`arca-deploy` cannot subscribe):
+
+```bash
+aws sns subscribe --region us-east-1 --topic-arn <BillingAlertTopicArn> \
+  --protocol email --notification-endpoint founder@example.com
+```
+
+A subscription made this way is not part of the template, so later deploys keep it. The logs are
+in the console (CloudWatch → Log groups → `/arca/api`) or, with a profile allowed to read them,
+`aws logs tail /arca/api --region us-east-1 --since 1h --follow`; `docker compose logs` on the
+host keeps working too.

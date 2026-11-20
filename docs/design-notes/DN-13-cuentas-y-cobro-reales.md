@@ -1,0 +1,2303 @@
+# DN-13 · Cuentas y cobro reales: Supabase Auth y Stripe
+
+- **Fecha:** 2026-11-17
+- **Estado (2026-11-19):** en implementación en la rama `feat/real-accounts`. Fase 1 hecha (datos: T3, T4 y T12, §12.1).
+  De la fase 2, hechas T6 y T10 (§16) y la parte del back de T7 y T11 (§17); falta el front (T9) y la configuración de
+  `Arca-dev` (T8). De la fase 3 (2026-11-20), hechas en el back T13 (el código), T14, T15 y T17 (§18); faltan el front (T16) y la
+  prueba real en modo test. Las migraciones nuevas solo se han aplicado a Supabase local y a PGlite; a ninguna base real. No hay
+  cuentas, claves, productos, precios ni webhooks creados en Stripe, y producción sigue en 501.
+  Rama `feat/billing-ops` (2026-11-20): catálogo de Stripe por modo, comprobado al arrancar, y T26 (§21); su migración está sin aplicar.
+  Las migraciones de esta nota necesitan la aprobación del founder antes de tocar cualquier base (§5.2).
+- **Repos:** `Arca-back` (casi todo el peso) y `Arca-front`. La nota vive en la rama `docs/auth-billing-design`,
+  creada desde `fix/score-stability`.
+- **Parte de:** DN-10 §10, pasos 1 a 3 (repositorios de Supabase, Supabase Auth real y Stripe real) y una parte del
+  paso 4 (correos reales de invitación). Respeta DN-11 (vistas por rol), DN-09 (modos) y DN-12 §7 (webapp simulada
+  en `live-debug`).
+
+Las marcas siguen la convención de DN-10: **[Jesús]** decidido por Jesús o por el founder, **[mía]** propuesto por el
+asistente y revisable. Las decisiones que solo puede tomar el founder están en la §14 con un código **F1…F14** y se
+citan así en el texto.
+
+---
+
+## 1. Por qué
+
+La webapp privada (DN-10, DN-11) existe y está probada, pero solo como simulación: el login lo firma el propio back
+(`MockAppAuth`), el pago lo hace un botón (`MockBillingProvider` + `POST /__debug/billing/pay`) y los datos viven en la
+memoria del proceso (`InMemoryWebappRepository`). En producción, `compose.ts` no construye la webapp y sus 22 rutas
+responden **501 `not_configured`** (`notConfiguredWebapp()` en `apps/api/src/webapp/routes.ts`).
+
+El embudo real termina hoy en `/assessment/results` sin salida: el CTA "Save your results" solo se pinta en los modos
+de debug. Para cobrar a un despacho hacen falta tres piezas reales, y esta nota las diseña para que se puedan
+implementar tarea por tarea:
+
+1. **Identidad:** cuentas de Supabase Auth, sin contraseña.
+2. **Datos:** las tablas de DN-10 y DN-11 en Postgres, detrás de un repositorio de Supabase con operaciones atómicas.
+3. **Cobro:** suscripciones de Stripe, con Checkout, Customer Portal y webhooks.
+
+## 2. Resumen de recomendaciones
+
+| # | Recomendación | Marca |
+|---|---|---|
+| R1 | **Sin contraseña**, como ya decidió el founder. El correo lleva un **código de 6 dígitos** que se escribe en la misma pestaña; el enlace es de respaldo y lleva a una página que pide un clic. Motivo: los filtros de correo de los despachos (Microsoft 365 Safe Links, Mimecast, Proofpoint) abren los enlaces y gastan los de un solo uso | [Jesús] sin contraseña; [mía] el código |
+| R2 | **Alta cerrada.** El registro público de Supabase se apaga. Solo el back crea usuarios, y solo para el email de un reclamo válido o de una invitación válida (`POST /auth/enroll`). Ninguna cuenta nace "en frío" (DN-10 §1) | [mía] |
+| R3 | El back verifica el JWT de Supabase con `jose`, contra el **JWKS** del proyecto y solo con algoritmos asimétricos (ES256/RS256). No hay secreto JWT compartido: DN-10 §4.8 deja de ofrecer `SUPABASE_JWT_SECRET` | [mía] |
+| R4 | El navegador nunca toca las tablas de la webapp. RLS activado sin políticas, y permisos solo para `service_role`, como hoy. La clave de servicio solo vive en el back | [mía], sigue a DN-10 |
+| R5 | Las escrituras de varias filas pasan a **funciones RPC** de Postgres (`security definer`, ejecutables solo por `service_role`), como `create_assessment`. Cierran también las carreras que dejó anotadas DN-10/DN-11 | [mía] |
+| R6 | **Dos proyectos de Supabase**: producción (con plan de pago, sin pausa) y `Arca-dev` (local, `live-debug`, previews). Con cuentas reales, compartir la base deja de ser aceptable (§5.2) | [mía]; decide el founder (F9) |
+| R7 | **Precios de catálogo en Stripe** (Product + dos Prices con `lookup_key`) en vez de `price_data`. Cambia la decisión 10 de DN-10: el Customer Portal solo cambia de plan entre precios de catálogo. El precio sigue editándose desde `/admin`: el back crea un Price nuevo | [mía] |
+| R8 | El webhook **lee el estado actual de la suscripción** en Stripe y lo aplica, en vez de fiarse del orden de los eventos. Idempotente por id de evento, y atómico: registrar el evento y aplicarlo van en la misma transacción | [mía] |
+| R9 | Producción enciende la webapp con un interruptor (`WEBAPP_ENABLED`). Sin él, todo sigue igual que hoy: 501. `mock` sigue siempre simulado; `live-debug` sigue simulado por defecto y puede usar los adaptadores reales contra `Arca-dev` con claves de test (`WEBAPP_PROVIDERS=real`) | [mía] |
+| R10 | Correos de invitación enviados por el back con un proveedor transaccional (recomendado: Amazon SES, ya estamos en AWS). Supabase usa ese mismo proveedor como SMTP propio para los códigos | [mía]; decide el founder (F11) |
+
+## 3. Objetivos, no objetivos y antiobjetivos
+
+**Objetivos**
+1. Que un despacho pueda, en producción: terminar el embudo, guardar sus resultados, crear su organización, pagar y
+   entrar a `/app`; invitar a su equipo; gestionar la suscripción; pedir el borrado de la organización o de su cuenta.
+2. Sustituir los tres simulados por adaptadores reales detrás de las interfaces que ya existen: `AppAuth`,
+   `BillingProvider` y `WebappRepository`. `WebappService` conserva todas sus reglas.
+3. Que `mock` siga entero sin red, y que `live-debug` siga funcionando como hoy por defecto.
+4. Dejar cada paso verificable con tests: unitarios, PGlite, Supabase local, Stripe en modo test con test clocks y un
+   E2E de navegador.
+
+**No objetivos**
+- Diseño visual definitivo (lo pule otra persona, DN-10 §2).
+- Login con Google o SSO SAML. Queda preparado: el back solo ve un JWT de Supabase (DN-10 §4.1).
+- Planes por número de usuarios, cupones o facturas a 30 días (`send_invoice`). Se mencionan como decisiones futuras.
+- Mudar la app a `app.arcacover.com` (DN-10 §8).
+- Borrado físico de los datos de una organización. DN-10 §4.6 lo dejó fuera por implicaciones legales; esta nota
+  propone una política de retención, pero no la ejecuta (F13).
+
+**Antiobjetivos**
+- Que la clave de servicio de Supabase, la clave secreta de Stripe o el secreto del webhook lleguen al navegador o al
+  bundle del front.
+- Que el front decida permisos o acceso: el back sigue siendo quien niega (DN-10, DN-11 D3).
+- Que una clave **live** de Stripe funcione fuera de producción, o una de test en producción sin decirlo.
+- Que las pruebas de desarrollo creen usuarios o cobros en el proyecto y la cuenta de producción.
+- Que un evento de Stripe repetido, tardío o desordenado cambie el acceso dos veces o hacia atrás.
+
+### 3.1 Encaje en el flujo actual
+
+```
+/quote → scan → /score → /assessment → /assessment/results              (anónimo, sin cambios)
+                                             │ CTA "Save your results and activate your account"
+                                             ▼ (en producción solo si NEXT_PUBLIC_WEBAPP_ENABLED=true)
+                         POST /claims { scanToken }  → claimId (un uso, 24 h)            (sin cambios)
+                                             │
+                                             ▼
+                         /app/signup?claim=…   email bloqueado = email del scan
+                         POST /auth/enroll { claimId }  → el back crea el usuario si no existe     (NUEVO)
+                         supabase.auth.signInWithOtp({ email, shouldCreateUser: false })            (NUEVO)
+                         la persona escribe el código → verifyOtp → sesión de Supabase              (NUEVO)
+                                             │
+                                             ▼
+                         POST /orgs { name, claimId }  + Bearer <access_token de Supabase>  (sin cambios)
+                                             │
+                                             ▼
+                         /app/billing → POST /orgs/:id/billing/checkout → Stripe Checkout   (REAL)
+                                             │  success_url
+                                             ▼
+                         /app/billing/return?session_id=… → POST /orgs/:id/billing/sync      (NUEVO)
+                         + webhook de Stripe → billing_status = active                       (REAL)
+                                             │
+                                             ▼
+                                           /app
+```
+
+El reclamo en dos pasos de DN-10 §4.7 no cambia. Lo que demuestra que la persona es dueña del email del scan (que
+nadie verificó al escanear) es el código que recibe en ese buzón: el back exige que el email de la sesión coincida
+con el del ticket.
+
+### 3.2 Qué hay en cada modo
+
+| | `production` con `WEBAPP_ENABLED=false` | `production` con `WEBAPP_ENABLED=true` | `live-debug` (por defecto) | `live-debug` con `WEBAPP_PROVIDERS=real` | `mock` |
+|---|---|---|---|---|---|
+| Rutas de la webapp | 501, como hoy | reales | simuladas (DN-12 §7) | reales | simuladas |
+| Identidad | — | Supabase Auth (proyecto de producción) | `MockAppAuth` | Supabase Auth de `Arca-dev` | `MockAppAuth` |
+| Datos de la webapp | — | Postgres de producción | memoria | Postgres de `Arca-dev` | memoria |
+| Cobro | — | Stripe **live** | `MockBillingProvider` | Stripe **test** (obligatorio) | `MockBillingProvider` |
+| Correos | — | proveedor real | ninguno (enlace en pantalla) | proveedor real o buzón de pruebas | ninguno |
+| `/__debug/auth/login`, `/__debug/billing/pay` | 404 | 404 | sí | **404** | sí |
+| `POST /billing/webhook` | 501 | real | 501 | real (vía `stripe listen`) | 501 |
+| CTA en resultados | no | sí | sí, etiquetado "simulado" | sí, etiquetado "Stripe test" | sí |
+
+**[mía]** `live-debug` con adaptadores reales solo arranca si la clave de Stripe es de test (`sk_test_`/`rk_test_`) y
+existen todas las variables de §9.1; si no, el back se niega a arrancar, como ya hace DN-09 con las combinaciones
+inválidas. Se recomienda usarlo solo contra `Arca-dev` (R6): el back no puede saber a qué proyecto apunta la URL, así
+que la línea de arranque lo dice (`webapp=real stripe=test`) y la persona lo comprueba.
+
+## 4. Autenticación (Supabase Auth)
+
+### 4.1 Método
+
+El founder ya decidió "magic links, sin contraseña nunca" (CLAUDE.md del front, §3). En Supabase, "magic link" y
+"OTP por email" son el mismo mecanismo: `signInWithOtp` manda un correo, y la plantilla decide si lleva un enlace, un
+código (`{{ .Token }}`) o los dos. La pregunta real es qué usa la persona para entrar.
+
+| Opción | A favor | En contra para un despacho |
+|---|---|---|
+| Contraseña | Familiar | Descartada por el founder; reutilización de contraseñas, relleno de credenciales, soporte de "olvidé mi contraseña" |
+| Enlace mágico solo | Un clic | Los filtros de correo corporativos (Safe Links de Microsoft 365, Mimecast, Proofpoint) abren el enlace para analizarlo y **gastan el token de un solo uso**: la persona ve "enlace inválido o caducado". Con PKCE, el enlace tiene que abrirse en el mismo navegador que lo pidió |
+| **Código de 6 dígitos (recomendado)** | Inmune a los filtros (no hay nada que abrir); funciona aunque el correo se lea en el móvil y la app esté en el portátil; la pestaña conserva el reclamo en `sessionStorage` | Hay que escribir 6 dígitos |
+| Google / Microsoft (OAuth) | Sin correo | Muchos despachos usan Microsoft 365; útil más adelante. No en esta fase |
+| SSO SAML | Lo que pide un despacho grande | Complemento de pago de Supabase; para cuando haya clientes que lo exijan |
+
+**Recomendación [mía]:** el correo lleva **el código, en grande, y debajo un enlace de respaldo**. El enlace no inicia
+sesión al abrirse: lleva a `/app/auth/confirm`, una página que muestra un botón "Continue signing in" y solo entonces
+llama a `verifyOtp({ token_hash, type: 'email' })`. Un escáner que abre enlaces no pulsa botones, así que no gasta el
+token. Con `token_hash` no hace falta el verificador PKCE, así que el enlace también funciona en otro dispositivo.
+
+- Caducidad del código: **10 minutos** (`Email OTP Expiration = 600`). El valor por defecto de Supabase es una hora;
+  para un código de 6 dígitos sobra. **[mía]**
+- Un envío por email cada 60 segundos (valor por defecto de Supabase), más los límites del back (§7.4).
+- **MFA (TOTP)** queda para la fase 6: obligatoria para los admins de plataforma (`aal2` en `/admin/*`) y opcional para
+  los owners (F14).
+
+### 4.2 Alta cerrada: quién puede tener cuenta
+
+DN-10 §4.7 ya dice que `/app/login` nunca crea usuarios (`shouldCreateUser: false`). Pero con el registro público de
+Supabase encendido, cualquiera con la clave publicable del front puede llamar a la API de Auth y crear usuarios para
+cualquier email, o usarla para mandar correos a terceros. **[mía]** Se cierra así:
+
+1. En el proyecto de Supabase se apaga **"Allow new users to sign up"**. Ningún cliente puede crear usuarios.
+2. El back crea el usuario, con la API de administración de Supabase (`auth.admin.createUser({ email, email_confirm: true })`
+   con la clave secreta que ya tiene), solo en `POST /auth/enroll`, y solo si:
+   - recibe un `claimId` válido (existe, no caducó, no se usó y su scan se puede reclamar: las mismas comprobaciones de
+     `redeemable`, sin gastarlo), y el email es el del ticket; o
+   - recibe un token de invitación válido (existe, pendiente y no caducada), y el email es el de la invitación.
+3. Si el usuario ya existe, `enroll` no hace nada y responde igual (204 o el email). No revela si había cuenta.
+4. El front llama después a `signInWithOtp({ email, options: { shouldCreateUser: false } })`.
+
+`email_confirm: true` no regala nada: la única forma de obtener una sesión es el código que llega a ese buzón.
+
+**Alternativa descartada [mía]:** que el back genere el código con `auth.admin.generateLink` y lo mande él. Pone un
+secreto de login en memoria del back y duplica lo que Supabase ya hace.
+
+**Login de alguien con cuenta** (`/app/login`): `signInWithOtp` con `shouldCreateUser: false`. Para un email sin
+cuenta, Supabase responde con un error; el front muestra **el mismo mensaje** en los dos casos ("If an account exists
+for this email, we sent you a code"), para no revelar quién es cliente.
+
+### 4.3 Sesión en el front
+
+Hoy el token simulado vive en `localStorage` (`arca.app.session`, `lib/app/session.ts`) y `lib/app/client.ts` lo manda
+como `Authorization: Bearer`. Con Supabase:
+
+- **Paquete:** `@supabase/ssr` con `createBrowserClient(url, publishableKey)`. Guarda la sesión en cookies del dominio
+  del front (legibles por JS) y la refresca sola. `lib/supabase.ts` pasa a usarlo.
+- **El token para la API** sale de `supabase.auth.getSession()` justo antes de cada llamada (`session.access_token`). La
+  API vive en otro origen (`api.arcacover.com`) y no recibe cookies, así que sigue siendo un Bearer.
+- **Estado:** `onAuthStateChange` alimenta el `AppContext`. `SIGNED_OUT` o `TOKEN_REFRESHED` fallido llevan a
+  `/app/login`.
+- **Cerrar sesión:** `supabase.auth.signOut({ scope: 'local' })`, y además `forgetOrg()` y `clearPendingClaim()`, como
+  hoy.
+- **Sin `proxy.ts` por ahora.** Next.js 16 renombró `middleware.ts` a `proxy.ts`, y la guía de Supabase para SSR lo usa
+  para refrescar la sesión en componentes de servidor. Las páginas de `/app` son componentes de cliente y no leen
+  datos en el servidor, así que no hace falta. Si algún día un componente de servidor lee datos del usuario, entra
+  el `proxy.ts` de la guía, y la regla de esa guía: proteger con `getClaims()`, nunca con `getSession()` en el servidor.
+- **`lib/app/session.ts`** deja de guardar el token en producción. `loadAppSession()` sigue existiendo (lo usan
+  `SaveResultsCta` y el registro) pero lee del cliente de Supabase en producción y del almacenamiento simulado en los
+  modos de debug.
+- **Duración [mía]:** el access token de Supabase dura una hora por defecto; se mantiene. La rotación de refresh tokens
+  con detección de reutilización queda encendida. El límite de inactividad y la duración máxima de sesión son
+  opciones del plan de pago de Supabase; propuesta: 7 días de inactividad, 30 días como máximo (F14).
+
+### 4.4 Cómo verifica la API al usuario
+
+`AppAuth` no cambia: `verify(token) → { userId, email } | null`. Se añade `SupabaseJwtAuth` en
+`apps/api/src/webapp/auth.ts`:
+
+```ts
+const jwks = createRemoteJWKSet(new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`));
+const { payload } = await jwtVerify(token, jwks, {
+  issuer: `${SUPABASE_URL}/auth/v1`, audience: 'authenticated',
+  algorithms: ['ES256', 'RS256'], requiredClaims: ['exp', 'sub', 'email'],
+});
+// además: payload.role === 'authenticated', payload.is_anonymous !== true, sub es un UUID
+return { userId: payload.sub, email: payload.email.toLowerCase(), aal: payload.aal, sessionId: payload.session_id };
+```
+
+- **Requisito:** el proyecto tiene que usar **claves de firma asimétricas** (sección "JWT Signing Keys" del panel). Con
+  el secreto HS256 heredado, el JWKS sale vacío y nada verifica: el back no arranca en `real` si el JWKS no tiene ninguna
+  clave (comprobación al arrancar, sin bloquear si Supabase no responde: reintenta y registra).
+- **Por qué `jose` y no `getClaims()` en el back:** `jose` ya es dependencia y hace lo mismo que `getClaims()` con claves
+  asimétricas (verificación local contra el JWKS, en caché). `getUser()` haría una petición a Supabase en cada
+  llamada; no hace falta, porque los permisos se leen de la base en cada petición.
+- **Rotación de claves:** `createRemoteJWKSet` vuelve a pedir el JWKS cuando llega un `kid` desconocido. Rotar en
+  Supabase con una clave en espera ("standby") no corta sesiones.
+- **Un proceso, un emisor.** El verificador lo elige `compose`: el real con `WEBAPP_PROVIDERS=real` o en producción, el
+  simulado en los demás casos. Nunca los dos a la vez, así que un token de `arca-mock-auth` jamás vale donde vale uno de
+  Supabase.
+- **Revocación.** Un access token sigue siendo válido hasta su `exp` aunque se cierre la sesión. No importa para los
+  permisos, que se leen de `memberships` en cada petición: quitar a alguien de una organización surte efecto en la
+  siguiente petición. Para una cuenta borrada, el back responde 401 si el perfil tiene `deleted_at` (§4.8).
+- **Sin claims de rol en el JWT [mía].** No se usa el "custom access token hook" para meter organización o rol en el
+  token: quedarían viejos hasta una hora después de un cambio de rol.
+
+### 4.5 Enlace entre `auth.users` y el modelo de la webapp
+
+- `profiles.user_id` = `auth.users.id` = `sub` del JWT. `memberships`, `invitations.invited_by`, `audit_log.actor_user_id`
+  y los demás ids de usuario ya son UUID sin clave foránea (migración de DN-10). Se mantiene así **[mía]**: la migración
+  sigue aplicándose en PGlite sin el esquema `auth`, y la coherencia la da el back, que escribe el perfil en cada
+  petición (`ensureProfile`).
+- `ensureProfile` actualiza el email del perfil con el del JWT. Se desactiva el cambio de email en la interfaz (y se
+  deja encendido "Secure email change" en Supabase); si algún día se permite, el perfil lo sigue solo.
+- **Admin de plataforma.** DN-10 §4.6 cita `npm run admin:grant -- <email>`, pero ese script **no existía** en
+  `package.json`. **Hecho en la fase 1 (T12, §12.1):** busca el perfil por email (la persona tiene que haber entrado una vez),
+  inserta en `platform_admins` y escribe `platform_admin.granted` en `audit_log` con `actor_kind = 'platform'`. Se
+  corre en local contra `Arca-dev`; contra producción, solo con la aprobación del founder y desde el host (SSM), nunca
+  copiando la clave de producción a un portátil.
+
+### 4.6 Invitaciones y cambios de rol
+
+Las reglas de DN-10 §4.7 (una invitación pendiente por email y organización, revocar al reinvitar, al aceptar y al
+quitar al miembro, 7 días de validez, solo se guarda el hash) no cambian. Cambia el transporte:
+
+1. `POST /orgs/:id/invitations` crea la invitación como hoy y, **después de confirmar la escritura**, el back manda el
+   correo con el enlace `${APP_BASE_URL}/app/invite/<token>`, el nombre de la organización, quién invita y el rol.
+   La respuesta sigue llevando `inviteUrl` **[mía]**: si el correo se pierde en un filtro, el owner puede copiar el
+   enlace. Un fallo del envío no deshace la invitación: se registra y la respuesta lo dice (`emailSent: false`).
+2. En `/app/invite/[token]`, la página llama a `POST /auth/enroll { invitationToken }`, que crea el usuario si hace falta
+   y devuelve el email de la invitación. La página lo muestra bloqueado, pide el código y, con la sesión, llama a
+   `POST /invitations/:token/accept` (sin cambios: exige que el email de la sesión sea el de la invitación).
+3. **Cambios de rol y bajas** surten efecto en la siguiente petición, porque el rol se lee de la base (§4.4).
+4. **La carrera anotada en `types.ts`** (un admin que degrada o quita a alguien a la vez que un owner lo asciende a
+   owner) se cierra en las RPC `set_member_role` y `remove_member` (§5.4): vuelven a comprobar `canManageMember` contra el
+   rol leído bajo `for update`, y no escriben nada si ya no se cumple.
+
+### 4.7 Reclamo del scan
+
+Sin cambios de regla respecto a DN-10 §4.7. Detalles nuevos:
+
+- El ticket del reclamo se lee en `POST /auth/enroll` (sin gastarlo) y se gasta en `POST /orgs` o
+  `POST /orgs/:id/analyses`, como hoy.
+- Con el código, la persona no sale de la pestaña: el `claimId` sigue en `sessionStorage`.
+- Con el enlace de respaldo, el reclamo viaja en la URL de vuelta: `emailRedirectTo` es
+  `${origin}/app/auth/confirm?next=/app/signup%3Fclaim%3D<claimId>`. La página de confirmación solo acepta un `next`
+  que empiece por `/app/` (nunca una URL absoluta), y `/app/signup` quita el `claim` de la barra de direcciones en cuanto
+  lo lee (`router.replace`), para que no quede en el historial ni en un `Referer`.
+- En otro dispositivo no hay ticket en `sessionStorage`: `/app/signup` usa el `claim` de la URL y el email de la sesión.
+  Si no coinciden, el back responde 403 como hoy.
+
+### 4.8 Borrado de cuenta y retención
+
+DN-10 solo tiene el borrado de **organizaciones** (solicitud + revisión humana). Falta el de una **persona**. **[mía]**
+
+`DELETE /me` (con la sesión):
+1. Si la persona es la **única owner** de alguna organización no borrada: **409 `sole_owner`**. Tiene que transferir la
+   propiedad o pedir el borrado de la organización.
+2. Si no, la RPC `delete_account` en una transacción: quita todas sus membresías (y libera sus acciones asignadas, como
+   `removeMember`), revoca las invitaciones pendientes a su email, marca el perfil con `deleted_at` y vacía su email y
+   su nombre, y escribe `account.deleted` en `audit_log` de cada organización afectada.
+3. Después, el back borra el usuario de Supabase con `auth.admin.deleteUser(id)`. Si falla, se reintenta (el perfil ya
+   está marcado y el back responde 401 a ese usuario).
+4. La actividad sigue mostrando sus filas, con `email: null` ("Former member"); el contrato ya lo admite
+   (`ActivityActor.email` es nullable).
+
+**Retención propuesta** (requiere el visto bueno del founder y, si es posible, de un abogado: F13):
+
+| Dato | Dónde | Propuesta |
+|---|---|---|
+| Cuenta (email, nombre) | `auth.users`, `profiles` | Se borra o vacía al borrar la cuenta |
+| Organización, análisis, plan de acción, actividad | tablas de DN-10/DN-11 | Se conservan mientras la organización exista; tras un borrado aprobado, N años (propuesta: 7) y después purga física. Hoy no hay purga (DN-10 §4.6) |
+| `audit_log` | Postgres | Igual que la organización; nunca se edita |
+| Facturas y pagos | Stripe | Los conserva Stripe por obligación legal; ARCA solo guarda ids |
+| Tickets de reclamo usados o caducados | `claim_tickets` | Purga a los 30 días |
+| Invitaciones aceptadas, revocadas o caducadas | `invitations` | Purga a los 180 días |
+| Eventos de Stripe | `stripe_events` | Purga al año |
+| Leads del embudo (scans) | `scans` | Sin cambios en esta nota |
+
+### 4.9 Plantillas de correo y URLs de vuelta
+
+**Plantillas de Supabase** (en inglés, como toda la interfaz):
+
+| Plantilla | Uso | Contenido |
+|---|---|---|
+| Magic Link | `signInWithOtp` para usuarios existentes, que con el alta cerrada son todos | Asunto "Your ARCA sign-in code"; el código `{{ .Token }}` en grande; "expires in 10 minutes"; enlace de respaldo `{{ .RedirectTo }}&token_hash={{ .TokenHash }}&type=email`; aviso "If you didn't request this, ignore this email" |
+| Confirm signup | no se usa (alta cerrada) | Se deja con un texto neutro |
+| Invite user | no se usa: las invitaciones las manda el back | Se deja con un texto neutro |
+| Change email address | desactivado en la interfaz | Texto neutro |
+
+El enlace de respaldo concatena con `&` porque `emailRedirectTo` siempre lleva ya `?next=…`. Si Supabase no acepta la
+URL de vuelta (no está en la lista), usa la Site URL y el enlace sale roto: la lista de URLs se prueba en cada entorno
+(§11).
+
+**Configuración de URLs por proyecto:**
+
+| Proyecto | Site URL | Redirect URLs permitidas |
+|---|---|---|
+| Producción | `https://arcacover.com` | `https://arcacover.com/app/auth/confirm**` |
+| `Arca-dev` | `http://localhost:3000` | `http://localhost:3000/**`; la URL de staging solo si staging tiene su propia API (§8.3) |
+| Previews de Vercel | — | **No** se añaden a producción. Los previews no tienen webapp (§8.3) |
+
+**SMTP propio obligatorio.** El SMTP de Supabase es para pruebas: tiene un límite de envíos muy bajo y no sirve para
+clientes. Se configura un proveedor (R10, F11) con remitente `no-reply@arcacover.com`, y SPF, DKIM y DMARC en el DNS
+del dominio (que vive en Vercel). Los correos de invitación del back salen por el mismo proveedor y el mismo remitente.
+
+## 5. Base de datos
+
+### 5.1 Punto de partida
+
+Ya existen, **sin aplicar a ninguna base**, las dos migraciones de la webapp:
+`20261025200000_webapp_organizations.sql` (DN-10) y `20261105120000_role_views.sql` (DN-11). Están probadas en PGlite y
+cubren `profiles`, `organizations`, `memberships`, `invitations`, `org_analyses`, `claim_tickets`, `plans`,
+`subscriptions`, `stripe_events`, `deletion_requests`, `platform_admins`, `audit_log` y `org_actions`, con RLS, permisos
+solo para `service_role`, la guarda de "al menos un owner" y el `audit_log` de solo añadir.
+
+Esta nota **no las reescribe**: añade una tercera migración con lo que falta para el cobro real, las RPC y los índices.
+Las tres se aplican juntas y en orden.
+
+### 5.2 Un proyecto o dos
+
+Hoy dev (`live-debug`) y producción comparten el mismo proyecto de Supabase (DN-09 §5.5), que además está en el plan
+gratuito y **se pausa solo** por inactividad. Con cuentas reales:
+
+| | Un proyecto compartido | **Dos proyectos (recomendado)** |
+|---|---|---|
+| Usuarios de prueba | Se crean en el Auth de producción, junto a los clientes | Solo en `Arca-dev` |
+| URLs de vuelta | La lista de producción tendría que admitir `localhost` | Producción solo admite `arcacover.com` |
+| Migraciones | Cada prueba de migración toca producción | Se ensayan en `Arca-dev` |
+| Stripe | Clientes de test y live apuntando a la misma tabla | Cada proyecto con su modo de Stripe |
+| Coste | 0 | El de producción pasa al plan de pago (sin pausas, copias diarias); `Arca-dev` puede seguir gratis |
+
+**Recomendación [mía]:** dos proyectos, y producción en plan de pago **antes** de tener un solo cliente: un proyecto que
+se pausa deja fuera a quien paga. DN-09 §11.7 ya describe cómo crear `Arca-dev`. Decisión del founder: F9 y F10.
+
+**Regla de aprobación [Jesús, de DN-10]:** ninguna migración se aplica a producción sin el visto bueno explícito del
+founder. Orden: `Arca-dev` → pruebas de §11 → aprobación → `supabase link` al proyecto de producción → `npm run db:push`
+→ `npm run db:verify` → volver a enlazar `Arca-dev` (DN-09 §11.7 avisa de este cambio de enlace).
+
+### 5.3 Migración nueva (`20261118000000_real_accounts_billing.sql`, hecha en T3: §12.1)
+
+Lo que añade, en el estilo de las dos anteriores (comentarios en inglés, `begin`/`commit`, RLS y permisos al final):
+
+```sql
+-- Stripe customer of an organization: created by the API on the first checkout, never by the browser.
+create table public.billing_customers (
+  org_id uuid primary key references public.organizations(id) on delete restrict,
+  customer_id text not null unique check (customer_id ~ '^cus_[A-Za-z0-9]+$'),
+  livemode boolean not null,
+  created_at timestamptz not null default now()
+);
+
+-- One open checkout per organization, so two owners clicking "Pay" do not start two subscriptions.
+create table public.checkout_sessions (
+  id text primary key check (id ~ '^cs_(test|live)_[A-Za-z0-9]+$'),
+  org_id uuid not null references public.organizations(id) on delete restrict,
+  plan_code text not null references public.plans(code) on delete restrict,
+  url text not null,
+  status text not null default 'open' check (status in ('open','complete','expired')),
+  created_by uuid not null,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now()
+);
+create unique index checkout_sessions_open_idx on public.checkout_sessions(org_id) where status = 'open';
+
+-- The catalog price a plan charges. amount_cents, currency and interval mirror it for display; a price change creates a
+-- new Stripe price and moves these columns together (§6.1).
+alter table public.plans
+  add column stripe_product_id text,
+  add column stripe_price_id text unique;
+
+-- What Stripe last said, kept raw beside the mapped status (§6.6).
+alter table public.subscriptions
+  add column provider_status text,
+  add column price_id text,
+  add column cancel_at_period_end boolean not null default false,
+  add column current_period_start timestamptz,
+  add column livemode boolean;
+create unique index subscriptions_subscription_idx on public.subscriptions(subscription_id) where subscription_id is not null;
+
+-- An event is "seen" when inserted and "done" when processed_at is set; only a processed event is skipped (§6.5).
+alter table public.stripe_events
+  add column livemode boolean,
+  add column org_id uuid,
+  add column attempts integer not null default 0,
+  add column last_error text;
+create index stripe_events_received_idx on public.stripe_events(received_at);
+
+-- Account deletion (§4.8): the profile stays as a tombstone with no email.
+alter table public.profiles
+  add column deleted_at timestamptz,
+  alter column email drop not null,
+  add constraint profiles_email_unless_deleted check ((deleted_at is null) = (email is not null));
+create unique index profiles_email_idx on public.profiles(lower(email)) where deleted_at is null;
+
+-- Lookups the service does today by scanning lists.
+create index invitations_email_idx on public.invitations(lower(email)) where accepted_at is null and revoked_at is null;
+create index claim_tickets_expiry_idx on public.claim_tickets(expires_at);
+```
+
+Notas:
+- Los nombres `billing_customers.customer_id` y `subscriptions.subscription_id` siguen la regla de DN-10: los ids del
+  proveedor van sin prefijo `stripe_`. `plans.stripe_price_id` lleva el prefijo porque es configuración del catálogo y
+  convive con columnas propias del plan. **[mía]**
+- La semilla de planes de DN-10 (precios de ejemplo) se queda. En producción, antes de encender la webapp, los dos
+  planes se actualizan con los precios reales y sus `stripe_price_id` (§12, T20). Con `WEBAPP_ENABLED=true`, el back no
+  arranca si un plan activo no tiene `stripe_price_id`. **[mía]** (Desde §21: el precio del modo de la clave, test o live, y
+  comprobado en Stripe al arrancar.)
+- `organizations.billing_status` sigue siendo **el** derecho de acceso (la "entitlement"): no hace falta una tabla
+  aparte, porque hoy solo hay un derecho (entrar o no). Solo lo escribe la RPC de cobro. Si mañana hay planes con
+  funciones distintas, se añade `plans.features jsonb` y una vista.
+
+### 5.4 Funciones RPC
+
+`SupabaseRepository` usa el cliente de datos de `supabase-js` (PostgREST), que no abre transacciones de varias
+sentencias. Cada escritura que DN-10/DN-11 exige atómica pasa a una función, con el patrón de `create_assessment`:
+`language plpgsql security definer set search_path = pg_catalog, public`, `revoke all … from public, anon,
+authenticated` y `grant execute … to service_role`. El repositorio traduce los `raise exception` con un código propio
+(`using errcode = 'P0001'` y un mensaje fijo como `webapp_conflict:scan_claimed`) a `WebappConflict` o
+`IneligibleAssignee`.
+
+| Función | Qué hace en una transacción | Bloqueos |
+|---|---|---|
+| `create_organization(p_org, p_owner, p_analysis)` | Organización + owner + análisis reclamado; `scan_claimed` si el scan ya es de alguien | La `UNIQUE` de `org_analyses.scan_id` |
+| `claim_analysis(p_analysis)` | Añadir un análisis a una organización existente | Igual |
+| `redeem_claim_ticket(p_id_hash, p_at)` | Gastar el ticket; devuelve si lo gastó esta llamada | `update … where used_at is null returning` |
+| `accept_invitation(p_invitation_id, p_user, p_role, p_at)` | Membresía + aceptar + revocar las demás pendientes de ese email + auditoría | `for update` sobre la invitación |
+| `set_member_role(p_org, p_target, p_role, p_actor, p_actor_role)` | Cambiar rol, re-comprobando `canManageMember` contra el rol leído bajo bloqueo; liberar acciones si pasa a `viewer`; auditoría | `select … for update` sobre la membresía (DN-11 en `types.ts`) |
+| `remove_member(p_org, p_target, p_actor, p_actor_role)` | Igual, borrando; revoca invitaciones de su email | Igual |
+| `upsert_assessment_action`, `create_custom_action`, `update_action` | Las escrituras del plan de acción con la regla del responsable (DN-11 D11) | `for share` sobre la membresía del responsable; `for update` sobre la organización al crear (límite de 100) |
+| `apply_billing_state(p_event, p_state)` | Registrar el evento como procesado + upsert de `subscriptions` + `billing_status` + `audit_log`, todo o nada (§6.5) | `for update` sobre la organización |
+| `review_deletion_request(...)` | Revisar + `deleted_at` + auditoría; resuelve la doble revisión que hoy da 500 en vez de 409 | `for update` sobre la solicitud |
+| `delete_account(p_user, p_at)` | §4.8 | `for update` sobre las membresías del usuario |
+
+`canManageMember` vive en `@arca/contracts` (TypeScript). Dentro de la RPC se reescribe como una expresión SQL de la
+misma tabla, y un test de PGlite recorre la matriz entera contra las dos versiones para que no diverjan. **[mía]**
+
+### 5.5 Row Level Security
+
+- **Todas** las tablas de la webapp ya tienen RLS activado y ninguna política: para `anon` y `authenticated` la
+  respuesta es "ninguna fila". Además, no tienen ningún permiso (`revoke all`). Se mantiene. **[mía, sigue a DN-10]**
+- La clave publicable del front (antes "anon") solo sirve para la API de Auth. Aunque alguien la use contra la API de
+  datos, no lee ni escribe ninguna tabla.
+- Las funciones nuevas revocan `execute` de `public`: en Postgres toda función nueva es ejecutable por `PUBLIC` salvo que
+  se revoque, y PostgREST expone las funciones del esquema `public` como `/rpc/…`.
+- Un test de PGlite (y otro contra Supabase local) comprueba, con los roles `anon` y `authenticated`, que `select`,
+  `insert` y `rpc` fallan en cada tabla y función de la webapp.
+- **Si algún día** el front leyera directamente de la base (no se recomienda), las políticas serían de pertenencia, con
+  `(select auth.uid())` para que Postgres lo evalúe una vez: `using (exists (select 1 from public.memberships m where
+  m.org_id = <tabla>.org_id and m.user_id = (select auth.uid())))`. Esta nota no las crea.
+
+### 5.6 Limpieza
+
+PGlite no tiene `pg_cron`, así que la limpieza la hace el back **[mía]**: un temporizador cada hora, en el único
+proceso de producción, borra lo que §4.8 marca para purga y pone `expired` a los `checkout_sessions` vencidos. Cada
+borrado es una sentencia acotada (`delete … where … limit` vía RPC) y escribe una línea de log con el recuento.
+
+## 6. Stripe
+
+### 6.1 Productos y precios
+
+| Plan (`plans.code`) | Producto Stripe | Price | `lookup_key` | Precio hoy en `plans.ts` (ejemplo) |
+|---|---|---|---|---|
+| `monthly` | "ARCA" | recurrente, mensual, USD | `arca_monthly` | 499,00 USD/mes |
+| `annual` | "ARCA" | recurrente, anual, USD | `arca_annual` | 4.990,00 USD/año |
+
+Los importes son los de ejemplo de la semilla; los reales son la decisión F1.
+
+**Por qué precios de catálogo y no `price_data` (cambia DN-10 D10) [mía]:**
+- El Customer Portal solo deja cambiar entre precios configurados en el catálogo. Con `price_data`, cada checkout crea un
+  precio suelto y el cliente no puede pasar de mensual a anual por su cuenta.
+- Los informes de Stripe (ingresos por plan, MRR) se agrupan por precio.
+- Stripe Tax necesita un código fiscal en el producto (el de SaaS para uso empresarial; se confirma en el panel).
+
+**Lo que se conserva de DN-10:** el precio se cambia desde `/admin` (`PUT /admin/plans/:code`). Con un importe nuevo,
+el back:
+1. crea un Price nuevo en el mismo producto, con `transfer_lookup_key: true` para quedarse con la `lookup_key`;
+2. desactiva el anterior (`active: false`);
+3. actualiza `plans` (`stripe_price_id`, `amount_cents`, `currency`, `interval`) y audita `plan.updated`.
+
+Los suscriptores existentes siguen con su precio anterior hasta que alguien los migre (F2). Si el paso 1 funciona y el
+3 falla, el reintento es seguro: el back busca primero un Price activo con esa `lookup_key` y ese importe.
+
+### 6.2 Checkout
+
+`POST /orgs/:id/billing/checkout { planCode }` (`billing.manage`, sin exigir pago):
+
+1. `authorize` como hoy. Si `hasPaidAccess`: 409 (cambiar de plan es cosa del portal).
+2. Si hay un `checkout_sessions` abierto y sin vencer para la organización: devuelve **su misma URL** (200). Así, dos
+   clics o dos owners no crean dos suscripciones.
+3. Cliente de Stripe: el de `billing_customers` o uno nuevo con `customers.create({ name: org.name, email: <email del
+   owner que paga>, metadata: { org_id } }, { idempotencyKey: 'customer:<orgId>' })`.
+4. `checkout.sessions.create(params, { idempotencyKey: 'checkout:<orgId>:<planCode>:<minuto>' })` con:
+
+| Parámetro | Valor | Por qué |
+|---|---|---|
+| `mode` | `subscription` | |
+| `customer` | el del paso 3 | Un cliente por organización |
+| `client_reference_id` | `org.id` | Para reconciliar |
+| `line_items` | `[{ price: plan.stripe_price_id, quantity: 1 }]` | Precio de catálogo (§6.1) |
+| `metadata`, `subscription_data.metadata` | `{ org_id }` | El webhook resuelve la organización sin depender del cliente |
+| `success_url` | `${APP_BASE_URL}/app/billing/return?session_id={CHECKOUT_SESSION_ID}` | §6.3 |
+| `cancel_url` | `${APP_BASE_URL}/app/billing` | Como hoy |
+| `billing_address_collection` | `required` | Factura con dirección; base de Stripe Tax |
+| `customer_update` | `{ name: 'auto', address: 'auto' }` | Guarda lo que escribe en el cliente |
+| `tax_id_collection` | `{ enabled: true }` si F3 lo pide | |
+| `automatic_tax` | `{ enabled: true }` solo si F3 = Stripe Tax | |
+| `allow_promotion_codes` | según F4 | |
+| `subscription_data.trial_period_days` | solo si F4 = prueba | |
+| `expires_at` | ahora + 1 h | Un checkout abierto bloquea otros (paso 2) |
+
+5. Guarda la sesión en `checkout_sessions` y audita `billing.checkout_started`. Devuelve `{ url }`.
+
+Métodos de pago: **solo tarjeta** al principio **[mía]**. Los métodos asíncronos (ACH) obligan a manejar
+`checkout.session.async_payment_*` y un estado intermedio; se pueden añadir para el plan anual (F5).
+
+### 6.3 Vuelta del checkout
+
+El webhook puede tardar unos segundos. Para que la persona no aterrice en un `/app` bloqueado:
+
+- `/app/billing/return` llama a `POST /orgs/:id/billing/sync { sessionId }` (`billing.manage`). El back recupera la
+  sesión de Stripe (`checkout.sessions.retrieve(id, { expand: ['subscription'] })`), comprueba que su
+  `client_reference_id` es esa organización y aplica el estado **por el mismo camino que el webhook** (§6.5). Es
+  idempotente.
+- Después la página consulta `GET /orgs/:id` hasta ver `paidAccess: true` (como mucho 30 s) y entra a `/app?paid=1`. Si
+  no llega, muestra "Your payment is being confirmed" con un botón para reintentar. El acceso solo lo da el back.
+
+### 6.4 Customer Portal
+
+`POST /orgs/:id/billing/portal` (`billing.manage`, sin exigir pago): `billingPortal.sessions.create({ customer,
+return_url: '${APP_BASE_URL}/app/billing' })`. Si la organización no tiene cliente todavía: 409 `no_customer`.
+
+Configuración del portal (en el panel de Stripe, una vez por modo, test y live):
+
+| Función | Valor propuesto [mía] |
+|---|---|
+| Actualizar método de pago | sí |
+| Historial de facturas | sí |
+| Datos del cliente (nombre, dirección, NIF) | sí |
+| Cancelar suscripción | sí, **al final del periodo**, con motivo |
+| Cambiar de plan | entre `arca_monthly` y `arca_annual`; prorrateo según F6 |
+| Pausar | no |
+
+Al volver del portal no hace falta `sync`: los cambios llegan por webhook y `/app/billing` lee el estado al cargar.
+
+### 6.5 Webhook
+
+`POST /billing/webhook`, público, en `https://api.arcacover.com/billing/webhook`. Se registra en el panel de Stripe
+(un endpoint en test para `Arca-dev`, otro en live para producción), con la **misma versión de API** que fija el SDK.
+
+**Procesamiento:**
+
+1. Lee el cuerpo **crudo** (`await c.req.text()`), antes de cualquier parseo, y verifica con
+   `stripe.webhooks.constructEvent(raw, c.req.header('Stripe-Signature'), STRIPE_WEBHOOK_SECRET)`. Firma inválida o
+   ausente: **400**, sin tocar la base. La tolerancia por defecto es de 5 minutos, así que el reloj del host tiene que
+   estar sincronizado (en EC2 lo está por defecto).
+2. `event.livemode` tiene que coincidir con el modo de la clave del proceso. Si no: 400 y log de error.
+3. Si el tipo no está en la tabla de abajo: **200** sin más (Stripe no reintenta).
+4. Inserta el evento en `stripe_events` si no estaba (`on conflict do nothing`) y suma un intento. Si ya tiene
+   `processed_at`: **200** (duplicado).
+5. Resuelve la organización: `metadata.org_id` de la sesión o de la suscripción; si no, por `billing_customers`. Sin
+   organización: marca el evento procesado con `last_error = 'unknown_org'`, 200 y log de aviso.
+6. **Lee el estado actual** de la suscripción en Stripe (`subscriptions.retrieve`). No se fía del contenido del evento,
+   que puede llegar tarde o desordenado. **[mía]**
+7. Aplica con la RPC `apply_billing_state`, que en una transacción marca el evento procesado, hace el upsert de
+   `subscriptions`, mueve `organizations.billing_status` y audita `billing.event_applied` (`actor_kind = 'system'`).
+8. Responde **200**. Cualquier excepción: **500**, el evento queda sin `processed_at` y Stripe reintenta (en live, con
+   espera creciente durante días).
+
+**Arreglo frente al código actual:** `WebappService.applyBillingEvent` registra el evento (`recordBillingEvent`) antes de
+aplicarlo. Si el proceso cae entre los dos pasos, el reintento se ve como duplicado y el cambio se pierde. La RPC del
+paso 7 lo resuelve, porque registrar y aplicar son la misma transacción.
+
+**Orden y concurrencia.** El paso 6 hace que el orden de llegada dé igual, salvo en un caso: dos entregas
+simultáneas para la misma organización leen el estado en momentos distintos y la más vieja confirma la última. Como
+producción es un solo proceso, el back serializa el procesamiento por organización con una cola en memoria **[mía]**.
+Si un día hay varias instancias, hará falta un candado de la base que cubra la lectura de Stripe. Lo que se escape lo
+corrige la reconciliación diaria (§9.5).
+
+**Una suscripción vieja no pisa a la nueva.** `subscriptions` tiene una fila por organización. Un evento de una
+suscripción distinta de la guardada solo se aplica si la guardada está en `canceled` (es una suscripción nueva tras
+cancelar). Si las dos están activas, hay un cobro doble: no se aplica, se audita `billing.duplicate_subscription` y se
+avisa (§9.5) para que una persona cancele y reembolse.
+
+**Eventos:**
+
+| Evento | Acción |
+|---|---|
+| `checkout.session.completed` | `checkout_sessions.status = complete`; enlaza `subscription_id`; lee y aplica la suscripción |
+| `checkout.session.expired` | `checkout_sessions.status = expired`. No cambia el acceso |
+| `customer.subscription.created` / `updated` / `deleted` | Lee y aplica |
+| `invoice.paid` | Lee y aplica (renovación confirmada); audita `billing.invoice_paid` con el importe |
+| `invoice.payment_failed` | Lee y aplica (normalmente pasa a `past_due`); audita `billing.payment_failed` |
+| `invoice.payment_action_required` | Audita; Stripe avisa al cliente para autenticar el pago (3DS) |
+| `customer.subscription.trial_will_end` | Solo si F4 = prueba: audita; Stripe avisa al cliente |
+| `charge.refunded` | Audita `billing.refunded`. No cambia el acceso |
+| `charge.dispute.created` | Audita y avisa (§9.5) |
+| `checkout.session.async_payment_succeeded` / `_failed` | Solo si F5 añade métodos asíncronos |
+
+Con la versión de API `2025-03-31.basil` y posteriores, `current_period_start` y `current_period_end` ya no están en la
+suscripción sino en cada elemento (`items.data[].current_period_end`), y la suscripción de una factura se lee en
+`invoice.parent.subscription_details.subscription`. El traductor lo tiene en cuenta: hay un solo elemento por
+suscripción.
+
+### 6.6 Estado de cobro
+
+| `subscription.status` de Stripe | `billing_status` | Acceso | En pantalla |
+|---|---|---|---|
+| `incomplete` | `pending_payment` si nunca pagó; si no, sin cambio | no | "Payment pending" |
+| `incomplete_expired` | `pending_payment` si nunca pagó; si no, `canceled` | no | "Payment not completed" |
+| `trialing` (solo con F4) | `active` | sí | "Trial until …" |
+| `active` | `active` | sí | "Active, renews …" o "Cancels on …" si `cancel_at_period_end` |
+| `past_due` | `past_due` | sí, con aviso (DN-10 §4.5) | "Payment failed, update your card" |
+| `unpaid` | `canceled` | no | "Subscription suspended" |
+| `paused` | `canceled` | no | (no se ofrece pausar) |
+| `canceled` | `canceled` | no | "Canceled": puede volver a pagar |
+
+```
+pending_payment ──checkout pagado──▶ active ◀──────── invoice.paid ────────┐
+      ▲                               │   │                                │
+      │                               │   └──renovación falla──▶ past_due ─┘
+  (nunca pagó)                        │                             │
+                                      └──cancelada / fin de periodo─┤ reintentos agotados
+                                                                    ▼
+                                                                canceled ──nuevo checkout──▶ active
+```
+
+- `billing_status` solo lo mueve `apply_billing_state`. El borrado aprobado no lo toca: pone `deleted_at` y cancela en
+  Stripe; el webhook que llega después mueve el estado a `canceled` (DN-10 §4.4).
+- **Reintentos (configuración de Stripe, "Manage failed payments") [mía]:** reintentos inteligentes durante 2 semanas
+  y, al agotarse, **cancelar la suscripción**. Así `unpaid` casi no aparece y `past_due` dura como mucho esas dos
+  semanas. La duración es la decisión F7.
+- `provider_status` guarda el estado crudo de Stripe para soporte y para la reconciliación.
+
+### 6.7 Modo test y modo live
+
+| | Clave | Webhook | Base |
+|---|---|---|---|
+| Local y `live-debug` real | `sk_test_…` o restringida `rk_test_…` | `stripe listen` (secreto `whsec_` local) | `Arca-dev` |
+| Producción | **restringida** `rk_live_…` | endpoint live | producción |
+
+- El back deduce el modo del prefijo de la clave. Producción se niega a arrancar con una clave de test salvo
+  `STRIPE_ALLOW_TEST_MODE=true` (para un ensayo en el host antes del lanzamiento); los modos de debug se niegan a
+  arrancar con una clave live. **[mía]**
+- **Clave restringida [mía]:** escritura en Customers, Checkout Sessions, Customer Portal, Subscriptions (para cancelar
+  al aprobar un borrado) y Prices (para `/admin`); lectura en Products, Invoices y Events. Nada más.
+- Las **test clocks** de Stripe (`testHelpers.testClocks`) permiten adelantar el tiempo de un cliente de test para
+  probar renovaciones, fallos y cancelaciones sin esperar (§11).
+
+### 6.8 Impuestos, recibos y facturas (puntos de decisión)
+
+- **Impuestos (F3).** Vender SaaS a despachos de EE. UU. puede estar sujeto a impuesto de ventas según el estado, y la
+  obligación nace al registrarse o superar umbrales en cada estado. Opciones: (a) Stripe Tax con `automatic_tax` y
+  registros donde toque; (b) sin impuestos al principio y revisar con un asesor fiscal. No somos asesores fiscales: la
+  decisión necesita a uno.
+- **Recibos.** Stripe manda recibo y factura por email si se activan en el panel ("Email customers about successful
+  payments" y los correos de facturas). Recomendado **[mía]**: activados, con la marca de ARCA, en vez de mandarlos
+  desde el back.
+- **Datos de factura (F12).** Razón social del despacho, dirección, identificador fiscal y un email de facturación que
+  puede no ser el del owner. Checkout recoge los tres primeros; el email de facturación se cambia en el portal.
+
+### 6.9 Reembolsos, disputas y borrado
+
+- **Reembolsos (F8):** al principio, a mano desde el panel de Stripe, con una política escrita. El webhook solo audita
+  `charge.refunded`; el acceso no cambia por un reembolso.
+- **Disputas:** se responden desde el panel de Stripe; el back audita y avisa.
+- **Aprobar un borrado** llama hoy a `billing.cancel(orgId)`. En real: `subscriptions.cancel(subscription_id)` inmediata
+  y, según F8, con o sin reembolso prorrateado.
+
+### 6.10 Interfaz `BillingProvider`
+
+La interfaz de `apps/api/src/webapp/billing.ts` crece (y el simulado la implementa igual):
+
+```ts
+interface BillingProvider {
+  ensureCustomer(input: { orgId: string; name: string; email: string }): Promise<{ customerId: string }>;
+  createCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; successUrl: string; cancelUrl: string })
+    : Promise<{ sessionId: string; url: string; expiresAt: string }>;
+  createPortal(input: { customerId: string; returnUrl: string }): Promise<{ url: string }>;
+  cancel(subscriptionId: string): Promise<void>;
+  /** The provider's current state of a subscription, mapped (§6.6). */
+  subscriptionState(subscriptionId: string): Promise<BillingState>;
+  checkoutState(sessionId: string): Promise<{ orgId: string; subscriptionId: string | null; status: string }>;
+  /** Verifies and parses a webhook; null when the signature is wrong. */
+  parseWebhook(raw: string, signature: string | undefined): Promise<ProviderEvent | null>;
+  createPrice(input: { plan: PlanRecord; amountCents: number }): Promise<{ priceId: string }>;
+}
+```
+
+`StripeBillingProvider` usa el paquete `stripe` de npm con la versión de API fijada en el constructor, `maxNetworkRetries: 2`
+y `timeout: 10_000`.
+
+## 7. API
+
+### 7.1 Composición
+
+`compose.ts` construye la webapp así:
+
+| Condición | Repositorio | Auth | Cobro | Correo |
+|---|---|---|---|---|
+| `production`, `WEBAPP_ENABLED=false` (por defecto) | — (501, como hoy) | — | — | — |
+| `production`, `WEBAPP_ENABLED=true` | `SupabaseWebappRepository` | `SupabaseJwtAuth` | `StripeBillingProvider` | `SesMailer` (o el de F11) |
+| debug, `WEBAPP_PROVIDERS=simulated` (por defecto) | `InMemoryWebappRepository` | `MockAppAuth` | `MockBillingProvider` | `MemoryMailer` |
+| `live-debug`, `WEBAPP_PROVIDERS=real` | `SupabaseWebappRepository` | `SupabaseJwtAuth` | `StripeBillingProvider` (test) | el real o `MemoryMailer` |
+| `mock`, `WEBAPP_PROVIDERS=real` | **no arranca** (mock nunca llama a servicios reales, DN-10 §2) | | | |
+
+La línea de arranque dice qué se construyó: `webapp=real stripe=live`, `webapp=real stripe=test`,
+`webapp=simulated-in-memory` o nada si no hay webapp.
+
+### 7.2 Rutas
+
+| Ruta | Estado | Cambio |
+|---|---|---|
+| `POST /auth/enroll { claimId } \| { invitationToken }` | **nueva**, pública | Crea el usuario de Supabase si hace falta (§4.2). Responde `{ email }`. Ticket o invitación inválidos: 410, como `redeemable` |
+| `GET /orgs/:id/billing` | **nueva**, miembro, sin exigir pago | `BillingView`: estado, plan, fin del periodo, `cancelAtPeriodEnd`, `manageable` (si el rol tiene `billing.manage`). Lo leen todos los roles (DN-11 D10) |
+| `POST /orgs/:id/billing/sync { sessionId }` | **nueva**, `billing.manage` | §6.3 |
+| `DELETE /me` | **nueva**, sesión | §4.8 |
+| `POST /billing/webhook` | 501 → **real** | §6.5. Fuera de `noStore` no cambia nada; fuera de CORS tampoco |
+| `POST /orgs/:id/billing/checkout` | real | Stripe; devuelve la sesión abierta si la hay (§6.2) |
+| `POST /orgs/:id/billing/portal` | real | Stripe; 409 `no_customer` sin cliente |
+| `POST /orgs/:id/invitations` | cambia | Manda el correo; añade `emailSent` a la respuesta |
+| `PUT /admin/plans/:code` | cambia | Un importe nuevo crea un Price (§6.1); 502 `billing_unavailable` si Stripe falla, sin tocar la tabla |
+| `POST /admin/deletion-requests/:id/approve` | cambia | Cancela en Stripe (§6.9) |
+| `/admin/*` | cambia en la fase 6 | Exige `aal2` (MFA) |
+| Todas las demás de DN-10/DN-11 | sin cambios | Pasan de 501 a reales en producción |
+| `POST /__debug/auth/login`, `POST /__debug/billing/pay` | sin cambios | Solo con proveedores simulados; con `WEBAPP_PROVIDERS=real`, 404 |
+
+### 7.3 Contrato de errores
+
+El formato no cambia: `{ error, message }` con los códigos de `WebappFailure`. Nuevos:
+
+| HTTP | `error` | Cuándo |
+|---|---|---|
+| 401 | `unauthorized` | Token ausente, inválido, caducado, de otro emisor, o cuenta borrada |
+| 403 | `mfa_required` | `/admin/*` con `aal1` (fase 6) |
+| 409 | `conflict` (mensaje `sole_owner`) | `DELETE /me` siendo único owner |
+| 409 | `conflict` (mensaje `no_customer`) | Portal sin cliente |
+| 429 | `rate_limited` | §7.4, con `Retry-After` |
+| 502 | `billing_unavailable` | Stripe no respondió o dio error 5xx; nada se escribió |
+| 503 | `auth_unavailable` | `enroll` no pudo hablar con Supabase |
+
+El webhook responde 400 (`invalid_signature`), 200 (aplicado, duplicado o ignorado) o 500 (reintentar). Nunca 401/403.
+
+### 7.4 Límites de peticiones
+
+En memoria por proceso, como `ScanLimiter` (producción es un proceso):
+
+| Ruta | Límite propuesto [mía] |
+|---|---|
+| `POST /claims` | 20/h por IP |
+| `POST /auth/enroll` | 10/h por IP y 5/h por ticket o invitación |
+| `POST /orgs/:id/invitations` | 30/día por organización (cada una manda un correo) |
+| `POST /orgs/:id/billing/checkout`, `/portal` | 10/h por organización |
+| `POST /orgs/:id/billing/sync` | 30/h por organización |
+| `DELETE /me` | 3/h por usuario |
+| `POST /billing/webhook` | sin límite (lo protege la firma) |
+
+Del lado de Supabase: un código cada 60 s por email, el límite de correos por hora del proyecto (se sube al poner el
+SMTP propio) y el de verificaciones por IP. CAPTCHA (Turnstile) en `enroll` y en el login, en la fase 6 si aparece abuso.
+
+### 7.5 CORS y CSRF
+
+- La API autentica con `Authorization: Bearer` y no usa cookies, así que una web ajena no puede hacer peticiones
+  autenticadas en nombre del usuario: no hay superficie de CSRF. `allowHeaders` sigue siendo exactamente
+  `Content-Type,Authorization` en producción.
+- **Recomendación [mía]:** quitar `http://localhost:3000` de `CORS_ALLOWED_ORIGINS` en `deploy/production.env` cuando la
+  webapp se encienda. Con cuentas reales, un front local no tiene por qué hablar con la API de producción.
+- El webhook no lo llama un navegador; CORS no le afecta.
+- El front pone `Referrer-Policy: strict-origin-when-cross-origin` (o `no-referrer`) en `/app/*`, porque `/app/invite/[token]`
+  y el `?claim=` llevan secretos en la URL (§4.7).
+
+### 7.6 Contratos 0.5.0 y orden de publicación
+
+Cambios en `packages/contracts/src`:
+
+| Esquema | Cambio |
+|---|---|
+| `EnrollRequest`, `EnrollResponse` | nuevos (`webapp.ts`) |
+| `BillingView` | nuevo: `{ billingStatus, plan: PlanView \| null, currentPeriodEnd, cancelAtPeriodEnd, manageable }` |
+| `BillingSyncRequest` | nuevo: `{ sessionId }` |
+| `InvitationView` | `emailSent: boolean` opcional (solo en la respuesta que crea) |
+| `DebugModeResponse` (`debug.ts`) | `webapp: 'simulated' \| 'real'` y `billing: 'simulated' \| 'test'`, como anticipó DN-12 §7.4 |
+
+Los campos nuevos de vistas existentes son opcionales, para que un front con 0.4.0 siga leyendo un back nuevo (el
+front parsea estricto). `DebugModeResponse` gana campos obligatorios: solo afecta a los modos de debug en local.
+
+**Ya en `packages/contracts/src` (T7, §17), sin publicar:** `EnrollRequest` (unión estricta: `{ claimId }` o
+`{ invitationToken }`, cada uno de 1 a 512 caracteres) y `EnrollResponse` (`{ email }`), con sus tipos, como exportaciones
+nuevas de `webapp.ts`. `DELETE /me` no tiene cuerpo ni respuesta (204), así que no añade esquema. Ningún esquema que el
+front ya parsea cambió. Salen con 0.5.0 (T18).
+
+**También en `packages/contracts/src` (fase 3, §18.5), sin publicar:** `BillingView` (la tabla de arriba) y `BillingSyncRequest`
+(`{ sessionId }`, solo ids `cs_test_…` o `cs_live_…`), exportaciones nuevas de `webapp.ts`. `POST /orgs/:id/billing/sync` responde con el
+`OrgView` de siempre.
+
+**Orden** (el de DN-11, guardado en la memoria del proyecto):
+1. Se fusiona el PR del back, con todo detrás de `WEBAPP_ENABLED=false`: producción sigue en 501.
+2. Se crea el tag `contracts-v0.5.0`; `contracts-release.yml` publica el `.tgz`.
+3. El PR del front apunta la dependencia a la URL de la release; el founder lo fusiona cuando pase Vercel.
+4. Se enciende el back (`WEBAPP_ENABLED=true` en `production.env`) y después el front (`NEXT_PUBLIC_WEBAPP_ENABLED=true`
+   en Vercel, producción). En ese orden: un front encendido con el back apagado mostraría el CTA y recibiría 501.
+
+## 8. Front
+
+### 8.1 Páginas y componentes
+
+| Pieza | Hoy | Con la webapp real |
+|---|---|---|
+| `lib/supabase.ts` | `createClient` dormido | `createBrowserClient` de `@supabase/ssr` |
+| `lib/app/auth.ts` | `signIn` → `debugSignIn` o `not_configured` | `requestCode(email)`, `verifyCode(email, code)`, `confirmLink(tokenHash)`, `signOut()`; en debug, el simulado como hoy |
+| `lib/app/session.ts` | token en `localStorage` | token del cliente de Supabase en producción; el reclamo y la última organización, como hoy |
+| `lib/app/client.ts` | Bearer de `loadAppSession()` | Bearer de `getSession()`; 401 → cerrar sesión y `/app/login` |
+| `components/app/SaveResultsCta.tsx` | solo en debug | también en producción si `NEXT_PUBLIC_WEBAPP_ENABLED === "true"`; `SimulationNotice` solo en debug |
+| `/app/signup` | email bloqueado + nombre → login simulado | 1) `enroll` + enviar código; 2) escribir código; 3) nombre de la organización → `POST /orgs` |
+| `/app/login` | email → login simulado | email → código; mensaje neutro (§4.2); la casilla de admin simulado sigue solo en mock |
+| `/app/auth/confirm` | — | **nueva**: botón que llama a `verifyOtp({ token_hash, type: 'email' })` y va a `next` (solo rutas `/app/`) |
+| `/app/invite/[token]` | escribir email → login simulado → aceptar | `enroll` → email bloqueado → código → aceptar |
+| `/app/billing` | planes + "Pay" → checkout simulado | estado desde `GET /orgs/:id/billing`; "Pay" → Stripe; "Manage subscription" → portal; los demás roles en solo lectura (DN-11 D10) |
+| `/app/billing/return` | — | **nueva**: `sync` + espera (§6.3) |
+| `/app/billing/mock-checkout` | debug | sin cambios: 404 y fuera del bundle en producción |
+| `/app/settings` | renombrar, pedir borrado de la organización | además "Delete my account" (§4.8) |
+| `/app/members` | invitar y copiar enlace | además "Invitation email sent" o "Email could not be sent, copy the link" |
+| `/app/admin` | prueba de concepto | sin cambios; en la fase 6, pantalla de alta de MFA |
+
+### 8.2 Variables de entorno
+
+| Variable | Pública | Dónde | Valor |
+|---|---|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL` | sí | Vercel (prod) y `.env.local` | URL del proyecto de producción o de `Arca-dev` |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | sí | Igual | Clave publicable (`sb_publishable_…`). Sustituye a `NEXT_PUBLIC_SUPABASE_ANON_KEY` del `.env.example` |
+| `NEXT_PUBLIC_WEBAPP_ENABLED` | sí | Vercel (prod) | `true` solo cuando el back esté encendido (§7.6 paso 4) |
+| `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_ARCA_MODE` | sí | Igual que hoy | Sin cambios |
+
+**Ninguna variable de servidor nueva en el front.** El front no usa Stripe.js (Checkout es una página de Stripe), así
+que no necesita ni la clave publicable de Stripe. El chequeo `check-no-debug` del build se amplía para fallar si el
+bundle contiene `sb_secret_`, `sk_live_`, `sk_test_`, `rk_live_`, `rk_test_` o `whsec_`. **[mía]**
+
+### 8.3 Previews y staging
+
+Los previews de Vercel se construyen en modo producción y hablan con la API de producción. Con la webapp real,
+necesitarían el Supabase de producción (el JWT tiene que ser de ese emisor) y apuntar a Stripe live. **[mía]**
+`NEXT_PUBLIC_WEBAPP_ENABLED` queda **sin definir en el entorno Preview** de Vercel, y también en `staging.arcacover.com`
+mientras staging no tenga su propia API. La webapp real se prueba en local con `live-debug` y `WEBAPP_PROVIDERS=real`.
+
+### 8.4 Panel de debug
+
+- **`mock`:** igual que hoy (login como rol de la semilla, pago simulado, "Show forbidden actions", reset).
+- **`live-debug` simulado:** igual que hoy (DN-12 §7).
+- **`live-debug` real:** el panel lee `webapp` y `billing` de `/__debug/mode`. Oculta el login y el pago simulados (las
+  rutas dan 404), muestra "Webapp: real · Stripe test" y enlaza a la tarjeta de test 4242 y a `stripe listen`. La
+  franja dice `LIVE DEBUG · real accounts (Arca-dev) · Stripe test`.
+
+## 9. Secretos e infraestructura
+
+### 9.1 Variables nuevas del back
+
+| Variable | Secreta | Producción | Local / `live-debug` real |
+|---|---|---|---|
+| `WEBAPP_ENABLED` | no | `deploy/production.env` (`false` hasta el lanzamiento) | — |
+| `WEBAPP_PROVIDERS` | no | — (producción siempre real) | `simulated` (por defecto) o `real` |
+| `APP_BASE_URL` | no | `production.env`: `https://arcacover.com` | `http://localhost:3000` (por defecto) |
+| `STRIPE_SECRET_KEY` | **sí** | SSM `/arca/prod/STRIPE_SECRET_KEY` (clave restringida live) | terminal o `.env.local` (test) |
+| `STRIPE_WEBHOOK_SECRET` | **sí** | SSM `/arca/prod/STRIPE_WEBHOOK_SECRET` | el que imprime `stripe listen` |
+| `STRIPE_ALLOW_TEST_MODE` | no | solo para un ensayo en el host | — |
+| `EMAIL_FROM` | no | `production.env`: `ARCA <no-reply@arcacover.com>` (escrito) | igual o buzón de pruebas |
+| `EMAIL_PROVIDER` | no | `production.env`: `resend` (F11, §16.4). `ses` queda como alternativa | `memory`; `resend` en `live-debug` real para una prueba de verdad |
+| `RESEND_API_KEY` | **sí** | SSM `/arca/prod/RESEND_API_KEY` (`scripts/arca-webapp-secrets.ps1`), clave `re_…` con acceso de envío al dominio `arcacover.com` | terminal o `.env.local`, solo para esa prueba |
+| Credencial de SES (si se usa) | — | **Ninguna**: permiso `ses:SendEmail` en el rol de la instancia, limitado a la identidad `arcacover.com` | — |
+| `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | ya existen | Ya en SSM; la clave secreta pasa a usarse también para la API de administración de Auth | Las de `Arca-dev` |
+
+No hacen falta `SUPABASE_JWT_SECRET` ni una URL de JWKS: el JWKS sale de `SUPABASE_URL` (§4.4).
+
+`deploy/render-env.py`: si `production.env` tiene `WEBAPP_ENABLED=true`, añade `STRIPE_SECRET_KEY` y
+`STRIPE_WEBHOOK_SECRET` a los parámetros obligatorios (y `RESEND_API_KEY` si `EMAIL_PROVIDER=resend`), como ya hace con
+`OPENAI_API_KEY`. Un despliegue sin ellos se niega en el host con un mensaje que los nombra.
+
+`infra/aws` (CDK): si F11 = SES, la identidad de dominio, el permiso de envío del rol de la instancia y un tema SNS para
+rebotes y quejas. La política del rol ya lee `/arca/prod/*`; no cambia.
+
+**Configuración que no es un secreto pero hay que dejar escrita** (en el runbook `docs/deployment/AWS_DEMO_RUNBOOK.md`,
+una sección nueva): en Supabase, el alta cerrada, las claves de firma asimétricas, las plantillas, las URLs, el SMTP, la
+caducidad del código y los límites; en Stripe, el producto, los precios, el portal, los reintentos, los correos al
+cliente y los dos endpoints de webhook.
+
+### 9.2 Caddy
+
+`deploy/Caddyfile` limita hoy el cuerpo de **todas** las peticiones a 32 KB. Un evento de Stripe suele ocupar pocos KB,
+pero una factura con muchas líneas o una suscripción expandida puede pasar de ese límite, y un 413 haría que Stripe
+reintentara sin fin. **[mía]** Se separa el webhook:
+
+```
+handle /billing/webhook {
+	request_body {
+		max_size 1MB
+	}
+	reverse_proxy api:8080
+}
+handle {
+	request_body {
+		max_size 32KB
+	}
+	# lo de hoy: basic_auth de /docs y reverse_proxy con health checks
+}
+```
+
+(Se comprueba con `caddy validate` en el test del stack y en `container-smoke.mjs`.) No hace falta lista blanca de IPs
+de Stripe: la firma es la defensa. El webhook queda expuesto en el mismo host y certificado que la API.
+
+### 9.3 Desarrollo local
+
+**Supabase:** dos opciones, que se complementan **[mía]**:
+- **Supabase local** (`supabase start`, necesita Docker): para los tests de integración de las RPC, la RLS y la API de
+  Auth. Trae un buzón de pruebas (Mailpit) donde se leen los códigos, así que el E2E puede iniciar sesión sin correo
+  real.
+- **`Arca-dev`**: para `live-debug` real con scans reales (DN-09 §11.7).
+
+**Stripe** (PowerShell):
+
+```powershell
+stripe login                                    # una vez, abre el navegador; sin claves en la terminal
+stripe listen --forward-to http://127.0.0.1:8080/billing/webhook
+# imprime el secreto whsec_ de esta sesión: se pega en la terminal del back, nunca en el historial
+$s = Read-Host -AsSecureString 'Stripe webhook secret'
+$env:STRIPE_WEBHOOK_SECRET = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
+$env:WEBAPP_PROVIDERS = 'real'
+npm run stack -- live-debug
+stripe trigger checkout.session.completed       # eventos de prueba sueltos
+```
+
+La regla de DN-09 §11.7 para las claves (leerlas con `Read-Host -AsSecureString`, nunca escribirlas en la línea de
+comandos) vale igual para `STRIPE_SECRET_KEY`.
+
+### 9.4 Supabase: lista de ajustes por proyecto
+
+| Ajuste | Producción | `Arca-dev` |
+|---|---|---|
+| Allow new users to sign up | **off** | off |
+| Email provider | on; Confirm email on | on |
+| JWT Signing Keys | asimétricas (ECC P-256) | asimétricas |
+| Email OTP Expiration / Length | 600 s / 6 | 600 s / 6 |
+| SMTP | propio (F11) | propio o el de pruebas |
+| Site URL / Redirect URLs | §4.9 | §4.9 |
+| Secure email change | on | on |
+| Plan | de pago (F10) | gratuito |
+
+**Pasos en el panel de cada proyecto real** (`Arca-dev` en T8, producción en T24; nada de esto se ha hecho todavía):
+
+1. **Authentication → Sign In / Providers → "Allow new users to sign up": off.** Es el alta cerrada (§4.2). El back sigue
+   creando usuarios con la API de administración (que no mira este ajuste), y `signInWithOtp` con `shouldCreateUser: false`
+   sigue mandando códigos a los usuarios que ya existen.
+2. En la misma pantalla, el **proveedor Email sigue encendido** (es el que manda los códigos), con "Confirm email" encendido.
+   Ojo con la confusión de nombres: en el `config.toml` local, `[auth.email] enable_signup` es este interruptor del proveedor
+   (no el del alta) y tiene que quedarse en `true`; el alta cerrada es `[auth] enable_signup = false`.
+3. **Email OTP Expiration = 600** y **Email OTP Length = 6** (en Authentication → Providers → Email, o en "Auth" según la
+   versión del panel).
+4. **Project Settings → JWT Keys:** migrar a claves de firma asimétricas (ECC P-256) y rotar para que la nueva firme. Comprobar
+   que `https://<proyecto>.supabase.co/auth/v1/.well-known/jwks.json` lista una clave `ES256`; si sale vacío, el back no
+   arranca en `real` (§16.1).
+5. **Authentication → Email Templates → Magic Link:** asunto "Your ARCA sign-in code" y el cuerpo de §4.9, con `{{ .Token }}`
+   (el código) y el enlace de respaldo `{{ .RedirectTo }}&token_hash={{ .TokenHash }}&type=email`. El de Supabase local está en
+   `supabase/templates/magic_link.html` y sirve de modelo. "Confirm signup", "Invite user" y "Change email address" con un texto
+   neutro.
+6. **Authentication → URL Configuration:** Site URL y Redirect URLs de la tabla de §4.9.
+7. **SMTP propio** (F11) y, con él, subir el límite de correos por hora.
+
+**Supabase local** (`supabase/config.toml`, T7): alta cerrada (`[auth] enable_signup = false`), códigos de 10 minutos
+(`otp_expiry = 600`), la plantilla con el código (`[auth.email.template.magic_link]`) y las URLs de vuelta del front local
+(`http://localhost:3000/**`, `http://127.0.0.1:3000/**`). Se aplican al reiniciar el stack (`supabase stop` y `supabase start`);
+el stack que corrió las pruebas de §17 seguía con la configuración anterior.
+
+### 9.5 Monitorización y alertas
+
+- **Logs estructurados** de cobro: `[billing] event <id> <type> applied|duplicate|ignored|failed`, sin emails ni
+  importes de tarjeta.
+- **Stripe** avisa por email cuando un endpoint de webhook falla de forma continuada; se pone el email del founder.
+- **Reconciliación diaria [mía]:** un temporizador del back lista las suscripciones de Stripe cambiadas en las últimas
+  48 h, las compara con `subscriptions` y registra `[billing] reconcile mismatch` y las corrige por el camino del
+  webhook.
+- **Alertas:** hoy solo hay alarmas de estado del EC2 hacia el tema SNS `alerts`. Se propone mandar los logs de Docker a
+  CloudWatch Logs (driver `awslogs`) con filtros de métricas sobre `[billing] failed`, `reconcile mismatch`,
+  `duplicate_subscription` y `dispute`, cada uno con una alarma al mismo tema SNS. (Hecho en §21.4, con un tema propio sin
+  suscripciones en vez del de `alerts`, y alguna línea más.)
+- **Correo:** rebotes y quejas del proveedor a SNS; un rebote de un código de login se ve en los logs de Auth de
+  Supabase.
+
+## 10. Seguridad y privacidad
+
+### 10.1 Datos personales
+
+| Dato | Dónde vive | Quién lo ve |
+|---|---|---|
+| Email y nombre de cada persona | `auth.users`, `profiles` | El back; los miembros de su organización; el admin de plataforma |
+| Nombre y dominio del despacho, análisis, plan de acción | Tablas de la webapp | Los miembros (según rol); el admin de plataforma |
+| Dirección de facturación, NIF, últimos 4 dígitos de la tarjeta | **Solo Stripe** | El owner en el portal; ARCA en el panel de Stripe |
+| Número completo de la tarjeta | **Nunca en ARCA**: Checkout es de Stripe (ámbito PCI mínimo, SAQ A) | — |
+| IP y user agent de los logins | Logs de Auth de Supabase | ARCA |
+| Actividad | `audit_log` | owner y admin de la organización; el admin de plataforma |
+
+### 10.2 Lo que espera un despacho
+
+Un despacho de abogados trata información confidencial y tiene deberes de diligencia tecnológica con sus proveedores
+(en EE. UU., las reglas de conducta profesional sobre confidencialidad y competencia tecnológica). Aunque ARCA no reciba
+información de los clientes del despacho, el análisis de riesgo es sensible (es la base de un seguro), y los despachos
+medianos mandan cuestionarios de seguridad. Lo que esta nota deja preparado para responderlos:
+- autenticación sin contraseña y MFA disponible (fase 6), con SSO como camino futuro;
+- permisos por rol aplicados en el servidor y un registro de actividad que no se puede editar;
+- cifrado en tránsito y en reposo (Supabase y Stripe), datos en EE. UU. (región del proyecto);
+- lista de subencargados: Supabase, Stripe, AWS (y el proveedor de correo), con sus acuerdos de tratamiento de datos,
+  que el founder firma o acepta (F13);
+- borrado de cuenta y una política de retención escrita.
+
+No es asesoría legal; los textos de privacidad y términos los revisa un abogado.
+
+### 10.3 Amenazas y defensas
+
+| Amenaza | Defensa |
+|---|---|
+| Cuenta para un email ajeno | Alta cerrada (§4.2); solo se entra con el código que llega a ese buzón |
+| Filtro de correo gasta el enlace | Código como camino principal; enlace con botón (§4.1) |
+| Robo de sesión por XSS | Cookies de sesión legibles por JS (limitación de `@supabase/ssr`): CSP estricta en `/app` cuando se mude a su subdominio (DN-10 §8); tokens de una hora |
+| Token de Supabase de otro proyecto | `iss` exacto del proyecto y JWKS propio |
+| Token simulado en producción | El verificador simulado no se construye en producción (§4.4) |
+| Clave de servicio o de Stripe filtrada al front | Solo en SSM y en el back; `check-no-debug` busca sus prefijos en el bundle (§8.2) |
+| Lectura directa de tablas con la clave publicable | RLS sin políticas y sin permisos para `anon`/`authenticated`; test que lo prueba (§5.5) |
+| Webhook falso | Firma sobre el cuerpo crudo; `livemode` coherente |
+| Webhook repetido, tardío o desordenado | `stripe_events` + `processed_at`; leer el estado actual; serialización por organización (§6.5) |
+| Doble suscripción | Una sesión abierta por organización; detección en el webhook y alerta |
+| Escalada de rol en carrera | RPC con re-comprobación bajo bloqueo (§5.4) |
+| Enumeración de clientes por el login | Mismo mensaje para email con y sin cuenta; `enroll` no dice si existía |
+| Abuso de correo (invitaciones, códigos) | Límites de §7.4; límites de Supabase; CAPTCHA en la fase 6 |
+| Admin de plataforma comprometido | MFA obligatoria (`aal2`) en `/admin/*` (fase 6); alta solo por script y auditada |
+| Secretos en URLs | `claim` se borra de la barra; `Referrer-Policy` en `/app` (§7.5) |
+
+### 10.4 Mínimo privilegio
+
+- Clave de Stripe **restringida** (§6.7).
+- La clave secreta de Supabase solo en el contenedor de la API; las funciones RPC solo ejecutables por `service_role`.
+- El front no tiene ninguna variable de servidor nueva.
+- Con SES, sin credenciales: permiso del rol de la instancia limitado a la identidad del dominio.
+
+### 10.5 Auditoría
+
+Se añaden a `audit_log` (con `actor_kind`): `billing.checkout_started`, `billing.event_applied` (ya existe),
+`billing.invoice_paid`, `billing.payment_failed`, `billing.refunded`, `billing.duplicate_subscription`,
+`billing.dispute`, `account.deleted`, `platform_admin.granted`. Los eventos de cobro son `system`; `TARGETS` y
+`ACTOR_KIND_OF_ACTION` de `service.ts` se amplían para que la actividad los nombre.
+
+## 11. Plan de pruebas
+
+**Unitarios (back)**
+- `SupabaseJwtAuth` con un JWKS local generado con `jose` (`generateKeyPair('ES256')`): token válido; caducado; otro
+  `iss`; otro `aud`; `alg: HS256` o `none`; `kid` desconocido (refetch); `is_anonymous: true`; sin `email`.
+- Traductor de Stripe → `BillingState`: una fila por estado de §6.6, con objetos de la versión de API fijada (periodo en
+  los elementos).
+- Algoritmo del webhook con un `BillingProvider` falso: firma inválida → 400; tipo ignorado → 200; duplicado → 200 sin
+  efecto; excepción a mitad → 500 y el reintento aplica; suscripción vieja no pisa a la nueva; doble suscripción →
+  alerta.
+- Guardas de arranque: clave live en debug, clave test en producción, `mock` + `real`, plan activo sin `stripe_price_id`.
+
+**Migración y RPC**
+- PGlite (como `assessment-database.test.ts`): las tres migraciones en orden; cada RPC con sus conflictos; la matriz
+  `canManageMember` SQL contra la de TypeScript; `anon` y `authenticated` sin acceso (§5.5).
+- **Suite de conformidad del repositorio [mía]:** los tests que hoy fijan `InMemoryWebappRepository` se corren también
+  contra `SupabaseWebappRepository` sobre Supabase local. Las dos implementaciones cumplen el mismo contrato.
+
+**Integración con Stripe en modo test** (con clave de test, sin tocar live; marcados para correr a mano o en un job
+aparte, no en cada `npm test`)
+- Checkout → `stripe listen` → `active`. La sesión se completa creando la suscripción por API con la tarjeta de prueba
+  `pm_card_visa`: Stripe desaconseja automatizar sus páginas alojadas.
+- **Test clocks:** cliente con reloj, suscripción mensual; adelantar un mes → `invoice.paid` → sigue `active`; cambiar a
+  una tarjeta que falla (`pm_card_chargeCustomerFail`) y adelantar → `past_due` con acceso; agotar los reintentos →
+  `canceled` y 402.
+- Cancelar al final del periodo desde el portal (por API) → `cancelAtPeriodEnd: true`, acceso hasta el fin.
+- Cambio de precio desde `/admin` → Price nuevo con la `lookup_key`; el siguiente checkout lo usa.
+- Webhook firmado a mano con `stripe.webhooks.generateTestHeaderString` para los casos de borde.
+
+**E2E de navegador** (Playwright, ampliando `npm run test:browser:webapp`)
+- Contra el stack en `live-debug` real con Supabase local y Stripe test: resultados → CTA → código leído de Mailpit →
+  organización → 402 → redirección a `checkout.stripe.com` comprobada → suscripción creada por API → `/app` activo.
+- Invitado: correo en Mailpit → enlace → código → acepta → ve lo que su rol permite.
+- Enlace de respaldo: abrir `/app/auth/confirm` sin pulsar no inicia sesión; pulsar sí.
+- El smoke de mock sigue pasando sin cambios (5 de 5).
+
+**Front**
+- Tests de la página de confirmación (`next` solo con `/app/`), del mensaje neutro del login, de `return` (espera y
+  reintento), y de que el CTA no se pinta en producción sin `NEXT_PUBLIC_WEBAPP_ENABLED`.
+- Build de producción: `check-no-debug` con los prefijos de secretos (§8.2).
+
+**Antes del lanzamiento (manual, en producción con la webapp encendida)**
+- El founder compra el plan mensual con una tarjeta real, comprueba factura, recibo, portal y cancelación, y se
+  reembolsa desde el panel.
+- Un correo de código llega a una cuenta de Microsoft 365 y a una de Google sin ir a spam.
+
+## 12. Despliegue por fases
+
+Esfuerzo en días de una persona, aproximado. "Founder" marca lo que solo puede hacer él (cuentas, pagos de planes,
+aprobaciones).
+
+| # | Tarea | Fase | Esfuerzo | Depende de |
+|---|---|---|---|---|
+| T0 | Decisiones F1–F14 (§14) | 0 · founder | — | — |
+| T1 | Crear `Arca-dev`; pasar producción a plan de pago; activar la cuenta de Stripe (datos de empresa) | 0 · founder | 0,5 | F9, F10 |
+| T2 | Dominio de correo: SPF, DKIM, DMARC; alta del proveedor (salir del sandbox si es SES) | 0 · founder + 0,5 | 0,5 | F11 |
+| T3 | ✅ Migración nueva + RPC + tests de PGlite (§5.3, §5.4, §5.5). Hecho: §12.1 | 1 · datos | 3 | — |
+| T4 | ✅ `SupabaseWebappRepository` + suite de conformidad sobre Supabase local. Hecho: §12.1 | 1 · datos | 4 | T3 |
+| T5 | Aplicar las tres migraciones a `Arca-dev` | 1 · datos | 0,25 | T3, T1 |
+| T6 | `SupabaseJwtAuth`, `WEBAPP_PROVIDERS`, guardas de arranque y línea de arranque (§4.4, §7.1). **Hecha (§16.1)** | 2 · auth | 1,5 | — |
+| T7 | ✅ `POST /auth/enroll` con la API de administración de Supabase y límites (§4.2). Hecho: §17 | 2 · auth | 1,5 | T4 |
+| T8 | Configurar Auth en `Arca-dev`: alta cerrada, claves asimétricas, plantillas, URLs, SMTP (§9.4) | 2 · auth | 1 | T2 |
+| T9 | Front: `@supabase/ssr`, módulo de sesión, login, signup, confirm, invite (§8.1) | 2 · auth | 4 | T6, T7 |
+| T10 | `Mailer` + correo de invitación (§4.6). **Hecha en el back, sin el SDK de SES (§16.2)** | 2 · auth | 1,5 | T2 |
+| T11 | `DELETE /me` + RPC + pantalla en settings (§4.8). **Back hecho (§17)**; la pantalla va con el front (T9) | 2 · auth | 1,5 | T4 |
+| T12 | ✅ Script `admin:grant` (§4.5). Hecho en la fase 1: §12.1 | 2 · auth | 0,5 | T4 |
+| T13 | Catálogo de Stripe en test; `plans` con `stripe_price_id`; cambio de precio desde `/admin` (§6.1). **Código hecho (§18)**; falta correr `stripe:catalog -- --apply` con la aprobación | 3 · cobro | 1,5 | T4 |
+| T14 | ✅ `StripeBillingProvider`: cliente, checkout, portal, sync, cancelar (§6.2–§6.4, §6.10). Hecho: §18 | 3 · cobro | 2 | T13 |
+| T15 | ✅ Webhook: firma, traductor, RPC `apply_billing_state`, cola por organización (§6.5, §6.6), reconciliación (programada en T26, §21). Hecho: §18 | 3 · cobro | 2,5 | T14 |
+| T16 | Front: `GET /orgs/:id/billing`, `/app/billing` real, `/app/billing/return`, portal (§8.1) | 3 · cobro | 1,5 | T14 |
+| T17 | ✅ Caddy: ruta del webhook con su límite de cuerpo (§9.2). Hecho: §18 | 3 · cobro | 0,5 | — |
+| T18 | Contratos 0.5.0 y publicación (§7.6) | 4 · integración | 0,5 | T6–T16 |
+| T19 | `/__debug/mode` con `webapp` y `billing`; panel y franja (§8.4). **Hecha (§20)**, sin publicar contratos | 4 · integración | 1 | T18 |
+| T20 | E2E en `live-debug` real + suite de Stripe con test clocks (§11) | 4 · integración | 3 | T9–T19 |
+| T21 | SSM (`STRIPE_*`), `render-env.py`, `production.env` con `WEBAPP_ENABLED=false`, CDK si SES (§9.1) | 5 · producción | 0,5 | T20 |
+| T22 | **Aprobación del founder** y aplicación de las migraciones a producción (§5.2) | 5 · founder | 0,5 | T21 |
+| T23 | Stripe live: producto, precios reales, portal, reintentos, correos, endpoint del webhook | 5 · founder + 0,5 | 0,5 | F1–F8 |
+| T24 | Supabase de producción: ajustes de §9.4 | 5 · producción | 0,5 | T22 |
+| T25 | Encender back y después front; compra real de prueba y reembolso (§11) | 5 · producción | 0,5 | T22–T24 |
+| T26 | Monitorización: logs a CloudWatch, filtros, alarmas, reconciliación diaria (§9.5). **Código hecho en `feat/billing-ops` (§21)**; falta `cdk deploy` y suscribir el email | 5 · producción | 2 | T15 |
+| T27 | Limpieza programada (§5.6) | 6 · endurecer | 1 | T4 |
+| T28 | MFA (TOTP) obligatoria para admins de plataforma, opcional para owners (§4.1) | 6 · endurecer | 1,5 | T9 |
+| T29 | CAPTCHA en `enroll` y login si hay abuso | 6 · endurecer | 1 | T9 |
+| T30 | Quitar `localhost` de CORS de producción; `Referrer-Policy` en `/app` (§7.5) | 6 · endurecer | 0,25 | T25 |
+
+**Total aproximado:** 38 a 40 días de trabajo técnico, más el tiempo del founder para cuentas, decisiones y
+aprobaciones. El camino crítico es T3 → T4 → T7 → T9 → T14 → T15 → T20 → T22 → T25.
+
+**Puertas entre fases:**
+- Fin de la fase 1: suite de conformidad verde contra Supabase local.
+- Fin de la fase 3: un recorrido completo en `live-debug` real contra `Arca-dev` y Stripe test.
+- Fin de la fase 4: E2E y test clocks verdes, y la release `contracts-v0.5.0` publicada.
+- Antes de T25: el founder aprueba precios, términos y privacidad.
+
+### 12.1 Fase 1 hecha: T3, T4 y T12 (2026-11-18)
+
+Rama `feat/real-accounts-data` (desde `feat/real-accounts`). Nada se conecta todavía en `compose.ts`: producción sigue en 501
+y `mock`/`live-debug` siguen con `InMemoryWebappRepository`. El repositorio nuevo se registra en la fase 2 (el punto de
+enganche `apps/api/src/webapp/real-adapters.ts` de la rama de auth). `packages/contracts` no cambia.
+
+**T3 · Migración y RPC.** `supabase/migrations/20261118000000_real_accounts_billing.sql`:
+- Las tablas, columnas e índices de §5.3 tal cual.
+- Funciones, todas `security definer` con `search_path` fijo, ejecutables solo por `service_role` y revocadas a `public`,
+  `anon` y `authenticated`. Errores con `errcode P0001` y mensaje fijo (`webapp_conflict:<motivo>`, `webapp_refused:member_change`,
+  `webapp_ineligible_assignee`, `webapp_missing:<registro>`, `webapp_duplicate:<registro>`, `webapp_invalid:organization`):
+  `create_organization`, `claim_analysis`, `redeem_claim_ticket`, `accept_invitation`, `set_member_role`, `remove_member`,
+  `revoke_invitation`, `upsert_assessment_action`, `create_custom_action`, `update_action`, `apply_billing_state`,
+  `review_deletion_request`, `delete_account`, `grant_platform_admin`, `revoke_platform_admin` y `list_audit`.
+- Ayudantes internos, sin permiso para ningún rol cliente ni para `service_role`: `can_manage_member` (la matriz de
+  `canManageMember` en SQL), `can_hold_actions`, `append_audit`, `require_assignee`, `patched_action` y `lock_member_change`.
+- RLS activado en las dos tablas nuevas, sin políticas y con permisos solo para `service_role` (§5.5).
+- Tests: `apps/api/tests/integration/real-accounts-database.test.ts` (PGlite, 33 tests): cada función con sus conflictos; la
+  matriz `canManageMember` SQL contra TypeScript; `anon`/`authenticated` sin acceso a tablas ni funciones; la migración sobre
+  filas ya escritas; y los casos de concurrencia de §5.4 como intercalados: doble revisión → `already_reviewed` (409, no 500),
+  doble revocación → la segunda no escribe ni audita, cambio de rol que pierde contra una baja → `null` sin auditoría, admin que
+  degrada a alguien recién ascendido a owner → `webapp_refused`, el mismo evento de Stripe dos veces → `duplicate`.
+
+**T4 · Repositorio y conformidad.**
+- `apps/api/src/webapp/supabase.ts`: `SupabaseWebappRepository` sobre `supabase-js` con la clave de servicio. Lecturas y
+  escrituras de una fila van a las tablas; toda escritura de varias filas, a su RPC. Lee solo las columnas de cada registro y
+  devuelve las fechas en ISO con `Z`, como el repositorio en memoria.
+- Suite de conformidad compartida: `apps/api/tests/conformance/webapp-repository.ts` (43 tests). Corre contra el repositorio en
+  memoria (`apps/api/tests/unit/webapp-repository.test.ts`), contra `SupabaseWebappRepository` sobre PGlite a través de un
+  sustituto de PostgREST (`apps/api/tests/fixtures/pglite-postgrest.ts`, en
+  `apps/api/tests/integration/webapp-repository-database.test.ts`, dentro de `npm test`, sin red) y contra un Supabase real
+  (`apps/api/tests/integration/webapp-repository-supabase.test.ts`), que se salta salvo que existan
+  `ARCA_CONFORMANCE_SUPABASE_URL` y `ARCA_CONFORMANCE_SUPABASE_KEY`, y que solo acepta un host local salvo
+  `ARCA_CONFORMANCE_SUPABASE_ALLOW_REMOTE=1` (para `Arca-dev`, nunca producción). Los pasos para correrla están en la cabecera
+  de ese archivo: `supabase db reset` en local, la URL y la clave de servicio de `supabase status -o env` en esas dos
+  variables, y `npx vitest run` de ese archivo. La suite no supone una base vacía: ids nuevos en cada test, listas filtradas a lo
+  que escribió, y fechas de un reloj lejano en el futuro que avanza de una ejecución a la siguiente. Deja sus filas (el
+  `audit_log` es de solo añadir); `supabase db reset` las borra. Cambia una sola fila compartida, el plan `monthly`, y la deja
+  como estaba.
+- **Resultado contra Supabase local:** verde, 43 de 43, dos veces seguidas (la segunda con las filas de la primera), contra Supabase local
+  (CLI 2.122.1, Postgres 17, PostgREST v14.5) tras `supabase db reset`, que aplicó las ocho migraciones sin errores. Además, con
+  la clave publicable (`anon`) la API de datos responde 401 a las tablas de la webapp, a las dos tablas nuevas y a las funciones
+  (`list_audit`, `delete_account`), y `delete_account` probada a mano en esa base (único owner → `sole_owner`; un miembro → baja
+  y perfil sin email). Las pruebas de RPC de T3 corren en PGlite; en Supabase local las cubren la suite y esa prueba a mano.
+
+**T12 · `admin:grant`.** `npm run admin:grant -- <email> [--revoke] [--dry-run]` (`apps/api/scripts/admin-grant.ts`, lógica en
+`apps/api/src/webapp/admin-grant.ts`, tests en `apps/api/tests/unit/admin-grant.test.ts` contra el repositorio en memoria). Lee
+`SUPABASE_URL` y `SUPABASE_SECRET_KEY` (o `SUPABASE_SERVICE_ROLE_KEY`) del entorno o de `.env.local`, como `db:verify`. Imprime
+el host de destino, nunca la clave. Sin perfil para ese email, se niega: la persona tiene que haber entrado una vez. Concede o
+retira con `grant_platform_admin`/`revoke_platform_admin`, que auditan `platform_admin.granted`/`platform_admin.revoked` con
+`actor_kind = 'platform'` y sin usuario, en el mismo paso y solo si algo cambió. `--dry-run` no escribe nada. Las reglas de §4.5
+siguen: en local contra `Arca-dev`, y contra producción solo con el visto bueno del founder y desde el host.
+
+**Desviaciones respecto a §5.4 y por qué [mía]:**
+- **Firmas.** `set_member_role(p_org_id, p_user_id, p_role, p_actor_user_id, p_actor_role, p_audit, p_at)` y `remove_member`
+  igual sin rol nuevo. Además de `p_actor_role`, reciben al actor: la función comprueba bajo bloqueo que **el actor sigue teniendo
+  ese rol** (si lo degradaron mientras tanto, se niega) y que `canManageMember` sigue valiendo contra el rol del objetivo leído
+  con `for update`. `p_audit` es `{ actor_kind, actor_user_id }`: quién firma la auditoría lo decide el servicio (la semilla de
+  mock audita como `system`). Los cambios de dueño de una organización se serializan con el mismo candado consultivo que
+  `guard_last_owner`, así la comprobación del último owner es exacta.
+- **Funciones nuevas que §5.4 no listaba:** `revoke_invitation` (la doble revocación que pedía el encargo), `grant_platform_admin`
+  y `revoke_platform_admin` (T12) y `list_audit` (el orden por `(created_at, seq)` con cursor no se puede expresar con los
+  filtros de PostgREST).
+- **La auditoría va dentro de la transacción** en `accept_invitation`, `set_member_role`, `remove_member`, `revoke_invitation`,
+  `apply_billing_state`, `review_deletion_request`, `delete_account` y las de admin. `create_organization` y `claim_analysis` no
+  auditan: lo sigue haciendo el servicio después, como hoy.
+- **`apply_billing_state(p_event, p_org_id, p_state, p_at)`** inserta el evento si no estaba (no hace falta un paso previo), suma
+  un intento, y si ya estaba procesado devuelve `duplicate`. Aplica "una suscripción vieja no pisa a la nueva" (§6.5) dentro de
+  la transacción: devuelve `duplicate_subscription` (y audita `billing.duplicate_subscription`) si otra suscripción que da acceso
+  llega con la guardada viva, y `stale_subscription` si la otra no da acceso; las dos marcan el evento procesado con
+  `last_error = 'other_subscription'`. `p_state` llega ya traducido a `billing_status` (§6.6): la traducción es de T15. Un campo
+  nulo conserva lo guardado, como hoy.
+- **`delete_account`** conserva las membresías de las organizaciones **ya borradas** (su historia y su último owner; el trigger del
+  último owner impediría quitarlas). Revoca las invitaciones pendientes a su email en todas las organizaciones (motivo
+  `account_deleted`) y audita `account.deleted` en cada organización viva que pierde al miembro. Es idempotente.
+- **Interfaz del repositorio** (`apps/api/src/webapp/types.ts`), con el repositorio en memoria al mismo nivel: `setRole` y
+  `removeMember` reciben un `MemberChange` y devuelven el rol que encontraron (o `null`), y lanzan `MemberChangeRefused`;
+  nuevos `acceptInvitation`, `revokeInvitation`, `applyBillingState`, `findProfileByEmail` y `revokePlatformAdmin`;
+  `reviewDeletionRequest` marca el borrado y audita en el mismo paso y lanza `already_reviewed`; `grantPlatformAdmin` devuelve si
+  cambió. El repositorio en memoria impone además lo que ya imponían los índices SQL: una invitación pendiente por email y
+  organización, un perfil por email y una suscripción del proveedor por organización.
+- **Servicio** (`service.ts`): aceptar, cambiar rol, quitar, revocar, revisar un borrado y aplicar un evento de cobro pasan por
+  esas operaciones atómicas. Respuestas nuevas: 403 cuando la nueva comprobación del almacén niega el cambio, 409 en la segunda
+  revisión, 410 en la segunda aceptación, 404 en la segunda revocación. Esto cierra la carrera que `types.ts` dejaba anotada
+  (DN-11) y el fallo de §6.5 (registrar el evento antes de aplicarlo) también para el pago simulado. La actividad de ARCA nombra
+  el usuario de `platform_admin.*`.
+- **Orden de `listPlans` en SQL:** por importe y código, lo que mantiene el orden de la semilla (mensual y luego anual).
+
+**Pendiente, de otras tareas:** usar `delete_account` (T11, que también añade `deleted_at` y el email nulo a `ProfileRecord`),
+leer y escribir los campos nuevos de `subscriptions` desde el webhook real (T15), `billing_customers` y `checkout_sessions`
+(T14), registrar el repositorio en `compose.ts` (fase 2) y aplicar las tres migraciones a `Arca-dev` (T5).
+
+## 13. Riesgos
+
+| Riesgo | Impacto | Mitigación |
+|---|---|---|
+| El proyecto de producción sigue en el plan gratuito y se pausa | Clientes que pagan sin acceso | F10 antes del lanzamiento |
+| Base compartida entre dev y producción | Usuarios y pagos de prueba mezclados con los reales | R6, F9 |
+| Correos de código en spam o bloqueados por el filtro del despacho | No pueden entrar | SMTP propio con SPF/DKIM/DMARC; código en vez de enlace; enlace de invitación copiable |
+| Webhook caído o lento | Pagó y no entra | `sync` al volver; reintentos de Stripe; reconciliación diaria; alerta |
+| Doble suscripción | Cobro doble | Una sesión abierta por organización; detección y alerta |
+| Cambio de versión de la API de Stripe | Campos que se mueven (como el periodo en basil) | Versión fijada en el SDK y en el endpoint; los tests usan objetos de esa versión |
+| Impuestos mal configurados | Deuda fiscal | F3 con un asesor |
+| Front y back con contratos distintos (parseo estricto) | Pantallas que fallan | Orden de §7.6; campos nuevos opcionales |
+| Un solo proceso (límites y cola en memoria) | Se pierden al reiniciar; no escala a varias instancias | Aceptable para el MVP; anotado en §6.5 y §7.4 |
+| Borrado de cuenta o de datos con implicaciones legales | Reclamaciones | Política de retención escrita (F13); borrado físico fuera de alcance |
+| Cookies de sesión legibles por JS | Robo de sesión si hay XSS | CSP y mudanza a subdominio (DN-10 §8); tokens de una hora |
+| La API de administración de Auth falla en `enroll` | No se puede registrar | 503 explícito y reintento; nada a medias |
+
+## 14. Decisiones abiertas para el founder
+
+| # | Decisión | Opciones | Recomendación |
+|---|---|---|---|
+| F1 | Precios | Importes y moneda de `monthly` y `annual` (hoy de ejemplo: 499 USD/mes y 4.990 USD/año) | USD; anual con descuento de unos dos meses |
+| F2 | Cambios de precio a clientes existentes | Mantener su precio / migrarlos con aviso | Mantenerlo (por defecto en Stripe) |
+| F3 | Impuestos | Stripe Tax desde el día 1 / sin impuestos y revisar con un asesor | Consultar a un asesor fiscal antes del lanzamiento; dejar `automatic_tax` listo |
+| F4 | Prueba gratuita y cupones | Sin prueba / N días con tarjeta / cupones de lanzamiento | Sin prueba (el análisis gratuito ya es la prueba); cupones permitidos para pilotos |
+| F5 | Métodos de pago | Solo tarjeta / también transferencia ACH para el anual | Solo tarjeta al principio |
+| F6 | Cambio de plan en el portal | Con prorrateo / sin él | Con prorrateo |
+| F7 | Margen de impago | Reintentos durante 1 / 2 / 3 semanas antes de cancelar | 2 semanas, con acceso y aviso mientras tanto |
+| F8 | Reembolsos | Ninguno / prorrateados / a criterio | A criterio, escrito en los términos; al aprobar un borrado, cancelación inmediata sin reembolso salvo excepción |
+| F9 | Proyectos de Supabase | Uno compartido / dos (producción y `Arca-dev`) | Dos |
+| F10 | Plan de Supabase de producción | Gratuito (se pausa) / de pago | De pago antes del primer cliente |
+| F11 | Proveedor de correo | Amazon SES / Postmark / Resend | **Decidido: Resend** (§16.4), para el SMTP de Supabase Auth y para las invitaciones de la API; SES queda como alternativa |
+| F12 | Quién paga y datos de factura | Solo el owner (hoy) / también admin; email de facturación propio; NIF | Solo el owner; dirección y NIF obligatorios en Checkout |
+| F13 | Retención y privacidad | Años de conservación tras un borrado; textos de privacidad y términos; acuerdos de tratamiento con Supabase, Stripe y AWS | 7 años y revisión de un abogado (§4.8) |
+| F14 | Sesiones y MFA | Duración de la sesión; MFA obligatoria u opcional para owners | 7 días de inactividad, 30 de máximo; MFA obligatoria para ARCA y opcional para clientes |
+
+## 15. Cambios que esta nota propone sobre DN-10, DN-11 y DN-12
+
+- **DN-10 §4.1 y §4.8:** la verificación del JWT es solo por JWKS con algoritmos asimétricos; desaparece la opción
+  `SUPABASE_JWT_SECRET`. `/app/login` sigue sin crear usuarios y, además, el registro público de Supabase se apaga
+  (§4.2).
+- **DN-10 §4.2:** tablas nuevas `billing_customers` y `checkout_sessions`; columnas nuevas en `plans`,
+  `subscriptions`, `stripe_events` y `profiles` (§5.3).
+- **DN-10 §4.4 y decisión 10:** el precio vive en `plans` **y** en un Price de catálogo de Stripe; `price_data` se
+  sustituye por `stripe_price_id`. Cambiar el precio desde `/admin` sigue funcionando (§6.1).
+- **DN-10 §4.4:** el webhook lee el estado actual de Stripe y registra y aplica en la misma transacción (§6.5).
+- **DN-10 §4.6:** el script `admin:grant` que se cita no existe; se escribe (§4.5).
+- **DN-10 §4.7:** las invitaciones se mandan por correo; `inviteUrl` se mantiene (§4.6). Ruta nueva `POST /auth/enroll`.
+- **DN-10 §10:** pasos 1 a 3 diseñados aquí; el paso 4 solo en lo que toca a los correos.
+- **DN-11:** la carrera de `setRole`/`removeMember` y la doble revisión de un borrado se cierran en las RPC (§5.4). La
+  actividad nombra los eventos de cobro nuevos (§10.5).
+- **DN-12 §7.4:** `DebugModeResponse` gana `webapp` y `billing`, como esa nota anticipó (§7.6).
+
+## 16. Implementación
+
+### 16.1 T6: verificación de Supabase Auth, proveedores de la webapp y guardas (2026-11-18)
+
+**Hecho** en `feat/real-accounts-auth` (sale de `feat/real-accounts`), commit `5313a91`. Sin contratos
+nuevos: `packages/contracts/src` no cambia y ninguna respuesta que parsee el front cambia de forma.
+
+**Ficheros**
+
+| Fichero | Qué |
+|---|---|
+| `apps/api/src/webapp/auth.ts` | `SupabaseJwtAuth`, `AuthUnavailable`, `JwksFetcher`; `AppUser` gana `aal` y `sessionId` opcionales |
+| `apps/api/src/webapp/real-adapters.ts` | **nuevo**: `RealWebappAdapters` (la costura) y `REAL_WEBAPP_ADAPTERS`, hoy vacío |
+| `apps/api/src/config/env.ts` | `WEBAPP_ENABLED`, `WEBAPP_PROVIDERS`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_ALLOW_TEST_MODE`, `EMAIL_PROVIDER`, `EMAIL_FROM`; devuelve `webapp`, `stripeMode`, `emailProvider`, `emailFrom` |
+| `apps/api/src/compose.ts` | `realWebapp()` junto a `simulatedWebapp()`; tercer parámetro `adapters`; línea de arranque |
+| `apps/api/src/webapp/routes.ts` | `AuthUnavailable` → **503** `auth_unavailable` |
+| `apps/api/src/debug/tools.ts`, `apps/api/src/http/app.ts` | el buzón en memoria y el reset; comentarios |
+| `deploy/production.env` | `WEBAPP_ENABLED=false`, explícito (parte de T21) |
+| `.env.example` | las variables nuevas, comentadas |
+
+**Verificación del JWT** (§4.4). `jwtVerify` de `jose` (ya era dependencia, `^5.9.6`; no se añadió nada) con
+`issuer = ${SUPABASE_URL}/auth/v1`, `audience: 'authenticated'`, `algorithms: ['ES256', 'RS256']` y
+`requiredClaims: ['exp', 'sub', 'email']`; después, `role === 'authenticated'`, `is_anonymous !== true`, `sub` UUID y un
+email con forma de email. `userId` es el `sub` en minúsculas y el email va en minúsculas (§4.5). Ningún claim da permisos:
+el rol sigue saliendo de `memberships` en cada petición. No existe camino con `SUPABASE_JWT_SECRET`.
+
+**El JWKS.** Se lee de `${SUPABASE_URL}/auth/v1/.well-known/jwks.json` y solo se quedan las claves EC P-256 o RSA con
+`kid`, de firma y con un algoritmo permitido (una `oct` se descarta). Caché de 10 minutos; un `kid` desconocido vuelve a
+leerlo, como mucho una vez cada 30 s (la rotación con clave en espera verifica sin cortar sesiones, y un `kid` inventado
+no hace que la API martillee a Supabase). Si Supabase no responde, siguen valiendo las últimas claves leídas; si no hay
+ninguna, la ruta responde 503 `auth_unavailable` y no 401, para que el front no cierre la sesión por un fallo nuestro.
+`jose` comprueba el algoritmo antes de pedir la clave: un token HS256 o sin firma nunca llega al JWKS.
+
+**Al arrancar** (`checkSigningKeys`): un JWKS sin ninguna clave asimétrica detiene el arranque (el proyecto sigue con el
+secreto HS256 heredado); un Supabase que no responde no lo bloquea: se registra `[auth] …` y la primera petición lo lee.
+
+**Qué construye cada modo** (§3.2, §7.1), resuelto en `loadEnv` como `webapp: 'none' | 'simulated' | 'real'`:
+
+| | `webapp` | Línea de arranque |
+|---|---|---|
+| `production` (por defecto o `WEBAPP_ENABLED=false`) | `none`: 501 en las 22 rutas, como hoy | sin cambios |
+| `production` con `WEBAPP_ENABLED=true` | `real` | `webapp=real stripe=live email=ses` |
+| `mock`, `live-debug` (por defecto, o `WEBAPP_PROVIDERS=simulated`) | `simulated`: idéntico a hoy, más el buzón en memoria | sin cambios (`webapp=simulated-in-memory` en `live-debug`) |
+| `live-debug` con `WEBAPP_PROVIDERS=real` | `real`; `/__debug/auth/login`, `/__debug/billing/pay` y `/__debug/seed` dan 404 | `webapp=real stripe=test email=memory` |
+
+**Guardas de arranque** (todas con un mensaje que nombra la variable):
+- `production` con cualquier `WEBAPP_PROVIDERS` (producción siempre es real y se enciende con `WEBAPP_ENABLED`).
+- `mock` con `WEBAPP_PROVIDERS=real`.
+- Una clave live de Stripe (`sk_live_`/`rk_live_`) en **cualquier** modo de debug, aunque no use Stripe: una clave live
+  en `.env.local` se rechaza, no se ignora. `STRIPE_ALLOW_TEST_MODE` no lo cambia nunca.
+- `production` real con clave de test, salvo `STRIPE_ALLOW_TEST_MODE=true`.
+- Una clave que no sea `sk_`/`rk_` + `live_`/`test_` (una publicable `pk_…` incluida), y un secreto de webhook sin `whsec_`.
+- La webapp real sin `STORAGE_BACKEND=supabase` (y por tanto sin `SUPABASE_URL` y clave secreta), sin
+  `STRIPE_SECRET_KEY` o sin `STRIPE_WEBHOOK_SECRET`.
+- `production` real sin `EMAIL_FROM` explícito, con `EMAIL_PROVIDER=memory`, o con un `APP_BASE_URL` que no sea `https`
+  (el valor por defecto es el front local: los enlaces de invitación y las vueltas de Stripe irían a localhost).
+- `EMAIL_PROVIDER=ses` con la webapp simulada; un `EMAIL_FROM` que no sea una dirección o `Nombre <dirección>`.
+
+**La costura.** `compose(env, storage?, adapters = REAL_WEBAPP_ADAPTERS)`. `RealWebappAdapters` tiene `repository`
+(`client => WebappRepository`, el cliente de servicio de los scans), `billing` (`{ secretKey, webhookSecret, mode,
+appBaseUrl } => BillingProvider`), `sesSendEmail` y `fetchJwks`. Hoy `REAL_WEBAPP_ADAPTERS` está vacío: con la webapp real
+pedida, `compose` se niega a arrancar y nombra lo que falta ("the Supabase webapp repository (DN-13 T4)", "the Stripe
+billing provider (DN-13 T14)", "the SES sender"), **antes** de tocar Supabase. Nunca cae a una pieza simulada. T4 solo
+tiene que añadir `repository: client => new SupabaseWebappRepository(client)` en ese fichero, y T14 el `billing`.
+
+**Desviaciones respecto a la nota**
+1. **Caché propia sobre `createLocalJWKSet`** en vez de `createRemoteJWKSet`: `jose` 5 no deja inyectar el `fetch`, y los
+   tests tenían que servir el JWKS sin red. Mismos tiempos que los de `jose` (10 min, 30 s), y además conserva las claves
+   viejas si Supabase no responde.
+2. **503 `auth_unavailable`** también para un verificador sin claves, no solo en `enroll` (§7.3).
+3. **Sin bucle de reintentos** al arrancar: si Supabase no responde, se registra y la primera petición vuelve a leer.
+4. **`live-debug` real todavía no arranca**: exige Stripe (§3.2), y el proveedor de Stripe es T14. La guarda lo dice.
+5. La línea de arranque añade `email=<proveedor>` a lo que propone la §7.1.
+6. `WEBAPP_ENABLED` solo lo lee producción; en los modos de debug no hace nada (siempre hay webapp).
+7. `POST /billing/webhook` sigue en 501 también con la webapp real: es T15.
+8. **No hecho aquí:** el 401 para una cuenta con `deleted_at` (§4.4, es T11), `admin:grant` (T12), `/__debug/mode` con
+   `webapp` y `billing` (T19, contratos 0.5.0) y `render-env.py` con los secretos de Stripe (T21).
+
+### 16.2 T10: `Mailer` y correo de invitación (2026-11-18)
+
+**Hecho** en el mismo commit, salvo el SDK de SES.
+
+| Fichero | Qué |
+|---|---|
+| `apps/api/src/webapp/mailer.ts` | **nuevo**: `Mailer`, `EmailMessage`, `MemoryMailer`, `SesMailer` con un `SesSendEmail` inyectado |
+| `apps/api/src/webapp/invitation-email.ts` | **nuevo**: `invitationEmail()` y `MailingWebappService` |
+
+- **`EMAIL_PROVIDER`**: `memory` (por defecto en los modos de debug) o `ses` (por defecto en producción, y la única
+  opción allí). **`EMAIL_FROM`**: por defecto `ARCA <no-reply@arcacover.com>`; en producción, obligatorio.
+- **`MemoryMailer`** guarda los mensajes en el proceso. Lo usan la webapp simulada (ahora también "manda" sus
+  invitaciones ahí) y `live-debug` real con `EMAIL_PROVIDER=memory`. El reset de `/__debug/reset` lo vacía con el resto
+  de la memoria de la webapp. Ninguna ruta lo expone todavía: el panel lo leerá cuando exista su contrato (T19).
+- **`SesMailer`** traduce el mensaje a la entrada de `SendEmail` de SES v2 (un destinatario, texto y HTML en UTF-8,
+  `ConfigurationSetName` opcional para rebotes y quejas). `@aws-sdk/client-sesv2` **no** es dependencia y no se añadió:
+  el envío llega inyectado (`RealWebappAdapters.sesSendEmail`). El cableado (`new SESv2Client(...)` +
+  `SendEmailCommand`) está escrito en el comentario de `SesMailer`; con SES no hay credencial, el rol de la instancia
+  da `ses:SendEmail` (§9.1, §10.4). Mientras no esté, producción con `EMAIL_PROVIDER=ses` se niega a arrancar.
+- **El correo** (§4.6), en inglés. Asunto `You're invited to join <organización> on ARCA`. Cuerpo: quién invita (su email:
+  no hay nombre que mostrar), la organización, el rol ("as an admin", "a member", "a viewer"), el enlace
+  `${APP_BASE_URL}/app/invite/<token>` (el mismo `inviteUrl` de la respuesta), la fecha de caducidad y "If you weren't
+  expecting this invitation, you can ignore this email". Ningún otro dato personal. El nombre de la organización lo
+  escribe un cliente: se le quitan los saltos de línea y caracteres de control antes del asunto y se escapa en el HTML.
+- **Cuándo se manda**: después de que la invitación quede escrita (y auditada). Un fallo del envío no la deshace: se
+  registra `[mail] invitation <id> was created but its email was not sent (<nombre del error>)`, sin email ni enlace.
+
+**Desviaciones**
+1. **`MailingWebappService` extiende `WebappService`** y envuelve `invite()`, en vez de tocar `service.ts`, que está
+   cambiando en paralelo (T4). Para el nombre de la organización vuelve a leerla con `orgView` tras la escritura: una
+   lectura más por invitación. Cuando llegue `emailSent`, la lógica puede entrar en el servicio.
+2. **Sin `emailSent` en la respuesta**: `InvitationView` es estricto y el front lo parsea; el campo llega con los
+   contratos 0.5.0 (§7.6). `inviteUrl` sigue igual.
+3. El asunto no lleva el email de quien invita (solo el cuerpo), para que no salga en las vistas previas.
+
+### 16.3 Pruebas
+
+Sin red, sin Supabase, Stripe ni AWS reales. Se escribieron antes que el código y fallaron primero.
+
+| Fichero | Tests nuevos | Qué fija |
+|---|---|---|
+| `apps/api/tests/unit/supabase-jwt-auth.test.ts` | 10 | ES256 y RS256 válidos con claves generadas con `jose` y un JWKS inyectado; caducado; sin `exp`; otro emisor; otra audiencia; HS256, sin firma y token simulado rechazados sin pedir el JWKS; `role`, `is_anonymous`, sin email, `sub` no UUID; solo claves asimétricas; `kid` desconocido → rotación verificada, con un refetch por enfriamiento; caché de 10 min; Supabase caído con y sin claves (503); comprobación de arranque |
+| `apps/api/tests/unit/env.test.ts` | 11 | Las guardas de arriba, modo por modo |
+| `apps/api/tests/integration/compose.test.ts` | 7 | Cada modo: `mock` y `live-debug` simulados idénticos y sin tocar la costura; `live-debug` real (Supabase verifica, simulaciones en 404, token simulado 401); producción apagada (501, nada construido); producción encendida (repositorios durables, CORS exacto, invitación por SES); arranque negado sin adaptadores; JWKS vacío o caído |
+| `apps/api/tests/unit/mailer.test.ts` | 8 | `MemoryMailer`, la entrada de SES v2, el correo (contenido, cabeceras y HTML seguros) y el envío tras la escritura, con fallo y con invitación rechazada |
+| `apps/api/tests/unit/deploy-marker.test.ts` | 1 | `production.env` deja la webapp apagada y sin `WEBAPP_PROVIDERS` |
+
+`npm run typecheck` limpio. `npm test` completo: 1437 de 1438; fallaron `infra/aws/lib/arca-demo-stack.test.ts` (no hay
+`aws-cdk-lib` en un worktree, esperado) y, una vez, un test de `crawler.test.ts` por carga, que pasa solo (29 de 29).
+
+### 16.4 F11 decidido: Resend (2026-11-20)
+
+**F11 es Resend**, para los dos correos: Supabase Auth ya manda los códigos de acceso por el SMTP de Resend desde
+`ARCA <no-reply@arcacover.com>` (dominio verificado en Resend, DKIM y SPF en el DNS de Vercel), y ahora la API manda las
+invitaciones por la API HTTP de Resend con el mismo remitente. SES queda como alternativa (`EMAIL_PROVIDER=ses`), con su remitente
+todavía sin cablear. Hecho en `feat/resend-mailer`.
+
+- **`ResendMailer`** (`apps/api/src/webapp/mailer.ts`): `POST https://api.resend.com/emails` con `fetch`, sin SDK; `Authorization:
+  Bearer RESEND_API_KEY`, `User-Agent` (Resend responde 403 sin él) y JSON `{ from, to: [to], subject, text, html }`. Tiempo máximo
+  de 5 s por intento.
+- **Un envío por invitación:** el correo lleva `Idempotency-Key: invitation-<id>` (Resend la guarda 24 h). Solo un mensaje con clave
+  se reintenta, una vez y con el mismo cuerpo, tras un tiempo agotado, un fallo de red o un 5xx; si el primer intento llegó, el
+  segundo no manda otro. Un 4xx, un límite de peticiones o una cuota agotada no se reintentan. Reinvitar crea otra invitación, con
+  otro id: otro correo.
+- **Fallos:** como con SES, el error se nombra por el tipo de Resend (`validation_error`, `rate_limit_exceeded`), por
+  `resend_http_<estado>` si la respuesta no es su JSON, o por `TimeoutError` y `NetworkError`; nunca con el mensaje de Resend, que
+  puede citar la dirección. El registro sigue siendo `[mail] invitation <id> was created but its email was not sent (<tipo>)`, y la
+  invitación no se deshace.
+- **Entorno** (`apps/api/src/config/env.ts`): `EMAIL_PROVIDER` admite `resend`; `RESEND_API_KEY` es obligatoria con él y debe empezar
+  por `re_` (el mensaje nunca la repite). Producción con la webapp encendida sigue pidiendo `EMAIL_FROM` explícito y `APP_BASE_URL`
+  `https`, y ahora acepta `resend` (con clave) o `ses` (con remitente en la costura, que comprueba `compose`); `memory` se niega.
+  Por defecto: `memory` en los modos de debug y `ses` en producción si no se dice nada (`production.env` dice `resend`). La webapp
+  simulada solo usa `memory`; `live-debug` con `WEBAPP_PROVIDERS=real` puede elegir `resend` para una prueba real.
+- **Costura:** `RealWebappAdapters.resendFetch` (opcional; por defecto el `fetch` global) para los tests. `REAL_WEBAPP_ADAPTERS` no
+  cambia: con `EMAIL_PROVIDER=resend` producción ya tiene todas sus piezas.
+- **Despliegue:** `deploy/production.env` con `EMAIL_PROVIDER=resend` y `EMAIL_FROM=ARCA <no-reply@arcacover.com>`
+  (`WEBAPP_ENABLED` sigue en `false`). `deploy/render-env.py` exige `/arca/prod/RESEND_API_KEY` cuando la webapp está encendida y el
+  proveedor es `resend`. El script de SSM pasa a llamarse `scripts/arca-webapp-secrets.ps1` y pide también `RESEND_API_KEY` (oculta,
+  con prefijo `re_`, Enter conserva la guardada; `-Only RESEND_API_KEY` pide solo esa; `-Status` la lista);
+  `scripts/arca-billing-secrets.ps1` sigue funcionando y reenvía al nuevo.
+- **Pruebas** (con `fetch` inyectado, sin llamar a Resend): 17 nuevas en `mailer.test.ts` (forma de la petición, clave de
+  idempotencia, reintentos, tiempo agotado, errores sin datos personales, invitación que sobrevive a un rechazo), `env.test.ts`
+  (guardas), `compose.test.ts` (producción y `live-debug` con Resend, fallo de red), `render-env.test.ts` y `deploy-marker.test.ts`.
+
+**Prueba real desde `live-debug`:** los pasos 1 a 8 de §18.8 (invitar exige una organización pagada) con, además,
+`$env:EMAIL_PROVIDER = 'resend'` y `$env:RESEND_API_KEY` leída con `Read-Host -AsSecureString`; la línea de arranque dice
+`webapp=real stripe=test email=resend`. Una invitación (`POST /orgs/<id>/invitations`) a un buzón propio manda un correo real desde
+`no-reply@arcacover.com`; en el panel de Resend (Emails) aparece con su estado.
+
+## 17. Implementación de T7 y T11 en el back (2026-11-19)
+
+**Hecho** en `feat/real-accounts`, commit `421a773`. Producción sigue en 501 (las dos rutas nuevas también: `/auth/*` y
+`DELETE /me` están detrás de `WEBAPP_ENABLED`), y `live-debug` real sigue sin arrancar hasta que exista el proveedor de Stripe
+(T14).
+
+### 17.1 Ficheros
+
+| Fichero | Qué |
+|---|---|
+| `apps/api/src/webapp/auth-admin.ts` | **nuevo**: `AuthAdmin` (`createUser(email) → 'created' \| 'exists'`, `deleteUser(id) → 'deleted' \| 'missing'`), `AuthAdminUnavailable`, `SupabaseAuthAdmin` (`auth.admin` de supabase-js) e `InMemoryAuthAdmin` |
+| `apps/api/src/webapp/service.ts` | `enroll`, `deleteAccount`, `requireLiveAccount`; `authAdmin` en las dependencias; código `auth_unavailable` (503) y conflicto `sole_owner`; listas de miembros sin cuentas cerradas; `account.deleted` en la actividad |
+| `apps/api/src/webapp/routes.ts` | `POST /auth/enroll`, `DELETE /me`, el 401 de una cuenta cerrada, los límites de §7.4 y `/auth/*` entre las rutas que dan 501 |
+| `apps/api/src/webapp/types.ts` | `ProfileRecord` con `deleted_at` y `email` nulo; `ProfileWrite`; `WebappRepository.deleteAccount`; `sole_owner` |
+| `apps/api/src/webapp/in-memory.ts`, `supabase.ts` | `deleteAccount` (en memoria, igual que la RPC; en Supabase, la RPC `delete_account`); `upsertProfile` nunca resucita un perfil cerrado; `deleted_at` en las lecturas |
+| `apps/api/src/webapp/real-adapters.ts`, `apps/api/src/compose.ts` | `authAdmin` en la costura (`client => new SupabaseAuthAdmin(client)`, el mismo cliente de servicio que el repositorio); sin él, la webapp real no arranca y lo nombra |
+| `apps/api/src/http/rate-limit.ts`, `apps/api/src/http/app.ts` | `WindowLimiter` (ventana deslizante por clave, en memoria); la IP del cliente llega a las rutas |
+| `apps/api/src/debug/tools.ts`, `apps/api/src/webapp/auth.ts` | el reset de debug olvida también los límites y los usuarios simulados; `mockUserIdFor`; el login simulado responde 409 a una cuenta cerrada |
+| `packages/contracts/src/webapp.ts` | `EnrollRequest`, `EnrollResponse` (exportaciones nuevas, §7.6) |
+| `supabase/config.toml`, `supabase/templates/magic_link.html` | Supabase local: alta cerrada, códigos de 10 minutos, plantilla con el código, URLs de vuelta (§9.4) |
+
+### 17.2 `POST /auth/enroll` (§4.2)
+
+- **Pública.** Cuerpo: exactamente uno de `{ claimId }` o `{ invitationToken }` (cualquier otra forma: 400 `invalid_request`).
+- **Reclamo:** las comprobaciones de `redeemable` sin gastarlo y sin usuario con el que comparar: existe, no caducó, no se usó,
+  y su scan está terminado y no es uno aislado por un fallo inyectado. El email es el del ticket.
+- **Invitación:** existe, ni aceptada, ni revocada, ni caducada, y su organización no está borrada. El email es el de la
+  invitación.
+- Con eso, `auth.admin.createUser({ email, email_confirm: true })` con la clave de servicio. Si el email ya tiene usuario
+  (`email_exists`, o el mensaje "already registered" de versiones anteriores de GoTrue), es el mismo éxito.
+- **Respuesta: 200 `{ email }`**, la misma tenga o no cuenta ese email. No se escribe nada más: el perfil lo crea `ensureProfile`
+  en la primera petición con sesión, con `profiles.user_id = sub = auth.users.id` (§4.5; comprobado contra Supabase local).
+- **Un solo 410 `gone`** (mismo cuerpo, mismo mensaje) para todo reclamo o invitación que no sirve, sea cual sea el motivo.
+- **503 `auth_unavailable`** si la API de administración falla o no responde. Antes no se ha escrito nada y el reclamo sigue
+  sin gastar: reintentar es seguro.
+- **Límites (§7.4):** 10 por hora por IP y 5 por hora por reclamo o invitación (la clave del límite es el hash, nunca el
+  secreto). Pasado el límite, 429 `rate_limited` con `Retry-After` en segundos. Un cuerpo inválido (400) no cuenta.
+
+### 17.3 `DELETE /me` (§4.8)
+
+1. Si la persona no tiene perfil todavía (nunca pasó por una ruta que lo escriba), se crea primero, para que quede la lápida.
+2. `deleteAccount` → RPC `delete_account` en una transacción. Única owner de alguna organización no borrada: **409 `conflict`**
+   con un mensaje que lo explica, sin escribir nada. Es el único 409 de esta ruta.
+3. `auth.admin.deleteUser(id, false)`: borrado físico; GoTrue borra con el usuario sus sesiones, refresh tokens e
+   identidades. Así se revocan las sesiones (comprobado: tras el borrado, el refresh token ya no sirve). Un usuario que ya no
+   existe cuenta como hecho.
+4. **204** sin cuerpo.
+
+Si el paso 3 falla dos veces seguidas dentro de la misma petición, la cuenta ya está cerrada (el paso 2 se confirmó) y la
+respuesta es **503 `auth_unavailable`**. `DELETE /me` es la única ruta que acepta el token de una cuenta cerrada, precisamente
+para que el front (o la persona) repita la petición con el mismo token: los dos pasos son idempotentes. Se registra
+`[auth] account <id> was closed but its Auth user was not deleted` (sin email). Límite: 3 por hora por usuario (429).
+
+**Cuenta cerrada = 401.** Toda ruta con sesión, salvo `DELETE /me`, lee el perfil y responde **401 `unauthorized`** si tiene
+`deleted_at`, aunque el access token siga vivo hasta su `exp`. Cuesta una lectura de `profiles` por petición. Además,
+`upsertProfile` no reescribe nunca un perfil cerrado (en SQL lo impide `profiles_email_unless_deleted`, porque el upsert no
+manda `deleted_at`): una petición que pasó la comprobación justo antes del borrado falla en vez de devolver el email al perfil.
+
+**Lo que ve el resto:** los miembros de la organización dejan de verlo; la actividad muestra `account.deleted` con
+`actor.email: null`, `targetLabel: null` y `change: { from: <rol>, to: null }`; las invitaciones pendientes a su email se
+revocan (`invitation.revoked`, motivo `account_deleted`). En una organización **ya borrada** la membresía se conserva (§12.1),
+pero la ficha del admin de plataforma no la lista: `MemberView.email` es obligatorio en el contrato y la persona ya no existe.
+
+### 17.4 Modos simulados
+
+`mock` y `live-debug` simulado usan `InMemoryAuthAdmin` con los mismos ids que el login simulado (`mockUserIdFor`), así que
+`enroll` y `DELETE /me` funcionan igual sin red. Como el login simulado deriva el id del email, una cuenta cerrada volvería como
+ella misma y recibiría 401 en todo: `POST /__debug/auth/login` responde **409** a ese email hasta un `POST /__debug/reset`, que
+olvida también los límites de la webapp y los usuarios simulados.
+
+### 17.5 Desviaciones respecto a la nota
+
+1. **`enroll` responde 200 `{ email }`**, nunca 204 (§4.2 dejaba elegir), y **un reclamo ya usado también es 410** (en
+   `redeemable` es 409): todos los rechazos tienen la misma respuesta.
+2. **`enroll` no crea el perfil.** El enlace con `auth.users` lo hace `ensureProfile` con el `sub` del token, como ya hacía.
+3. **Reintento del borrado en Auth:** dos intentos dentro de la petición y, si fallan, 503 y reintento desde el cliente. No hay
+   cola en segundo plano. Si nadie reintenta, queda un usuario de Auth huérfano: puede pedir un código, pero todas las rutas le
+   dan 401, y ese email no puede volver a registrarse (`enroll` lo ve como "ya existe"). Pendiente para T27: un barrido que
+   borre en Auth los usuarios cuyo perfil está cerrado.
+4. **Sesiones:** se revocan con el borrado físico del usuario, sin una llamada aparte a `signOut`.
+5. **La 503 reutiliza `auth_unavailable`**, el código que T6 ya usa cuando el verificador no tiene claves (§16.1).
+6. **El 409 de `DELETE /me`** lleva un mensaje legible, no la palabra `sole_owner`: la ruta no tiene otro 409.
+7. **Privacidad (F13):** cerrar la cuenta vacía `profiles` y borra el usuario de Auth, pero el email sigue en
+   `invitations.email` y en el `target` de las filas `invitation.revoked` del `audit_log` (las escribe la RPC de la fase 1).
+   Queda para la política de retención.
+8. **Configuración local:** se cambió además la caducidad del código (`otp_expiry = 600`), la plantilla y las URLs de vuelta,
+   no solo el alta cerrada (§9.4).
+
+### 17.6 Pruebas
+
+Escritas antes que el código; fallaron primero (módulos y métodos inexistentes).
+
+| Fichero | Tests | Qué fija |
+|---|---|---|
+| `apps/api/tests/unit/auth-admin.test.ts` | 6 | La petición exacta a `/auth/v1/admin/users` (POST con `email_confirm`, DELETE con `should_soft_delete: false`); "ya existe" y "ya no existe" como éxito; 500, 502, 401 y fallo de red como `AuthAdminUnavailable`, sin el email en el log; el admin en memoria |
+| `apps/api/tests/integration/webapp-accounts.test.ts` | 13 | `enroll` por reclamo y por invitación, misma respuesta si ya existía, el reclamo sigue sin gastar; un único 410 para nueve motivos; 400; 503 sin nada escrito; límites con `Retry-After`. `DELETE /me`: 409 al único owner; cierre completo y 401 en todas las rutas; owner con otro owner; 503 y reintento; límite; ficha del admin de una organización borrada; sin sesión |
+| `apps/api/tests/conformance/webapp-repository.ts` | +4 (×3 destinos) | `deleteAccount`: `sole_owner` sin cambios; cierre de membresías vivas, acciones, enlaces y perfil con su auditoría; idempotente, el perfil no resucita y el email queda libre; único owner de una organización borrada y usuario sin perfil |
+| `apps/api/tests/integration/compose.test.ts` | +2 y ampliados | La costura entrega `authAdmin` con el mismo cliente; sin él no arranca; producción apagada da 501 en las dos rutas; `mock` simula y el login simulado da 409 tras cerrar la cuenta |
+| `apps/api/tests/integration/real-accounts-supabase.test.ts` | 2 | Contra Supabase local (ver abajo); se salta sin `ARCA_AUTH_SUPABASE_*` |
+
+`npm run typecheck` limpio. `npm test` completo una vez: 1564 pasan, 49 se saltan (la suite de conformidad sobre Supabase real y
+esta prueba, sin sus variables) y 1 falla: `infra/aws/lib/arca-demo-stack.test.ts` por tiempo bajo carga; sola pasa 7 de 7.
+
+### 17.7 Resultado contra Supabase local
+
+Stack local de la CLI 2.122.1 con GoTrue v2.196.0, las ocho migraciones aplicadas.
+
+- **Suite de conformidad** (`webapp-repository-supabase.test.ts`): **47 de 47**, con los cuatro casos nuevos de `deleteAccount`
+  sobre la RPC real.
+- **Prueba de punta a punta** (`real-accounts-supabase.test.ts`): **2 de 2**, dos veces. Arranca la webapp real de `live-debug`
+  con `compose` y los adaptadores que se entregan (el repositorio de Supabase y `SupabaseAuthAdmin`; el cobro simulado en lugar
+  de T14). Recorrido: scan terminado en la tabla `scans` → `POST /claims` → antes de `enroll`, `signInWithOtp` con
+  `shouldCreateUser: false` falla → `POST /auth/enroll` crea el usuario (confirmado) y repetirlo da la misma respuesta → inicio
+  de sesión con el correo que GoTrue dejó en Mailpit → **el token es ES256 y su `kid` está en el JWKS local**, y
+  `SupabaseJwtAuth` lo verifica → `GET /me` con `id = sub` y el perfil enlazado → `POST /orgs` → `DELETE /me` del owner: 409.
+  Después: invitación → `enroll` con el token de invitación → inicio de sesión → aceptar → `DELETE /me`: 204, `GET /me` con el
+  mismo token: 401, el refresh token ya no sirve, el usuario de Auth no existe, `signInWithOtp` vuelve a fallar, repetir el
+  borrado da 204, y el owner ve la baja en miembros y en la actividad.
+- **El proyecto local firma con clave asimétrica:** el JWKS publica una clave EC P-256 (`ES256`), y la CLI configura GoTrue con
+  `GOTRUE_JWT_KEYS`. No hizo falta tocar el verificador ni configurar nada.
+- **El código de 6 dígitos:** la plantilla por defecto de GoTrue v2.196 solo lleva el enlace (`token` = hash del código), no
+  `{{ .Token }}`. Como el stack no se podía reiniciar, la prueba usa lo que trae el correo: el código si la plantilla lo lleva y,
+  si no, el hash del enlace (`verifyOtp({ token_hash, type: 'email' })`, el camino del enlace de respaldo). Ambas veces entró por
+  el enlace. El camino del código se comprobó aparte con el mismo GoTrue: un código de 6 dígitos de `auth.admin.generateLink`
+  verificado con `verifyOtp({ email, token, type: 'email' })`, la llamada exacta del front, da una sesión del mismo usuario.
+  Con la plantilla nueva (`supabase/templates/magic_link.html`, tras reiniciar) el correo de Mailpit traerá el código.
+- **Alta pública:** el stack que corrió las pruebas seguía con `enable_signup = true` (lo dice la prueba al empezar); el
+  `config.toml` nuevo la apaga en el siguiente reinicio.
+
+Cómo correrla: la cabecera de `apps/api/tests/integration/real-accounts-supabase.test.ts` (URL, clave secreta y clave publicable
+de `supabase status -o env` en `ARCA_AUTH_SUPABASE_URL`, `ARCA_AUTH_SUPABASE_SECRET_KEY` y `ARCA_AUTH_SUPABASE_PUBLISHABLE_KEY`;
+solo hosts locales).
+
+### 17.8 Lo que necesita el front (T9)
+
+| Llamada | Petición | Respuestas |
+|---|---|---|
+| `POST /auth/enroll` (sin sesión) | `{ claimId }` o `{ invitationToken }` (`EnrollRequest`) | 200 `{ email }` (`EnrollResponse`); 400 `invalid_request`; 410 `gone` (el enlace ya no vale: volver a los resultados o pedir otra invitación); 429 `rate_limited` con `Retry-After`; 503 `auth_unavailable` (reintentar) |
+| `DELETE /me` (Bearer) | sin cuerpo | 204; 401 `unauthorized`; 409 `conflict` (único owner: transferir o pedir el borrado de la organización); 429; 503 `auth_unavailable` (la cuenta ya está cerrada: repetir la misma petición) |
+| Cualquier ruta con sesión | — | además, 401 `unauthorized` si la cuenta está cerrada |
+
+**Secuencia de alta y entrada** (`@supabase/ssr`, `createBrowserClient(url, publishableKey)`):
+
+1. Reclamo: `POST /claims { scanToken }` → `claimId` (como hoy, en `sessionStorage`). Invitación: el `token` de
+   `/app/invite/<token>`.
+2. `POST /auth/enroll` con uno de los dos → `{ email }`. La pantalla muestra ese email bloqueado. Una sola vez por flujo; para
+   reenviar el código no hace falta repetirlo.
+3. `supabase.auth.signInWithOtp({ email, options: { shouldCreateUser: false, emailRedirectTo:
+   '${origin}/app/auth/confirm?next=<ruta /app/...>' } })`. Un error aquí se muestra con el mensaje neutro de §4.2.
+4. La persona escribe el código: `supabase.auth.verifyOtp({ email, token, type: 'email' })` → sesión. Enlace de respaldo:
+   `/app/auth/confirm` pide un clic y llama a `verifyOtp({ token_hash, type: 'email' })`.
+5. Cada llamada a la API lleva `Authorization: Bearer ${(await supabase.auth.getSession()).data.session.access_token}`.
+6. Reclamo: `POST /orgs { name, claimId }`. Invitación: `POST /invitations/:token/accept`.
+7. **Login** de alguien con cuenta (`/app/login`): solo los pasos 3 a 5, sin `enroll`.
+8. **Borrar la cuenta** (`/app/settings`): `DELETE /me`; con 204, `supabase.auth.signOut({ scope: 'local' })`, `forgetOrg()`,
+   `clearPendingClaim()` y a la portada. Con 409, explicar lo de la propiedad. Con 503, ofrecer reintentar (el token sigue
+   valiendo para esa ruta).
+
+### 17.9 Pendiente
+
+- **T9** (front) y **T8** (configurar `Arca-dev`: los pasos de §9.4).
+- Reiniciar Supabase local para aplicar el `config.toml` nuevo, y entonces la prueba de §17.7 entra con el código del correo.
+- El barrido de usuarios de Auth huérfanos (§17.5, punto 3), con la limpieza de T27.
+- La pantalla "Delete my account" (parte de T11 en el front).
+
+## 18. Fase 3 en el back: T13 (código), T14, T15 y T17 (2026-11-20)
+
+**Hecho** en `feat/real-accounts`, commit `48344da`. Producción sigue en 501 (`WEBAPP_ENABLED=false`). `live-debug` con
+`WEBAPP_PROVIDERS=real` ya arranca (clave de test, correo en memoria); producción con la webapp encendida sigue sin arrancar mientras
+falte el remitente de SES, y ahora además exige que cada plan activo tenga su precio de Stripe. **No se llamó a la API de Stripe**:
+no hay productos, precios, clientes ni webhooks creados, y `npm run stripe:catalog -- --apply` no se ha ejecutado (lo aprueba el
+founder aparte). Tampoco se instaló la CLI de Stripe. (Eso era al cerrar la fase 3; la primera prueba real en modo test, con el
+catálogo de test creado, es §18.10.)
+
+### 18.1 Ficheros
+
+| Fichero | Qué |
+|---|---|
+| `apps/api/package.json`, `package-lock.json` | `stripe` **23.1.0**, versión exacta, publicada el 2026-10-29 (más de dos semanas antes de instalarla) |
+| `apps/api/src/webapp/stripe.ts` | **nuevo**: `StripeBillingProvider`, `STRIPE_API_VERSION = '2026-10-28.endive'`, `stripeClient`, `providerEventOf` (evento → organización, cliente, suscripción), `subscriptionOf`, y las piezas del catálogo (`catalogProduct`, `catalogPrice`, `createCatalogPrice`, `retirePrice`) |
+| `apps/api/src/webapp/billing-events.ts` | **nuevo**: `BillingEvents` (webhook, vuelta del checkout, reconciliación), `billingStatusFor` (§6.6), `KeyedQueue` (una tarea por organización a la vez), `WebhookRejected` |
+| `apps/api/src/webapp/billing.ts` | La interfaz `BillingProvider` de §6.10 (con `expireCheckout`, `recentSubscriptionIds`, `mode`, `webhooks`, `needsCatalogPrice`), `ProviderSubscription`, `ProviderCheckout`, `ProviderEvent`, `BillingUnavailable`; `MockBillingProvider` la implementa entera |
+| `apps/api/src/webapp/service.ts` | `checkout` (una sesión abierta por organización), `syncCheckout`, `billingView`, `portal` con cliente, `billingWebhook`, `reconcileBilling`; `updatePlan` crea el Price nuevo; aprobar un borrado cancela la suscripción viva; código `billing_unavailable` (502); `ACTOR_KIND_OF_ACTION` con las acciones de cobro de §10.5 |
+| `apps/api/src/webapp/routes.ts` | `GET /orgs/:id/billing`, `POST /orgs/:id/billing/sync`, `POST /billing/webhook` real; límites de §7.4 para checkout, portal y sync |
+| `apps/api/src/webapp/types.ts`, `in-memory.ts`, `supabase.ts` | `PlanRecord` con `stripe_product_id` y `stripe_price_id`; `SubscriptionRecord` con lo que Stripe dijo (`provider_status`, `price_id`, `cancel_at_period_end`, `current_period_start`, `livemode`); `BillingCustomerRecord`, `CheckoutSessionRecord`; métodos nuevos del repositorio: `isBillingEventProcessed`, `closeBillingEvent`, `getBillingCustomer`, `findBillingCustomer`, `addBillingCustomer`, `getOpenCheckoutSession`, `getCheckoutSession`, `addCheckoutSession`, `closeCheckoutSession` |
+| `supabase/migrations/20261120000000_billing_events.sql` | **nueva**: la RPC `close_billing_event` (§18.4, punto 2), solo para `service_role` |
+| `apps/api/src/webapp/stripe-catalog.ts`, `apps/api/scripts/stripe-catalog.ts`, `package.json` | **nuevos**: `npm run stripe:catalog` (§18.6) |
+| `apps/api/src/webapp/real-adapters.ts`, `apps/api/src/compose.ts` | `billing: config => new StripeBillingProvider(config)` en la costura; guarda de precios de catálogo al arrancar; `compose` devuelve `reconcileBilling` |
+| `apps/api/src/webapp/plans.ts`, `apps/api/src/config/env.ts` | La semilla con los ids de Stripe a `null`; `stripeKeyMode` exportada para el script |
+| `packages/contracts/src/webapp.ts` | `BillingView` y `BillingSyncRequest`, exportaciones nuevas (§18.5) |
+| `deploy/Caddyfile`, `deploy/render-env.py` | T17 y la parte de §9.1 de `render-env.py` (§18.3) |
+
+### 18.2 Rutas
+
+| Ruta | Quién | Respuestas |
+|---|---|---|
+| `GET /orgs/:id/billing` | cualquier miembro, sin exigir pago | 200 `BillingView`: `{ billingStatus, plan, currentPeriodEnd, cancelAtPeriodEnd, manageable }` |
+| `POST /orgs/:id/billing/checkout { planCode }` | `billing.manage`, sin exigir pago | 200 `{ url }` (la misma mientras la sesión siga abierta en Stripe); 409 si ya paga, si el plan no tiene precio de Stripe, o si un pago sigue confirmándose (3-D Secure); 429 pasadas 10 por hora y organización; 502 `billing_unavailable` |
+| `POST /orgs/:id/billing/portal` | `billing.manage`, sin exigir pago | 200 `{ url }`; 409 sin cliente de Stripe todavía (§6.4); 429 (10/h); 502 |
+| `POST /orgs/:id/billing/sync { sessionId }` | `billing.manage`, sin exigir pago | 200 `OrgView` tal como queda; 400 si el id no es `cs_test_…`/`cs_live_…`; 404 si la sesión no existe o es de otra organización; 429 (30/h); 502 |
+| `POST /billing/webhook` | público, sin CORS ni sesión | 200 `{ received: true, outcome }` (`applied`, `recorded`, `duplicate`, `ignored`, `unknown_org`, `duplicate_subscription`, `stale_subscription`); 400 `invalid_signature` o `livemode_mismatch`; 500 para que Stripe reintente. Con el proveedor simulado sigue en 501 |
+| `PUT /admin/plans/:code` | admin de plataforma | Un importe, moneda o intervalo nuevo crea el Price antes de tocar la tabla; 502 sin escribir nada si Stripe falla |
+
+Los límites se cuentan **después** de autorizar, con el id de la organización ya leído: nadie de fuera puede gastar los de otra.
+
+### 18.3 Cómo funciona
+
+**Checkout (§6.2).** Todo el trabajo de cobro de una organización (checkout, vuelta, webhook, reconciliación) pasa por una cola en
+memoria por organización (`KeyedQueue`), así dos clics o dos owners nunca abren dos sesiones. Dentro de su turno: se vuelve a leer la
+organización (409 si ya paga); si hay una sesión abierta y sin vencer en `checkout_sessions`, se pregunta a Stripe por ella: abierta y
+del mismo plan → su URL; abierta y de otro plan → se expira en Stripe y se abre otra; pagada → su suscripción se aplica por el camino de
+la vuelta y, si la organización ya paga, 409. Si no, cliente de `billing_customers` (o uno nuevo, `idempotencyKey: customer:<orgId>`),
+`checkout.sessions.create` con los parámetros de la tabla de §6.2 (sin impuestos, cupones ni prueba: F3, F4), `expires_at` a una hora,
+`success_url = ${APP_BASE_URL}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, y se guarda la sesión. Si otro proceso guardó la
+suya antes (el índice único de sesiones abiertas), se expira la nuestra en Stripe y se devuelve la suya. Se audita
+`billing.checkout_started` (el owner, como miembro).
+
+**Webhook (§6.5).** Cuerpo crudo (`arrayBuffer`) → `stripe.webhooks.constructEvent` con `STRIPE_WEBHOOK_SECRET` y la tolerancia de
+5 minutos medida con el reloj del proceso → `livemode` contra el modo de la clave → si el tipo no está en la lista, 200 `ignored` sin
+registrar → si el evento ya está procesado, 200 `duplicate` **sin leer Stripe** → organización por `metadata.org_id` (sesión,
+suscripción o `parent.subscription_details.metadata` de la factura) o, si no, por `billing_customers`; sin organización,
+`close_billing_event` con `last_error = 'unknown_org'` → en el turno de la organización: los eventos de suscripción
+(`checkout.session.completed`, `customer.subscription.created/updated/deleted`, `invoice.paid`, `invoice.payment_failed`) **leen la
+suscripción en Stripe** y la aplican con `apply_billing_state`; `checkout.session.expired`, `invoice.payment_action_required`,
+`charge.refunded` y `charge.dispute.created` se registran con `close_billing_event` y su auditoría. Logs:
+`[billing] event <id> <tipo> <resultado>` y `[billing] event <id> <tipo> failed (<nombre del error>)`, sin emails ni importes de tarjeta.
+
+**Estado (§6.6).** `billingStatusFor`: `active`/`trialing` → `active`; `past_due` → `past_due`; `unpaid`, `paused`, `canceled` y
+cualquier estado desconocido → `canceled`; `incomplete` → `pending_payment` si nunca pagó, si no sin cambio; `incomplete_expired` →
+`pending_payment` si nunca pagó, si no `canceled`. "Nunca pagó" es `billing_status = pending_payment`. Una suscripción distinta de la
+viva que no da acceso se mapea siempre a un estado sin acceso, para que `apply_billing_state` la trate como vieja y no como cobro doble.
+El plan se saca de `plan_code` en los metadatos del Price (todos los Prices que crea ARCA lo llevan), si no del plan cuyo
+`stripe_price_id` coincide, y si no del único plan activo de ese intervalo.
+
+**Vuelta del checkout (§6.3).** `checkout.sessions.retrieve`; si su `client_reference_id` no es la organización, 404. Cierra la sesión
+como diga Stripe y aplica su suscripción por el mismo camino, con el id de evento `sync:<sesión>:<estado de Stripe>`: repetir la vuelta
+sin novedades es un duplicado; un estado nuevo se aplica.
+
+**Reconciliación (§9.5).** `reconcileBilling()` lista los eventos de Stripe de las últimas 48 h de los tipos de suscripción, lee cada
+suscripción que nombran, la compara con la fila guardada (`provider_status`, fin de periodo, `cancel_at_period_end`, `billing_status`) y,
+si no coincide, registra `[billing] reconcile mismatch org <id> subscription <id>` y la aplica con un id que nombra lo que vio
+(`reconcile:<sub>:<estado>:<fin>:<cancelación>`), así la misma discrepancia se aplica y audita una sola vez. Devuelve
+`{ checked, mismatched, applied, failed }`. `compose` la expone como `reconcileBilling`; **programarla** (un temporizador diario en
+el proceso de producción) queda para T26.
+
+**Precio desde `/admin` (§6.1).** Un importe, moneda o intervalo nuevo: se busca un Price activo con la `lookup_key` del plan y esos
+valores (un reintento lo encuentra); si no, se crea en el mismo Product con `transfer_lookup_key: true`, `plan_code` en los metadatos e
+`idempotencyKey: price:<plan>:<price anterior>:<importe>:<moneda>:<intervalo>`; el anterior se archiva (`active: false`, sin bloquear
+si falla) y después se actualiza `plans`. Los suscriptores siguen con su precio (F2).
+
+**Borrado aprobado (§6.9).** Si la organización tiene una suscripción no cancelada, `subscriptions.cancel` inmediata, sin reembolso
+(F8). La revisión ya está escrita, así que un fallo de Stripe no la deshace: se registra `[billing] failed to cancel subscription …` para
+que una persona la cancele en el panel. El webhook que llega después mueve `billing_status`.
+
+**Caddy (T17, §9.2).** `handle /billing/webhook` con `request_body { max_size 1MB }`; `handle` con `max_size 32KB` para todo lo demás; el
+`reverse_proxy` con sus health checks en un snippet `(api)` que importan los dos. Fuera de los dos `handle` no queda ningún límite que
+cortase antes el del webhook. `basic_auth` de `/docs` y las cabeceras no cambian.
+
+**`render-env.py` (§9.1).** Con `WEBAPP_ENABLED=true` en `production.env`, `STRIPE_SECRET_KEY` y `STRIPE_WEBHOOK_SECRET` pasan a ser
+parámetros obligatorios de `/arca/prod`; un despliegue sin ellos se niega en el host y los nombra, sin imprimir valores.
+
+### 18.4 Desviaciones respecto a la nota
+
+1. **Versión de API `2026-10-28.endive`**, no `2025-03-31.basil`: es la que fija el SDK 23.1.0. Lo que §6.5 cuenta de basil sigue
+   valiendo (periodo en `items.data[]`, suscripción de una factura en `parent.subscription_details`). La constante está escrita en el
+   código y tipada contra el SDK: subir el SDK sin revisar falla el typecheck. El traductor acepta además la forma antigua de la factura
+   (suscripción arriba), por si un endpoint o `stripe listen` usan una versión anterior de la cuenta.
+2. **RPC nueva `close_billing_event`** (migración `20261120000000_billing_events.sql`), que §5.4 no listaba: registra como procesado,
+   en una transacción con su auditoría, un evento que no mueve ninguna suscripción (reembolso, disputa, checkout expirado, organización
+   desconocida). Sin ella, esos eventos solo podían registrarse en dos pasos.
+3. **Clave de idempotencia del checkout:** la de §6.2 (`checkout:<org>:<plan>:<minuto>`) más lo que vino antes (la sesión que sustituye o
+   la última suscripción) cuando lo hay. Con la clave por minuto sola, un checkout nuevo en el mismo minuto que uno cerrado recibía de
+   Stripe la sesión vieja. Además, si Stripe devuelve una sesión que no está `open`, el back se niega a entregarla.
+4. **Sesión abierta de otro plan:** §6.2 decía devolver su URL; se expira en Stripe y se abre la del plan pedido, para que nunca haya dos
+   sesiones pagables. Y una sesión que Stripe ya da por pagada se aplica (vuelta) en vez de abrir otra.
+5. **Solo tarjeta con `allowed_payment_method_types: ['card']`**: el SDK 23 quitó `payment_method_types` de `Checkout.SessionCreateParams`.
+6. **Respuesta del webhook** `{ received: true, outcome }`, y un 400 con código propio `livemode_mismatch` además de `invalid_signature`.
+7. **`billing.invoice_paid` y `billing.payment_failed`** se auditan justo después de `apply_billing_state`, no dentro de su transacción
+   (la firma de la RPC de la fase 1 no lleva auditoría extra). Si el proceso cae entre los dos, falta esa línea; el estado está aplicado.
+8. **Disputas:** el objeto de la disputa no trae cliente, así que no se audita en la organización: se registra `[billing] dispute …` en el
+   log (para la alarma de §9.5) y el evento queda procesado como `unknown_org`. Leer el cargo para encontrar la organización queda pendiente.
+9. **Cancelar al aprobar un borrado** solo si hay suscripción viva (antes se llamaba siempre), y un fallo de Stripe no da 5xx (§18.3).
+10. **`billing.checkout_started` se audita como `member`** (lo hace el owner), no como `system` como el resto de §10.5.
+11. **Guarda de precios:** producción con la webapp encendida no arranca si un plan activo no tiene `stripe_price_id` (§5.3); `live-debug`
+    real solo avisa (`[billing] the active plans … have no stripe_price_id`) y el checkout de esos planes responde 409.
+12. **`GET /orgs/:id/billing`** (que §12 pone en T16) está hecho en el back: el front de T16 solo tiene que leerlo.
+13. **El simulado pasa por las mismas tablas:** el checkout de `mock` y `live-debug` simulado crea cliente y sesión en el repositorio en
+    memoria; un segundo clic devuelve la misma página de pago simulada; el portal simulado responde 409 hasta el primer checkout; el pago
+    simulado cierra su sesión. `POST /__debug/billing/pay` no cambia.
+14. **`success_url`** pasa a `/app/billing/return?session_id=…` también en el simulado (que no la usa): esa página es de T16.
+15. **`caddy validate` no se corrió:** no hay binario de Caddy en el portátil, Docker no respondía y no se descargan imágenes. El test lee
+    la estructura del Caddyfile (§18.7); `caddy validate` queda para el primer `npm run test:container` o el despliegue.
+16. **La suite de conformidad contra Supabase local no se corrió:** Docker Desktop no respondía (`supabase status` no encontró el demonio)
+    y no se arrancó nada. Los métodos nuevos del repositorio pasan la suite en memoria y sobre PGlite con las nueve migraciones.
+
+### 18.5 Contratos
+
+Exportaciones **nuevas** de `packages/contracts/src/webapp.ts`, sin publicar (salen con 0.5.0, T18): `BillingView`
+(`{ billingStatus, plan: PlanView | null, currentPeriodEnd: string | null, cancelAtPeriodEnd: boolean, manageable: boolean }`, estricto) y
+`BillingSyncRequest` (`{ sessionId }`, solo `cs_test_…` o `cs_live_…`). `POST /orgs/:id/billing/sync` responde con el `OrgView` de siempre
+y el webhook no es un contrato del front. Ningún esquema que el front ya parsea cambió.
+
+### 18.6 `npm run stripe:catalog`
+
+`npm run stripe:catalog [-- --apply] [--allow-live]`. Lee `STRIPE_SECRET_KEY`, `SUPABASE_URL` y `SUPABASE_SECRET_KEY` (o
+`SUPABASE_SERVICE_ROLE_KEY`) del entorno o de `.env.local`, como `admin:grant`. Asegura el Product `arca` ("ARCA") y, por cada plan de
+`plans.ts`, un Price recurrente activo con la `lookup_key` `arca_<código>`, `plan_code` en los metadatos y el importe, moneda e intervalo de
+la tabla `plans` (los de ejemplo: 499 USD/mes y 4.990 USD/año, salvo que un admin los cambiara). Un Price que ya coincide se reutiliza; uno
+con otro importe recibe un Price nuevo que se queda con la `lookup_key`, y el viejo se archiva. Después escribe `stripe_product_id` y
+`stripe_price_id` en `plans`.
+
+- **Por defecto es un ensayo:** solo lee (Products y Prices) y dice qué crearía y escribiría.
+- `--apply` crea y escribe; exige la base (`SUPABASE_*`), y lo comprueba antes de llamar a Stripe.
+- Una clave **live** se rechaza sin `--allow-live`, antes de llamar a Stripe (el catálogo live es T23, del founder).
+- Imprime el modo, el host de Supabase, ids e importes; **nunca una clave** (los mensajes de error de Stripe se imprimen con la clave tapada).
+- Es idempotente: una segunda pasada no crea nada.
+- La clave restringida necesita escritura en Products y Prices (además de los permisos de §6.7).
+
+### 18.7 Pruebas
+
+Sin red: el SDK real con un `fetch` inyectado (`Stripe.createFetchHttpClient`) que hace de un Stripe pequeño
+(`apps/api/tests/fixtures/stripe.ts`), con objetos tipados contra los tipos del SDK de la versión fijada (un campo que se mueva rompe el
+typecheck del fixture) y claves de idempotencia que repiten la primera respuesta, como Stripe. Escritas antes que el código; fallaron
+primero (módulos inexistentes, y el Caddyfile y `render-env.py` sin el cambio).
+
+| Fichero | Tests | Qué fija |
+|---|---|---|
+| `apps/api/tests/unit/stripe-billing.test.ts` | 13 | Versión fijada en el SDK y en cada petición; cliente con su clave de idempotencia; parámetros exactos del checkout; replay de la misma sesión; leer, expirar y "ya pagada"; portal; cancelar dos veces; estado con el periodo del elemento; 5xx y red → `BillingUnavailable`, 4xx → error normal; firma válida, cuerpo re-serializado, otro secreto, sin cabecera, basura, caducada (6 min) y en tolerancia (4 min); traducción de cada evento, factura antigua incluida; suscripciones cambiadas desde una fecha; precio nuevo con la `lookup_key`, el viejo archivado y el reintento sin escribir; producto creado si falta; la clave nunca sale fuera de la cabecera |
+| `apps/api/tests/integration/stripe-billing-flow.test.ts` | 19 | Servicio, rutas y proveedor real sobre el Stripe falso: tabla de §6.6; una sesión por organización (dos clics a la vez, dos owners); sesión vencida y cambio de plan; 409 pagada, sin precio; 502 sin escribir; vuelta (antes y después de pagar, idempotente, de otra organización, inexistente, mal formada); portal 409 sin cliente; `BillingView` de owner y viewer; webhook: firma mala, ausente, falsa y caducada (400 sin escribir), otro modo, tipo ignorado, duplicado sin leer Stripe, organización desconocida; **eventos desordenados resueltos leyendo Stripe**; **incomplete → active → past_due → unpaid → active → canceled** y volver a pagar; **suscripción doble** (no se aplica, se audita y se avisa); fallo a mitad → 500 y el reintento aplica; **serialización por organización** (la segunda entrega no lee Stripe hasta que acaba la primera); factura pagada, acción requerida, reembolso, disputa y checkout expirado; **reconciliación** (corrige lo perdido, deja lo que coincide, una sola vez, solo 48 h); precio desde `/admin` (502 sin tocar la tabla, Price nuevo, el siguiente checkout lo cobra); borrado aprobado cancela en Stripe |
+| `apps/api/tests/unit/stripe-catalog.test.ts` | 6 | Banderas; ensayo sin escrituras; `--apply` crea producto y precios y escribe ids; idempotente; importe cambiado → Price nuevo con la `lookup_key`; clave live y `--apply` sin base rechazados antes de llamar a Stripe; no imprime la clave |
+| `apps/api/tests/conformance/webapp-repository.ts` | +4 (y 2 ampliados), ×3 destinos | Ids de Stripe del plan (únicos); campos crudos de la suscripción; un cliente por organización; una sesión abierta por organización, vencimiento y cierre; `close_billing_event` una vez, con su auditoría, y `isBillingEventProcessed` |
+| `apps/api/tests/unit/deploy-caddy.test.ts` | 4 | 1 MB en `/billing/webhook`, 32 KB en el resto, ningún límite fuera de los dos `handle`, health checks, cabeceras y `basic_auth` |
+| `apps/api/tests/unit/render-env.test.ts` | 3 | Con la webapp apagada no pide Stripe; encendida, se niega y nombra cada secreto que falta sin imprimir valores; con los dos, los escribe escapados (corre `deploy/render-env.py` con el Python del sistema; se salta si no hay) |
+| `apps/api/tests/integration/compose.test.ts` | +3 y ampliados | La costura entrega `StripeBillingProvider`; producción sin precios no arranca y `live-debug` avisa; el webhook da 501 con el simulado y 400 sin firma con el real; lo que se entrega hoy solo echa en falta el remitente de SES |
+| `packages/contracts/tests/webapp.test.ts` | +2 | `BillingView` y `BillingSyncRequest` |
+| Otros ajustados | — | `webapp-service`, `webapp-auth-billing`, `webapp` (rutas nuevas en el recorrido de rutas y la matriz de roles; `billing.checkout_started` en la auditoría), `webapp-database`, `real-accounts-database` (`close_billing_event` en la lista de RPC sin acceso para `anon`/`authenticated`) |
+
+`npm run typecheck` limpio. `npm test` completo una vez: **1631 pasan, 53 se saltan** (las suites contra un Supabase real, sin sus
+variables), ninguno falla (87 ficheros, 2 saltados).
+
+### 18.8 Cómo hacer la prueba real en modo test
+
+Necesita, del founder o de Jesús: la cuenta de Stripe en modo test, una clave restringida `rk_test_…` con los permisos de §6.7 más
+escritura en Products, el portal configurado en el panel de test, y la aprobación para crear el catálogo. Todo en PowerShell, con las
+claves leídas con `Read-Host -AsSecureString` (§9.3), nunca escritas en la línea de comandos.
+
+1. **Base:** Supabase local (`supabase start`, después `supabase migration up` para aplicar `20261120000000_billing_events.sql`) o
+   `Arca-dev` con las nueve migraciones (T5). `SUPABASE_URL` y `SUPABASE_SECRET_KEY` apuntando a ella.
+2. **Clave:** `STRIPE_SECRET_KEY` = la `rk_test_…`.
+3. **Catálogo:** `npm run stripe:catalog` (ensayo) y, con el visto bueno, `npm run stripe:catalog -- --apply`. Comprobar en el panel de test
+   el Product `arca` y los Prices `arca_monthly` y `arca_annual`.
+4. **Portal (panel de test → Settings → Billing → Customer portal):** guardar una configuración con la tabla de §6.4 (cambio de plan entre
+   los dos Prices, cancelar al final del periodo). Sin una configuración guardada, Stripe rechaza la sesión y `POST /billing/portal` responde 500.
+5. **Webhook local:** instalar la CLI de Stripe, `stripe login`, y
+   `stripe listen --latest --forward-to http://127.0.0.1:8080/billing/webhook --events checkout.session.completed,checkout.session.expired,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,invoice.paid,invoice.payment_failed,invoice.payment_action_required,charge.refunded,charge.dispute.created`.
+   Copiar el `whsec_…` que imprime a `STRIPE_WEBHOOK_SECRET` (con `Read-Host -AsSecureString`). `--latest` da los objetos en una versión
+   igual o posterior a la fijada; el back solo saca ids de ellos y lee el estado con la suya.
+6. **Arrancar:** `$env:WEBAPP_PROVIDERS = 'real'` y `npm run stack -- live-debug`. La línea de arranque dice
+   `webapp=real stripe=test email=memory`.
+7. **Cuenta y organización** (sin el front de T9, a mano): con Supabase local, `POST /claims` con el token de un scan terminado →
+   `POST /auth/enroll` → `signInWithOtp` y el código de Mailpit (`http://127.0.0.1:54324`) → `POST /orgs` con el `access_token`, como en
+   `real-accounts-supabase.test.ts`.
+8. **Pagar:** `POST /orgs/<id>/billing/checkout { "planCode": "monthly" }` → abrir la URL → tarjeta `4242 4242 4242 4242`, cualquier fecha
+   futura, cualquier CVC → Stripe vuelve a `/app/billing/return?session_id=…` (la página es de T16; basta con copiar el `session_id`).
+   `stripe listen` muestra `checkout.session.completed` → 200 `applied`. `GET /orgs/<id>` → `paidAccess: true`.
+9. **Vuelta:** `POST /orgs/<id>/billing/sync { "sessionId": "cs_test_…" }` → `OrgView` activo (idempotente).
+10. **Portal:** `POST /orgs/<id>/billing/portal` → abrir la URL → cancelar al final del periodo → el webhook deja
+    `GET /orgs/<id>/billing` con `cancelAtPeriodEnd: true`.
+11. **Renovaciones y fallos:** test clocks de Stripe (§11) sobre un cliente de prueba; `stripe trigger` sirve para ver la firma y el 200,
+    pero sus objetos no llevan `org_id` y acaban en `unknown_org`.
+12. **Reconciliación:** sin programar todavía; para probarla, llamar a `reconcileBilling()` de `compose` desde un script o un test manual.
+
+### 18.9 Pendiente
+
+- **T16** (front): `/app/billing` real con `GET /orgs/:id/billing`, "Pay" y "Manage subscription", y la página `/app/billing/return` con
+  `sync` y la espera de §6.3.
+- **T18:** contratos 0.5.0 con `EnrollRequest`, `EnrollResponse`, `BillingView` y `BillingSyncRequest` (y `emailSent` y `DebugModeResponse`).
+- ~~**T19:** `/__debug/mode` con `webapp` y `billing`; panel y franja.~~ Hecha (§20).
+- ~~La prueba real en modo test~~: hecha el 2026-11-20 (§18.10). Queda la suite de conformidad contra Supabase local en cuanto Docker
+  vuelva, y las decisiones que abrió esa prueba (§18.10.4).
+- ~~Programar la reconciliación diaria y las alarmas de los logs `[billing]` (T26)~~: hecho en `feat/billing-ops` (§21). Queda encontrar la
+  organización de una disputa leyendo el cargo.
+- ~~El remitente de SES (`RealWebappAdapters.sesSendEmail`), sin el cual producción con la webapp encendida no arranca.~~ Ya no
+  bloquea: producción manda con Resend (§16.4); el remitente de SES solo hace falta si se vuelve a SES.
+
+### 18.10 Primera prueba real en modo test (2026-11-20)
+
+La de §18.8, hecha de punta a punta con Stripe en **modo test** y el proyecto de Supabase compartido de `.env.local` ("Arca-base", el
+de producción, que Jesús eligió usar para desarrollo; los datos de prueba se borran después). Sin front: un script de scratch (no
+versionado) monta el back con `compose()` en `live-debug`, `WEBAPP_PROVIDERS=real`, el repositorio, la auth JWT y el admin de Supabase
+reales, el `StripeBillingProvider` real con la clave restringida `rk_test_…`, correo en memoria y **fuentes de scan simuladas** (sin
+Apify ni OpenAI: se cargó el entorno como `live` con claves ficticias y después se cambió `sourceMode` a `mock`). La CLI de Stripe
+1.55.8 hizo `stripe listen --latest --events <los de §18.8> --forward-to http://127.0.0.1:8080/billing/webhook`; su `whsec_` pasó al
+proceso de la API sin imprimirse. La sesión de Supabase se sacó con el admin de Auth (`generateLink` + `verifyOtp`, sin correo: el SMTP
+del plan gratuito no manda a direcciones arbitrarias), con emails `e2e-<marca de tiempo>@arca.example`. El pago, con la tarjeta de
+prueba `4242 4242 4242 4242` en la página de Checkout de test de Stripe, abierta con Playwright sin cabeza.
+
+#### 18.10.1 Qué se hizo y qué pasó
+
+| Paso | Resultado |
+|---|---|
+| 1. `npm run stripe:catalog` (ensayo) y `-- --apply` | **Bien.** Product `arca`, `price_1Udm71…` (`arca_monthly`, 499 USD/mes) y `price_1Udm72…` (`arca_annual`, 4.990 USD/año); `plans` con sus ids. Una segunda pasada no crea nada |
+| 2. Configuración del portal (API, no el panel) | **Bien, con un ajuste.** `bpc_1Udm8M…`, `is_default: true` (la primera configuración de la cuenta queda por defecto). Stripe **no deja** activar el cambio de plan sin "actualizar método de pago", así que va encendido; cancelar al final del periodo y cambio entre los dos prices como §6.4; historial de facturas y datos del cliente, apagados en esta prueba |
+| 3. API + `stripe listen` | **Bien.** Línea de arranque `webapp=real stripe=test email=memory` |
+| 4. Scan simulado (`robust.arca.example`) → `POST /claims` → `POST /auth/enroll` → sesión → `POST /orgs` | **Bien.** 201, `pending_payment`, `paidAccess: false` |
+| 5. `POST /orgs/:id/billing/checkout` | **Falló** la primera vez: 500 (§18.10.2). Tras el arreglo: 200; un segundo clic devuelve la misma URL y no crea otra sesión |
+| 5. Pagar con 4242 | **Bien.** `checkout.session.completed`, `invoice.paid` y `customer.subscription.created` → 200 `applied`; `GET /orgs/:id` → `active`, `paidAccess: true`; auditoría `billing.checkout_started`, `billing.event_applied` ×3 y `billing.invoice_paid` (49900 USD) |
+| 5. `POST /orgs/:id/billing/sync` ×2 con el `cs_test_…` | **Bien.** Las dos 200 `active`; la primera audita `checkout.sync` una vez, la segunda es duplicado |
+| 6. Portal → cancelar al final del periodo | **Bien.** `customer.subscription.updated` → `applied`; `GET /orgs/:id/billing` → `cancelAtPeriodEnd: true` (sigue `active`). "Don't cancel subscription" lo devuelve a `false` |
+| 7. Entrega duplicada | **Bien, por otro camino.** `stripe events resend` lo rechazó la clave restringida (le falta `webhook_write`, que no se concedió). Se leyeron los eventos reales con `events.retrieve`, se firmaron con el mismo secreto de `stripe listen` y se entregaron dos veces cada uno (`checkout.session.completed`, `invoice.paid`, `customer.subscription.updated`): seis 200 `duplicate`, ninguna auditoría nueva. Una firma con otro secreto → 400 `invalid_signature` |
+| 8. Test clock: renovación | **Bien.** Segunda organización con su cliente en un test clock (fila de `billing_customers` escrita antes del primer checkout); pagar, adelantar 31 días → `invoice.paid` y `customer.subscription.updated` `applied`, fin de periodo 2027-01-20 |
+| 8. Test clock: pago fallido | **Bien.** Tarjeta `4000 0000 0000 0341` añadida desde el portal como predeterminada (y quitado por API el método que Checkout fija en la suscripción), adelantar 31 días → `invoice.payment_failed` `applied` → `past_due`, `paidAccess: true` (DN-10 §4.5) |
+| 12. `reconcileBilling()` | **Bien.** `{ checked: 2, mismatched: 0, applied: 0, failed: 0 }` |
+
+Ningún webhook respondió otra cosa que 200; ningún `failed` en los logs `[billing]`.
+
+#### 18.10.2 Lo que se rompió y su arreglo
+
+**Managed Payments.** La cuenta de Stripe tiene **Managed Payments** (Stripe como *merchant of record*) activado por defecto, y con él
+Stripe rechaza `allowed_payment_method_types` (400: "cannot be used with Managed Payments"). El back lo trataba como error de la petición
+y `POST /billing/checkout` respondía 500. Arreglo (commit `7a45af9`): la sesión pasa `managed_payments: { enabled: false }`, porque ARCA
+es quien vende y los impuestos siguen siendo F3; así no depende del valor por defecto de la cuenta. El Stripe falso de las pruebas ahora
+se comporta como esa cuenta (rechaza la lista de métodos sin la bandera) y el test de parámetros exactos espera la bandera; los dos
+ficheros fallaron primero (19 tests) y pasan con el arreglo.
+
+#### 18.10.3 Pruebas
+
+`npm run typecheck` limpio. `npm test`: **1631 pasan, 53 se saltan**, ninguno falla (87 ficheros, 2 saltados), en dos pasadas seguidas.
+Una primera pasada dio un fallo suelto que no se repitió en las dos siguientes (no se identificó el fichero).
+
+#### 18.10.4 Lo que la prueba deja para decidir
+
+1. **Un solo modo de Stripe por base.** `plans.stripe_price_id` y `stripe_product_id` guardan **un** id por plan, sin modo. La base
+   compartida tiene ahora los de **test**. Producción con `WEBAPP_ENABLED=true` y una clave live pasaría la guarda de arranque (solo mira
+   que haya id) y cada checkout fallaría con "No such price" (500). En el lanzamiento (T23), `npm run stripe:catalog -- --apply
+   --allow-live` contra esa base crea el catálogo live y **sobrescribe** los ids de test (no archiva los de test, que no ve con la clave
+   live); desde ese momento el `live-debug` real sobre la misma base deja de poder cobrar en test. Opciones: (a) la base de desarrollo
+   aparte de §5.2 (`Arca-dev`), que es lo que la nota pedía; (b) columnas por modo (`stripe_price_id_test`/`_live`) o resolver el precio
+   por `lookup_key` en el modo de la clave; (c) como mínimo, que la guarda de arranque compruebe en Stripe que cada `stripe_price_id`
+   existe en el modo de la clave. `subscriptions`, `billing_customers` y los eventos ya llevan `livemode`. **Resuelto con (b) y (c)
+   en `feat/billing-ops` (§21)**: columnas live junto a las de test y comprobación en Stripe al arrancar.
+2. **Adaptive Pricing está activado en la cuenta.** Desde Colombia, Checkout ofreció pagar en **COP** (1.777.400,27 COP al mes, con el
+   cambio de Stripe) y lo dejó seleccionado; la sesión y la factura quedan en USD (49900) y el portal dice "Charged in COP". Para despachos
+   de EE. UU. no cambia nada, pero es una decisión del founder: dejarlo, apagarlo en el panel o pasar `adaptive_pricing: { enabled: false }`
+   en la sesión.
+3. **Managed Payments** (§18.10.2) es una alternativa real a F3 (Stripe cobraría y declararía los impuestos como vendedor). El back lo
+   apaga explícitamente hasta que el founder decida; si se elige, cambia el checkout (sin lista de métodos) y quién factura.
+4. **Permisos de la clave restringida.** Para esta prueba hizo falta escritura en Products, Prices y Customer portal (catálogo y portal) y
+   en test clocks; `stripe events resend` necesita además `webhook_write`, que no hace falta en producción. §6.7 sigue valiendo para la
+   clave live.
+5. **Configuración del portal:** Stripe obliga a "actualizar método de pago" si se permite cambiar de plan. La de test se creó por API
+   (`bpc_1Udm8M…`); la de live (T23) puede hacerse igual o en el panel.
+
+#### 18.10.5 Datos de prueba creados (para borrarlos)
+
+Supabase (proyecto compartido): organizaciones `edd4b058-abea-4219-adc8-bc2650bcb794` y `c72deeee-824a-4754-b18b-3401dafad29a`; usuarios de
+Auth `fb1c187f-7c91-4f35-861f-a9d64139258f` y `c5b7ff6f-2cc2-4b66-ad6a-1db2fbaf55c6` (`e2e-1795159422259@arca.example`,
+`e2e-1795160146820@arca.example`); scans `sc_e2b604fac1ff4f4ea229ddecdb30d70c`, `sc_19dc0dc49e454a2d806cc3a997405391` y
+`sc_d0d3ea6837f14ea09e20a02a0a755b5f`; con sus perfiles, membresías, `org_analyses`, `claim_tickets`, `subscriptions`, `billing_customers`,
+`checkout_sessions`, auditoría y 15 filas de `stripe_events`. Los ids de Stripe de `plans` son los de test (§18.10.4, punto 1).
+
+Stripe (test): product `arca` y sus dos prices; portal `bpc_1Udm8MEw83ixrW1LTNwzfS19`; clientes `cus_Vf6NHrLxDbvnKT` y `cus_Vf6ZTtKE5OAf2p`
+(este en el test clock `clock_1UdmMYEw83ixrW1LKCI0DigN`); suscripciones `sub_1UdmEFEw83ixrW1LgeLdQiqU` (activa, renueva en test el
+2026-12-20) y `sub_1UdmN3Ew83ixrW1LtZgR4eHH` (`past_due`, en el reloj); checkouts `cs_test_a0wHS6…` y `cs_test_a0OjeA…`.
+
+El borrado está preparado y **sin ejecutar** en dos scripts de scratch (no versionados): un SQL para el editor de Supabase, en una
+transacción que comprueba los ids y emails antes de borrar y apaga las guardas de solo-añadir y de último owner solo dentro de ella, y un
+script de Stripe en ensayo por defecto (`--apply` cancela, borra el cliente y el test clock; `--catalog` archiva además el catálogo y
+desactiva el portal).
+
+## 19. Pre-checkout con Checkout incrustado (2026-11-20)
+
+Diseño aprobado por el usuario (maqueta de cinco pasos): antes de pagar, la persona dice quién es y qué despacho paga, verifica su
+email con el código y paga dentro de la página de ARCA, con Stripe ya relleno con lo que dio. Rama `feat/real-accounts` en los dos
+repos. Producción sigue en 501 (`WEBAPP_ENABLED=false`). La migración nueva la aplicó el coordinador al proyecto compartido tras
+revisarla (el usuario autorizó aplicar las migraciones de DN-13); con ella se hizo el recorrido real de §19.9.
+
+### 19.1 Flujo
+
+| Paso | Front | Back |
+|---|---|---|
+| 1. You | Email del reclamo bloqueado, nombre, rol (Managing partner / Partner / Office manager / Other), teléfono opcional | — |
+| 2. Your firm | Razón social, EIN opcional, dirección de facturación (calle, ciudad, estado, ZIP), abogados (1 / 2–5 / 6–20 / 21–50 / 50+), estados donde ejerce | — |
+| 3. Plan | Planes de `GET /plans` | — |
+| 4. Verify email | `POST /auth/enroll` + código (§17.8); con el código, `POST /orgs` con el perfil | `CreateOrgWithProfileRequest`; organización, owner, análisis y perfil en una transacción |
+| 5. Payment | Checkout incrustado (`@stripe/react-stripe-js` `EmbeddedCheckoutProvider`/`EmbeddedCheckout`) | `POST /orgs/:id/billing/checkout { planCode, uiMode: 'embedded' }` → `{ clientSecret, sessionId }` |
+
+Nada se escribe antes del código: los pasos 1–3 viven en la pestaña. Quien abandona en el paso 5 ya tiene cuenta y organización
+(`pending_payment`) y termina el pago en `/app/billing`, con el mismo Checkout incrustado. Al pagar, Stripe lleva a
+`${APP_BASE_URL}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, que llama a `POST /orgs/:id/billing/sync` (§6.3) y entra en
+`/app`. Los modos simulados muestran los mismos cuatro primeros pasos y pagan en el checkout simulado, sin Stripe.js.
+
+### 19.2 Ficheros
+
+| Fichero | Qué |
+|---|---|
+| `supabase/migrations/20261121000000_org_profiles.sql` | **nueva**: tabla `org_profiles`, función `create_organization_with_profile`, `checkout_sessions.ui_mode` (§19.3) |
+| `packages/contracts/src/webapp.ts` | Exportaciones nuevas (§19.5) |
+| `apps/api/src/webapp/types.ts` | `OrgProfileRecord`, `CheckoutUiMode`; `CheckoutSessionRecord` con `ui_mode` y `url` nulo; `createOrganization(…, profile?)`, `getOrgProfile` |
+| `apps/api/src/webapp/in-memory.ts`, `supabase.ts` | El perfil en la misma escritura atómica; con perfil, la RPC nueva; sin él, `create_organization` como antes |
+| `apps/api/src/webapp/billing.ts` | `CustomerDetails`; `updateCustomer`, `createEmbeddedCheckout`; `ProviderCheckout` con `uiMode` y `clientSecret`; el simulado los implementa |
+| `apps/api/src/webapp/stripe.ts` | Cliente relleno con el perfil y el EIN como `us_ein`; `updateCustomer`; sesión incrustada; parámetros comunes en `openSession` |
+| `apps/api/src/webapp/service.ts` | `createOrganization` guarda el perfil; `embeddedCheckout`; una sola regla de sesión abierta para los dos tipos (`openCheckout`); `billingCustomer` crea o actualiza el cliente con el perfil |
+| `apps/api/src/webapp/routes.ts` | `POST /orgs` lee `CreateOrgWithProfileRequest`; el checkout lee `CheckoutSessionRequest` |
+
+### 19.3 Migración `20261121000000_org_profiles.sql`
+
+Aditiva, sin tocar ninguna tabla de scans:
+
+- **`org_profiles`** (una fila por organización, `org_id` FK a `organizations`): `contact_name`, `contact_role`, `contact_phone`,
+  `legal_name`, `ein` (`^\d{2}-\d{7}$`), `address_line1`, `address_city`, `address_state` (dos mayúsculas), `address_postal_code`
+  (ZIP o ZIP+4), `address_country` (siempre `US`), `attorney_range`, `practice_states` (`text[]`, de 1 a 51, sin nulos),
+  `created_by`, `created_at`, `updated_at`. Cada columna con su `check`, como el contrato.
+- **`create_organization_with_profile(p_org, p_owner, p_analysis, p_profile)`**: llama a `create_organization` (mismos errores) y
+  después inserta el perfil, todo en la misma transacción; un perfil de otra organización es `webapp_invalid:organization`.
+  `security definer`, `search_path` fijo, solo `service_role`.
+- **`checkout_sessions`**: columna `ui_mode` (`hosted` por defecto, o `embedded`), `url` pasa a admitir nulo y una restricción
+  `checkout_sessions_url_of_hosted` exige `url` en las alojadas. Las filas que ya existen quedan `hosted` con su URL (probado). Es
+  el único cambio a una tabla existente, y relaja una restricción sin perder datos.
+- RLS encendida sin políticas, sin permisos para `anon` ni `authenticated`, como §5.5.
+
+### 19.4 Stripe
+
+- **`ui_mode: 'embedded_page'`**, no `'embedded'`: la versión fijada (`2026-10-28.endive`) renombró los modos (`hosted_page`,
+  `embedded_page`, `elements`). Sin `success_url` ni `cancel_url` (Stripe los rechaza en una sesión incrustada); `return_url` con
+  `{CHECKOUT_SESSION_ID}`; `redirect_on_completion` por defecto (`always`). El resto, igual que la alojada: solo tarjeta,
+  `managed_payments` y `adaptive_pricing` apagados, `billing_address_collection: 'required'`, `customer_update` `auto`, una hora.
+- **Clave de idempotencia** propia: `checkout:<org>:<plan>:embedded:<minuto>[:<anterior>]`, para que una alojada y una incrustada del
+  mismo minuto no se confundan. La de la alojada no cambia.
+- **El secreto del cliente no se guarda.** Al reutilizar una sesión abierta se vuelve a leer en Stripe (`checkout.sessions.retrieve`
+  lo devuelve en las incrustadas); si no viene, se expira y se abre otra.
+- **Una sesión abierta por organización, de cualquier tipo.** Pedir la otra (o otro plan) expira la abierta antes (§18.4 punto 4).
+- **Cliente relleno**: `name` = razón social, `email` = el de quien paga, `phone`, `address` (país `US`) y el EIN con `tax_id_data`
+  `us_ein`. Si la organización ya tenía cliente (un intento anterior), `updateCustomer` lo pone al día antes de la sesión: actualiza
+  los campos, lee sus tax ids, quita un `us_ein` distinto y crea el que falte (clave `tax_id:<cliente>:us_ein:<ein>`). Sin perfil, el
+  cliente de siempre (nombre de la organización y email).
+- **Dirección: no se pide dos veces.** Con un cliente hecho desde el perfil, la sesión va con `billing_address_collection: 'auto'`:
+  Stripe usa la dirección del cliente y pide solo lo que la tarjeta necesita (titular, país y ZIP). Sin perfil sigue en `'required'`
+  (§6.2). Lo decide `prefilled` en `createCheckout`/`createEmbeddedCheckout`.
+- **Sin Link**: `wallet_options: { link: { display: 'never' } }` en toda sesión. Link ofrecía su pago por banco al lado de la tarjeta,
+  y la regla es solo tarjeta (§6.2, F5).
+- `tax_id_collection` sigue apagado (F3): el EIN va al cliente porque el despacho lo dio, no porque Checkout lo pida.
+
+### 19.5 Contratos (sin publicar, salen con 0.5.0)
+
+Exportaciones nuevas de `webapp.ts`; ningún esquema que el front parsea con 0.4.0 cambió:
+
+- `ORG_CONTACT_ROLES`, `ATTORNEY_RANGES`, `US_STATES` (50 estados y DC) y sus tipos.
+- `OrgProfileInput`: estricto; recorta textos; teléfono y EIN opcionales (en blanco = `null`); teléfono de 10 a 15 dígitos y como
+  mucho 20 caracteres (el límite de Stripe); EIN de 9 dígitos normalizado a `12-3456789`; dirección de EE. UU.; estados sin repetir.
+- `CreateOrgWithProfileRequest` = `CreateOrgRequest` + `profile` opcional (`CreateOrgRequest` no cambia).
+- `CheckoutSessionRequest` = `{ planCode, uiMode?: 'hosted' | 'embedded' }`; `EmbeddedCheckoutResponse` = `{ clientSecret, sessionId }`.
+
+El front las copia en `lib/app/checkout-contract.ts` hasta 0.5.0.
+
+### 19.6 Desviaciones respecto a lo pedido
+
+1. `ui_mode` es `embedded_page` (§19.4).
+2. `checkout_sessions` cambia (columna nueva y `url` nulo): hacía falta para la regla de una sesión abierta con dos tipos.
+3. El perfil no entra en la auditoría (`org.created` sigue con nombre y scan): la leen todos los owners y admins.
+4. El remitente que nombra la pantalla del código (`no-reply@arcacover.com`, §4.9) solo es cierto con el SMTP propio (F11).
+5. `billing_address_collection` pasa a `'auto'` cuando el cliente tiene la dirección del perfil (§6.2 decía `'required'` siempre), y
+   Link se apaga en todas las sesiones. Los dos salieron del recorrido real (§19.9).
+6. **Stripe no rellena el titular ni el ZIP desde el cliente.** Checkout solo rellena (y bloquea) el email del Customer; el nombre y
+   la dirección de facturación solo los rellena desde una tarjeta guardada. Lo que el perfil ya da no se pide (la dirección), pero
+   el titular de la tarjeta y el ZIP los pide Stripe para verificar la tarjeta. Rellenarlos exigiría `ui_mode: 'elements'` (Checkout
+   con Elements, valores por defecto propios): queda como opción para el founder.
+
+### 19.7 Pruebas
+
+Escritas antes que el código; fallaron primero.
+
+| Fichero | Tests | Qué fija |
+|---|---|---|
+| `packages/contracts/tests/webapp.test.ts` | +6 | Listas, normalización, opcionales, 20 rechazos, compatibilidad de `CreateOrgRequest`, tipos de checkout |
+| `apps/api/tests/unit/stripe-billing.test.ts` | +3 | Cliente con perfil y `tax_id_data`; `updateCustomer` (una vez, sustituye un EIN viejo, 502 si Stripe cae); parámetros exactos de la sesión incrustada, clave de idempotencia, secreto, `checkoutState` |
+| `apps/api/tests/integration/embedded-checkout.test.ts` | 12 | `POST /orgs` con perfil normalizado y sin datos en la auditoría; sin perfil; 400 sin crear nada ni gastar el reclamo; cliente relleno y `us_ein`; `return_url`; misma sesión a dos clics; una abierta entre tipos; reanudar tras vencer con el mismo cliente actualizado; `sync` aplica el pago; sin perfil; 400/401/404; 502 sin guardar; proveedor simulado |
+| `apps/api/tests/integration/org-profiles-database.test.ts` | 5 | La RPC sobre PGlite, cada `check`, perfil de otra organización, `ui_mode` y su restricción, RLS y permisos, y la migración sobre filas existentes |
+| `apps/api/tests/conformance/webapp-repository.ts` | +1 y 1 ampliado (×3 destinos) | Perfil atómico con la organización; sesión incrustada sin URL |
+| `apps/api/tests/fixtures/stripe.ts` | — | Clientes con teléfono, dirección y tax ids; actualizar; tax ids; sesiones incrustadas con las reglas de Stripe (`return_url` sí, `success_url` no) |
+
+`npm run typecheck` limpio. `npm test`: **1659 pasan, 54 se saltan** (las suites contra un Supabase real, sin sus variables), ninguno
+falla (87 ficheros, 2 saltados).
+
+### 19.8 Pendiente
+
+- ~~Aplicar la migración y el recorrido real~~: hechos (§19.9). La clave `rk_test_` escribe tax ids (lo comprobó el coordinador).
+- Decidir si Checkout con Elements compensa para rellenar también el titular y el ZIP (§19.6, punto 6).
+- El nombre comercial de la cuenta de Stripe de test sale en el texto legal del formulario ("Entorno de prueba de Arca", en
+  español): se cambia en el panel de Stripe (Settings → Business), no en el código.
+- Publicar 0.5.0 (T18) con estas exportaciones.
+
+### 19.9 Recorrido real en modo test (2026-11-20)
+
+Con la migración aplicada. Back de scratch (no versionado) en `127.0.0.1:8090`: `compose()` en `live-debug`, `WEBAPP_PROVIDERS=real`,
+el repositorio, la auth JWT y el admin de Supabase del proyecto compartido, el `StripeBillingProvider` con la clave `rk_test_`, correo en
+memoria y **fuentes de scan simuladas** (sin Apify ni OpenAI). `stripe listen` (CLI 1.55.8, clave por `STRIPE_API_KEY`, nunca impresa)
+reenviando los eventos de §18.8 a ese puerto; su `whsec_` pasó al proceso sin imprimirse. Front con `next dev --webpack` en
+`localhost:3010`, `live-debug` y `NEXT_PUBLIC_WEBAPP_ENABLED=true`. Playwright sin cabeza; la petición del front a `/auth/v1/otp` se
+respondió en el propio script (**ningún correo enviado**) y el código salió de `auth.admin.generateLink`. Todos los logs pasan por un
+redactor (`sk_/rk_/pk_`, `whsec_`, `acct_`, `sb_secret_`, JWT).
+
+| Paso | Resultado |
+|---|---|
+| `/quote` → scan simulado de `robust.arca.example` → assessment (auto-respuesta del panel) → resultados | **Bien.** Tarjeta "Keep E2E…'s results" con 71 / FORTIFIED, 4 pasos y el precio de la API |
+| "Activate your account" → pasos 1–3 | **Bien.** Email bloqueado al del scan; perfil completo; plan Monthly |
+| Paso 4: `POST /auth/enroll` real, código del admin de Auth en las seis casillas | **Bien.** Sesión de Supabase; `POST /orgs` con el perfil → 201 |
+| Paso 5: Checkout incrustado | **Primera vez mal** (abajo); tras el arreglo, bien: email del cliente relleno y bloqueado, sin dirección, solo tarjeta |
+| Cliente de Stripe | **Bien.** Razón social, email, teléfono, dirección (100 Main St, Miami, FL 33101, US) y `us_ein 12-3456789` |
+| Pago con 4242 | **Bien.** Stripe vuelve a `/app/billing/return?session_id=cs_test_…`, `sync` → `active`, `/app?paid=1` ("Payment received. Your organization is active.") |
+| Webhooks | `checkout.session.completed`, `customer.subscription.created`, `invoice.paid` procesados sin error (más el `checkout.sync`) |
+| Base | `organizations.billing_status = active`; `org_profiles` con todo el perfil; `subscriptions` activa; `checkout_sessions` `embedded`, `url` nulo, `complete`; auditoría `org.created`, `billing.checkout_started`, `billing.event_applied` ×4, `billing.invoice_paid` |
+| Abandono y reanudación (móvil, 390×844) | **Bien.** Con el Checkout abierto en el paso 5 se va a `/app` → el paywall lleva a `/app/billing` → "Pay with Monthly" abre **la misma sesión** (mismo `cs_test_…`, el secreto se volvió a leer en Stripe) → 4242 → `/app` activo |
+| Fuera de la máquina | Solo el proyecto de Supabase y los dominios de Stripe; ningún host bloqueado, ningún error de página |
+
+**Lo que se rompió y su arreglo** (commit `4fc2040`, con los tests primero): (1) Checkout pedía la dirección de facturación entera,
+que el cliente ya tenía, y no dejaba pagar sin ella; (2) ofrecía Link y su pago por banco ("Bank — $5 back") junto a la tarjeta. Ahora
+`billing_address_collection: 'auto'` con perfil y `wallet_options.link.display: 'never'` (§19.4). Tras el arreglo, los campos visibles
+del formulario son número, caducidad, CVC, titular, país y ZIP.
+
+**Pruebas:** `npm run typecheck` limpio; `npm test` 1658 pasan, 54 se saltan, 1 falla por tiempo (`infra/aws`, sola pasa 7 de 7).
+
+**Datos creados** (se conservan para la demo; la lista completa con su nota, en el scratch del recorrido, `created.tsv`):
+
+- Supabase: organizaciones `fb72f0c4-2e4e-44c1-90a5-b66237ca56ed` y `3cf4824c-e39c-42fe-a39c-266c70343e00` (pagadas, con perfil) y
+  `a309b508-7678-4b33-903b-e652b0ae5c8e` y `916b4755-b88d-47b6-8cdf-8967b52d9026` (dos intentos cortados por el fallo, `pending_payment`);
+  usuarios de Auth `80f067cb-9396-4569-a85a-f9d1dbd66375`, `a2fb3ba0-b9c9-4b94-b06d-538d9c45a58d`, `789867dc-a6cd-4917-9cd9-ffa296f4af1a`
+  y `ab5104d5-70ab-422b-99c8-99fba048d814` (`e2e-1795190378086`, `…455708`, `…811171` y `…912801@arca.example`); scans
+  `sc_e7e12a5958b84d6f902c5bc4324f48ea`, `sc_5ab466b5132a4f088270c5fedc1240ef`, `sc_e309ce2c22764337a875af4a3d03e087` y
+  `sc_8ca9e74fa93e4e3ab2164b6b8c069629`, con sus assessments, perfiles, membresías, `org_profiles`, `claim_tickets`, `billing_customers`,
+  `checkout_sessions`, `subscriptions`, auditoría y 8 filas de `stripe_events`.
+- Stripe (test): clientes `cus_VfEiY9xU9G0JR9`, `cus_VfEjKmYd1kdRjz`, `cus_VfEpAGaKouF2T5` y `cus_VfEqLeQUb06Y0g` (los cuatro con
+  `us_ein`); suscripciones `sub_1UduLeEw83ixrW1L5oRinyBM` y `sub_1UduNUEw83ixrW1LF2TG39GG` (activas, renuevan el 2026-12-20); sesiones
+  `cs_test_a0KJ8ijs…` y `cs_test_a0RoXkzG…` (pagadas) y `cs_test_a0cyCIgr…` y `cs_test_a0Av2ear…` (abiertas, vencen a la hora).
+
+## 20. T19: `/__debug/mode` dice qué webapp hay (2026-11-20)
+
+Rama `feat/t19-debug-mode` en los dos repos (sale de `feat/real-accounts`). Producción no cambia: sigue sin construir las
+herramientas de debug y `/__debug/mode` da 404 (con la webapp apagada y encendida; test nuevo para `GET` con `WEBAPP_ENABLED=true`).
+
+- **Contrato** (`packages/contracts/src/debug.ts`, sale con 0.5.0, sin publicar ni etiquetar): `DebugModeResponse` gana dos campos
+  obligatorios, `webapp: 'simulated' | 'real'` y `billing: 'simulated' | 'test'`, como pedía §7.6. **No hay `live`:** una clave live
+  detiene cualquier modo de debug al arrancar (§16.1), así que el contrato de debug no puede ni decirlo. Solo la palabra del modo,
+  nunca la clave ni su prefijo.
+- **Back** (`compose.ts`, `debugWebapp`): `mock` y `live-debug` simulado → `simulated`/`simulated`; `live-debug` con
+  `WEBAPP_PROVIDERS=real` → `real`/`test`, leído de `env.webapp` y `env.stripeMode`. Si un `stripeMode` distinto de `test` llegara
+  a un modo de debug (no puede, por la guarda de `loadEnv`), el arranque se niega en vez de describirlo.
+- **Front:** la franja y el panel leen los dos campos del back, no la variable. Franja: `MOCK · no real APIs · in-memory data`
+  (igual), `LIVE DEBUG · real scans · simulated accounts & billing` (igual) y `LIVE DEBUG · real scans · real accounts · Stripe test`
+  (nueva, 53 caracteres, una línea a 390 px). Sin "(Arca-dev)" de §8.4: el back no sabe a qué proyecto apunta su URL (§3.2).
+  Si las cuentas del build (`NEXT_PUBLIC_WEBAPP_ENABLED`) y las del back no coinciden, la franja dice
+  `ACCOUNTS MISMATCH · front=real, back=simulated` (o al revés) con el aspecto de un modo desalineado: el back rechaza los tokens
+  del otro tipo y nadie podría entrar. El panel gana la fila "Webapp": `Webapp: simulated · billing simulated` con una línea sobre
+  la memoria, o `Webapp: real · Stripe test` con la tarjeta 4242, el enlace a las tarjetas de test de Stripe, el enlace a
+  `stripe listen` y la orden `stripe listen --forward-to <API>/billing/webhook`; en rojo, el desacuerdo y qué variable cambiar.
+  El login y el pago simulados del panel ya solo existían en `mock`, así que no hubo nada que esconder en `live-debug` real.
+- **Front sin 0.5.0:** el esquema de 0.4.0 es estricto y llamaría "otra forma" a la respuesta nueva, así que el front la lee con
+  `lib/debug/mode-contract.ts` (los dos campos a mano, el resto con el esquema de 0.4.0), como `enroll-contract.ts`. Con 0.5.0 pasa
+  a reexportar `DebugModeResponse`. Un front de antes de este cambio ve a un back nuevo como `MODE MISMATCH · … back unreachable or
+  production`: solo afecta a los modos de debug en local.
+- **Pruebas** (escritas antes y vistas fallar): back, `packages/contracts/tests/debug.test.ts` (+2) y `compose.test.ts` (los cinco
+  casos de `/__debug/mode` con los campos, `live-debug` real con `real`/`test` y sin secretos ni prefijos en el cuerpo, producción
+  encendida en 404, y la negativa a describir un modo live); front, `mode-contract`, `mode-check`, `ModeBanner`, `StatePanel`,
+  `DebugRoot` y los marcadores nuevos del chequeo de fugas (`ACCOUNTS MISMATCH`, la etiqueta real y `stripe listen --forward-to`).
+  `npm run typecheck` limpio; `npm test` 1679 pasan y 54 se saltan (`infra/aws`, que necesita `npm ci` en `infra/aws`, pasa 7 de 7).
+- **Visto en el navegador** (Chromium sin cabeza, back en `mock` en el 8091 y front en el 3011): franja y fila "Webapp" en `mock`.
+  Los estados reales se vieron con un stub local que solo responde `/__debug/mode` con la forma de `live-debug` real (no había claves
+  de Stripe ni de Supabase en el worktree): franja real y franja de desacuerdo, de 24 px en 1280 y en 390.
+- **Pendiente:** publicar 0.5.0 (T18) y cambiar `mode-contract.ts` por la reexportación; el buzón en memoria (§16.2) sigue sin ruta
+  ni contrato.
+## 21. Catálogo de Stripe por modo y operación del cobro: T26 (2026-11-20)
+
+Rama `feat/billing-ops`, creada desde `feat/real-accounts`, sin publicar ni fusionar. Resuelve el punto 1 de §18.10.4 (un solo
+modo de Stripe por base) y hace T26 (§9.5): la reconciliación diaria programada, los logs del back en CloudWatch y sus alarmas.
+**No se aplicó ninguna migración a una base real, no se ejecutó ningún comando de AWS que cree o cambie recursos** (solo
+`cdk synth` y los tests de `infra/aws`) y no se usó ninguna clave de Stripe: todo corre contra el Stripe falso de las pruebas.
+
+### 21.1 Catálogo por modo (test y live en la misma base)
+
+El proyecto "Arca-base" lo usan a la vez el desarrollo local (clave de test) y producción (clave live en el lanzamiento). Un id de
+Price o de Product pertenece a un modo, así que cada plan guarda los dos:
+
+| Modo de la clave | Product | Price |
+|---|---|---|
+| test (`sk_test_`/`rk_test_`) | `plans.stripe_product_id` | `plans.stripe_price_id` |
+| live (`sk_live_`/`rk_live_`) | `plans.stripe_live_product_id` | `plans.stripe_live_price_id` |
+
+Los ids que hay hoy (los que escribió `npm run stripe:catalog -- --apply` con la `rk_test_`) **se quedan donde están** como el par
+de test. **[mía]** Se eligió no renombrar ni añadir un par `stripe_test_*`: así la migración es solo aditiva y el código de
+`feat/real-accounts` que aún corre contra la base compartida sigue leyendo y escribiendo los ids de test sin cambios. El coste es
+que el nombre del par de test no dice "test"; lo dicen los comentarios de columna de la migración y la función
+`catalogIdsOf(plan, modo)` de `apps/api/src/webapp/plans.ts`, que es la única forma en que el código los lee.
+
+Quién usa el par del modo de la clave (`env.stripeMode`, o `catalogModeOf(billing.mode)`; el proveedor simulado usa el de test):
+
+- **Repositorios** (en memoria y Supabase): `PlanRecord` lleva los cuatro campos; cada precio es único entre planes en su modo.
+- **`npm run stripe:catalog`**: lee y escribe solo el par de su modo; el otro ni se lee. Con `--allow-live` (T23) escribe el par live
+  y deja los ids de test. El informe nombra la columna (`plans.monthly.stripe_live_price_id written`).
+- **Checkout** (`service.ts`, `stripe.ts`): cobra el precio del modo; un plan sin precio en ese modo responde 409, aunque tenga el del
+  otro.
+- **Precio desde `/admin`**: crea el Price nuevo en la cuenta de la clave, archiva el anterior **de ese modo** y escribe ese par.
+- **Webhook y reconciliación** (`billing-events.ts`): el plan de una suscripción cuyo Price no lleva `plan_code` se busca por el
+  precio del modo de la clave.
+
+**Migración a aplicar: `supabase/migrations/20261122000000_plan_catalog_modes.sql`.** Añade `plans.stripe_live_product_id` y
+`plans.stripe_live_price_id` (`unique`), ambas nulas, y comentarios en las cuatro columnas. No borra, renombra ni reescribe nada, no
+toca ninguna tabla de scans, assessments ni otra de la webapp, y los permisos de `plans` no cambian (solo `service_role`). Probada en
+PGlite sobre las migraciones anteriores con ids de test ya escritos: quedan como test y el par live queda vacío. **Hay que aplicarla
+antes de correr este código contra la base**: el repositorio de Supabase lee las columnas nuevas y, sin ellas, `listPlans` falla.
+
+### 21.2 Comprobación al arrancar
+
+Con la webapp real (producción con `WEBAPP_ENABLED=true`, o `live-debug` con `WEBAPP_PROVIDERS=real`), `requireCatalogPrices`
+(`compose.ts`) mira cada plan activo:
+
+1. que tenga precio en el modo de la clave;
+2. que ese precio exista en la cuenta de Stripe de la clave, esté activo y su `livemode` sea el de la clave: **un `prices.retrieve`
+   por plan**, en paralelo, al arrancar. Sin escrituras.
+
+Si algo falla, **producción no arranca** y el mensaje nombra cada plan y su problema ("monthly has no live price
+(plans.stripe_live_price_id)", "its live price price_… does not exist in this Stripe account", "is archived", "is a test price",
+"Stripe could not be asked for …") y manda a `npm run stripe:catalog` y a `npm run stripe:catalog -- --apply --allow-live`.
+**`live-debug` avisa** (`[billing] the Stripe catalog of this test key is not ready: …`) y arranca, como antes. Un Stripe caído al
+arrancar también para producción **[mía]**: un precio que no se ha podido comprobar no se da por bueno; Docker reintenta el
+arranque (`restart: unless-stopped`) y la alarma `WebappStartRefused` (§21.4) lo avisa. Un plan inactivo no necesita precio. Con el
+proveedor simulado no se pregunta a nadie, pero los ids tienen que estar.
+
+### 21.3 Reconciliación diaria programada
+
+`apps/api/src/webapp/reconcile-schedule.ts`, llamado desde `server.ts` solo cuando `compose` devuelve `reconcileBilling` (webapp
+real): la primera pasada **5 minutos después de arrancar** y después **cada 24 horas**, contadas desde el final de la anterior, así
+dos pasadas nunca se solapan por mucho que tarde una. Una pasada que falla (rechazo o excepción) se registra y no llega al proceso;
+el temporizador no retiene el proceso (`unref`) y se para con `SIGTERM`. Una línea por pasada:
+
+- `[billing] reconcile done checked=<n> mismatched=<n> applied=<n> failed=<n> duration_ms=<n>`
+- `[billing] reconcile failed (<nombre del error>); next run in 24 h` (solo el nombre del error: un mensaje de Stripe puede citar
+  una clave enmascarada)
+
+La línea con los contadores que antes escribía `reconcile()` la escribe ahora el programador. Una suscripción que la reconciliación
+no puede leer se registra como `[billing] reconcile failed for subscription <id> (<error>)` (antes
+`reconcile of subscription <id> failed`), para que la misma alarma cubra los dos casos.
+
+### 21.4 Logs en CloudWatch y alarmas (T26)
+
+Hasta ahora los logs del contenedor se quedaban en el host (`json-file`) y las únicas alarmas eran las de estado del EC2. Con esta
+rama:
+
+- **Stack (`infra/aws`):** el grupo de logs `/arca/api` (tres meses), permiso del rol del host para escribir en él
+  (`logs:CreateLogStream`, `logs:PutLogEvents`) y consultarlo (`logs:DescribeLogStreams`), solo sobre ese grupo; filtros de métrica
+  en el espacio `ARCA/Billing`; una alarma por métrica (suma ≥ 1 en 5 minutos, sin datos = sin alarma) hacia un tema SNS **nuevo y
+  sin suscripciones** (`BillingAlertTopicArn`, salida del stack), aparte del tema `alerts` del host. Nada de facturación de AWS,
+  presupuestos ni costes.
+- **Host:** `deploy/compose.cloudwatch.yaml` cambia el log del contenedor `api` al driver `awslogs` (`mode: non-blocking`, búfer de
+  4 MB; Caddy sigue en `json-file`). `deploy/activate.sh` comprueba si el host llega al grupo (`aws logs describe-log-streams`) y solo
+  entonces pasa ese fichero a compose con `-f`; si no, lo quita y sigue como antes. Nunca se llama `compose.override.yaml`, así una
+  vuelta atrás a una imagen anterior no lo recoge. La región va en `.env.demo` (`ARCA_AWS_REGION`). `docker compose logs` sigue
+  funcionando.
+
+| Alarma (métrica) | Líneas que cuenta |
+|---|---|
+| `ReconcileFailed` | `[billing] reconcile failed …` (la pasada, o una suscripción) |
+| `ReconcileMismatch` | `[billing] reconcile mismatch …` |
+| `WebhookFailed` | `[billing] event … failed (…)` y `[billing] event … refused: livemode=…` |
+| `DuplicateSubscription` | `[billing] duplicate_subscription …` |
+| `Dispute` | `[billing] dispute …` |
+| `UnknownOrg` | `[billing] event … unknown_org` y `[billing] reconcile: subscription … names no organization …` (una disputa también, §18.4 punto 8) |
+| `CancelFailed` | `[billing] failed to cancel subscription …` |
+| `WebappStartRefused` | `The real webapp cannot start …` (§21.2) |
+
+Un test de `infra/aws` comprueba, con las líneas tal como las escribe el back, que cada una sube exactamente su métrica y que las
+normales (`reconcile done`, `event … applied`, `event … duplicate`) no suben ninguna. Coste aproximado: ocho alarmas estándar y
+ocho métricas personalizadas, unos pocos USD al mes, más la ingesta de logs (poca).
+
+### 21.5 Lo que no hace un `push` a `main`
+
+El workflow de despliegue solo se dispara con cambios en `apps/`, `packages/`, `deploy/` y compañía, **no en `infra/`**, y no ejecuta
+`cdk deploy`. Los cambios del stack necesitan, en este orden (§9 de `docs/deployment/AWS_DEMO_RUNBOOK.md`):
+
+1. **Un administrador** sube la versión nueva de la política `ArcaCdkExecution` (`infra/aws/cdk-execution-policy.json` permite ahora
+   `logs:*` sobre `/arca/api` y `logs:DescribeLogGroups`): `aws iam create-policy-version … --set-as-default`. Sin ella, el
+   `cdk deploy` falla al crear el grupo de logs.
+2. `cdk diff` y `cdk deploy` con `alertEmails` como siempre. No reemplaza el EC2 (no cambia el user data).
+3. El **siguiente** despliegue de la API (fusionar en `main`, o el workflow con el SHA ya desplegado) encuentra el grupo y empieza a
+   mandar los logs. Fusionar antes del `cdk deploy` no rompe nada: el despliegue dice "API logs: kept on the host".
+
+### 21.6 Pruebas
+
+Escritas antes que el código; fallaron primero (los 13 de la parte A, la prueba nueva de la reconciliación, el programador, los del
+stack y los del despliegue). El test de la parte A "con clave de test no toca el live" ya pasaba: fija lo que había.
+
+| Fichero | Qué fija |
+|---|---|
+| `apps/api/tests/integration/plan-catalog-modes-database.test.ts` (nuevo, 3) | La migración sobre el esquema anterior con ids de test: quedan como test, par live vacío; los dos modos conviven, únicos por modo, sin acceso para `anon`/`authenticated`; solo toca `public.plans`, sin `drop`/`rename`/`delete` |
+| `apps/api/tests/conformance/webapp-repository.ts` (+1, ×3 destinos) | Escribir un modo deja el otro; precio live único; limpiar con `null` |
+| `apps/api/tests/unit/stripe-catalog.test.ts` (+2) | Con clave live y `--allow-live` escribe el par live y deja los ids de test (idempotente); con clave de test no toca el live |
+| `apps/api/tests/unit/stripe-billing.test.ts` (+3) | Clave live: cobra el precio live, rechaza un plan solo con precio de test (alojado e incrustado), sustituye el precio live sin mandar el id de test a la cuenta live; `priceState` (activo, archivado, inexistente, Stripe caído, live) |
+| `apps/api/tests/integration/stripe-billing-flow.test.ts` (+4) | De punta a punta con clave live: checkout, 409 sin precio live, precio desde `/admin`; plan de una suscripción por el precio de su modo; la reconciliación cuenta como fallida una suscripción ilegible con la línea de la alarma y no escribe la línea resumen |
+| `apps/api/tests/integration/compose.test.ts` (1 reescrito, +3) | Producción sin precio en el modo de la clave no arranca, `live-debug` avisa; con el proveedor real sobre el Stripe falso: arranca leyendo una vez cada precio, se niega con un precio inexistente, archivado, de otro modo o con Stripe caído, y `live-debug` avisa sin imprimir claves |
+| `apps/api/tests/unit/reconcile-schedule.test.ts` (nuevo, 6) | 5 minutos y cada 24 h; la línea con contadores; sin solapes; fallos registrados por nombre y el calendario sigue; `stop`; `unref` |
+| `apps/api/tests/unit/deploy-logs.test.ts` (nuevo, 4) | El override (`!override`, solo `api`, `/arca/api`, no bloqueante); `compose.yaml` sigue en `json-file`; `activate.sh` lo pasa con `-f` solo si llega al grupo, nunca como `compose.override.yaml`; va en la imagen |
+| `infra/aws/lib/arca-demo-stack.test.ts` (+5) | Grupo y permisos del host solo sobre él; cada línea, su métrica; una alarma por métrica al tema sin suscripciones; la política de ejecución; nada de presupuestos ni alarmas de facturación de AWS |
+| Ajustados | `org-profiles-database` (ya no es la última migración), `webapp-database` y `webapp-service` (los campos nuevos del plan) |
+
+Además: `docker compose -f compose.yaml -f deploy/compose.cloudwatch.yaml config` (sin demonio) da el bloque `logging` sustituido
+entero, sin las opciones de `json-file`, y falla con un mensaje claro sin `ARCA_AWS_REGION`; `cdk synth --strict` limpio.
+
+`npm run typecheck` limpio. `npm test` completo: **1708 pasan, 55 se saltan** (las suites contra un Supabase real, sin sus
+variables), ninguno falla (90 ficheros, 2 saltados); el de `infra/aws` pasó en la misma pasada.
+
+### 21.7 Pendiente para el founder
+
+- **Aplicar la migración** `20261122000000_plan_catalog_modes.sql` a "Arca-base" tras revisarla (y no correr esta rama contra esa
+  base antes).
+- **Lanzamiento (T23):** con la clave `rk_live_`, `npm run stripe:catalog` (ensayo) y `npm run stripe:catalog -- --apply --allow-live`.
+  Escribe el par live y deja el de test; el `live-debug` real sobre la misma base sigue cobrando en test.
+- **AWS:** actualizar `ArcaCdkExecution` (administrador), `cdk deploy` y el siguiente despliegue de la API (§21.5).
+- **Suscribir un email** al tema `BillingAlertTopicArn` y confirmar el correo de AWS (consola de SNS o `aws sns subscribe` con un
+  perfil de administrador; `arca-deploy` no puede). Hasta entonces las alarmas saltan sin avisar a nadie.
+- Sigue pendiente encontrar la organización de una disputa leyendo el cargo (§18.4 punto 8): hasta entonces cada disputa sube
+  también `UnknownOrg`.

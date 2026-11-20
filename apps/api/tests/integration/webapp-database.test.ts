@@ -81,10 +81,14 @@ describe('PostgreSQL webapp schema (DN-10, DN-11)', () => {
   });
 
   it('seeds the example plans', async () => {
-    const plans = await db.query('select code,name,amount_cents,currency,"interval",active from public.plans order by code');
+    const plans = await db.query(`select code,name,amount_cents,currency,"interval",active,stripe_product_id,stripe_price_id,
+      stripe_live_product_id,stripe_live_price_id from public.plans order by code`);
+    // No Stripe price in either mode until npm run stripe:catalog writes it (DN-13 §6.1, §21).
     expect(plans.rows).toEqual([
-      { code: 'annual', name: 'Annual (example price)', amount_cents: 499_000, currency: 'usd', interval: 'year', active: true },
-      { code: 'monthly', name: 'Monthly (example price)', amount_cents: 49_900, currency: 'usd', interval: 'month', active: true },
+      { code: 'annual', name: 'Annual (example price)', amount_cents: 499_000, currency: 'usd', interval: 'year', active: true,
+        stripe_product_id: null, stripe_price_id: null, stripe_live_product_id: null, stripe_live_price_id: null },
+      { code: 'monthly', name: 'Monthly (example price)', amount_cents: 49_900, currency: 'usd', interval: 'month', active: true,
+        stripe_product_id: null, stripe_price_id: null, stripe_live_product_id: null, stripe_live_price_id: null },
     ]);
     // The in-memory repository seeds the same plans; the two must not drift.
     expect(plans.rows).toEqual([...DEFAULT_PLANS].sort((a, b) => a.code.localeCompare(b.code)));
@@ -441,9 +445,12 @@ describe('the role views migration over a DN-10 audit log', () => {
         { action: 'member.invited', actor_kind: 'member' }, { action: 'org.deletion_requested', actor_kind: 'member' },
         { action: 'org.deletion_rejected', actor_kind: 'platform' }, { action: 'org.deletion_requested', actor_kind: 'member' },
         { action: 'org.deletion_approved', actor_kind: 'platform' }, { action: 'plan.updated', actor_kind: 'platform' }]);
-      // The migration and the service agree on who alone writes each of these actions.
+      // The migration and the service agree on who alone writes each of these actions. The billing actions DN-13 added later were
+      // never written before this migration: the system writes them, always naming its kind.
+      const dn10 = new Set(written.map(([action]) => action));
       for (const [action, kind] of Object.entries(ACTOR_KIND_OF_ACTION)) {
-        expect(rows.filter((row) => row.action === action).map((row) => row.actor_kind), action).toEqual([kind]);
+        if (dn10.has(action)) expect(rows.filter((row) => row.action === action).map((row) => row.actor_kind), action).toEqual([kind]);
+        else expect([action.startsWith('billing.'), kind], action).toEqual([true, 'system']);
       }
 
       // The guard was off for the correction only.

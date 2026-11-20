@@ -36,6 +36,22 @@ const EnvSchema = z.object({
   APP_BASE_URL: z.preprocess(value => typeof value === 'string' && value.trim() === '' ? undefined : value,
     z.string().trim().url().refine(url => /^https?:\/\//i.test(url), 'APP_BASE_URL must be an http or https URL')
       .default('http://localhost:3000')),
+  // The private webapp (DN-13 §7.1). Production serves it only with WEBAPP_ENABLED=true, on the real providers; without it every
+  // webapp route answers 501. The debug modes always serve it: simulated by default, real only in live-debug with
+  // WEBAPP_PROVIDERS=real. Never a JWT secret: Supabase tokens verify against the project's JWKS, derived from SUPABASE_URL.
+  WEBAPP_ENABLED: z.preprocess(blankAsUnset, z.enum(['true', 'false']).default('false')),
+  WEBAPP_PROVIDERS: z.preprocess(blankAsUnset, z.enum(['simulated', 'real']).optional()),
+  // Stripe's mode comes from the key's prefix (DN-13 §6.7); StripeBillingProvider (webapp/stripe.ts) uses both with the real webapp.
+  STRIPE_SECRET_KEY: z.preprocess(blankAsUnset, z.string().trim().optional()),
+  STRIPE_WEBHOOK_SECRET: z.preprocess(blankAsUnset, z.string().trim().optional()),
+  // Lets production run on a test key, for a rehearsal on the host before the launch. It never lets a live key run elsewhere.
+  STRIPE_ALLOW_TEST_MODE: z.preprocess(blankAsUnset, z.enum(['true', 'false']).default('false')),
+  // How the back sends its own emails (invitations, DN-13 §4.6). memory keeps them in the process (the debug modes' default);
+  // resend sends through Resend's API (production's, F11), ses through Amazon SES (the alternative, and production's default).
+  EMAIL_PROVIDER: z.preprocess(blankAsUnset, z.enum(['memory', 'ses', 'resend']).optional()),
+  EMAIL_FROM: z.preprocess(blankAsUnset, z.string().trim().optional()),
+  // Resend's API key (re_…), read only with EMAIL_PROVIDER=resend. In production it lives in SSM, /arca/prod/RESEND_API_KEY.
+  RESEND_API_KEY: z.preprocess(blankAsUnset, z.string().trim().optional()),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
   // Actor runs in flight at once, across every scan. The account allows 32 jobs and 64 GB, and each
   // directory run takes 1 GB: 16 lets Bar and Avvo each run 8 lookups at once, half the account.
@@ -121,6 +137,7 @@ export function loadEnv(source = process.env) {
     if (!supabaseKey) throw new Error('SUPABASE_SECRET_KEY (or legacy SUPABASE_SERVICE_ROLE_KEY) is required for Supabase storage');
     if (supabaseKey.startsWith('sb_publishable_')) throw new Error('Supabase storage requires a server secret key, not a publishable key');
   }
+  const { webapp, stripeMode, emailProvider, emailFrom } = webappProviders(env, mode, storageBackend);
   if (sourceMode === 'live' && !env.APIFY_API_TOKEN?.trim()) throw new Error('APIFY_API_TOKEN is required for live directory sources');
   if (sourceMode === 'live' && env.WEBSITE_EVIDENCE_PROVIDER !== 'rules' && !env.OPENAI_API_KEY?.trim()) {
     throw new Error(`OPENAI_API_KEY is required when WEBSITE_EVIDENCE_PROVIDER=${env.WEBSITE_EVIDENCE_PROVIDER}`);
@@ -138,5 +155,79 @@ export function loadEnv(source = process.env) {
     throw new Error('APIFY_ACTIVE_RUN_TTL_MS must exceed the remote run timeout by at least 60 seconds');
   }
   return { ...env, ASSESSMENT_PLANNER: assessmentPlanner, mode, overridden, sourceMode, storageBackend, supabaseKey, corsOrigins,
-    apifySpendCeilingUsd, openAiMaxRequestsPerScan };
+    apifySpendCeilingUsd, openAiMaxRequestsPerScan, webapp, stripeMode, emailProvider, emailFrom };
+}
+
+export const DEFAULT_EMAIL_FROM = 'ARCA <no-reply@arcacover.com>';
+// A bare address, or a display name and one address in angle brackets: one sender, and nothing that could become a header.
+const SENDER = /^(?:([^<>",;\u0000-\u001f\u007f]{1,64}) <([^<>\s,;]+)>|([^<>\s,;"]+))$/;
+
+function emailSender(value: string): string {
+  const match = SENDER.exec(value);
+  const address = match?.[2] ?? match?.[3];
+  if (!address || !z.string().email().safeParse(address).success) {
+    throw new Error('EMAIL_FROM must be an address, or a name and an address in angle brackets (ARCA <no-reply@arcacover.com>)');
+  }
+  return value;
+}
+
+/** What the prefix of a Stripe secret or restricted key says (DN-13 §6.7). A publishable key, or anything else, is refused. */
+export function stripeKeyMode(key: string): 'live' | 'test' {
+  const prefix = /^(?:sk|rk)_(live|test)_\S+$/.exec(key);
+  if (!prefix) throw new Error('STRIPE_SECRET_KEY must be a Stripe secret (sk_) or restricted (rk_) key, live or test');
+  return prefix[1] as 'live' | 'test';
+}
+
+/**
+ * Which webapp this process serves (DN-13 §3.2, §7.1): none (production's 501), the simulated one (memory, MockAppAuth,
+ * MockBillingProvider) or the real one (Supabase, Stripe, a real mailer). Every combination that would mix them, or put a live
+ * key where it does not belong, stops the start. SES also needs a sender in the seam, which compose checks (RealWebappAdapters).
+ */
+function webappProviders(env: z.infer<typeof EnvSchema>, mode: z.infer<typeof EnvSchema>['ARCA_MODE'], storageBackend: 'memory' | 'supabase') {
+  const keyMode = env.STRIPE_SECRET_KEY === undefined ? null : stripeKeyMode(env.STRIPE_SECRET_KEY);
+  // Checked in every debug mode, even one that never calls Stripe: a live key sitting in .env.local is refused, not ignored.
+  if (mode !== 'production' && keyMode === 'live') {
+    throw new Error('A live Stripe key (sk_live_ or rk_live_) never loads outside production: put a test key in STRIPE_SECRET_KEY');
+  }
+  if (mode === 'production' && env.WEBAPP_PROVIDERS !== undefined) {
+    throw new Error(`WEBAPP_PROVIDERS=${env.WEBAPP_PROVIDERS} is for live-debug: production always runs the real providers, `
+      + 'and switches the webapp on with WEBAPP_ENABLED=true');
+  }
+  if (mode === 'mock' && env.WEBAPP_PROVIDERS === 'real') {
+    throw new Error('ARCA_MODE=mock never calls a real service: WEBAPP_PROVIDERS=real needs ARCA_MODE=live-debug');
+  }
+  // WEBAPP_ENABLED is production's switch; the debug modes always serve a webapp.
+  const webapp = mode === 'production' ? (env.WEBAPP_ENABLED === 'true' ? 'real' : 'none') : env.WEBAPP_PROVIDERS ?? 'simulated';
+  const emailProvider = webapp === 'none' ? null : env.EMAIL_PROVIDER ?? (mode === 'production' ? 'ses' : 'memory');
+  const emailFrom = env.EMAIL_FROM === undefined ? DEFAULT_EMAIL_FROM : emailSender(env.EMAIL_FROM);
+  if (webapp === 'simulated' && emailProvider !== 'memory') {
+    throw new Error(`EMAIL_PROVIDER=${emailProvider} needs the real webapp: the simulated one keeps its emails in memory`);
+  }
+  if (emailProvider === 'resend') {
+    if (!env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is required with EMAIL_PROVIDER=resend');
+    // Never echoes the value: a key typed into the wrong variable is still a secret.
+    if (!/^re_[A-Za-z0-9_-]+$/.test(env.RESEND_API_KEY)) throw new Error('RESEND_API_KEY must be a Resend API key (re_…)');
+  }
+  if (webapp === 'real') {
+    if (storageBackend !== 'supabase') {
+      throw new Error('The real webapp keeps its data in Supabase, next to the scans it claims: it requires STORAGE_BACKEND=supabase');
+    }
+    if (!env.STRIPE_SECRET_KEY) throw new Error('STRIPE_SECRET_KEY is required for the real webapp');
+    if (!env.STRIPE_WEBHOOK_SECRET) throw new Error('STRIPE_WEBHOOK_SECRET is required for the real webapp');
+    if (!env.STRIPE_WEBHOOK_SECRET.startsWith('whsec_')) throw new Error('STRIPE_WEBHOOK_SECRET must be a Stripe webhook signing secret (whsec_)');
+    if (mode === 'production') {
+      if (keyMode === 'test' && env.STRIPE_ALLOW_TEST_MODE !== 'true') {
+        throw new Error('Production refuses a Stripe test key: set STRIPE_ALLOW_TEST_MODE=true only for a rehearsal on the host');
+      }
+      if (emailProvider === 'memory') {
+        throw new Error('EMAIL_PROVIDER=memory would drop every invitation email: production sends with resend (or ses)');
+      }
+      if (env.EMAIL_FROM === undefined) throw new Error('EMAIL_FROM is required when production switches the webapp on');
+      // The default is the local front: invitation links and Stripe's return URLs would send customers to localhost.
+      if (!/^https:\/\//i.test(env.APP_BASE_URL)) {
+        throw new Error('APP_BASE_URL must be the https address of the front when production switches the webapp on');
+      }
+    }
+  }
+  return { webapp, stripeMode: webapp === 'real' ? keyMode : null, emailProvider, emailFrom } as const;
 }

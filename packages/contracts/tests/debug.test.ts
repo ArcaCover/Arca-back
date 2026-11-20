@@ -86,6 +86,7 @@ describe('DebugModeResponse', () => {
   const mode = {
     mode: 'live-debug', sourceMode: 'live', storageBackend: 'supabase', websiteEvidenceProvider: 'agentic',
     assessmentPlanner: 'agent', signalLlmModel: 'gpt-5.4-mini', inUse: { openai: true, apify: true, supabase: false },
+    webapp: 'simulated', billing: 'simulated',
   };
 
   it('accepts a complete description of the running back', () => {
@@ -108,6 +109,24 @@ describe('DebugModeResponse', () => {
     expect(DebugModeResponse.safeParse({ ...mode, websiteEvidenceProvider: 'firecrawl' }).success).toBe(false);
     const { inUse, ...rest } = mode;
     expect(DebugModeResponse.safeParse({ ...rest, configured: inUse }).success).toBe(false);
+  });
+
+  // DN-13 §7.6, T19: which webapp the back built, and what bills it. Words only, never a key or its prefix.
+  it('says whether the accounts and the billing are simulated or real, and real billing is Stripe in test mode', () => {
+    const real = { ...mode, webapp: 'real', billing: 'test' };
+    expect(DebugModeResponse.parse(real)).toEqual(real);
+    for (const webapp of ['none', 'supabase', '']) expect(DebugModeResponse.safeParse({ ...mode, webapp }).success, webapp).toBe(false);
+    // A live Stripe key never runs in a debug mode (DN-13 §16.1), so the debug contract cannot even say it.
+    for (const billing of ['live', 'stripe', 'rk_test', 'sk_test_', '']) {
+      expect(DebugModeResponse.safeParse({ ...real, billing }).success, billing).toBe(false);
+    }
+  });
+
+  it('requires both, so a back that does not say what its webapp is never passes for one', () => {
+    const { webapp: _webapp, ...noWebapp } = mode;
+    const { billing: _billing, ...noBilling } = mode;
+    expect(DebugModeResponse.safeParse(noWebapp).success).toBe(false);
+    expect(DebugModeResponse.safeParse(noBilling).success).toBe(false);
   });
 });
 

@@ -84,7 +84,7 @@ const DOMAIN = 'robust.arca.example';
 const description = (mode: 'mock' | 'live-debug'): DebugModeResponse => ({ mode, sourceMode: mode === 'mock' ? 'mock' : 'live',
   storageBackend: mode === 'mock' ? 'memory' : 'supabase', websiteEvidenceProvider: mode === 'mock' ? 'mock' : 'agentic',
   assessmentPlanner: 'rules', signalLlmModel: mode === 'mock' ? null : 'fixture-model',
-  inUse: { openai: mode !== 'mock', apify: mode !== 'mock', supabase: mode !== 'mock' } });
+  inUse: { openai: mode !== 'mock', apify: mode !== 'mock', supabase: mode !== 'mock' }, webapp: 'simulated', billing: 'simulated' });
 
 function debugSetup(options: { mode?: 'mock' | 'live-debug'; gate?: Promise<void>; assessmentAgent?: PlanningAgent;
   assessmentPlanningTimeoutMs?: number } = {}) {

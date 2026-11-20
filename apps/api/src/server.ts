@@ -5,11 +5,12 @@ import { serve, type HttpBindings } from '@hono/node-server';
 import { loadEnv } from './config/env.js';
 import { listenHostname } from './config/mode.js';
 import { compose, interruptedBefore } from './compose.js';
+import { scheduleReconciliation } from './webapp/reconcile-schedule.js';
 
 const envPath = fileURLToPath(new URL('../../../.env.local', import.meta.url));
 if (existsSync(envPath)) loadEnvFile(envPath);
 const env = loadEnv();
-const { app, drain, recoverAssessments, repository, apify, banner, clientIps } = await compose(env);
+const { app, drain, recoverAssessments, repository, apify, banner, clientIps, reconcileBilling } = await compose(env);
 await recoverAssessments();
 // The debug modes listen on loopback only; production keeps every interface (DN-09 5.1).
 const server = serve({ port: env.PORT, hostname: listenHostname(env.mode), fetch: (request, bindings) => {
@@ -32,9 +33,13 @@ const costTimer = apify ? setInterval(() => {
   void apify.reconcileCosts().catch(() => console.error('[api] Apify cost reconciliation failed'));
 }, 60_000) : undefined;
 costTimer?.unref();
+// The real webapp's Stripe reconciliation (DN-13 §9.5, T26): a few minutes after start, then daily, one run at a time. A failed run
+// is a [billing] log line for the CloudWatch alarm, never a crash. Without the real webapp there is nothing to reconcile.
+const reconciliation = reconcileBilling ? scheduleReconciliation(reconcileBilling) : null;
 for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => {
   clearInterval(recoverTimer);
   clearInterval(costTimer);
+  reconciliation?.stop();
   server.close();
   const shutdownTimer = setTimeout(() => process.exit(1), 60_000);
   shutdownTimer.unref();

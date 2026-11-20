@@ -83,6 +83,21 @@
       "Resource": "arn:aws:cloudwatch:us-east-1:194633188202:alarm:ArcaDemoStack-*"
     },
     {
+      "Sid": "ApiLogGroup",
+      "Effect": "Allow",
+      "Action": "logs:*",
+      "Resource": [
+        "arn:aws:logs:us-east-1:194633188202:log-group:/arca/api",
+        "arn:aws:logs:us-east-1:194633188202:log-group:/arca/api:*"
+      ]
+    },
+    {
+      "Sid": "FindLogGroups",
+      "Effect": "Allow",
+      "Action": "logs:DescribeLogGroups",
+      "Resource": "arn:aws:logs:us-east-1:194633188202:log-group:*"
+    },
+    {
       "Sid": "NeverBillingBudgetsOrAccount",
       "Effect": "Deny",
       "Action": [

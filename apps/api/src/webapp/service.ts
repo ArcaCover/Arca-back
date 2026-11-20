@@ -1,24 +1,30 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { can, canManageMember, hasPaidAccess, type ActionItemView, type ActionPlanResponse, type ActionStatus, type ActivityEventView,
   type ActivityPage, type AdminAuditPage, type AdminMetricsView, type AdminOrgDetailView, type AdminOrgView, type AnalysisView,
-  type AssessmentResult, type AuditActorKind, type ClaimResponse, type CreateActionRequest, type CreateOrgRequest, type DeletionRequestView,
+  type AssessmentResult, type AuditActorKind, type BillingView, type ClaimResponse, type CreateActionRequest, type CreateOrgWithProfileRequest,
+  type DeletionRequestView, type EmbeddedCheckoutResponse, type EnrollRequest, type EnrollResponse, type OrgProfileInput,
   type InvitationView, type InviteRequest, type Layer1Result, type MeResponse, type MemberView, type OrgView, type Permission, type PlanView,
   type Role, type UpdateActionRequest, type UpdatePlanRequest } from '@arca/contracts';
 import type { AssessmentRepository } from '../assessment/repository.js';
 import { verifySessionToken } from '../auth/session-token.js';
 import type { ScanRecord, ScanRepository } from '../repositories/types.js';
 import type { AppUser } from './auth.js';
-import type { BillingEvent, BillingProvider } from './billing.js';
-import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, WebappConflict, type ActionPatch, type AuditRecord, type CustomActionRecord,
-  type DeletionRequestRecord, type InvitationRecord, type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord,
+import { AuthAdminUnavailable, type AuthAdmin } from './auth-admin.js';
+import { BillingUnavailable, type BillingEvent, type BillingProvider, type CustomerDetails } from './billing.js';
+import { BillingEvents, type ReconcileReport, type WebhookOutcome } from './billing-events.js';
+import { catalogIdsOf, catalogModeOf, catalogPatchOf } from './plans.js';
+import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict, type ActionPatch, type AuditActor, type AuditRecord,
+  type BillingApplyOutcome, type CheckoutSessionRecord, type CheckoutUiMode, type CustomActionRecord,
+  type DeletionRequestRecord, type InvitationRecord, type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord, type OrgProfileRecord,
   type PlanRecord, type WebappConflictReason, type WebappRepository } from './types.js';
 
 const STATUS = { invalid_request: 400, unauthorized: 401, payment_required: 402, forbidden: 403, not_found: 404, conflict: 409, gone: 410,
-  rate_limited: 429 } as const;
+  rate_limited: 429, billing_unavailable: 502, auth_unavailable: 503 } as const;
 type FailureCode = keyof typeof STATUS;
 
 export class WebappFailure extends Error {
-  constructor(readonly code: FailureCode, message: string, readonly status: (typeof STATUS)[FailureCode]) {
+  /** `retryAfter`, in seconds, goes out as the Retry-After header of a 429. */
+  constructor(readonly code: FailureCode, message: string, readonly status: (typeof STATUS)[FailureCode], readonly retryAfter?: number) {
     super(message);
     this.name = 'WebappFailure';
   }
@@ -32,7 +38,21 @@ const CONFLICTS: Record<WebappConflictReason, string> = {
   already_invited: 'This email already has a pending invitation',
   deletion_pending: 'A deletion request is already pending',
   action_limit: `An organization keeps at most ${MAX_CUSTOM_ACTIONS} actions of its own`,
+  already_reviewed: 'This deletion request was already reviewed',
+  invitation_closed: 'This invitation is no longer valid',
+  sole_owner: 'You are the only owner of an organization: make someone else an owner or request its deletion first',
 };
+// One answer for every claim or invitation POST /auth/enroll cannot use (DN-13 §4.2): unknown, expired, spent, revoked, accepted, or
+// of a deleted organization. The request names no email, so none is revealed either way.
+const ENROLL_REFUSED = 'This link is no longer valid; start again from your results or ask for a new invitation';
+const ALREADY_PAID = 'This organization is already paid; use billing/portal';
+/** Stripe did not answer: nothing was written (DN-13 §7.3). */
+async function orUnavailable<T>(work: Promise<T>): Promise<T> {
+  try { return await work; } catch (error) {
+    if (error instanceof BillingUnavailable) throw fail('billing_unavailable', 'Payments are unavailable right now; try again in a minute');
+    throw error;
+  }
+}
 /** The rules the repository enforces atomically come back as a 409. */
 async function orConflict<T>(write: Promise<T>): Promise<T> {
   try { return await write; } catch (error) {
@@ -49,6 +69,23 @@ async function orIneligible<T>(write: Promise<T>): Promise<T> {
     throw error;
   }
 }
+
+/** The pre-checkout's profile as its row (DN-13 §19): written once, with the organization, by the person who creates it. */
+const profileRecord = (orgId: string, userId: string, profile: OrgProfileInput, at: string): OrgProfileRecord => ({ org_id: orgId,
+  contact_name: profile.contactName, contact_role: profile.contactRole, contact_phone: profile.phone ?? null, legal_name: profile.legalName,
+  ein: profile.ein ?? null, address_line1: profile.billingAddress.line1, address_city: profile.billingAddress.city,
+  address_state: profile.billingAddress.state, address_postal_code: profile.billingAddress.postalCode, address_country: 'US',
+  attorney_range: profile.attorneyRange, practice_states: [...profile.practiceStates], created_by: userId, created_at: at, updated_at: at });
+/**
+ * Who the organization's Stripe customer is: the firm's legal name, phone, address and EIN when it gave its profile, so Checkout asks
+ * none of it again (DN-13 §19); otherwise its name, as before. The email is always the payer's, the one Checkout shows.
+ */
+const customerDetails = (org: OrganizationRecord, payer: AppUser, profile: OrgProfileRecord | null): CustomerDetails => profile
+  ? { orgId: org.id, name: profile.legal_name, email: payer.email, phone: profile.contact_phone, ein: profile.ein,
+    address: { line1: profile.address_line1, city: profile.address_city, state: profile.address_state, postalCode: profile.address_postal_code } }
+  : { orgId: org.id, name: org.name, email: payer.email };
+/** A Checkout session the organization may be sent to: Stripe's page (hosted) or the client secret ARCA's page mounts (embedded). */
+type OpenCheckout = { sessionId: string; url: string | null; clientSecret: string | null };
 
 const CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
 const INVITATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -117,7 +154,8 @@ const trackedData = (tracked: Tracked, fields: ReadonlyArray<keyof Tracked>) =>
 // corrects the rows DN-10 wrote with the same list.
 export const ACTOR_KIND_OF_ACTION: Readonly<Record<string, Exclude<AuditActorKind, 'member'>>> = Object.freeze({
   'org.deletion_approved': 'platform', 'org.deletion_rejected': 'platform', 'plan.updated': 'platform',
-  'billing.event_applied': 'system',
+  'billing.event_applied': 'system', 'billing.duplicate_subscription': 'system', 'billing.invoice_paid': 'system',
+  'billing.payment_failed': 'system', 'billing.payment_action_required': 'system', 'billing.refunded': 'system', 'billing.dispute': 'system',
 });
 // An action is a string from a row, so the tables below are read by own key only: one named like a property every object has
 // ('constructor', '__proto__') names no entry.
@@ -130,9 +168,10 @@ const TARGETS: Readonly<Record<string, 'user' | 'email' | 'scan' | 'org' | 'acti
   'member.joined': 'user', 'member.role_changed': 'user', 'member.removed': 'user',
   'member.invited': 'email', 'invitation.revoked': 'email',
   'analysis.claimed': 'scan',
-  'org.created': 'org', 'org.renamed': 'org',
+  'org.created': 'org', 'org.renamed': 'org', 'account.deleted': 'user',
   'action.created': 'action', 'action.updated': 'action', 'action.deleted': 'action',
   'plan.updated': 'plan',
+  'platform_admin.granted': 'user', 'platform_admin.revoked': 'user',
 };
 type Change = NonNullable<ActivityEventView['change']>;
 const textOrNull = (value: unknown): string | null | undefined => typeof value === 'string' || value === null ? value : undefined;
@@ -149,7 +188,7 @@ function changeOf({ action, data }: AuditRecord): Change | null {
   switch (action) {
     case 'member.role_changed': case 'org.renamed': return pair(data.from, data.to);
     case 'member.invited': case 'member.joined': return pair(null, data.role);
-    case 'member.removed': return pair(data.role, null);
+    case 'member.removed': case 'account.deleted': return pair(data.role, null);
     case 'org.created': return pair(null, data.name);
     case 'action.updated': {
       const [before, after] = [fields(data.before), fields(data.after)];
@@ -162,6 +201,11 @@ function changeOf({ action, data }: AuditRecord): Change | null {
 export type WebappServiceDeps = {
   repository: WebappRepository; scans: ScanRepository; assessments: AssessmentRepository; billing: BillingProvider;
   sessionSecret: string; appBaseUrl: string;
+  /**
+   * Creates and deletes Supabase Auth users (DN-13 §4.2, §4.8): the admin API in the real webapp, the in-memory one in the debug
+   * modes. Only POST /auth/enroll and DELETE /me need it; compose always passes one.
+   */
+  authAdmin?: AuthAdmin;
   /** False for a scan that lives only in memory (an injected fault, DN-09 §5.5): it can never be claimed. */
   isDurableScan?: (scanId: string) => boolean;
   now?: () => number;
@@ -179,11 +223,14 @@ export class WebappService {
   private readonly now: () => number;
   // When each user wrote to an action plan in the last minute. Per process, like the assessment's answer limit.
   private readonly actionWrites = new Map<string, number[]>();
+  // Stripe's events, the return from Checkout and the reconciliation, one organization at a time (DN-13 §6.5).
+  private readonly billingEvents: BillingEvents;
 
   constructor(private readonly deps: WebappServiceDeps) {
     this.repo = deps.repository;
     this.appBaseUrl = deps.appBaseUrl.replace(/\/+$/, '');
     this.now = deps.now ?? Date.now;
+    this.billingEvents = new BillingEvents({ repository: deps.repository, billing: deps.billing, now: this.now });
   }
 
   /**
@@ -237,15 +284,70 @@ export class WebappService {
       platformAdmin: await this.repo.isPlatformAdmin(user.userId) };
   }
 
-  /** Step 2 of the claim: the organization, its owner and the analysis are written together, or nothing is. */
-  async createOrganization(user: AppUser, req: CreateOrgRequest): Promise<OrgView> {
+  /**
+   * Closed sign-up (DN-13 §4.2): the Supabase Auth user of a claim's email, or of a pending invitation's, is created here and
+   * nowhere else. The claim gets the checks of `redeemable` without being spent, and without a user to compare emails with: the
+   * code that reaches that mailbox is what proves the person owns it. Already enrolled is the same answer. Nothing is written
+   * before the Auth admin API answers, so its failure (503) leaves nothing half made.
+   */
+  async enroll(req: EnrollRequest): Promise<EnrollResponse> {
+    const email = 'claimId' in req ? await this.enrollableClaim(req.claimId) : await this.enrollableInvitation(req.invitationToken);
+    if (!email) throw fail('gone', ENROLL_REFUSED);
+    try {
+      await this.requireAuthAdmin().createUser(email);
+    } catch (error) {
+      if (error instanceof AuthAdminUnavailable) throw fail('auth_unavailable', 'Accounts cannot be created right now; try again in a minute');
+      throw error;
+    }
+    return { email };
+  }
+
+  /**
+   * A closed account is refused on every route (DN-13 §4.4): its access token stays valid until it expires, up to an hour, and
+   * its Auth user may outlive the deletion if the admin API failed.
+   */
+  async requireLiveAccount(user: AppUser): Promise<void> {
+    if ((await this.repo.getProfile(user.userId))?.deleted_at) throw fail('unauthorized', 'This account was deleted');
+  }
+
+  /**
+   * DELETE /me (DN-13 §4.8). The store closes the account in one step, refusing a sole owner (409); then the Auth user goes,
+   * which drops its sessions and refresh tokens. That second step is tried twice; if it still fails the account is closed already
+   * (every route answers 401 to it) and the answer is 503, so the front asks again with the same token: both steps are idempotent.
+   */
+  async deleteAccount(user: AppUser): Promise<void> {
+    const admin = this.requireAuthAdmin();
+    // A user who never reached a route that writes the profile gets one now, so the tombstone exists and their token is refused
+    // from here on.
+    if (!(await this.repo.getProfile(user.userId))) await this.ensureProfile(user);
+    await orConflict(this.repo.deleteAccount(user.userId, this.timestamp()));
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await admin.deleteUser(user.userId);
+        return;
+      } catch (error) {
+        if (!(error instanceof AuthAdminUnavailable)) throw error;
+        if (attempt === 2) {
+          console.error(`[auth] account ${user.userId} was closed but its Auth user was not deleted; DELETE /me again retries`);
+          throw fail('auth_unavailable', 'Your account was closed, but signing it out everywhere failed; try again');
+        }
+      }
+    }
+  }
+
+  /**
+   * Step 2 of the claim: the organization, its owner, the analysis and, from the pre-checkout, the firm profile (DN-13 §19) are written
+   * together, or nothing is. The profile stays out of the audit row, which every owner and admin reads.
+   */
+  async createOrganization(user: AppUser, req: CreateOrgWithProfileRequest): Promise<OrgView> {
     const { idHash, scan, assessmentId } = await this.redeemable(user, req.claimId);
     const at = this.timestamp();
     const org: OrganizationRecord = { id: randomUUID(), name: req.name, domain: scan.canonical_domain, billing_status: 'pending_payment',
       deleted_at: null, created_by: user.userId, created_at: at };
     await this.ensureProfile(user);
     await orConflict(this.repo.createOrganization(org, { org_id: org.id, user_id: user.userId, role: 'owner', invited_by: null, created_at: at },
-      { org_id: org.id, scan_id: scan.scan_id, assessment_id: assessmentId, claimed_by: user.userId, claimed_at: at }));
+      { org_id: org.id, scan_id: scan.scan_id, assessment_id: assessmentId, claimed_by: user.userId, claimed_at: at },
+      req.profile ? profileRecord(org.id, user.userId, req.profile, at) : null));
     // Spent only once the organization exists: a creation that fails does not burn the ticket.
     await this.repo.markClaimTicketUsed(idHash, at);
     await this.audit(user.userId, org.id, 'org.created', org.id, { name: org.name, scanId: scan.scan_id }, 'member');
@@ -291,7 +393,7 @@ export class WebappService {
 
   /** `orgId` is the id `authorize` returned. */
   async listMembers(orgId: string): Promise<{ members: MemberView[]; invitations: InvitationView[] }> {
-    const members = await Promise.all((await this.repo.listMembers(orgId)).map(member => this.memberView(member)));
+    const members = await this.memberViews(await this.repo.listMembers(orgId));
     const invitations = (await this.repo.listInvitations(orgId)).filter(invitation => !this.expired(invitation.expires_at)).map(invitationView);
     return { members, invitations };
   }
@@ -320,8 +422,10 @@ export class WebappService {
     const id = asUuid(invitationId);
     const invitation = id && (await this.repo.listInvitations(org.id)).find(pending => pending.id === id);
     if (!invitation) throw fail('not_found', 'Invitation not found');
-    await this.repo.updateInvitation(invitation.id, { revoked_at: this.timestamp() });
-    await this.audit(actor.userId, org.id, 'invitation.revoked', invitation.email, { invitationId: invitation.id }, 'member');
+    // The second of two revokes that race finds it revoked already, and writes and audits nothing.
+    if (!(await this.repo.revokeInvitation(org.id, invitation.id, this.timestamp(), this.actor(actor.userId, 'member'), null))) {
+      throw fail('not_found', 'Invitation not found');
+    }
   }
 
   async acceptInvitation(user: AppUser, token: string): Promise<OrgView> {
@@ -334,22 +438,18 @@ export class WebappService {
     const org = await this.repo.getOrganization(invitation.org_id);
     if (!org) throw fail('not_found', 'Invitation not found');
     if (org.deleted_at !== null) throw fail('gone', 'This organization was deleted');
-    const at = this.timestamp();
-    const existing = await this.repo.getMembership(org.id, user.userId);
-    if (existing) {
-      // Someone who already belongs keeps their role; the invitation is only closed, and so are the other links of that email.
-      await this.repo.updateInvitation(invitation.id, { accepted_at: at });
-      await this.revokePending(user.userId, org.id, invitation.email, 'accepted');
-      return this.view(org, existing.role);
-    }
+    // Members are listed with the email of their profile, so the profile comes first.
     await this.ensureProfile(user);
-    await orConflict(this.repo.addMember({ org_id: org.id, user_id: user.userId, role: invitation.role, invited_by: invitation.invited_by,
-      created_at: at }));
-    await this.repo.updateInvitation(invitation.id, { accepted_at: at });
-    // No other link stays live, or a member removed later could use it to come back.
-    await this.revokePending(user.userId, org.id, invitation.email, 'accepted');
-    await this.audit(user.userId, org.id, 'member.joined', user.userId, { role: invitation.role, invitationId: invitation.id }, 'member');
-    return this.view(org, invitation.role);
+    // One step in the store (DN-13 §5.4): the membership, unless they already belong (then they keep their role), the acceptance,
+    // the other links of that email revoked, since a member removed later could use one to come back, and the audit. An accept
+    // that raced another, or a revoke, finds it closed: the same 410 as above.
+    try {
+      const { role } = await this.repo.acceptInvitation(invitation.id, user.userId, this.timestamp(), this.actor(user.userId, 'member'));
+      return this.view(org, role);
+    } catch (error) {
+      if (error instanceof WebappConflict && error.reason === 'invitation_closed') throw fail('gone', CONFLICTS.invitation_closed);
+      throw error;
+    }
   }
 
   /**
@@ -361,9 +461,11 @@ export class WebappService {
     const target = await this.member(org.id, targetUserId);
     if (!canManageMember(actorRole, target.role, role)) throw fail('forbidden', 'Your role cannot give this role to this member');
     if (target.role !== role) {
+      // The store checks the actor's right again against the roles as it locks them, and audits the role it found (DN-13 §4.6).
       // Removed by another request since it was read: nothing was written, so nothing is audited.
-      if (!(await orConflict(this.repo.setRole(org.id, target.user_id, role)))) throw fail('not_found', 'Member not found');
-      await this.audit(actor.userId, org.id, 'member.role_changed', target.user_id, { from: target.role, to: role }, 'member');
+      const before = await this.memberChange(this.repo.setRole(org.id, target.user_id, role, this.change(actor, actorRole)),
+        'Your role cannot give this role to this member');
+      if (before === null) throw fail('not_found', 'Member not found');
     }
     return this.memberView({ ...target, role });
   }
@@ -373,52 +475,184 @@ export class WebappService {
     const { org, role: actorRole } = await this.authorize(actor, orgId, 'members.remove', { payment: true });
     const target = await this.member(org.id, targetUserId);
     if (!canManageMember(actorRole, target.role)) throw fail('forbidden', 'Your role cannot remove this member');
-    // Two removals that race both find the member; only the one that removed them audits.
-    if (!(await orConflict(this.repo.removeMember(org.id, target.user_id)))) throw fail('not_found', 'Member not found');
-    await this.audit(actor.userId, org.id, 'member.removed', target.user_id, { role: target.role }, 'member');
-    // A link still pending for their email would let the removed member back in.
-    const profile = await this.repo.getProfile(target.user_id);
-    if (profile) await this.revokePending(actor.userId, org.id, profile.email, 'member_removed');
+    // Two removals that race both find the member; only the one that removed them writes anything. The same step audits it and
+    // revokes the links still pending for their email, which would let them back in.
+    const before = await this.memberChange(this.repo.removeMember(org.id, target.user_id, this.change(actor, actorRole)),
+      'Your role cannot remove this member');
+    if (before === null) throw fail('not_found', 'Member not found');
   }
 
-  /** Paying is how an organization gets in, so checkout and portal ask for billing.manage but not for a payment. */
+  /**
+   * Paying is how an organization gets in, so checkout and portal ask for billing.manage but not for a payment. One open Checkout
+   * Session per organization (DN-13 §6.2): while Stripe holds it open for the same plan, every click, of any owner, gets its URL; for
+   * another plan it is expired first; one Stripe says was paid is applied (the return's path) instead of opening a second. The
+   * organization's billing work runs one at a time, so two clicks never open two sessions. 502 when Stripe does not answer.
+   */
   async checkout(actor: AppUser, orgId: string, planCode: string): Promise<{ url: string }> {
-    const { org } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
-    // A second checkout would start a second subscription; changing plan or card is the portal's job.
-    if (hasPaidAccess(org.billing_status)) throw fail('conflict', 'This organization is already paid; use billing/portal');
-    const plan = await this.repo.getPlan(planCode);
-    if (!plan?.active) throw fail('invalid_request', 'Unknown or inactive plan');
-    const { url } = await this.deps.billing.createCheckout({ orgId: org.id, plan, successUrl: `${this.appBaseUrl}/app?paid=1`,
-      cancelUrl: `${this.appBaseUrl}/app/billing` });
+    const { url } = await this.openCheckout(actor, orgId, planCode, 'hosted');
+    if (!url) throw new Error('A hosted checkout without a URL');
     return { url };
   }
 
+  /**
+   * Checkout embedded in ARCA's page (DN-13 §19), under the same rules as the hosted one: one open session per organization, whatever
+   * its kind, so asking for the other kind expires the open one first. The client secret is never stored: an open session's is read
+   * again from Stripe.
+   */
+  async embeddedCheckout(actor: AppUser, orgId: string, planCode: string): Promise<EmbeddedCheckoutResponse> {
+    const { sessionId, clientSecret } = await this.openCheckout(actor, orgId, planCode, 'embedded');
+    if (!clientSecret) throw new Error('An embedded checkout without a client secret');
+    return { clientSecret, sessionId };
+  }
+
+  private async openCheckout(actor: AppUser, orgId: string, planCode: string, uiMode: CheckoutUiMode): Promise<OpenCheckout> {
+    const { org } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
+    return this.billingEvents.forOrg(org.id, async () => {
+      // Read again in the organization's turn: a webhook or a return may have paid it meanwhile. A second checkout would start a
+      // second subscription; changing plan or card is the portal's job.
+      const current = (await this.repo.getOrganization(org.id)) ?? org;
+      if (hasPaidAccess(current.billing_status)) throw fail('conflict', ALREADY_PAID);
+      const plan = await this.repo.getPlan(planCode);
+      if (!plan?.active) throw fail('invalid_request', 'Unknown or inactive plan');
+      // The price of the key's mode (DN-13 §21): a live key does not sell a plan that only has a test price.
+      if (this.deps.billing.needsCatalogPrice && !catalogIdsOf(plan, catalogModeOf(this.deps.billing.mode)).priceId) {
+        throw fail('conflict', 'This plan cannot be bought yet: it has no Stripe price (npm run stripe:catalog)');
+      }
+      const at = this.timestamp();
+      const open = await this.repo.getOpenCheckoutSession(org.id, at);
+      if (open) {
+        const reused = await this.reuseCheckout(org.id, open, plan.code, uiMode);
+        if (reused) return reused;
+      }
+      const { customerId, prefilled } = await this.billingCustomer(current, actor);
+      // What came before this session keeps its idempotency key apart from a session closed in the same minute (DN-13 §6.2).
+      const after = open?.id ?? (await this.repo.getSubscription(org.id))?.subscription_id ?? null;
+      const created: OpenCheckout & { expiresAt: string } = uiMode === 'embedded'
+        ? { url: null, ...await orUnavailable(this.deps.billing.createEmbeddedCheckout({ orgId: org.id, customerId, plan, after, prefilled,
+          returnUrl: `${this.appBaseUrl}/app/billing/return?session_id={CHECKOUT_SESSION_ID}` })) }
+        : { clientSecret: null, ...await orUnavailable(this.deps.billing.createCheckout({ orgId: org.id, customerId, plan, after, prefilled,
+          successUrl: `${this.appBaseUrl}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${this.appBaseUrl}/app/billing` })) };
+      const stored = await this.repo.addCheckoutSession({ id: created.sessionId, org_id: org.id, plan_code: plan.code, url: created.url,
+        status: 'open', created_by: actor.userId, expires_at: created.expiresAt, created_at: at, ui_mode: uiMode }, at);
+      if (stored.id !== created.sessionId) {
+        // Another process stored its session first: that one is the organization's, and this one must not be paid.
+        await this.deps.billing.expireCheckout(created.sessionId).catch(() => undefined);
+        const clientSecret = stored.ui_mode === 'embedded' ? (await orUnavailable(this.deps.billing.checkoutState(stored.id)))?.clientSecret ?? null : null;
+        // Of the other kind, the caller cannot use it: one more click, after it, decides (reuseCheckout).
+        if (stored.ui_mode !== uiMode || (uiMode === 'hosted' ? !stored.url : !clientSecret)) {
+          throw fail('conflict', 'Another checkout of this organization was just opened; try again');
+        }
+        return { sessionId: stored.id, url: stored.url, clientSecret };
+      }
+      await this.audit(actor.userId, org.id, 'billing.checkout_started', created.sessionId, { planCode: plan.code }, 'member');
+      return { sessionId: created.sessionId, url: created.url, clientSecret: created.clientSecret };
+    });
+  }
+
+  /**
+   * The open session again while Stripe still holds it open for this plan and this kind of Checkout (an embedded one with the client
+   * secret Stripe gives back). Otherwise it is closed here as Stripe says and null comes back, so a new one opens; or, when it was
+   * paid, its subscription is applied and an organization that now pays gets the 409.
+   */
+  private async reuseCheckout(orgId: string, open: CheckoutSessionRecord, planCode: string, uiMode: CheckoutUiMode): Promise<OpenCheckout | null> {
+    let checkout = await orUnavailable(this.deps.billing.checkoutState(open.id));
+    if (checkout?.status === 'open') {
+      const same = open.plan_code === planCode && open.ui_mode === uiMode;
+      if (same && uiMode === 'hosted' && open.url) return { sessionId: open.id, url: open.url, clientSecret: null };
+      if (same && uiMode === 'embedded' && checkout.clientSecret) return { sessionId: open.id, url: null, clientSecret: checkout.clientSecret };
+      // Another plan or another kind: the open one is closed first, so the organization never holds two that could both be paid.
+      if (await orUnavailable(this.deps.billing.expireCheckout(open.id)) === 'expired') {
+        await this.repo.closeCheckoutSession(open.id, 'expired');
+        return null;
+      }
+      checkout = await orUnavailable(this.deps.billing.checkoutState(open.id));
+    }
+    if (!checkout || checkout.status !== 'complete') {
+      await this.repo.closeCheckoutSession(open.id, 'expired');
+      return null;
+    }
+    const subscription = await orUnavailable(this.billingEvents.applyCheckout(orgId, checkout));
+    const now = await this.repo.getOrganization(orgId);
+    if (now && hasPaidAccess(now.billing_status)) throw fail('conflict', ALREADY_PAID);
+    // Paid but still being confirmed (3-D Secure): a second checkout now could become a second subscription.
+    if (subscription?.status === 'incomplete') throw fail('conflict', 'A payment of this organization is still being confirmed; try again in a few minutes');
+    return null;
+  }
+
+  /**
+   * The organization's Stripe customer: the one stored, brought up to the firm profile when there is one (DN-13 §19), or a new one
+   * made from it; without a profile, a new one named after the organization, with the payer's email, as before.
+   */
+  private async billingCustomer(org: OrganizationRecord, payer: AppUser): Promise<{ customerId: string; prefilled: boolean }> {
+    const profile = await this.repo.getOrgProfile(org.id);
+    const details = customerDetails(org, payer, profile);
+    // With the profile the customer holds the billing address, so Checkout need not ask for it.
+    const prefilled = profile !== null;
+    const stored = await this.repo.getBillingCustomer(org.id);
+    if (stored) {
+      if (profile) await orUnavailable(this.deps.billing.updateCustomer(stored.customer_id, details));
+      return { customerId: stored.customer_id, prefilled };
+    }
+    const { customerId } = await orUnavailable(this.deps.billing.ensureCustomer(details));
+    return { customerId: (await this.repo.addBillingCustomer({ org_id: org.id, customer_id: customerId, livemode: this.deps.billing.mode === 'live',
+      created_at: this.timestamp() })).customer_id, prefilled };
+  }
+
+  /** 409 until the organization is a Stripe customer, which its first checkout makes it (DN-13 §6.4). */
   async portal(actor: AppUser, orgId: string): Promise<{ url: string }> {
     const { org } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
-    const { url } = await this.deps.billing.createPortal({ orgId: org.id, returnUrl: `${this.appBaseUrl}/app/billing` });
+    const customer = await this.repo.getBillingCustomer(org.id);
+    if (!customer) throw fail('conflict', 'This organization has no billing customer yet: start with a checkout');
+    const { url } = await orUnavailable(this.deps.billing.createPortal({ customerId: customer.customer_id, returnUrl: `${this.appBaseUrl}/app/billing` }));
     return { url };
   }
+
+  /**
+   * The return from Checkout (DN-13 §6.3): the session is read at Stripe and, when it belongs to this organization, its subscription
+   * is applied by the webhook's path, before the webhook arrives. Answers the organization as it is now. A session of another
+   * organization, or one Stripe does not know, is not found.
+   */
+  async syncCheckout(actor: AppUser, orgId: string, sessionId: string): Promise<OrgView> {
+    const { org, role } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
+    const checkout = await orUnavailable(this.deps.billing.checkoutState(sessionId));
+    if (!checkout || checkout.orgId?.toLowerCase() !== org.id) throw fail('not_found', 'Checkout session not found');
+    await orUnavailable(this.billingEvents.syncCheckout(org.id, checkout));
+    return this.view((await this.repo.getOrganization(org.id)) ?? org, role);
+  }
+
+  /** What every member sees of the subscription (DN-13 §7.2, DN-11 D10), with no payment needed. */
+  async billingView(user: AppUser, orgId: string): Promise<BillingView> {
+    const { org, role } = await this.authorize(user, orgId, null, { payment: false });
+    const subscription = await this.repo.getSubscription(org.id);
+    const plan = subscription && await this.repo.getPlan(subscription.plan_code);
+    return { billingStatus: org.billing_status, plan: plan ? planView(plan) : null,
+      currentPeriodEnd: subscription?.current_period_end ? iso(subscription.current_period_end) : null,
+      cancelAtPeriodEnd: subscription?.cancel_at_period_end ?? false, manageable: can(role, 'billing.manage') };
+  }
+
+  /** Whether POST /billing/webhook is served: only a provider that signs its webhooks (Stripe), never the simulated one. */
+  get acceptsBillingWebhooks(): boolean { return this.deps.billing.webhooks; }
+  /** POST /billing/webhook (DN-13 §6.5): throws WebhookRejected for a 400; any other error is a 500 so Stripe retries. */
+  billingWebhook(raw: string | Uint8Array, signature: string | undefined): Promise<WebhookOutcome> {
+    return this.billingEvents.webhook(raw, signature);
+  }
+  /** The daily reconciliation (DN-13 §9.5). The process that runs it schedules it. */
+  reconcileBilling(options: { windowMs?: number } = {}): Promise<ReconcileReport> { return this.billingEvents.reconcile(options); }
 
   /**
    * Moves the subscription and billing_status, never the deletion state (DN-10 §4.4). Each event id counts once. An event names
    * its organization by the id its checkout carried; one that is not a UUID names none.
    */
-  async applyBillingEvent(event: BillingEvent): Promise<'applied' | 'duplicate' | 'unknown_org'> {
+  async applyBillingEvent(event: BillingEvent): Promise<BillingApplyOutcome | 'unknown_org'> {
     const orgId = asUuid(event.orgId);
     const org = orgId && await this.repo.getOrganization(orgId);
     if (!org) return 'unknown_org';
-    if (!(await this.repo.recordBillingEvent(event.id, event.type))) return 'duplicate';
-    const current = await this.repo.getSubscription(org.id);
-    const planCode = event.planCode ?? current?.plan_code ?? null;
-    // An event that names no plan, for an organization that never subscribed, only moves billing_status.
-    if (planCode) {
-      await this.repo.upsertSubscription({ org_id: org.id, plan_code: planCode, customer_id: event.customerId ?? current?.customer_id ?? null,
-        subscription_id: event.subscriptionId ?? current?.subscription_id ?? null, status: event.status,
-        current_period_end: event.currentPeriodEnd ?? current?.current_period_end ?? null, updated_at: this.timestamp() });
-    }
-    await this.repo.setBillingStatus(org.id, event.status);
-    await this.audit(null, org.id, 'billing.event_applied', event.id, { type: event.type, status: event.status, planCode }, 'system');
-    return 'applied';
+    // The simulated checkout that was paid closes, so the next checkout opens a new one.
+    if (event.checkoutSessionId) await this.repo.closeCheckoutSession(event.checkoutSessionId, 'complete');
+    // Recorded and applied in one step (DN-13 §6.5): a crash in between can no longer leave an event seen but never applied. An
+    // event that names no plan, for an organization that never subscribed, only moves billing_status.
+    return this.repo.applyBillingState({ id: event.id, type: event.type }, org.id, { status: event.status, plan_code: event.planCode,
+      customer_id: event.customerId, subscription_id: event.subscriptionId, current_period_end: event.currentPeriodEnd }, this.timestamp());
   }
 
   /** Only a request: nothing changes until an ARCA person reviews it, and access stays meanwhile (DN-10 §4.5). */
@@ -557,7 +791,7 @@ export class WebappService {
     const org = orgId && await this.repo.getOrganization(orgId);
     if (!orgId || !org) throw fail('not_found', 'Organization not found');
     const pending = await this.repo.getPendingDeletionRequest(orgId);
-    const members = await Promise.all((await this.repo.listMembers(orgId)).map(member => this.memberView(member)));
+    const members = await this.memberViews(await this.repo.listMembers(orgId));
     return { id: org.id, name: org.name, domain: org.domain, billingStatus: org.billing_status, deleted: org.deleted_at !== null,
       createdAt: iso(org.created_at), planCode: (await this.repo.getSubscription(orgId))?.plan_code ?? null,
       analysisCount: (await this.repo.listAnalyses(orgId)).length, pendingDeletion: pending && deletionView(pending),
@@ -610,13 +844,26 @@ export class WebappService {
     if (request.status !== 'pending') throw fail('conflict', 'This deletion request was already reviewed');
     const status = decision === 'approve' ? 'approved' : 'rejected';
     const at = this.timestamp();
-    await this.repo.reviewDeletionRequest(request.id, status, admin.userId, note ?? null, at);
-    if (status === 'approved') {
-      await this.repo.markOrganizationDeleted(request.org_id, at);
-      await this.deps.billing.cancel(request.org_id);
-    }
-    await this.audit(admin.userId, request.org_id, `org.deletion_${status}`, request.id, { note: note ?? null }, 'platform');
+    // The review, the deletion mark and the audit are one step; the second of two reviews that race is the same 409 (DN-13 §5.4).
+    await orConflict(this.repo.reviewDeletionRequest(request.id, status, admin.userId, note ?? null, at, this.actor(admin.userId, 'platform')));
+    if (status === 'approved') await this.cancelSubscription(request.org_id);
     return deletionView({ ...request, status, reviewed_by: admin.userId, reviewed_at: at, review_note: note ?? null });
+  }
+
+  /**
+   * An approved deletion stops the charges (DN-13 §6.9): the live subscription is canceled at once at the provider; the webhook that
+   * follows moves billing_status. The review is already written, so a provider failure does not undo it: it is logged for a person to
+   * cancel from the dashboard.
+   */
+  private async cancelSubscription(orgId: string) {
+    const subscription = await this.repo.getSubscription(orgId);
+    if (!subscription?.subscription_id || subscription.status === 'canceled') return;
+    try {
+      await this.deps.billing.cancel({ orgId, subscriptionId: subscription.subscription_id });
+    } catch (error) {
+      console.error(`[billing] failed to cancel subscription ${subscription.subscription_id} of deleted organization ${orgId} `
+        + `(${error instanceof Error ? error.name : 'unknown error'}); cancel it in the Stripe dashboard`);
+    }
   }
 
   /** Inactive plans included; the caller runs requirePlatformAdmin first. */
@@ -624,14 +871,22 @@ export class WebappService {
     return (await this.repo.listPlans()).map(planView);
   }
 
-  /** The price lives only in the plans table, so the next checkout already charges the new one (DN-10 §4.4). */
+  /**
+   * The price lives in the plans table and in a catalog price (DN-13 §6.1): a new amount, currency or interval first creates the new
+   * price at the provider (502, with the table untouched, when it does not answer), then points the plan at it, so the next checkout
+   * charges it. Subscribers keep the price they pay (F2).
+   */
   async updatePlan(admin: AppUser, code: string, patch: UpdatePlanRequest): Promise<PlanView> {
     await this.requirePlatformAdmin(admin);
     const before = await this.repo.getPlan(code);
     if (!before) throw fail('not_found', 'Plan not found');
-    // A field left undefined is not changed.
+    const price = { amountCents: patch.amountCents ?? before.amount_cents, currency: patch.currency ?? before.currency,
+      interval: patch.interval ?? before.interval };
+    const repriced = price.amountCents !== before.amount_cents || price.currency !== before.currency || price.interval !== before.interval;
+    const catalog = repriced ? await orUnavailable(this.deps.billing.createPrice({ plan: before, ...price })) : null;
+    // A field left undefined is not changed. The new price is written in the slot of the key's mode; the other mode's stays (DN-13 §21).
     await this.repo.updatePlan(code, { name: patch.name, amount_cents: patch.amountCents, currency: patch.currency, interval: patch.interval,
-      active: patch.active });
+      active: patch.active, ...catalogPatchOf(catalogModeOf(this.deps.billing.mode), { priceId: catalog?.priceId, productId: catalog?.productId }) });
     const after = (await this.repo.getPlan(code))!;
     await this.audit(admin.userId, null, 'plan.updated', code, { before, after }, 'platform');
     return planView(after);
@@ -649,6 +904,28 @@ export class WebappService {
     this.requireClaimable(scan);
     const assessment = await this.deps.assessments.getByScan(scan.scan_id);
     return { idHash, scan, assessmentId: assessment?.id ?? null };
+  }
+
+  /** The email of a claim that `redeemable` would take, read and not spent; null for any claim it would refuse. */
+  private async enrollableClaim(claimId: string): Promise<string | null> {
+    const ticket = await this.repo.getClaimTicket(sha256(claimId));
+    if (!ticket || this.expired(ticket.expires_at) || ticket.used_at !== null) return null;
+    const scan = await this.deps.scans.get(ticket.scan_id);
+    if (!scan || !isFinished(scan) || this.deps.isDurableScan?.(scan.scan_id) === false) return null;
+    return ticket.email.toLowerCase();
+  }
+
+  /** The email of an invitation that acceptInvitation would take; null for any invitation it would refuse. */
+  private async enrollableInvitation(token: string): Promise<string | null> {
+    const invitation = await this.repo.findInvitationByHash(sha256(token));
+    if (!invitation || invitation.accepted_at || invitation.revoked_at || this.expired(invitation.expires_at)) return null;
+    const org = await this.repo.getOrganization(invitation.org_id);
+    return org && org.deleted_at === null ? invitation.email.toLowerCase() : null;
+  }
+
+  private requireAuthAdmin(): AuthAdmin {
+    if (!this.deps.authAdmin) throw new Error('The webapp has no Auth admin');
+    return this.deps.authAdmin;
   }
 
   private requireClaimable(scan: ScanRecord): asserts scan is FinishedScan {
@@ -677,22 +954,45 @@ export class WebappService {
 
   private async memberView(member: MembershipRecord): Promise<MemberView> {
     const profile = await this.repo.getProfile(member.user_id);
-    if (!profile) throw new Error('Member without a profile');
+    if (!profile?.email) throw new Error('Member without a profile');
     return { userId: member.user_id, email: profile.email, role: member.role, joinedAt: iso(member.created_at) };
   }
+  /**
+   * A closed account leaves no member in a live organization, but a deleted one keeps its memberships (DN-13 §4.8): those show
+   * nobody, since the person, and their email, are gone.
+   */
+  private async memberViews(members: MembershipRecord[]): Promise<MemberView[]> {
+    const live = await Promise.all(members.map(async member => (await this.repo.getProfile(member.user_id))?.deleted_at ? null : member));
+    return Promise.all(live.filter(member => member !== null).map(member => this.memberView(member)));
+  }
 
-  /** Revokes every pending invitation of this email in the organization, expired ones included: listInvitations returns them all. */
-  private async revokePending(actor: string, orgId: string, email: string, reason: 'reinvited' | 'accepted' | 'member_removed') {
+  /**
+   * Revokes every pending invitation of this email in the organization, expired ones included: listInvitations returns them all.
+   * Accepting and removing a member revoke theirs in their own step.
+   */
+  private async revokePending(actor: string, orgId: string, email: string, reason: 'reinvited') {
     const at = this.timestamp();
     for (const invitation of (await this.repo.listInvitations(orgId)).filter(pending => sameEmail(pending.email, email))) {
-      await this.repo.updateInvitation(invitation.id, { revoked_at: at });
-      await this.audit(actor, orgId, 'invitation.revoked', invitation.email, { invitationId: invitation.id, reason }, 'member');
+      await this.repo.revokeInvitation(orgId, invitation.id, at, this.actor(actor, 'member'), reason);
+    }
+  }
+
+  /** What the service checked before a member change, for the store to check again under its lock. */
+  private change(actor: AppUser, actorRole: Role) {
+    return { actorUserId: actor.userId, actorRole, audit: this.actor(actor.userId, 'member'), at: this.timestamp() };
+  }
+  /** A member change refused by the store, because a role moved meanwhile, is the 403 the service's own check gives. */
+  private async memberChange(write: Promise<Role | null>, refusal: string): Promise<Role | null> {
+    try { return await orConflict(write); } catch (error) {
+      if (error instanceof MemberChangeRefused) throw fail('forbidden', refusal);
+      throw error;
     }
   }
 
   /** Members are listed with the email of their profile, so every path that adds a member writes the profile first. */
   private async ensureProfile(user: AppUser) {
     const current = await this.repo.getProfile(user.userId);
+    // Never deleted_at: a closed account's profile refuses this write (DN-13 §4.8).
     await this.repo.upsertProfile({ user_id: user.userId, email: user.email.toLowerCase(), full_name: current?.full_name ?? null,
       last_org_id: current?.last_org_id ?? null, created_at: current?.created_at ?? this.timestamp() });
   }
@@ -704,9 +1004,14 @@ export class WebappService {
    */
   private async audit(actor: string | null, orgId: string | null, action: string, target: string, data: Record<string, unknown>,
     actorKind: AuditActorKind) {
+    await this.repo.appendAudit({ id: randomUUID(), ...this.actor(actor, actorKind), org_id: orgId, action, target, data,
+      created_at: this.timestamp() });
+  }
+
+  /** Who an audit row names, the rows a store writes itself included: the mock seed's member actions are the system's. */
+  private actor(actor: string | null, actorKind: AuditActorKind): AuditActor {
     const system = this.deps.auditAsSystem === true && actorKind === 'member';
-    await this.repo.appendAudit({ id: randomUUID(), actor_kind: system ? 'system' : actorKind, actor_user_id: system ? null : actor,
-      org_id: orgId, action, target, data, created_at: this.timestamp() });
+    return { actor_kind: system ? 'system' : actorKind, actor_user_id: system ? null : actor };
   }
 
   /** The analysis behind the current plan, or null when no analysis of the organization has a completed assessment. */
@@ -794,7 +1099,7 @@ export class WebappService {
   /** An assignee is always a member, and every member has a profile. */
   private async profileEmail(userId: string): Promise<string> {
     const profile = await this.repo.getProfile(userId);
-    if (!profile) throw new Error('Member without a profile');
+    if (!profile?.email) throw new Error('Member without a profile');
     return profile.email;
   }
 

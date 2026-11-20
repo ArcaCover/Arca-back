@@ -156,6 +156,10 @@ async function scene<R extends InMemoryWebappRepository = InMemoryWebappReposito
   return { service, repository, scans, assessments, billing, auth, addScan, claim, user, ownedOrg, pay, join, team, platformAdmin,
     advance: (ms: number) => { clock += ms; }, now: () => clock };
 }
+/** The newest seq of an organization's audit log, and the rows written after it, oldest first. */
+const lastSeq = async (s: { repository: InMemoryWebappRepository }, orgId: string) => (await s.repository.listAudit(orgId, { limit: 1 }))[0]?.seq ?? 0;
+const auditSince = async (s: { repository: InMemoryWebappRepository }, orgId: string, since: number) =>
+  (await s.repository.listAudit(orgId, { limit: 500 })).filter(row => row.seq > since).reverse();
 const inviteToken = (invitation: InvitationView) => invitation.inviteUrl!.split('/app/invite/')[1]!;
 const roleOf = async (s: { repository: InMemoryWebappRepository }, orgId: string, userId: string) =>
   (await s.repository.getMembership(orgId, userId))?.role ?? null;
@@ -354,13 +358,12 @@ describe('members', () => {
   it('a role change or a removal of a member another request removed meanwhile is a 404, and audits nothing', async () => {
     const s = await scene(new HoldingRepository(DEFAULT_PLANS));
     const { owner, org, admin, member, viewer } = await s.team();
-    const appendAudit = vi.spyOn(s.repository, 'appendAudit');
     const cases = [
       { target: member, request: () => s.service.setRole(owner, org.id, member.userId, 'viewer') },
       { target: viewer, request: () => s.service.removeMember(owner, org.id, viewer.userId) },
     ];
     for (const { target, request } of cases) {
-      appendAudit.mockClear();
+      const since = await lastSeq(s, org.id);
       // The late request finds the member, and its answer is held until another request has removed them.
       const hold = s.repository.holdNext('getMembership', ([, userId]) => userId === target.userId);
       const late = request().then(() => null, (caught: unknown) => caught);
@@ -371,9 +374,43 @@ describe('members', () => {
       expect(error, target.email).toBeInstanceOf(WebappFailure);
       expect(error, target.email).toMatchObject({ code: 'not_found', status: 404, message: 'Member not found' });
       expect(await roleOf(s, org.id, target.userId), target.email).toBeNull();
-      expect(appendAudit.mock.calls.map(([record]) => [record.action, record.actor_user_id, record.target]), target.email)
+      expect((await auditSince(s, org.id, since)).map(record => [record.action, record.actor_user_id, record.target]), target.email)
         .toEqual([['member.removed', admin.userId, target.userId]]);
     }
+  });
+
+  it('a change by an admin to a member another request just made owner is a 403, and writes nothing (DN-13 §4.6)', async () => {
+    const s = await scene(new HoldingRepository(DEFAULT_PLANS));
+    const { owner, org, admin, member } = await s.team();
+    const cases = [
+      () => s.service.setRole(admin, org.id, member.userId, 'viewer'),
+      () => s.service.removeMember(admin, org.id, member.userId),
+    ];
+    for (const request of cases) {
+      const since = await lastSeq(s, org.id);
+      // The admin's request reads the target as a member; the owner's promotion lands before its write.
+      const hold = s.repository.holdNext('getMembership', ([, userId]) => userId === member.userId);
+      const late = request().then(() => null, (caught: unknown) => caught);
+      await hold.reached;
+      await s.service.setRole(owner, org.id, member.userId, 'owner');
+      hold.release();
+      expect(await late).toMatchObject({ code: 'forbidden', status: 403 });
+      expect(await roleOf(s, org.id, member.userId)).toBe('owner');
+      expect((await auditSince(s, org.id, since)).map(row => [row.action, row.data])).toEqual([['member.role_changed', { from: 'member', to: 'owner' }]]);
+      await s.service.setRole(owner, org.id, member.userId, 'member');
+    }
+  });
+
+  it('the second of two racing revokes of one invitation is a 404 and audits nothing', async () => {
+    const s = await scene();
+    const { owner, org, admin } = await s.team();
+    const invitation = await s.service.invite(owner, org.id, { email: 'twice@firm.com', role: 'member' });
+    const since = await lastSeq(s, org.id);
+    const results = await Promise.allSettled([s.service.revokeInvitation(owner, org.id, invitation.id),
+      s.service.revokeInvitation(admin, org.id, invitation.id)]);
+    expect(results.map(result => result.status).sort()).toEqual(['fulfilled', 'rejected']);
+    expect(results.find(result => result.status === 'rejected')).toMatchObject({ reason: { code: 'not_found', status: 404 } });
+    expect((await auditSince(s, org.id, since)).map(row => row.action)).toEqual(['invitation.revoked']);
   });
 
   it('an invitation is accepted once, by its own email', async () => {
@@ -439,40 +476,40 @@ describe('members', () => {
     expect(await s.service.acceptInvitation(guest, inviteToken(third))).toMatchObject({ id: org.id, role: 'viewer' });
   });
 
-  it('accepting or removing closes every other link of that email', async () => {
+  it('accepting or removing closes the links of that email', async () => {
     const s = await scene();
     const { owner, org } = await s.ownedOrg();
     await s.pay(owner, org.id);
-    // A second live link for the same email, which the in-memory store allows (the SQL index would not).
-    const extraLink = async (name: string) => {
+    // A live link for the email of someone who already belongs, which only a race leaves (invite refuses a member's email). The
+    // store keeps one pending link per email, as invitations_pending_email_idx does.
+    const strayLink = async (name: string) => {
       const token = `${name}-${'x'.repeat(40)}`;
-      await s.repository.createInvitation({ id: `inv_${name}`, org_id: org.id, email: 'guest@firm.com', role: 'admin', token_hash: sha256(token),
+      await s.repository.createInvitation({ id: randomUUID(), org_id: org.id, email: 'guest@firm.com', role: 'admin', token_hash: sha256(token),
         invited_by: owner.userId, expires_at: iso(s.now() + DAY), accepted_at: null, revoked_at: null, created_at: iso(s.now()) });
       return token;
     };
     const guest = await s.user('guest@firm.com');
 
-    // Accept, then remove: the second link answers 410 and the removed member stays out.
+    // Accept, then remove: the link is spent and the removed member stays out.
     const invitation = await s.service.invite(owner, org.id, { email: 'guest@firm.com', role: 'member' });
-    const second = await extraLink('second');
     await s.service.acceptInvitation(guest, inviteToken(invitation));
     expect((await s.service.listMembers(org.id)).invitations).toEqual([]);
     await s.service.removeMember(owner, org.id, guest.userId);
-    await expectFailure(s.service.acceptInvitation(guest, second), 'gone', 410);
+    await expectFailure(s.service.acceptInvitation(guest, inviteToken(invitation)), 'gone', 410);
     expect(await roleOf(s, org.id, guest.userId)).toBeNull();
 
-    // Removing a member closes the links still pending for their email.
+    // Removing a member closes the link still pending for their email.
     await s.service.acceptInvitation(guest, inviteToken(await s.service.invite(owner, org.id, { email: 'guest@firm.com', role: 'member' })));
-    const leftover = await extraLink('leftover');
+    const leftover = await strayLink('leftover');
     await s.service.removeMember(owner, org.id, guest.userId);
     await expectFailure(s.service.acceptInvitation(guest, leftover), 'gone', 410);
     expect(await roleOf(s, org.id, guest.userId)).toBeNull();
 
-    // Someone who already belongs keeps their role, and the other links are closed too.
+    // Someone who already belongs keeps their role, and the link is closed.
     await s.service.acceptInvitation(guest, inviteToken(await s.service.invite(owner, org.id, { email: 'guest@firm.com', role: 'member' })));
-    const [stale, other] = [await extraLink('stale'), await extraLink('other')];
+    const stale = await strayLink('stale');
     expect(await s.service.acceptInvitation(guest, stale)).toMatchObject({ id: org.id, role: 'member' });
-    await expectFailure(s.service.acceptInvitation(guest, other), 'gone', 410);
+    await expectFailure(s.service.acceptInvitation(guest, stale), 'gone', 410);
     expect(await s.service.listMembers(org.id)).toMatchObject({ invitations: [] });
   });
 
@@ -523,7 +560,11 @@ describe('billing', () => {
     expect(await s.service.applyBillingEvent(s.billing.pay(new URL(url).searchParams.get('session')!)!)).toBe('applied');
     expect(await s.service.orgView(owner, org.id)).toMatchObject({ billingStatus: 'active', paidAccess: true });
     expect(await s.repository.getSubscription(org.id)).toEqual({ org_id: org.id, plan_code: 'monthly', customer_id: expect.any(String),
-      subscription_id: expect.any(String), status: 'active', current_period_end: '2026-11-25T12:00:00.000Z', updated_at: iso(T0) });
+      subscription_id: expect.any(String), status: 'active', current_period_end: '2026-11-25T12:00:00.000Z', updated_at: iso(T0),
+      provider_status: null, price_id: null, cancel_at_period_end: false, current_period_start: null, livemode: null });
+    // The simulated checkout that was paid is closed, and its customer is the organization's.
+    expect(await s.repository.getOpenCheckoutSession(org.id, iso(T0))).toBeNull();
+    expect(await s.repository.getBillingCustomer(org.id)).toMatchObject({ customer_id: (await s.repository.getSubscription(org.id))!.customer_id });
 
     await s.service.requestDeletion(owner, org.id, 'Closing the firm');
     const canceled: BillingEvent = { id: 'evt_canceled', type: 'subscription.canceled', orgId: org.id, status: 'canceled', planCode: null,
@@ -620,12 +661,35 @@ describe('deletion and the platform admin', () => {
 
     const createCheckout = vi.spyOn(s.billing, 'createCheckout');
     await s.service.checkout(owner, org.id, 'monthly');
-    expect(createCheckout).toHaveBeenCalledWith({ orgId: org.id, plan: { code: 'monthly', name: 'Monthly (example price)',
-      amount_cents: 1000, currency: 'usd', interval: 'month', active: true }, successUrl: `${APP}/app?paid=1`, cancelUrl: `${APP}/app/billing` });
+    // The new amount is a new catalog price (DN-13 §6.1), here the simulated provider's.
+    expect(createCheckout).toHaveBeenCalledWith({ orgId: org.id, customerId: expect.stringMatching(/^cus_mock_/), after: null, prefilled: false,
+      plan: { code: 'monthly', name: 'Monthly (example price)', amount_cents: 1000, currency: 'usd', interval: 'month', active: true,
+        stripe_product_id: 'prod_mock', stripe_price_id: expect.stringMatching(/^price_mock_/), stripe_live_product_id: null, stripe_live_price_id: null },
+      successUrl: `${APP}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${APP}/app/billing` });
 
     await s.service.updatePlan(ops, 'annual', { active: false });
     expect((await s.service.listPlans()).map(plan => plan.code)).toEqual(['monthly']);
     expect((await s.service.listAllPlans()).map(plan => PlanView.parse(plan).code)).toEqual(['monthly', 'annual']);
+  });
+});
+
+describe('deletion review races', () => {
+  it('the second of two racing reviews is a 409, not a 500, and the first decision stands with one audit row', async () => {
+    const s = await scene();
+    const { owner, org } = await s.ownedOrg();
+    await s.pay(owner, org.id);
+    const request = await s.service.requestDeletion(owner, org.id, 'Closing the firm');
+    const [first, second] = [await s.platformAdmin(), await s.user('ops2@arca.example')];
+    await s.repository.grantPlatformAdmin(second.userId, null);
+    const results = await Promise.allSettled([s.service.reviewDeletion(first, request.id, 'approve'),
+      s.service.reviewDeletion(second, request.id, 'reject')]);
+    expect(results.map(result => result.status).sort()).toEqual(['fulfilled', 'rejected']);
+    expect(results.find(result => result.status === 'rejected')).toMatchObject({ reason: { code: 'conflict', status: 409 } });
+    const decided = (await s.repository.getDeletionRequest(request.id))!;
+    expect((await s.repository.getOrganization(org.id))!.deleted_at).toBe(decided.status === 'approved' ? iso(T0) : null);
+    expect((await s.repository.listAudit(org.id, { limit: 50 })).filter(row => row.action.startsWith('org.deletion_') && row.action !== 'org.deletion_requested')
+      .map(row => row.action)).toEqual([`org.deletion_${decided.status}`]);
+    expect(s.billing.canceled).toEqual(decided.status === 'approved' ? [org.id] : []);
   });
 });
 
@@ -646,7 +710,7 @@ describe('views', () => {
       invited_by: owner.userId, expires_at: '2026-11-01 13:30:00.5+00', accepted_at: null, revoked_at: null, created_at: pg });
     await s.repository.createDeletionRequest({ id: 'dr_pg', org_id: org.id, requested_by: owner.userId, reason: 'Closing the firm',
       status: 'pending', reviewed_by: null, reviewed_at: null, review_note: null, created_at: pg });
-    await s.repository.reviewDeletionRequest('dr_pg', 'rejected', owner.userId, null, pg);
+    await s.repository.reviewDeletionRequest('dr_pg', 'rejected', owner.userId, null, pg, { actor_kind: 'platform', actor_user_id: owner.userId });
 
     const analysis = (await s.service.listAnalyses(org.id)).find(view => view.scanId === 'sc_pg')!;
     expect(AnalysisView.parse(analysis).claimedAt).toBe(expected);
@@ -661,7 +725,6 @@ describe('views', () => {
 describe('audit', () => {
   it('every change writes the audit log', async () => {
     const s = await scene();
-    const appendAudit = vi.spyOn(s.repository, 'appendAudit');
     const { owner, org, admin, member, viewer } = await s.team();
     await s.service.attachAnalysis(owner, org.id, await s.claim('sc_2'));
     await s.service.setRole(admin, org.id, viewer.userId, 'member');
@@ -673,10 +736,13 @@ describe('audit', () => {
     await s.service.reviewDeletion(ops, request.id, 'reject');
     await s.service.updatePlan(ops, 'monthly', { amountCents: 1000 });
 
-    // Who acted is fixed when the row is written: ARCA staff from /admin/* as platform, a billing event as system (DN-11 §4.3).
-    const log = appendAudit.mock.calls.map(([record]) => [record.action, record.actor_user_id, record.org_id, record.actor_kind]);
+    // Who acted is fixed when the row is written: ARCA staff from /admin/* as platform, a billing event as system (DN-11 §4.3). The
+    // store writes some rows itself, in the same step as the change (DN-13 §5.4), so the log is read from the store.
+    const rows = (await s.repository.listAllAudit({ limit: 500 })).reverse();
+    const log = rows.map(record => [record.action, record.actor_user_id, record.org_id, record.actor_kind]);
     expect(log).toEqual([
       ['org.created', owner.userId, org.id, 'member'],
+      ['billing.checkout_started', owner.userId, org.id, 'member'],
       ['billing.event_applied', null, org.id, 'system'],
       ...[admin, member, viewer].flatMap(joined => [['member.invited', owner.userId, org.id, 'member'],
         ['member.joined', joined.userId, org.id, 'member']]),
@@ -689,14 +755,13 @@ describe('audit', () => {
       ['org.deletion_rejected', ops.userId, org.id, 'platform'],
       ['plan.updated', ops.userId, null, 'platform'],
     ]);
-    expect(appendAudit.mock.calls.find(([record]) => record.action === 'member.role_changed')![0])
+    expect(rows.find(record => record.action === 'member.role_changed'))
       .toMatchObject({ target: viewer.userId, data: { from: 'viewer', to: 'member' } });
     expect(await s.repository.listAudit(org.id, { limit: 200 })).toHaveLength(log.length - 1);
   });
 
   it('the copy for the mock demo seed audits as the system what a member would, naming no user', async () => {
     const s = await scene();
-    const appendAudit = vi.spyOn(s.repository, 'appendAudit');
     const system = s.service.asSystem();
     const owner = await s.user(OWNER);
     const org = await system.createOrganization(owner, { name: 'Robust Law (demo)', claimId: await s.claim('sc_1') });
@@ -707,8 +772,9 @@ describe('audit', () => {
     // The same rules and store: the member is in, and the original service keeps auditing members as members.
     expect(await roleOf(s, org.id, admin.userId)).toBe('admin');
     await s.service.renameOrganization(owner, org.id, 'Robust Law');
-    expect(appendAudit.mock.calls.map(([record]) => [record.action, record.actor_user_id, record.actor_kind])).toEqual([
-      ['org.created', null, 'system'], ['billing.event_applied', null, 'system'], ['member.invited', null, 'system'],
+    expect((await s.repository.listAllAudit({ limit: 50 })).reverse().map(record => [record.action, record.actor_user_id, record.actor_kind])).toEqual([
+      ['org.created', null, 'system'], ['billing.checkout_started', owner.userId, 'member'], ['billing.event_applied', null, 'system'],
+      ['member.invited', null, 'system'],
       ['member.joined', null, 'system'], ['org.renamed', owner.userId, 'member']]);
   });
 });
@@ -1191,6 +1257,7 @@ describe('activity', () => {
       ['org.deletion_rejected', { kind: 'arca', email: null }],
       ['org.deletion_requested', { kind: 'member', email: OWNER }],
       ['billing.event_applied', { kind: 'system', email: null }],
+      ['billing.checkout_started', { kind: 'member', email: OWNER }],
       ['org.created', { kind: 'member', email: OWNER }],
     ]);
     const json = JSON.stringify(page);
@@ -1269,6 +1336,7 @@ describe('activity', () => {
     const { events } = ActivityPage.parse(await s.service.activity(owner, org.id, { limit: 200 }));
     expect(events.map(({ action, targetLabel, change }) => ({ action, targetLabel, change })).reverse()).toEqual([
       { action: 'org.created', targetLabel: 'Smith & Partners', change: { from: null, to: 'Smith & Co' } },
+      { action: 'billing.checkout_started', targetLabel: null, change: null },
       { action: 'billing.event_applied', targetLabel: null, change: null },
       ...['admin', 'member', 'viewer'].flatMap(role => [
         { action: 'member.invited', targetLabel: `${role}@firm.com`, change: { from: null, to: role } },
@@ -1295,15 +1363,15 @@ describe('activity', () => {
     const { owner, org } = await s.team();
     const all = (await s.service.activity(owner, org.id, { limit: 200 })).events;
     expect(all.map(event => event.action)).toEqual(['member.joined', 'member.invited', 'member.joined', 'member.invited', 'member.joined',
-      'member.invited', 'billing.event_applied', 'org.created']);
+      'member.invited', 'billing.event_applied', 'billing.checkout_started', 'org.created']);
     const first = await s.service.activity(owner, org.id, { limit: 3 });
     expect(first.events).toEqual(all.slice(0, 3));
     const second = await s.service.activity(owner, org.id, { limit: 3, before: first.nextBefore! });
     expect(second.events).toEqual(all.slice(3, 6));
     expect(await s.service.activity(owner, org.id, { limit: 3, before: second.nextBefore! })).toEqual({ events: all.slice(6), nextBefore: null });
     // A page that ends on the last event says so.
-    expect((await s.service.activity(owner, org.id, { limit: 8 })).nextBefore).toBeNull();
-    expect((await s.service.activity(owner, org.id, { limit: 7 })).nextBefore).toEqual(expect.any(Number));
+    expect((await s.service.activity(owner, org.id, { limit: 9 })).nextBefore).toBeNull();
+    expect((await s.service.activity(owner, org.id, { limit: 8 })).nextBefore).toEqual(expect.any(Number));
   });
 });
 
@@ -1389,15 +1457,16 @@ describe('the platform admin panel', () => {
     expect(all.events.map(event => [event.action, event.orgId, event.orgName, event.actorKind, event.actorEmail, event.targetLabel])).toEqual([
       ['plan.updated', null, null, 'platform', 'ops@arca.example', 'monthly'],
       ['billing.event_applied', a.org.id, 'Smith & Co', 'system', null, null],
+      ['billing.checkout_started', a.org.id, 'Smith & Co', 'member', OWNER, null],
       ['org.created', b.org.id, 'Boss LLP', 'member', 'boss@b.com', 'Boss LLP'],
       ['org.created', a.org.id, 'Smith & Co', 'member', OWNER, 'Smith & Co'],
     ]);
     expect(all.nextBefore).toBeNull();
     expect((await s.service.adminAudit({ orgId: b.org.id, limit: 100 })).events.map(event => event.action)).toEqual(['org.created']);
     expect(await s.service.adminAudit({ orgId: randomUUID(), limit: 100 })).toEqual({ events: [], nextBefore: null });
-    const first = await s.service.adminAudit({ limit: 2 });
-    expect(first.events).toEqual(all.events.slice(0, 2));
-    expect(await s.service.adminAudit({ limit: 2, before: first.nextBefore! })).toEqual({ events: all.events.slice(2), nextBefore: null });
+    const first = await s.service.adminAudit({ limit: 3 });
+    expect(first.events).toEqual(all.events.slice(0, 3));
+    expect(await s.service.adminAudit({ limit: 3, before: first.nextBefore! })).toEqual({ events: all.events.slice(3), nextBefore: null });
   });
 
   it('never gives a system row an email in ARCA\'s audit, even one that names a user', async () => {
@@ -1481,7 +1550,7 @@ describe('ids of the store', () => {
     expect(await s.repository.listInvitations(org.id)).toEqual([]);
     const portal = vi.spyOn(s.billing, 'createPortal');
     await s.service.portal(owner, ORG);
-    expect(portal).toHaveBeenCalledWith({ orgId: org.id, returnUrl: `${APP}/app/billing` });
+    expect(portal).toHaveBeenCalledWith({ customerId: (await s.repository.getBillingCustomer(org.id))!.customer_id, returnUrl: `${APP}/app/billing` });
     const request = await s.service.requestDeletion(owner, ORG, 'Closing the firm');
     expect(request.orgId).toBe(org.id);
     expect(await s.service.reviewDeletion(await s.platformAdmin(), request.id.toUpperCase(), 'reject')).toMatchObject({ id: request.id,
