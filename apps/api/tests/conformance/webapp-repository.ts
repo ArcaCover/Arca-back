@@ -512,6 +512,28 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
         await expect(repo.updatePlan(`weekly_${uuid()}`, { active: false })).rejects.toThrow('Plan not found');
       });
 
+      it('keeps the catalog ids of both Stripe modes side by side, each price unique among the plans (DN-13 §21)', async () => {
+        const before = (await repo.getPlan('monthly'))!;
+        const annual = await repo.getPlan('annual');
+        const [test, live] = [`price_conft${randomBytes(6).toString('hex')}`, `price_confl${randomBytes(6).toString('hex')}`];
+        try {
+          await repo.updatePlan('monthly', { stripe_product_id: 'prod_conf', stripe_price_id: test });
+          await repo.updatePlan('monthly', { stripe_live_product_id: 'prod_conf_live', stripe_live_price_id: live });
+          // Writing one mode leaves the other as it was.
+          expect(await repo.getPlan('monthly')).toEqual({ ...before, stripe_product_id: 'prod_conf', stripe_price_id: test,
+            stripe_live_product_id: 'prod_conf_live', stripe_live_price_id: live });
+          expect((await repo.listPlans()).find(plan => plan.code === 'monthly')).toMatchObject({ stripe_price_id: test, stripe_live_price_id: live });
+          await expect(repo.updatePlan('annual', { stripe_live_price_id: live })).rejects.toThrow();
+          expect(await repo.getPlan('annual')).toEqual(annual);
+          await repo.updatePlan('monthly', { stripe_live_price_id: null });
+          expect(await repo.getPlan('monthly')).toMatchObject({ stripe_price_id: test, stripe_live_price_id: null });
+        } finally {
+          await repo.updatePlan('monthly', { stripe_product_id: before.stripe_product_id, stripe_price_id: before.stripe_price_id,
+            stripe_live_product_id: before.stripe_live_product_id, stripe_live_price_id: before.stripe_live_price_id });
+        }
+        expect(await repo.getPlan('monthly')).toEqual(before);
+      });
+
       it('keeps the subscription of an organization, one per provider id, and moves its billing status apart', async () => {
         const { id } = await organization();
         const other = await organization();

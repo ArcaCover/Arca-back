@@ -29,13 +29,15 @@ export type ClaimTicketRecord = {
   id_hash: string; scan_id: string; email: string; expires_at: string; used_at: string | null;
 };
 /**
- * `stripe_price_id` is the catalog Price a checkout of the plan charges, and `stripe_product_id` its Product (DN-13 §6.1). Both are
- * null until `npm run stripe:catalog -- --apply` (or a price change from /admin) writes them; the amount, currency and interval mirror
- * that Price for display.
+ * The catalog Price a checkout of the plan charges, and its Product (DN-13 §6.1), once per Stripe mode (§21): `stripe_price_id` and
+ * `stripe_product_id` with a test key, `stripe_live_price_id` and `stripe_live_product_id` with a live one (read them with
+ * catalogIdsOf). Each is null until `npm run stripe:catalog -- --apply` (or a price change from /admin) with a key of that mode writes
+ * it; the amount, currency and interval mirror that Price for display.
  */
 export type PlanRecord = {
   code: string; name: string; amount_cents: number; currency: string; interval: 'month' | 'year'; active: boolean;
   stripe_product_id: string | null; stripe_price_id: string | null;
+  stripe_live_product_id: string | null; stripe_live_price_id: string | null;
 };
 /**
  * The subscription an organization holds, one row per organization (DN-10 §4.2). `status` is the mapped billing status (§6.6);

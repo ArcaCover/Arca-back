@@ -11,7 +11,9 @@ import { SupabaseWebappRepository } from '../src/webapp/supabase.js';
 // npm run stripe:catalog [-- --apply] [--allow-live]   (DN-13 §6.1, T13)
 //
 // Makes sure the Stripe catalog has the Product `arca` and one monthly and one annual Price with the amounts of the plans table
-// (lookup keys arca_monthly and arca_annual), and writes their ids into that table. A dry run unless --apply. Reads STRIPE_SECRET_KEY,
+// (lookup keys arca_monthly and arca_annual), and writes their ids into that table, in the columns of the key's mode (DN-13 §21):
+// stripe_product_id and stripe_price_id with a test key, stripe_live_product_id and stripe_live_price_id with a live one, so the one
+// database development and production share keeps both catalogs. A dry run unless --apply. Reads STRIPE_SECRET_KEY,
 // SUPABASE_URL and SUPABASE_SECRET_KEY (or SUPABASE_SERVICE_ROLE_KEY) from the environment or from .env.local, like admin:grant. A
 // live key is refused unless --allow-live (the live catalog is T23, the founder's). Prints the Stripe mode, the Supabase host and
 // the ids; never a key. Run it against Arca-dev with a test key (the restricted key needs write on Products and Prices).

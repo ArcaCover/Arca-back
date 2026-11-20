@@ -3,15 +3,16 @@ import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
 import { CatalogError, parseCatalogArgs, syncStripeCatalog } from '../../src/webapp/stripe-catalog.js';
 import { stripeClient } from '../../src/webapp/stripe.js';
+import type { PlanRecord } from '../../src/webapp/types.js';
 import { fakeStripe } from '../fixtures/stripe.js';
 
 // npm run stripe:catalog (DN-13 §6.1, T13): the Product and the monthly and annual Prices of plans.ts at Stripe, and their ids in
 // the plans table. Against a fake Stripe; no network.
 const KEY = 'rk_test_catalogsecret';
 
-function setup(options: { mode?: 'test' | 'live' } = {}) {
+function setup(options: { mode?: 'test' | 'live'; plans?: PlanRecord[] } = {}) {
   const stripe = fakeStripe({ livemode: options.mode === 'live' });
-  const repository = new InMemoryWebappRepository(DEFAULT_PLANS);
+  const repository = new InMemoryWebappRepository(options.plans ?? DEFAULT_PLANS);
   const lines: string[] = [];
   const run = (input: { apply?: boolean; allowLive?: boolean; repository?: InMemoryWebappRepository | null } = {}) => syncStripeCatalog({
     stripe: stripeClient(KEY, { fetch: stripe.fetch, maxNetworkRetries: 0 }), mode: options.mode ?? 'test', plans: DEFAULT_PLANS,
@@ -67,6 +68,36 @@ describe('stripe:catalog', () => {
     expect(fresh).not.toBe(old);
     expect(stripe.prices.get(fresh)).toMatchObject({ unit_amount: 59_900, lookup_key: 'arca_monthly' });
     expect(stripe.prices.get(old)).toMatchObject({ lookup_key: null });
+  });
+
+  // One Supabase project serves the test key of development and the live key of production (DN-13 §21): each run writes the ids of
+  // its own mode and leaves the other mode's.
+  it('with a live key and --allow-live writes the live pair, and leaves the test ids where they are', async () => {
+    const withTestIds = DEFAULT_PLANS.map(plan => ({ ...plan, stripe_product_id: 'arca', stripe_price_id: `price_1Test${plan.code}` }));
+    const { stripe, repository, lines, run } = setup({ mode: 'live', plans: withTestIds });
+    const report = await run({ apply: true, allowLive: true });
+    const monthly = (await repository.getPlan('monthly'))!;
+    expect(monthly).toMatchObject({ stripe_product_id: 'arca', stripe_price_id: 'price_1Testmonthly', stripe_live_product_id: 'arca',
+      stripe_live_price_id: expect.stringMatching(/^price_/) });
+    expect(stripe.prices.get(monthly.stripe_live_price_id!)).toMatchObject({ livemode: true, lookup_key: 'arca_monthly', unit_amount: 49_900 });
+    expect((await repository.getPlan('annual'))).toMatchObject({ stripe_price_id: 'price_1Testannual', stripe_live_price_id: expect.stringMatching(/^price_/) });
+    expect(report.plans.map(plan => [plan.code, plan.price, plan.plan])).toEqual([['monthly', 'created', 'written'], ['annual', 'created', 'written']]);
+    const printed = lines.join(' | ');
+    expect(printed).toMatch(/Stripe live mode/);
+    expect(printed).toMatch(/plans\.monthly\.stripe_live_price_id written/);
+    // Idempotent in its mode too: the live ids it wrote are current.
+    const again = await run({ apply: true, allowLive: true });
+    expect(again.plans.map(plan => plan.plan)).toEqual(['unchanged', 'unchanged']);
+  });
+
+  it('with a test key writes the test pair and never touches the live one', async () => {
+    const withLiveIds = DEFAULT_PLANS.map(plan => ({ ...plan, stripe_live_product_id: 'arca', stripe_live_price_id: `price_1Live${plan.code}` }));
+    const { repository, lines, run } = setup({ plans: withLiveIds });
+    await run({ apply: true });
+    expect(await repository.getPlan('monthly')).toMatchObject({ stripe_price_id: expect.stringMatching(/^price_/), stripe_live_product_id: 'arca',
+      stripe_live_price_id: 'price_1Livemonthly' });
+    expect((await repository.getPlan('monthly'))!.stripe_price_id).not.toBe('price_1Livemonthly');
+    expect(lines.join(' | ')).toMatch(/plans\.monthly\.stripe_price_id written/);
   });
 
   it('refuses a live key without --allow-live, and --apply without the plans table, before calling Stripe', async () => {

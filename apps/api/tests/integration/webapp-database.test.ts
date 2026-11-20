@@ -81,14 +81,14 @@ describe('PostgreSQL webapp schema (DN-10, DN-11)', () => {
   });
 
   it('seeds the example plans', async () => {
-    const plans = await db.query(`select code,name,amount_cents,currency,"interval",active,stripe_product_id,stripe_price_id
-      from public.plans order by code`);
-    // No Stripe price until npm run stripe:catalog writes it (DN-13 §6.1).
+    const plans = await db.query(`select code,name,amount_cents,currency,"interval",active,stripe_product_id,stripe_price_id,
+      stripe_live_product_id,stripe_live_price_id from public.plans order by code`);
+    // No Stripe price in either mode until npm run stripe:catalog writes it (DN-13 §6.1, §21).
     expect(plans.rows).toEqual([
       { code: 'annual', name: 'Annual (example price)', amount_cents: 499_000, currency: 'usd', interval: 'year', active: true,
-        stripe_product_id: null, stripe_price_id: null },
+        stripe_product_id: null, stripe_price_id: null, stripe_live_product_id: null, stripe_live_price_id: null },
       { code: 'monthly', name: 'Monthly (example price)', amount_cents: 49_900, currency: 'usd', interval: 'month', active: true,
-        stripe_product_id: null, stripe_price_id: null },
+        stripe_product_id: null, stripe_price_id: null, stripe_live_product_id: null, stripe_live_price_id: null },
     ]);
     // The in-memory repository seeds the same plans; the two must not drift.
     expect(plans.rows).toEqual([...DEFAULT_PLANS].sort((a, b) => a.code.localeCompare(b.code)));

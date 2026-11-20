@@ -15,8 +15,11 @@ function setup(options: { now?: () => number; mode?: 'test' | 'live' } = {}) {
   const stripe = fakeStripe({ now, livemode: options.mode === 'live' });
   stripe.addProduct();
   const price = stripe.addPrice({ id: 'price_monthly1', lookupKey: 'arca_monthly', amount: 49_900, interval: 'month', planCode: 'monthly' });
+  // The price of the key's mode is the fake's; the other mode's slot holds an id this Stripe does not know (DN-13 §21).
+  const live = options.mode === 'live';
   const plan: PlanRecord = { code: 'monthly', name: 'Monthly', amount_cents: 49_900, currency: 'usd', interval: 'month', active: true,
-    stripe_product_id: 'arca', stripe_price_id: price.id };
+    stripe_product_id: 'arca', stripe_price_id: live ? 'price_1TestOnly' : price.id,
+    stripe_live_product_id: live ? 'arca' : null, stripe_live_price_id: live ? price.id : null };
   const provider = new StripeBillingProvider({ secretKey: options.mode === 'live' ? 'rk_live_fixture' : 'rk_test_fixture', webhookSecret: WEBHOOK_SECRET,
     mode: options.mode ?? 'test', appBaseUrl: APP }, { fetch: stripe.fetch, now, maxNetworkRetries: 0 });
   return { stripe, provider, plan, price };
@@ -281,6 +284,43 @@ describe('StripeBillingProvider', () => {
         currency: 'usd', interval: 'year' });
       expect(created.productId).toBe('arca');
       expect(stripe.products.get('arca')).toMatchObject({ name: 'ARCA' });
+    });
+  });
+
+  describe('the catalog of the mode of the key (DN-13 §21)', () => {
+    it('with a live key charges the live price, and refuses a plan that only has a test one', async () => {
+      const { stripe, provider, plan, price } = setup({ mode: 'live' });
+      const { customerId } = await provider.ensureCustomer({ orgId: ORG, name: 'Smith & Co', email: 'owner@firm.com' });
+      const checkout = await provider.createCheckout({ orgId: ORG, customerId, plan, successUrl: 's', cancelUrl: 'c' });
+      expect(checkout.sessionId).toMatch(/^cs_live_/);
+      expect(stripe.calls.at(-1)!.form.line_items).toEqual({ 0: { price: price.id, quantity: '1' } });
+      await expect(provider.createEmbeddedCheckout({ orgId: ORG, customerId, plan: { ...plan, stripe_live_price_id: null }, returnUrl: 'r' }))
+        .rejects.toThrow(/no Stripe price/);
+      await expect(provider.createCheckout({ orgId: ORG, customerId, plan: { ...plan, stripe_live_price_id: null }, successUrl: 's', cancelUrl: 'c' }))
+        .rejects.toThrow(/no Stripe price/);
+    });
+
+    it('with a live key replaces the live price of a plan and leaves its test id alone', async () => {
+      const { stripe, provider, plan, price } = setup({ mode: 'live' });
+      const created = await provider.createPrice({ plan, amountCents: 59_900, currency: 'usd', interval: 'month' });
+      expect(created).toEqual({ priceId: expect.stringMatching(/^price_/), productId: 'arca' });
+      expect(stripe.prices.get(price.id)).toMatchObject({ active: false });
+      expect(stripe.calls.find(call => call.method === 'POST' && call.path === '/v1/prices')?.idempotencyKey)
+        .toBe(`price:monthly:${price.id}:59900:usd:month`);
+      // The test id was never sent to the live account.
+      expect(stripe.calls.some(call => call.path.includes('price_1TestOnly'))).toBe(false);
+    });
+
+    it('says whether a catalog price exists, is active, and of which mode, for the check at start', async () => {
+      const { stripe, provider, price } = setup();
+      expect(await provider.priceState(price.id)).toEqual({ active: true, livemode: false });
+      stripe.prices.get(price.id)!.active = false;
+      expect(await provider.priceState(price.id)).toEqual({ active: false, livemode: false });
+      expect(await provider.priceState('price_1Unknown')).toBeNull();
+      stripe.failNext(call => call.path === `/v1/prices/${price.id}`);
+      await expect(provider.priceState(price.id)).rejects.toBeInstanceOf(BillingUnavailable);
+      const live = setup({ mode: 'live' });
+      expect(await live.provider.priceState(live.price.id)).toEqual({ active: true, livemode: true });
     });
   });
 

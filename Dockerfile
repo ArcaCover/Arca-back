@@ -44,7 +44,7 @@ COPY --from=build /app/packages/questions/package.json ./packages/questions/pack
 COPY --from=build /app/packages/questions/dist ./packages/questions/dist
 # The deployment payload travels with the image it deploys: the host extracts it at deploy time,
 # so a rollback also restores that commit's compose file, Caddyfile and configuration.
-COPY compose.yaml deploy/Caddyfile deploy/production.env deploy/activate.sh deploy/render-env.py ./deploy-payload/
+COPY compose.yaml deploy/Caddyfile deploy/production.env deploy/activate.sh deploy/render-env.py deploy/compose.cloudwatch.yaml ./deploy-payload/
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends dumb-init \

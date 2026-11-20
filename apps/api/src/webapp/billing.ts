@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { BillingStatus } from '@arca/contracts';
+import { catalogIdsOf } from './plans.js';
 import type { PlanRecord } from './types.js';
 
 /**
@@ -74,7 +75,7 @@ export interface BillingProvider {
   readonly mode: 'simulated' | 'test' | 'live';
   /** Whether the provider signs webhooks: without them, POST /billing/webhook stays 501 (the simulated provider pays through debug). */
   readonly webhooks: boolean;
-  /** Whether a checkout charges a catalog price, so a plan without `stripe_price_id` cannot be sold. */
+  /** Whether a checkout charges a catalog price, so a plan without a price in the provider's mode cannot be sold (DN-13 §21). */
   readonly needsCatalogPrice: boolean;
   ensureCustomer(input: CustomerDetails): Promise<{ customerId: string }>;
   /** Brings a customer made before up to the organization's profile, its EIN included, before a new Checkout (DN-13 §19). */
@@ -104,6 +105,11 @@ export interface BillingProvider {
   createPrice(input: { plan: PlanRecord; amountCents: number; currency: string; interval: 'month' | 'year' }): Promise<{ priceId: string; productId: string }>;
   /** The subscriptions whose state changed since then, for the daily reconciliation (DN-13 §9.5). */
   recentSubscriptionIds(since: Date): Promise<string[]>;
+  /**
+   * A catalog price as the provider holds it, for the check at start (DN-13 §21): whether it is active and of which mode; null when
+   * the account does not know it. Throws BillingUnavailable when the provider cannot be asked.
+   */
+  priceState(priceId: string): Promise<{ active: boolean; livemode: boolean } | null>;
 }
 
 const id = (prefix: string) => `${prefix}_mock_${randomUUID().replaceAll('-', '')}`;
@@ -166,6 +172,8 @@ export class MockBillingProvider implements BillingProvider {
     return { priceId: id('price'), productId: 'prod_mock' };
   }
   async recentSubscriptionIds() { return []; }
+  // It charges no catalog price (needsCatalogPrice is false), so it knows none and nothing asks it.
+  async priceState(_priceId: string) { return null; }
 
   /** The event a completed checkout would send; null for an unknown session or one already paid. */
   pay(sessionId: string): BillingEvent | null {
@@ -179,7 +187,7 @@ export class MockBillingProvider implements BillingProvider {
     session.status = 'complete';
     session.subscriptionId = subscriptionId;
     this.subscriptions.set(subscriptionId, { subscriptionId, customerId: session.customerId, orgId: session.orgId, status: 'active',
-      priceId: session.plan.stripe_price_id, planCode: session.plan.code, interval: session.plan.interval, currentPeriodStart: start.toISOString(),
+      priceId: catalogIdsOf(session.plan, 'test').priceId, planCode: session.plan.code, interval: session.plan.interval, currentPeriodStart: start.toISOString(),
       currentPeriodEnd: periodEnd.toISOString(), cancelAtPeriodEnd: false, livemode: false });
     return { id: id('evt'), type: 'checkout.completed', orgId: session.orgId, status: 'active', planCode: session.plan.code,
       customerId: session.customerId, subscriptionId, currentPeriodEnd: periodEnd.toISOString(), checkoutSessionId: sessionId };

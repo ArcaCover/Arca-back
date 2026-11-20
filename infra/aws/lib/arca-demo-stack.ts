@@ -7,6 +7,7 @@ import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as logs from 'aws-cdk-lib/aws-logs';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as subscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
@@ -33,6 +34,35 @@ const encoded = (relativePath: string) => Buffer.from(readFileSync(path.join(rep
 // Runtime secrets live here, one SecureString per environment variable.
 export const SECRETS_PATH = '/arca/prod';
 export const GITHUB_DEPLOY_ROLE_NAME = 'arca-github-deploy';
+// The API container's logs (Docker's awslogs driver, deploy/compose.cloudwatch.yaml). deploy/activate.sh names it too.
+export const API_LOG_GROUP_NAME = '/arca/api';
+export const BILLING_METRIC_NAMESPACE = 'ARCA/Billing';
+
+/**
+ * The alarms on the API's billing lines (DN-13 §9.5, T26). Each one counts the log lines that hold every term of one of its patterns
+ * (a CloudWatch filter pattern of quoted terms); the lines themselves are written by apps/api/src/webapp (billing-events.ts,
+ * reconcile-schedule.ts, service.ts) and compose.ts. One such line in five minutes raises the alarm.
+ */
+export const BILLING_ALARMS: ReadonlyArray<{ id: string; metricName: string; description: string; patterns: ReadonlyArray<readonly string[]> }> = [
+  { id: 'ReconcileFailed', metricName: 'ReconcileFailures', patterns: [['[billing] reconcile failed']],
+    description: 'The daily Stripe reconciliation failed, or could not read a subscription: the API log says which' },
+  { id: 'ReconcileMismatch', metricName: 'ReconcileMismatches', patterns: [['[billing] reconcile mismatch']],
+    description: 'The daily reconciliation found a subscription the back had wrong (a lost webhook) and corrected it: check why' },
+  { id: 'WebhookFailed', metricName: 'WebhookFailures',
+    patterns: [['[billing] event', 'failed ('], ['[billing] event', 'refused: livemode=']],
+    description: 'A Stripe webhook failed to process (Stripe retries it) or came from the other Stripe mode (a misconfigured endpoint)' },
+  { id: 'DuplicateSubscription', metricName: 'DuplicateSubscriptions', patterns: [['[billing] duplicate_subscription']],
+    description: 'An organization pays two live subscriptions: cancel and refund one in the Stripe dashboard' },
+  { id: 'Dispute', metricName: 'Disputes', patterns: [['[billing] dispute']],
+    description: 'A customer disputed a charge: answer it in the Stripe dashboard before its deadline' },
+  { id: 'UnknownOrg', metricName: 'UnknownOrgEvents',
+    patterns: [['[billing] event', 'unknown_org'], ['[billing] reconcile: subscription', 'names no organization']],
+    description: 'A Stripe event or subscription names no organization of the back (a dispute always does, for now)' },
+  { id: 'CancelFailed', metricName: 'CancelFailures', patterns: [['[billing] failed to cancel subscription']],
+    description: 'An approved deletion could not cancel its Stripe subscription: cancel it in the Stripe dashboard' },
+  { id: 'WebappStartRefused', metricName: 'WebappStartRefusals', patterns: [['The real webapp cannot start']],
+    description: 'The API refused to start the real webapp (for example the Stripe catalog of its key is not ready) and keeps restarting' },
+];
 
 export class ArcaDemoStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ArcaDemoStackProps) {
@@ -72,6 +102,15 @@ export class ArcaDemoStack extends cdk.Stack {
     repository.grantPull(role);
     // SecureStrings use the AWS managed aws/ssm key, whose key policy already lets SSM decrypt
     // for principals of this account, so no KMS statement is needed.
+    // The API's logs, shipped by Docker's awslogs driver once deploy/activate.sh finds this group (DN-13 §9.5). Three months, then gone.
+    const apiLogs = new logs.LogGroup(this, 'ApiLogGroup', {
+      logGroupName: API_LOG_GROUP_NAME,
+      retention: logs.RetentionDays.THREE_MONTHS,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    apiLogs.grantWrite(role);
+    // activate.sh looks the group up before pointing the driver at it.
+    role.addToPolicy(new iam.PolicyStatement({ actions: ['logs:DescribeLogStreams'], resources: [apiLogs.logGroupArn] }));
     role.addToPolicy(new iam.PolicyStatement({
       actions: ['ssm:GetParametersByPath'],
       resources: [this.formatArn({ service: 'ssm', resource: 'parameter', resourceName: SECRETS_PATH.slice(1) }),
@@ -191,11 +230,33 @@ export class ArcaDemoStack extends cdk.Stack {
       alarm.addOkAction(new cloudwatchActions.SnsAction(alerts));
     }
 
+    // The payment lines of the API's logs (DN-13 §9.5, T26), into a topic of their own. It is created with no subscription on
+    // purpose: the founder subscribes an email to it (aws sns subscribe, or the console) and confirms it. Stripe billing of
+    // customers only; AWS spend, budgets and cost settings stay outside this stack.
+    const billingAlerts = new sns.Topic(this, 'BillingAlertTopic', { displayName: 'ARCA billing alerts (API logs)' });
+    for (const alarm of BILLING_ALARMS) {
+      alarm.patterns.forEach((terms, index) => new logs.MetricFilter(this, `${alarm.id}Filter${index || ''}`, {
+        logGroup: apiLogs, metricNamespace: BILLING_METRIC_NAMESPACE, metricName: alarm.metricName,
+        filterPattern: logs.FilterPattern.allTerms(...terms), metricValue: '1',
+      }));
+      new cloudwatch.Alarm(this, `${alarm.id}Alarm`, {
+        alarmDescription: alarm.description,
+        metric: new cloudwatch.Metric({ namespace: BILLING_METRIC_NAMESPACE, metricName: alarm.metricName, statistic: 'Sum',
+          period: cdk.Duration.minutes(5) }),
+        threshold: 1, evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        // No line, no alarm: a quiet log is a healthy one.
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }).addAlarmAction(new cloudwatchActions.SnsAction(billingAlerts));
+    }
+
     new cdk.CfnOutput(this, 'EcrRepositoryUri', { value: repository.repositoryUri });
     new cdk.CfnOutput(this, 'InstanceId', { value: instance.instanceId });
     new cdk.CfnOutput(this, 'ElasticIpAddress', { value: elasticIp.ref });
     new cdk.CfnOutput(this, 'DemoUrl', { value: `https://${props.demoHostname}` });
     new cdk.CfnOutput(this, 'GithubDeployRoleArn', { value: deployRole.roleArn });
     new cdk.CfnOutput(this, 'SecretsPath', { value: SECRETS_PATH });
+    new cdk.CfnOutput(this, 'ApiLogGroupName', { value: apiLogs.logGroupName });
+    new cdk.CfnOutput(this, 'BillingAlertTopicArn', { value: billingAlerts.topicArn });
   }
 }
