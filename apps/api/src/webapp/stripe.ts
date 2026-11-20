@@ -193,6 +193,9 @@ export class StripeBillingProvider implements BillingProvider {
       // ARCA is the seller (taxes are F3). An account can have Managed Payments (Stripe as merchant of record) on by default, and
       // then Stripe refuses a payment method list; this session says so explicitly instead of taking the account's default.
       managed_payments: { enabled: false },
+      // Always charged and shown in USD (decision of 2026-11-20): an account with Adaptive Pricing on offered the visitor their
+      // local currency (COP in the first test-mode run). Explicit here so a change in the dashboard cannot turn it back on.
+      adaptive_pricing: { enabled: false },
       expires_at: nowS + CHECKOUT_TTL_S,
       // Taxes (F3), promotion codes and a trial (F4) wait for the founder's decisions.
     }, { idempotencyKey: `checkout:${input.orgId}:${input.plan.code}:${Math.floor(this.now() / 60_000)}${input.after ? `:${input.after}` : ''}` }));
