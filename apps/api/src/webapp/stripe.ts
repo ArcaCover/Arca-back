@@ -1,5 +1,5 @@
 import Stripe from 'stripe';
-import { BillingUnavailable, type BillingProvider, type ProviderCheckout, type ProviderEvent, type ProviderSubscription } from './billing.js';
+import { BillingUnavailable, type BillingProvider, type CustomerDetails, type ProviderCheckout, type ProviderEvent, type ProviderSubscription } from './billing.js';
 import type { PlanRecord } from './types.js';
 
 /**
@@ -52,6 +52,13 @@ async function found<T>(work: () => Promise<T>): Promise<T | null> {
     if (isMissing(error)) return null;
     throw translate(error);
   }
+}
+
+/** The customer's own fields, from the pre-checkout's profile when there is one (DN-13 §19): a US address, the phone as typed. */
+function customerFields(input: CustomerDetails): Stripe.CustomerUpdateParams {
+  return { name: input.name, email: input.email, ...(input.phone ? { phone: input.phone } : {}),
+    ...(input.address ? { address: { line1: input.address.line1, city: input.address.city, state: input.address.state,
+      postal_code: input.address.postalCode, country: 'US' } } : {}) };
 }
 
 /** The subscription as DN-13 §6.5 reads it: one item, whose price and period are the subscription's. */
@@ -170,23 +177,65 @@ export class StripeBillingProvider implements BillingProvider {
     this.stripe = stripeClient(config.secretKey, { fetch: options.fetch, maxNetworkRetries: options.maxNetworkRetries });
   }
 
-  async ensureCustomer(input: { orgId: string; name: string; email: string }) {
-    // The organization is in the key, so two requests that race within Stripe's 24 h of idempotency get one customer.
-    const customer = await call(() => this.stripe.customers.create({ name: input.name, email: input.email, metadata: { org_id: input.orgId } },
-      { idempotencyKey: `customer:${input.orgId}` }));
+  async ensureCustomer(input: CustomerDetails) {
+    // The organization is in the key, so two requests that race within Stripe's 24 h of idempotency get one customer. What the firm
+    // gave in the pre-checkout (DN-13 §19) goes with it, so Checkout asks none of it again.
+    const customer = await call(() => this.stripe.customers.create({ ...customerFields(input),
+      ...(input.ein ? { tax_id_data: [{ type: 'us_ein' as const, value: input.ein }] } : {}), metadata: { org_id: input.orgId } },
+    { idempotencyKey: `customer:${input.orgId}` }));
     return { customerId: customer.id };
   }
 
+  /**
+   * The customer of an organization brought up to its profile before a new Checkout (DN-13 §19): name, email, phone and address, and
+   * the EIN as its only us_ein tax id. Updating is idempotent; the tax ids are read first, so a retry adds none.
+   */
+  async updateCustomer(customerId: string, input: CustomerDetails) {
+    await call(() => this.stripe.customers.update(customerId, customerFields(input)));
+    if (!input.ein) return;
+    const ein = input.ein;
+    const held = await call(() => this.stripe.customers.listTaxIds(customerId, { limit: 100 }));
+    const eins = held.data.filter(taxId => taxId.type === 'us_ein');
+    for (const stale of eins.filter(taxId => taxId.value !== ein)) await call(() => this.stripe.customers.deleteTaxId(customerId, stale.id));
+    if (!eins.some(taxId => taxId.value === ein)) {
+      await call(() => this.stripe.customers.createTaxId(customerId, { type: 'us_ein', value: ein },
+        { idempotencyKey: `tax_id:${customerId}:us_ein:${ein}` }));
+    }
+  }
+
   async createCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; successUrl: string; cancelUrl: string; after?: string | null }) {
+    const session = await this.openSession(input, { success_url: input.successUrl, cancel_url: input.cancelUrl },
+      `checkout:${input.orgId}:${input.plan.code}:${Math.floor(this.now() / 60_000)}${input.after ? `:${input.after}` : ''}`);
+    if (!session.url) throw new Error('Stripe returned a checkout session without a URL');
+    return { sessionId: session.id, url: session.url, expiresAt: iso(session.expires_at)! };
+  }
+
+  /**
+   * Checkout embedded in ARCA's page (DN-13 §19): the same session as the hosted one, mounted by Stripe.js with its client secret,
+   * coming back to `returnUrl` (with {CHECKOUT_SESSION_ID}) instead of the success and cancel pages. Its idempotency key names the
+   * mode, so a hosted session asked for in the same minute is another one.
+   */
+  async createEmbeddedCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; returnUrl: string; after?: string | null }) {
+    const session = await this.openSession(input, { ui_mode: 'embedded_page', return_url: input.returnUrl },
+      `checkout:${input.orgId}:${input.plan.code}:embedded:${Math.floor(this.now() / 60_000)}${input.after ? `:${input.after}` : ''}`);
+    if (!session.client_secret) throw new Error('Stripe returned an embedded checkout session without a client secret');
+    return { sessionId: session.id, clientSecret: session.client_secret, expiresAt: iso(session.expires_at)! };
+  }
+
+  /** What every subscription Checkout of ARCA carries (DN-13 §6.2), hosted or embedded; `page` is where it is paid and where it ends. */
+  private async openSession(input: { orgId: string; customerId: string; plan: PlanRecord },
+    page: Pick<Stripe.Checkout.SessionCreateParams, 'ui_mode' | 'success_url' | 'cancel_url' | 'return_url'>,
+    idempotencyKey: string): Promise<Stripe.Checkout.Session> {
     const price = input.plan.stripe_price_id;
     if (!price) throw new Error(`The plan ${input.plan.code} has no Stripe price yet: run npm run stripe:catalog`);
     const nowS = Math.floor(this.now() / 1000);
     const session = await call(() => this.stripe.checkout.sessions.create({
-      mode: 'subscription', customer: input.customerId, client_reference_id: input.orgId,
+      mode: 'subscription', ...(page.ui_mode ? { ui_mode: page.ui_mode } : {}), customer: input.customerId, client_reference_id: input.orgId,
       line_items: [{ price, quantity: 1 }],
       // The webhook finds the organization on the session and on the subscription, whatever the customer.
       metadata: { org_id: input.orgId }, subscription_data: { metadata: { org_id: input.orgId } },
-      success_url: input.successUrl, cancel_url: input.cancelUrl,
+      ...(page.success_url ? { success_url: page.success_url, cancel_url: page.cancel_url } : {}),
+      ...(page.return_url ? { return_url: page.return_url } : {}),
       billing_address_collection: 'required', customer_update: { name: 'auto', address: 'auto' },
       // Card only for now (DN-13 §6.2, F5): an asynchronous method would need the async_payment events and a state in between.
       allowed_payment_method_types: ['card'],
@@ -198,11 +247,10 @@ export class StripeBillingProvider implements BillingProvider {
       adaptive_pricing: { enabled: false },
       expires_at: nowS + CHECKOUT_TTL_S,
       // Taxes (F3), promotion codes and a trial (F4) wait for the founder's decisions.
-    }, { idempotencyKey: `checkout:${input.orgId}:${input.plan.code}:${Math.floor(this.now() / 60_000)}${input.after ? `:${input.after}` : ''}` }));
+    }, { idempotencyKey }));
     // An idempotent replay of a session that is no longer open would hand out a link that cannot be paid.
     if (session.status !== 'open') throw new Error(`Stripe returned a checkout session that is ${session.status}, not open`);
-    if (!session.url) throw new Error('Stripe returned a checkout session without a URL');
-    return { sessionId: session.id, url: session.url, expiresAt: iso(session.expires_at)! };
+    return session;
   }
 
   async expireCheckout(sessionId: string) {
@@ -250,8 +298,10 @@ export class StripeBillingProvider implements BillingProvider {
     const session = await found(() => this.stripe.checkout.sessions.retrieve(sessionId));
     if (!session) return null;
     const status = (['open', 'complete', 'expired'] as const).find(known => known === session.status) ?? null;
+    const uiMode = session.ui_mode === 'embedded_page' ? 'embedded' as const : session.ui_mode === 'hosted_page' ? 'hosted' as const : null;
     return { sessionId: session.id, orgId: session.client_reference_id ?? session.metadata?.org_id ?? null, customerId: idOf(session.customer),
-      subscriptionId: idOf(session.subscription), status, livemode: session.livemode };
+      subscriptionId: idOf(session.subscription), status, livemode: session.livemode, uiMode,
+      clientSecret: uiMode === 'embedded' ? session.client_secret ?? null : null };
   }
 
   async parseWebhook(raw: string | Uint8Array, signature: string | undefined) {

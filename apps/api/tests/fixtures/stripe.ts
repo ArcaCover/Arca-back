@@ -48,6 +48,9 @@ export function fakeStripe(options: { now?: () => number; livemode?: boolean } =
   const livemode = options.livemode ?? false;
   const calls: Call[] = [];
   const customers = new Map<string, DeepPartial<Stripe.Customer> & { id: string; metadata: Record<string, string> }>();
+  const taxIds: Array<{ id: string; customer: string; type: string; value: string }> = [];
+  const taxIdObject = (taxId: { id: string; customer: string; type: string; value: string }) => ({ id: taxId.id, object: 'tax_id' as const,
+    customer: taxId.customer, type: taxId.type, value: taxId.value, country: 'US', livemode, created: now() }) satisfies DeepPartial<Stripe.TaxId>;
   const sessions = new Map<string, CheckoutFixture>();
   const subscriptions = new Map<string, SubscriptionFixture>();
   const prices = new Map<string, PriceFixture>();
@@ -73,11 +76,18 @@ export function fakeStripe(options: { now?: () => number; livemode?: boolean } =
   function checkoutObject(form: Record<string, unknown>): CheckoutFixture {
     const id = `cs_${livemode ? 'live' : 'test'}_${randomBytes(16).toString('hex')}`;
     const metadata = (form.metadata ?? {}) as Record<string, string>;
+    // An embedded session (DN-13 §19) lives in the merchant's page: no URL, a client secret for Stripe.js, and a return URL.
+    const embedded = form.ui_mode === 'embedded_page';
     return { id, object: 'checkout.session', mode: 'subscription', status: 'open', livemode, customer: form.customer as string,
       client_reference_id: (form.client_reference_id as string | undefined) ?? null, metadata, subscription: null,
-      success_url: form.success_url as string, cancel_url: form.cancel_url as string, url: `https://checkout.stripe.com/c/pay/${id}`,
+      ui_mode: embedded ? 'embedded_page' : 'hosted_page',
+      success_url: (form.success_url as string | undefined) ?? null, cancel_url: (form.cancel_url as string | undefined) ?? null,
+      return_url: embedded ? form.return_url as string : undefined,
+      url: embedded ? null : `https://checkout.stripe.com/c/pay/${id}`,
+      client_secret: embedded ? `${id}_secret_${randomBytes(12).toString('hex')}` : null,
       expires_at: Number(form.expires_at ?? now() + DAY), created: now(), payment_status: 'unpaid' };
   }
+  const addressOf = (value: unknown) => value && typeof value === 'object' ? value as Stripe.Address : undefined;
 
   async function answer(call: Call): Promise<{ status: number; body: unknown } | Response> {
     const { method, path, form, query } = call;
@@ -85,9 +95,38 @@ export function fakeStripe(options: { now?: () => number; livemode?: boolean } =
     const ok = (body: unknown) => ({ status: 200, body });
     if (method === 'POST' && path === '/v1/customers') {
       const customer = { id: randomId('cus'), object: 'customer' as const, name: form.name as string, email: form.email as string,
+        phone: (form.phone as string | undefined) ?? null, address: addressOf(form.address) ?? null,
         metadata: (form.metadata ?? {}) as Record<string, string>, livemode, created: now() };
       customers.set(customer.id, customer);
+      for (const datum of Object.values((form.tax_id_data ?? {}) as Record<string, { type: string; value: string }>)) {
+        taxIds.push({ id: randomId('txi'), customer: customer.id, type: datum.type, value: datum.value });
+      }
       return ok(customer);
+    }
+    if (parts[0] === 'customers' && parts[1]) {
+      const customer = customers.get(parts[1]);
+      if (!customer) return missing('customer', parts[1]);
+      if (parts[2] === 'tax_ids') {
+        const mine = () => taxIds.filter(taxId => taxId.customer === customer.id);
+        if (method === 'GET' && parts.length === 3) return ok({ object: 'list', data: mine().map(taxIdObject), has_more: false, url: `/v1/customers/${customer.id}/tax_ids` });
+        if (method === 'POST' && parts.length === 3) {
+          const taxId = { id: randomId('txi'), customer: customer.id, type: form.type as string, value: form.value as string };
+          taxIds.push(taxId);
+          return ok(taxIdObject(taxId));
+        }
+        if (method === 'DELETE' && parts[3]) {
+          const index = taxIds.findIndex(taxId => taxId.id === parts[3] && taxId.customer === customer.id);
+          if (index < 0) return missing('tax_id', parts[3]);
+          taxIds.splice(index, 1);
+          return ok({ id: parts[3], object: 'tax_id', deleted: true });
+        }
+      }
+      if (method === 'GET' && parts.length === 2) return ok(customer);
+      if (method === 'POST' && parts.length === 2) {
+        for (const field of ['name', 'email', 'phone'] as const) if (form[field] !== undefined) customer[field] = form[field] as string;
+        if (form.address !== undefined) customer.address = addressOf(form.address) ?? null;
+        return ok(customer);
+      }
     }
     if (parts[0] === 'checkout' && parts[1] === 'sessions') {
       if (method === 'POST' && parts.length === 2) {
@@ -99,6 +138,16 @@ export function fakeStripe(options: { now?: () => number; livemode?: boolean } =
         // payment method list on a session that does not turn it off.
         if (form.allowed_payment_method_types !== undefined && (form.managed_payments as { enabled?: string } | undefined)?.enabled !== 'false') {
           return stripeError(400, 'invalid_request_error', 'allowed_payment_method_types cannot be used with Managed Payments, which is enabled by default on your account. Remove allowed_payment_method_types, or pass managed_payments[enabled]=false to disable it for this request.');
+        }
+        // Like Stripe: an embedded session comes back to a return URL, never to the hosted page's success and cancel URLs.
+        if (form.ui_mode === 'embedded_page' && (form.success_url !== undefined || form.cancel_url !== undefined)) {
+          return stripeError(400, 'invalid_request_error', 'success_url and cancel_url cannot be used with ui_mode embedded_page; use return_url.');
+        }
+        if (form.ui_mode === 'embedded_page' && form.return_url === undefined) {
+          return stripeError(400, 'invalid_request_error', 'return_url is required when ui_mode is embedded_page.');
+        }
+        if (form.ui_mode !== 'embedded_page' && form.return_url !== undefined) {
+          return stripeError(400, 'invalid_request_error', 'return_url can only be used with ui_mode embedded_page or elements.');
         }
         const session = checkoutObject(form);
         sessions.set(session.id, session);
@@ -214,6 +263,8 @@ export function fakeStripe(options: { now?: () => number; livemode?: boolean } =
   const signer = new Stripe('sk_test_signer');
   return {
     fetch, calls, customers, sessions, subscriptions, prices, products, events,
+    /** The tax ids a customer holds now, as type and value. */
+    taxIds: (customerId: string) => taxIds.filter(taxId => taxId.customer === customerId).map(({ type, value }) => ({ type, value })),
     /** The calls that changed something at Stripe. */
     writes: () => calls.filter(call => call.method !== 'GET'),
     /** The next call that matches gets this answer instead (one use). */

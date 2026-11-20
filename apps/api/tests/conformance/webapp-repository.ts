@@ -4,7 +4,7 @@ import type { Role } from '@arca/contracts';
 import {
   IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict, type ActionPatch, type AssessmentActionRecord, type AuditActor,
   type BillingStateRecord, type CheckoutSessionRecord, type ClaimTicketRecord, type CustomActionRecord, type DeletionRequestRecord, type InvitationRecord,
-  type MemberChange, type MembershipRecord, type NewAuditRecord, type OrgAnalysisRecord, type OrganizationRecord, type ProfileWrite,
+  type MemberChange, type MembershipRecord, type NewAuditRecord, type OrgAnalysisRecord, type OrganizationRecord, type OrgProfileRecord, type ProfileWrite,
   type SubscriptionRecord, type WebappConflictReason, type WebappRepository,
 } from '../../src/webapp/types.js';
 
@@ -44,6 +44,12 @@ const orgOf = (id: string, createdBy: string, patch: Partial<OrganizationRecord>
   domain: 'firm.example', billing_status: 'pending_payment', deleted_at: null, created_by: createdBy, created_at: tick(), ...patch });
 const membershipOf = (orgId: string, userId: string, role: Role = 'member'): MembershipRecord => ({ org_id: orgId, user_id: userId, role,
   invited_by: null, created_at: tick() });
+const profileRecordOf = (orgId: string, createdBy: string, patch: Partial<OrgProfileRecord> = {}): OrgProfileRecord => {
+  const at = tick();
+  return { org_id: orgId, contact_name: 'Ana Smith', contact_role: 'managing_partner', contact_phone: '+1 (305) 555-0100', legal_name: 'Smith & Co LLP',
+    ein: '12-3456789', address_line1: '100 Main St', address_city: 'Miami', address_state: 'FL', address_postal_code: '33101-1234', address_country: 'US',
+    attorney_range: '6-20', practice_states: ['FL', 'NY', 'DC'], created_by: createdBy, created_at: at, updated_at: at, ...patch };
+};
 const analysisOf = (orgId: string, scanId: string): OrgAnalysisRecord => ({ org_id: orgId, scan_id: scanId, assessment_id: null,
   claimed_by: uuid(), claimed_at: tick() });
 
@@ -145,6 +151,35 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
         expect(await repo.getOrganization(fresh)).toBeNull();
         await expect(repo.createOrganization(orgOf(id, owner), membershipOf(id, owner, 'owner'), null)).rejects.toThrow('Duplicate organization');
         expect(await repo.listMembers(id)).toHaveLength(1);
+      });
+
+      it('creates an organization with its firm profile in the same step, or neither (DN-13 §19)', async () => {
+        const owner = uuid();
+        const id = uuid();
+        const scanId = await target.scan();
+        const profile = profileRecordOf(id, owner);
+        await repo.createOrganization(orgOf(id, owner), membershipOf(id, owner, 'owner'), analysisOf(id, scanId), profile);
+        expect(await repo.getOrgProfile(id)).toEqual(profile);
+        // Without one, as every caller before the pre-checkout: no profile.
+        const { id: plain } = await organization();
+        expect(await repo.getOrgProfile(plain)).toBeNull();
+        expect(await repo.getOrgProfile(uuid())).toBeNull();
+        // A claim that conflicts leaves neither the organization nor its profile.
+        const [other, otherOwner] = [uuid(), uuid()];
+        await expectConflict(repo.createOrganization(orgOf(other, otherOwner), membershipOf(other, otherOwner, 'owner'), analysisOf(other, scanId),
+          profileRecordOf(other, otherOwner)), 'scan_claimed');
+        expect(await repo.getOrganization(other)).toBeNull();
+        expect(await repo.getOrgProfile(other)).toBeNull();
+        // A profile of another organization is refused before anything is written.
+        const fresh = uuid();
+        await expect(repo.createOrganization(orgOf(fresh, owner), membershipOf(fresh, owner, 'owner'), null, profileRecordOf(uuid(), owner)))
+          .rejects.toThrow('Invalid organization');
+        expect(await repo.getOrganization(fresh)).toBeNull();
+        // The optional fields stay empty.
+        const bare = uuid();
+        const minimal = profileRecordOf(bare, owner, { contact_phone: null, ein: null, practice_states: ['WY'] });
+        await repo.createOrganization(orgOf(bare, owner), membershipOf(bare, owner, 'owner'), null, minimal);
+        expect(await repo.getOrgProfile(bare)).toEqual(minimal);
       });
 
       it('lists the organizations of a user with the role held in each, deleted ones included', async () => {
@@ -588,7 +623,7 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
           const createdAt = tick();
           const sessionId = `cs_test_Conf${randomBytes(8).toString('hex')}`;
           return { id: sessionId, org_id: id, plan_code: 'monthly', url: `https://checkout.stripe.com/c/pay/${sessionId}`, status: 'open',
-            created_by: owner, expires_at: plus(createdAt, 60 * 60 * 1000), created_at: createdAt, ...patch };
+            created_by: owner, expires_at: plus(createdAt, 60 * 60 * 1000), created_at: createdAt, ui_mode: 'hosted', ...patch };
         };
         const first = sessionOf();
         expect(await repo.getOpenCheckoutSession(id, first.created_at)).toBeNull();
@@ -613,6 +648,11 @@ export function describeWebappRepository(name: string, setup: () => Promise<Conf
         expect(await repo.closeCheckoutSession(first.id, 'complete')).toBe(true);
         expect(await repo.closeCheckoutSession(`cs_test_Conf${randomBytes(8).toString('hex')}`, 'complete')).toBe(false);
         expect(await repo.getOpenCheckoutSession(id, later)).toBeNull();
+        // An embedded session (DN-13 §19) has no page of its own: no url, and the same one-open rule.
+        const embedded = sessionOf({ url: null, ui_mode: 'embedded', created_at: later, expires_at: plus(later, 60 * 60 * 1000) });
+        expect(await repo.addCheckoutSession(embedded, later)).toEqual(embedded);
+        expect(await repo.getOpenCheckoutSession(id, plus(later, 1000))).toEqual(embedded);
+        expect(await repo.addCheckoutSession(sessionOf({ created_at: later, expires_at: plus(later, 60 * 60 * 1000) }), later)).toEqual(embedded);
       });
 
       it('records an event that moves no subscription in one step with its audit, once', async () => {

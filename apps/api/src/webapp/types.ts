@@ -48,10 +48,24 @@ export type SubscriptionRecord = {
 };
 /** The Stripe customer of an organization (DN-13 §6.2): one per organization, created by the back on the first checkout. */
 export type BillingCustomerRecord = { org_id: string; customer_id: string; livemode: boolean; created_at: string };
-/** A Stripe Checkout Session the back opened (DN-13 §6.2). At most one `open` per organization. */
+/**
+ * A Stripe Checkout Session the back opened (DN-13 §6.2). At most one `open` per organization. A hosted session has Stripe's page in
+ * `url`; an embedded one (§19) is mounted in ARCA's page with a client secret the back never stores, and has no url.
+ */
 export type CheckoutSessionRecord = {
-  id: string; org_id: string; plan_code: string; url: string; status: 'open' | 'complete' | 'expired'; created_by: string; expires_at: string;
-  created_at: string;
+  id: string; org_id: string; plan_code: string; url: string | null; status: 'open' | 'complete' | 'expired'; created_by: string; expires_at: string;
+  created_at: string; ui_mode: CheckoutUiMode;
+};
+export type CheckoutUiMode = 'hosted' | 'embedded';
+/**
+ * The firm profile of the pre-checkout (DN-13 §19), written once with its organization. The Stripe customer is made from it. The
+ * address is a US one: `address_country` is always 'US'.
+ */
+export type OrgProfileRecord = {
+  org_id: string; contact_name: string; contact_role: 'managing_partner' | 'partner' | 'office_manager' | 'other'; contact_phone: string | null;
+  legal_name: string; ein: string | null; address_line1: string; address_city: string; address_state: string; address_postal_code: string;
+  address_country: 'US'; attorney_range: '1' | '2-5' | '6-20' | '21-50' | '50+'; practice_states: string[]; created_by: string;
+  created_at: string; updated_at: string;
 };
 /**
  * How closeBillingEvent leaves an event that moves no subscription: why it was not applied (`unknown_org`), and the audit row, as the
@@ -200,9 +214,15 @@ export interface WebappRepository {
    * finds nothing left to do and keeps the first deletion time.
    */
   deleteAccount(userId: string, at: string): Promise<{ orgIds: string[] }>;
-  /** Atomic: the organization, its first owner and the claimed analysis go in together or not at all (`scan_claimed`). */
-  createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null): Promise<void>;
+  /**
+   * Atomic: the organization, its first owner, the claimed analysis and the firm profile (DN-13 §19) go in together or not at all
+   * (`scan_claimed`). A profile of another organization is refused like a mismatched owner ('Invalid organization').
+   */
+  createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null,
+    profile?: OrgProfileRecord | null): Promise<void>;
   getOrganization(id: string): Promise<OrganizationRecord | null>;
+  /** The firm profile of the pre-checkout; null for an organization created without one. */
+  getOrgProfile(orgId: string): Promise<OrgProfileRecord | null>;
   updateOrganizationName(orgId: string, name: string): Promise<void>;
   /** Includes deleted organizations (`deleted_at` set): the caller decides what to show. */
   listOrganizationsForUser(userId: string): Promise<Array<{ org: OrganizationRecord; role: Role }>>;

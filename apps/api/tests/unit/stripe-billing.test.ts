@@ -67,12 +67,78 @@ describe('StripeBillingProvider', () => {
       .rejects.toThrow(/no Stripe price/);
   });
 
+  describe('the pre-checkout (DN-13 §19)', () => {
+    const details = { orgId: ORG, name: 'Smith & Co LLP', email: 'ana@smith.law', phone: '+1 (305) 555-0100',
+      address: { line1: '100 Main St', city: 'Miami', state: 'FL', postalCode: '33101' }, ein: '12-3456789' };
+    const RETURN = `${APP}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`;
+
+    it('creates the customer with what the firm already gave: name, email, phone, the US address and the EIN as a us_ein tax id', async () => {
+      const { stripe, provider } = setup();
+      const { customerId } = await provider.ensureCustomer(details);
+      expect(stripe.calls[0]).toMatchObject({ method: 'POST', path: '/v1/customers', idempotencyKey: `customer:${ORG}` });
+      expect(stripe.calls[0]!.form).toEqual({ name: 'Smith & Co LLP', email: 'ana@smith.law', phone: '+1 (305) 555-0100',
+        address: { line1: '100 Main St', city: 'Miami', state: 'FL', postal_code: '33101', country: 'US' },
+        tax_id_data: { 0: { type: 'us_ein', value: '12-3456789' } }, metadata: { org_id: ORG } });
+      expect(stripe.customers.get(customerId)).toMatchObject({ name: 'Smith & Co LLP', phone: '+1 (305) 555-0100',
+        address: { line1: '100 Main St', city: 'Miami', state: 'FL', postal_code: '33101', country: 'US' } });
+      expect(stripe.taxIds(customerId)).toEqual([{ type: 'us_ein', value: '12-3456789' }]);
+      // Without them, the customer of before: no phone, address nor tax id sent.
+      await provider.ensureCustomer({ orgId: '00000000-0000-4000-8000-000000000001', name: 'Plain', email: 'a@b.co' });
+      expect(Object.keys(stripe.calls.at(-1)!.form).sort()).toEqual(['email', 'metadata', 'name']);
+    });
+
+    it('updates a customer it made before with the profile, adding the EIN once and replacing an old one', async () => {
+      const { stripe, provider } = setup();
+      const { customerId } = await provider.ensureCustomer({ orgId: ORG, name: 'Old name', email: 'old@smith.law' });
+      await provider.updateCustomer(customerId, details);
+      expect(stripe.calls.find(call => call.method === 'POST' && call.path === `/v1/customers/${customerId}`)!.form).toEqual({ name: 'Smith & Co LLP',
+        email: 'ana@smith.law', phone: '+1 (305) 555-0100', address: { line1: '100 Main St', city: 'Miami', state: 'FL', postal_code: '33101', country: 'US' } });
+      expect(stripe.taxIds(customerId)).toEqual([{ type: 'us_ein', value: '12-3456789' }]);
+      // Again: nothing new at Stripe's tax ids.
+      await provider.updateCustomer(customerId, details);
+      expect(stripe.taxIds(customerId)).toHaveLength(1);
+      expect(stripe.calls.filter(call => call.method === 'POST' && call.path === `/v1/customers/${customerId}/tax_ids`)).toHaveLength(1);
+      // Another EIN takes the old one's place.
+      await provider.updateCustomer(customerId, { ...details, ein: '98-7654321' });
+      expect(stripe.taxIds(customerId)).toEqual([{ type: 'us_ein', value: '98-7654321' }]);
+      // Stripe down while updating: nothing was done, and the caller hears so.
+      stripe.failNext(call => call.path === `/v1/customers/${customerId}`);
+      await expect(provider.updateCustomer(customerId, details)).rejects.toBeInstanceOf(BillingUnavailable);
+    });
+
+    it('opens an embedded Checkout: ui_mode embedded_page, the return URL, card only, USD, no Managed Payments, and a client secret', async () => {
+      const { stripe, provider, plan } = setup();
+      const { customerId } = await provider.ensureCustomer(details);
+      const checkout = await provider.createEmbeddedCheckout({ orgId: ORG, customerId, plan, returnUrl: RETURN });
+      expect(checkout).toEqual({ sessionId: expect.stringMatching(/^cs_test_/), clientSecret: expect.stringMatching(/^cs_test_\w+_secret_\w+$/),
+        expiresAt: new Date(T0 + 60 * 60 * 1000).toISOString() });
+      const call = stripe.calls.at(-1)!;
+      expect(call.idempotencyKey).toBe(`checkout:${ORG}:monthly:embedded:${Math.floor(T0 / 60_000)}`);
+      expect(call.form).toEqual({ mode: 'subscription', ui_mode: 'embedded_page', customer: customerId, client_reference_id: ORG,
+        line_items: { 0: { price: plan.stripe_price_id, quantity: '1' } }, metadata: { org_id: ORG }, subscription_data: { metadata: { org_id: ORG } },
+        return_url: RETURN, billing_address_collection: 'required', customer_update: { name: 'auto', address: 'auto' },
+        allowed_payment_method_types: { 0: 'card' }, managed_payments: { enabled: 'false' }, adaptive_pricing: { enabled: 'false' },
+        expires_at: String(Math.floor(T0 / 1000) + 3600) });
+      // No page of its own: Stripe gives it no URL, and its client secret is read back with the session.
+      expect(stripe.sessions.get(checkout.sessionId)).toMatchObject({ ui_mode: 'embedded_page', url: null });
+      expect(await provider.checkoutState(checkout.sessionId)).toEqual({ sessionId: checkout.sessionId, orgId: ORG, customerId, subscriptionId: null,
+        status: 'open', livemode: false, uiMode: 'embedded', clientSecret: checkout.clientSecret });
+      // The same request in the same minute is the same session; a hosted one in that minute is another.
+      expect(await provider.createEmbeddedCheckout({ orgId: ORG, customerId, plan, returnUrl: RETURN })).toEqual(checkout);
+      const hosted = await provider.createCheckout({ orgId: ORG, customerId, plan, successUrl: RETURN, cancelUrl: `${APP}/app/billing` });
+      expect(hosted.sessionId).not.toBe(checkout.sessionId);
+      expect(stripe.sessions.size).toBe(2);
+      await expect(provider.createEmbeddedCheckout({ orgId: ORG, customerId, plan: { ...plan, stripe_price_id: null }, returnUrl: RETURN }))
+        .rejects.toThrow(/no Stripe price/);
+    });
+  });
+
   it('reads a checkout back, expires an open one, and says when it completed first', async () => {
     const { stripe, provider, plan } = setup();
     const { customerId } = await provider.ensureCustomer({ orgId: ORG, name: 'Smith & Co', email: 'owner@firm.com' });
     const open = await provider.createCheckout({ orgId: ORG, customerId, plan, successUrl: 's', cancelUrl: 'c' });
     expect(await provider.checkoutState(open.sessionId)).toEqual({ sessionId: open.sessionId, orgId: ORG, customerId, subscriptionId: null,
-      status: 'open', livemode: false });
+      status: 'open', livemode: false, uiMode: 'hosted', clientSecret: null });
     expect(await provider.expireCheckout(open.sessionId)).toBe('expired');
     expect(stripe.sessions.get(open.sessionId)!.status).toBe('expired');
     const paid = await provider.createCheckout({ orgId: ORG, customerId, plan: { ...plan, code: 'monthly2' }, successUrl: 's', cancelUrl: 'c' });

@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
-import { AttachAnalysisRequest, BillingSyncRequest, CheckoutRequest, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, EnrollRequest,
-  InviteRequest, ReviewRequest, SetRoleRequest, UpdateActionRequest, UpdateOrgRequest, UpdatePlanRequest } from '@arca/contracts';
+import { AttachAnalysisRequest, BillingSyncRequest, CheckoutSessionRequest, CreateActionRequest, CreateClaimRequest, CreateOrgWithProfileRequest,
+  DeletionRequestBody, EnrollRequest, InviteRequest, ReviewRequest, SetRoleRequest, UpdateActionRequest, UpdateOrgRequest,
+  UpdatePlanRequest } from '@arca/contracts';
 import { WindowLimiter } from '../http/rate-limit.js';
 import { AuthUnavailable, type AppAuth, type AppUser } from './auth.js';
 import { WebhookRejected } from './billing-events.js';
@@ -88,7 +89,8 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth; clie
     await service.deleteAccount(me);
     return c.body(null, 204);
   });
-  app.post('/orgs', signedIn(async (c, me) => c.json(await service.createOrganization(me, await body(c, CreateOrgRequest)), 201)));
+  // The firm profile of the pre-checkout (DN-13 §19) is optional, so the request of 0.4.0 still works.
+  app.post('/orgs', signedIn(async (c, me) => c.json(await service.createOrganization(me, await body(c, CreateOrgWithProfileRequest)), 201)));
   app.get('/orgs/:id', signedIn(async (c, me) => c.json(await service.orgView(me, param(c, 'id')))));
   app.patch('/orgs/:id', signedIn(async (c, me) =>
     c.json(await service.renameOrganization(me, param(c, 'id'), (await body(c, UpdateOrgRequest)).name))));
@@ -119,11 +121,12 @@ export function webappRoutes(deps: { service: WebappService; auth: AppAuth; clie
   // Billing (DN-13 §6.2–§6.4, §7.2). The limits count an organization's sessions once its owner is authorized, so nobody else can
   // spend them.
   app.get('/orgs/:id/billing', signedIn(async (c, me) => c.json(await service.billingView(me, param(c, 'id')))));
+  // Stripe's page by default ({ url }), or Checkout embedded in ARCA's page with `uiMode: 'embedded'` ({ clientSecret, sessionId }, §19).
   app.post('/orgs/:id/billing/checkout', signedIn(async (c, me) => {
-    const { planCode } = await body(c, CheckoutRequest);
+    const { planCode, uiMode } = await body(c, CheckoutSessionRequest);
     const { org } = await service.authorize(me, param(c, 'id'), 'billing.manage', { payment: false });
     limit([[`billing:checkout:${org.id}`, BILLING_SESSIONS_PER_ORG]]);
-    return c.json(await service.checkout(me, org.id, planCode));
+    return c.json(uiMode === 'embedded' ? await service.embeddedCheckout(me, org.id, planCode) : await service.checkout(me, org.id, planCode));
   }));
   app.post('/orgs/:id/billing/portal', signedIn(async (c, me) => {
     const { org } = await service.authorize(me, param(c, 'id'), 'billing.manage', { payment: false });

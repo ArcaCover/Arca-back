@@ -30,6 +30,21 @@ export type ProviderSubscription = {
 export type ProviderCheckout = {
   sessionId: string; orgId: string | null; customerId: string | null; subscriptionId: string | null;
   status: 'open' | 'complete' | 'expired' | null; livemode: boolean;
+  /** Hosted (Stripe's page) or embedded in ARCA's page (DN-13 §19); null for a kind ARCA does not open. */
+  uiMode: 'hosted' | 'embedded' | null;
+  /** What Stripe.js mounts an embedded session with; null for any other. Never stored by the back. */
+  clientSecret: string | null;
+};
+
+/**
+ * Who the Stripe customer of an organization is (DN-13 §6.2, §19): the organization's name and the payer's email, and, when the
+ * firm gave its profile in the pre-checkout, its legal name, phone, US billing address and EIN, so Checkout asks none of it again.
+ */
+export type CustomerDetails = {
+  orgId: string; name: string; email: string; phone?: string | null;
+  address?: { line1: string; city: string; state: string; postalCode: string } | null;
+  /** 12-3456789; Stripe keeps it as the customer's us_ein tax id. */
+  ein?: string | null;
 };
 
 /** A verified webhook event, reduced to where its object keeps the organization, the customer and the subscription. */
@@ -61,7 +76,9 @@ export interface BillingProvider {
   readonly webhooks: boolean;
   /** Whether a checkout charges a catalog price, so a plan without `stripe_price_id` cannot be sold. */
   readonly needsCatalogPrice: boolean;
-  ensureCustomer(input: { orgId: string; name: string; email: string }): Promise<{ customerId: string }>;
+  ensureCustomer(input: CustomerDetails): Promise<{ customerId: string }>;
+  /** Brings a customer made before up to the organization's profile, its EIN included, before a new Checkout (DN-13 §19). */
+  updateCustomer(customerId: string, input: CustomerDetails): Promise<void>;
   /**
    * The plan travels whole, so the provider charges the price in the plans table and nothing else (DN-10 §4.4). The same request
    * within a minute is the same session (DN-13 §6.2); `after` names what came before this one (the session it replaces, or the
@@ -69,6 +86,9 @@ export interface BillingProvider {
    */
   createCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; successUrl: string; cancelUrl: string; after?: string | null })
     : Promise<{ sessionId: string; url: string; expiresAt: string }>;
+  /** The same session embedded in ARCA's page (DN-13 §19): a client secret instead of a URL, and one return URL for every outcome. */
+  createEmbeddedCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; returnUrl: string; after?: string | null })
+    : Promise<{ sessionId: string; clientSecret: string; expiresAt: string }>;
   /** Closes an open checkout so it can no longer be paid; says `complete` when the customer paid it first. */
   expireCheckout(sessionId: string): Promise<'expired' | 'complete'>;
   createPortal(input: { customerId: string; returnUrl: string }): Promise<{ url: string }>;
@@ -96,7 +116,7 @@ export class MockBillingProvider implements BillingProvider {
   /** Organizations whose subscription was canceled, for the tests. */
   readonly canceled: string[] = [];
   private readonly sessions = new Map<string, { orgId: string; plan: PlanRecord; customerId: string; status: 'open' | 'complete' | 'expired';
-    subscriptionId: string | null }>();
+    subscriptionId: string | null; clientSecret: string | null }>();
   private readonly subscriptions = new Map<string, ProviderSubscription>();
   private readonly appBaseUrl: string;
 
@@ -104,13 +124,22 @@ export class MockBillingProvider implements BillingProvider {
     this.appBaseUrl = appBaseUrl.replace(/\/+$/, '');
   }
 
-  async ensureCustomer(_input: { orgId: string; name: string; email: string }) { return { customerId: id('cus') }; }
+  async ensureCustomer(_input: CustomerDetails) { return { customerId: id('cus') }; }
+  async updateCustomer(_customerId: string, _input: CustomerDetails) { /* nothing leaves the process */ }
   async createCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; successUrl: string; cancelUrl: string }) {
     const sessionId = id('cs');
     this.sessions.set(sessionId, { orgId: input.orgId, plan: structuredClone(input.plan), customerId: input.customerId, status: 'open',
-      subscriptionId: null });
+      subscriptionId: null, clientSecret: null });
     return { sessionId, url: `${this.appBaseUrl}/app/billing/mock-checkout?session=${encodeURIComponent(sessionId)}`,
       expiresAt: new Date(this.now() + CHECKOUT_TTL_MS).toISOString() };
+  }
+  /** The front never mounts it (the debug modes pay through the simulated checkout), but the back's rules are the same. */
+  async createEmbeddedCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; returnUrl: string }) {
+    const sessionId = id('cs');
+    const clientSecret = `${sessionId}_secret_mock`;
+    this.sessions.set(sessionId, { orgId: input.orgId, plan: structuredClone(input.plan), customerId: input.customerId, status: 'open',
+      subscriptionId: null, clientSecret });
+    return { sessionId, clientSecret, expiresAt: new Date(this.now() + CHECKOUT_TTL_MS).toISOString() };
   }
   async expireCheckout(sessionId: string) {
     const session = this.sessions.get(sessionId);
@@ -129,7 +158,7 @@ export class MockBillingProvider implements BillingProvider {
   async checkoutState(sessionId: string): Promise<ProviderCheckout | null> {
     const session = this.sessions.get(sessionId);
     return session ? { sessionId, orgId: session.orgId, customerId: session.customerId, subscriptionId: session.subscriptionId,
-      status: session.status, livemode: false } : null;
+      status: session.status, livemode: false, uiMode: session.clientSecret ? 'embedded' : 'hosted', clientSecret: session.clientSecret } : null;
   }
   async parseWebhook() { return null; }
   async createPrice(_input: { plan: PlanRecord; amountCents: number; currency: string; interval: 'month' | 'year' }) {

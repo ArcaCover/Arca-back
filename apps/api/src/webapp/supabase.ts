@@ -4,7 +4,7 @@ import { IneligibleAssignee, MemberChangeRefused, WebappConflict, type ActionPat
   type AuditPageQuery, type AuditRecord, type BillingApplyOutcome, type BillingCustomerRecord, type BillingEventClosing, type BillingStateRecord,
   type CheckoutSessionRecord, type ClaimTicketRecord, type CustomActionRecord,
   type DeletionRequestRecord, type InvitationRecord, type MemberChange, type MembershipRecord, type NewAuditRecord, type OrgActionRecord,
-  type OrgAnalysisRecord, type OrganizationRecord, type PlanRecord, type ProfileRecord, type ProfileWrite, type SubscriptionRecord, type WebappConflictReason,
+  type OrgAnalysisRecord, type OrganizationRecord, type OrgProfileRecord, type PlanRecord, type ProfileRecord, type ProfileWrite, type SubscriptionRecord, type WebappConflictReason,
   type WebappRepository } from './types.js';
 
 // The columns each record reads, so a new column of a table (DN-13 §5.3) never leaks into a record, and the timestamps among them,
@@ -22,8 +22,11 @@ const TABLES = {
     'provider_status', 'price_id', 'cancel_at_period_end', 'current_period_start', 'livemode'],
     times: ['current_period_end', 'updated_at', 'current_period_start'] },
   billing_customers: { columns: ['org_id', 'customer_id', 'livemode', 'created_at'], times: ['created_at'] },
-  checkout_sessions: { columns: ['id', 'org_id', 'plan_code', 'url', 'status', 'created_by', 'expires_at', 'created_at'],
+  checkout_sessions: { columns: ['id', 'org_id', 'plan_code', 'url', 'status', 'created_by', 'expires_at', 'created_at', 'ui_mode'],
     times: ['expires_at', 'created_at'] },
+  org_profiles: { columns: ['org_id', 'contact_name', 'contact_role', 'contact_phone', 'legal_name', 'ein', 'address_line1', 'address_city',
+    'address_state', 'address_postal_code', 'address_country', 'attorney_range', 'practice_states', 'created_by', 'created_at', 'updated_at'],
+    times: ['created_at', 'updated_at'] },
   deletion_requests: { columns: ['id', 'org_id', 'requested_by', 'reason', 'status', 'reviewed_by', 'reviewed_at', 'review_note', 'created_at'],
     times: ['reviewed_at', 'created_at'] },
   org_actions: { columns: ['id', 'org_id', 'source', 'scan_id', 'action_key', 'title', 'detail', 'domain', 'status', 'assignee_user_id',
@@ -121,10 +124,16 @@ export class SupabaseWebappRepository implements WebappRepository {
     return { orgIds: orgs };
   }
 
-  async createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null) {
-    await this.rpc('create_organization', { p_org: org, p_owner: owner, p_analysis: analysis }, 'create organization');
+  async createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null, profile: OrgProfileRecord | null = null) {
+    // Without a profile, the function of the real accounts migration, as before; with one, the pre-checkout's (DN-13 §19).
+    if (profile) {
+      await this.rpc('create_organization_with_profile', { p_org: org, p_owner: owner, p_analysis: analysis, p_profile: profile }, 'create organization');
+    } else {
+      await this.rpc('create_organization', { p_org: org, p_owner: owner, p_analysis: analysis }, 'create organization');
+    }
   }
   getOrganization(id: string) { return this.one<OrganizationRecord>('organizations', 'read organization', { id }); }
+  getOrgProfile(orgId: string) { return this.one<OrgProfileRecord>('org_profiles', 'read organization profile', { org_id: orgId }); }
   async updateOrganizationName(orgId: string, name: string) {
     if (!(await this.patch('organizations', { id: orgId }, { name }, 'rename organization'))) throw new Error('Organization not found');
   }

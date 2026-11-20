@@ -235,6 +235,53 @@ export const BillingView = z.object({
 }).strict();
 // POST /orgs/:id/billing/sync (DN-13 §6.3): the Checkout Session id Stripe put in the return URL. The answer is the OrgView.
 export const BillingSyncRequest = z.object({ sessionId: z.string().regex(/^cs_(test|live)_[A-Za-z0-9]{1,255}$/) }).strict();
+
+// The pre-checkout (DN-13 §19): before paying, the person says who they are and which firm pays, and nothing of it is asked
+// again on Stripe's page. The profile travels with POST /orgs and the back keeps it beside the organization (org_profiles).
+export const ORG_CONTACT_ROLES = ['managing_partner', 'partner', 'office_manager', 'other'] as const;
+export type OrgContactRole = (typeof ORG_CONTACT_ROLES)[number];
+// Attorneys at the firm, in the bands the form offers.
+export const ATTORNEY_RANGES = ['1', '2-5', '6-20', '21-50', '50+'] as const;
+export type AttorneyRange = (typeof ATTORNEY_RANGES)[number];
+// The 50 states and the District of Columbia, as USPS writes them: the billing address and where the firm practices.
+export const US_STATES = [
+  'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'DC', 'FL', 'GA', 'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD', 'MA', 'MI',
+  'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ', 'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC', 'SD', 'TN', 'TX', 'UT', 'VT',
+  'VA', 'WA', 'WV', 'WI', 'WY',
+] as const;
+export type UsState = (typeof US_STATES)[number];
+const usState = z.enum(US_STATES);
+// A blank optional field reads as none, so the form can send what it holds.
+const blankAsNull = (value: unknown) => typeof value === 'string' && value.trim() === '' ? null : value;
+// Stripe keeps a customer's phone in at most 20 characters; 10 to 15 digits covers a US number and an international one.
+const phone = z.preprocess(blankAsNull, z.string().trim().max(20).regex(/^\+?[0-9 ().-]+$/)
+  .refine(value => { const digits = value.replace(/\D/g, '').length; return digits >= 10 && digits <= 15; }, 'Not a phone number')
+  .nullable().optional());
+// An EIN is nine digits; Stripe's us_ein tax id wants it as 12-3456789.
+const ein = z.preprocess(blankAsNull, z.string().trim().regex(/^\d{2}-?\d{7}$/)
+  .transform(value => { const digits = value.replace('-', ''); return `${digits.slice(0, 2)}-${digits.slice(2)}`; }).nullable().optional());
+export const OrgProfileInput = z.object({
+  contactName: z.string().trim().min(1).max(120),
+  contactRole: z.enum(ORG_CONTACT_ROLES),
+  phone,
+  legalName: z.string().trim().min(1).max(200),
+  ein,
+  // A US address: the country is implied, and Stripe gets it as US.
+  billingAddress: z.object({
+    line1: z.string().trim().min(1).max(200), city: z.string().trim().min(1).max(100), state: usState,
+    postalCode: z.string().trim().regex(/^\d{5}(-\d{4})?$/),
+  }).strict(),
+  attorneyRange: z.enum(ATTORNEY_RANGES),
+  practiceStates: z.array(usState).min(1).max(US_STATES.length)
+    .refine(states => new Set(states).size === states.length, 'A state appears twice'),
+}).strict();
+// POST /orgs with the profile: the request 0.4.0 knows, plus an optional profile, so a caller without one keeps working.
+export const CreateOrgWithProfileRequest = CreateOrgRequest.extend({ profile: OrgProfileInput.optional() }).strict();
+// POST /orgs/:id/billing/checkout (DN-13 §19): the hosted page (UrlResponse, the default) or Checkout embedded in ARCA's page
+// (EmbeddedCheckoutResponse: the client secret Stripe.js mounts it with).
+export const CheckoutSessionRequest = z.object({ planCode: z.string().min(1), uiMode: z.enum(['hosted', 'embedded']).optional() }).strict();
+export const EmbeddedCheckoutResponse = z.object({ clientSecret: z.string().min(1).max(2048), sessionId: z.string().min(1).max(255) }).strict();
+
 export const CreateActionRequest = z.object({
   title: z.string().trim().min(1).max(200),
   detail: z.string().trim().max(2000).transform(detail => detail === '' ? null : detail).nullable().optional(),
@@ -276,3 +323,7 @@ export type EnrollRequest = z.infer<typeof EnrollRequest>;
 export type EnrollResponse = z.infer<typeof EnrollResponse>;
 export type BillingView = z.infer<typeof BillingView>;
 export type BillingSyncRequest = z.infer<typeof BillingSyncRequest>;
+export type OrgProfileInput = z.infer<typeof OrgProfileInput>;
+export type CreateOrgWithProfileRequest = z.infer<typeof CreateOrgWithProfileRequest>;
+export type CheckoutSessionRequest = z.infer<typeof CheckoutSessionRequest>;
+export type EmbeddedCheckoutResponse = z.infer<typeof EmbeddedCheckoutResponse>;

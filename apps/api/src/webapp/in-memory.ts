@@ -3,7 +3,7 @@ import { AUDIT_ACTOR_KINDS, can, canManageMember, type BillingStatus, type Role 
 import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict } from './types.js';
 import type { ActionPatch, AssessmentActionRecord, AuditActor, AuditPageQuery, AuditRecord, BillingApplyOutcome, BillingCustomerRecord,
   BillingEventClosing, BillingStateRecord, CheckoutSessionRecord, ClaimTicketRecord, CustomActionRecord, DeletionRequestRecord, InvitationRecord, MemberChange, MembershipRecord, NewAuditRecord,
-  OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, PlanRecord, ProfileRecord, ProfileWrite, SubscriptionRecord, WebappRepository } from './types.js';
+  OrgActionRecord, OrgAnalysisRecord, OrganizationRecord, OrgProfileRecord, PlanRecord, ProfileRecord, ProfileWrite, SubscriptionRecord, WebappRepository } from './types.js';
 
 // updatePlan can change these and nothing else; the code is the identity of the plan.
 const PLAN_FIELDS = ['name', 'amount_cents', 'currency', 'interval', 'active', 'stripe_product_id', 'stripe_price_id'] as const;
@@ -33,6 +33,7 @@ export class InMemoryWebappRepository implements WebappRepository {
   private readonly billingEvents = new Map<string, { type: string; processed: boolean }>();
   private readonly billingCustomers = new Map<string, BillingCustomerRecord>();
   private readonly checkoutSessions = new Map<string, CheckoutSessionRecord>();
+  private readonly orgProfiles = new Map<string, OrgProfileRecord>();
   private readonly deletionRequests = new Map<string, DeletionRequestRecord>();
   private readonly platformAdmins = new Map<string, string | null>();
   private readonly actions: OrgActionRecord[] = [];
@@ -49,7 +50,7 @@ export class InMemoryWebappRepository implements WebappRepository {
   clear(): void {
     this.profiles.clear(); this.organizations.clear(); this.memberships.length = 0; this.invitations.clear();
     this.analyses.clear(); this.tickets.clear(); this.subscriptions.clear(); this.billingEvents.clear();
-    this.billingCustomers.clear(); this.checkoutSessions.clear();
+    this.billingCustomers.clear(); this.checkoutSessions.clear(); this.orgProfiles.clear();
     this.deletionRequests.clear(); this.platformAdmins.clear(); this.actions.length = 0; this.auditLog.length = 0;
     this.plans.clear();
     for (const plan of this.seedPlans) this.plans.set(plan.code, structuredClone(plan));
@@ -92,17 +93,21 @@ export class InMemoryWebappRepository implements WebappRepository {
     return { orgIds: live.map(m => m.org_id) };
   }
 
-  async createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null) {
+  async createOrganization(org: OrganizationRecord, owner: MembershipRecord, analysis: OrgAnalysisRecord | null, profile: OrgProfileRecord | null = null) {
     // Every check comes before the first write, so a refusal leaves nothing behind.
-    if (owner.role !== 'owner' || owner.org_id !== org.id || (analysis && analysis.org_id !== org.id)) throw new Error('Invalid organization');
+    if (owner.role !== 'owner' || owner.org_id !== org.id || (analysis && analysis.org_id !== org.id) || (profile && profile.org_id !== org.id)) {
+      throw new Error('Invalid organization');
+    }
     if (this.organizations.has(org.id)) throw new Error('Duplicate organization');
     if (analysis && this.analyses.has(analysis.scan_id)) throw new WebappConflict('scan_claimed');
-    const copy = structuredClone({ org, owner, analysis });
+    const copy = structuredClone({ org, owner, analysis, profile });
     this.organizations.set(org.id, copy.org);
     this.memberships.push(copy.owner);
     if (copy.analysis) this.analyses.set(copy.analysis.scan_id, copy.analysis);
+    if (copy.profile) this.orgProfiles.set(org.id, copy.profile);
   }
   async getOrganization(id: string) { return structuredClone(this.organizations.get(id) ?? null); }
+  async getOrgProfile(orgId: string) { return structuredClone(this.orgProfiles.get(orgId) ?? null); }
   async updateOrganizationName(orgId: string, name: string) { this.requireOrganization(orgId).name = name; }
   async listOrganizationsForUser(userId: string) {
     return structuredClone([...this.organizations.values()].flatMap(org => {

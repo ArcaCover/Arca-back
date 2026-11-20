@@ -1,8 +1,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { can, canManageMember, hasPaidAccess, type ActionItemView, type ActionPlanResponse, type ActionStatus, type ActivityEventView,
   type ActivityPage, type AdminAuditPage, type AdminMetricsView, type AdminOrgDetailView, type AdminOrgView, type AnalysisView,
-  type AssessmentResult, type AuditActorKind, type BillingView, type ClaimResponse, type CreateActionRequest, type CreateOrgRequest, type DeletionRequestView,
-  type EnrollRequest, type EnrollResponse,
+  type AssessmentResult, type AuditActorKind, type BillingView, type ClaimResponse, type CreateActionRequest, type CreateOrgWithProfileRequest,
+  type DeletionRequestView, type EmbeddedCheckoutResponse, type EnrollRequest, type EnrollResponse, type OrgProfileInput,
   type InvitationView, type InviteRequest, type Layer1Result, type MeResponse, type MemberView, type OrgView, type Permission, type PlanView,
   type Role, type UpdateActionRequest, type UpdatePlanRequest } from '@arca/contracts';
 import type { AssessmentRepository } from '../assessment/repository.js';
@@ -10,11 +10,11 @@ import { verifySessionToken } from '../auth/session-token.js';
 import type { ScanRecord, ScanRepository } from '../repositories/types.js';
 import type { AppUser } from './auth.js';
 import { AuthAdminUnavailable, type AuthAdmin } from './auth-admin.js';
-import { BillingUnavailable, type BillingEvent, type BillingProvider } from './billing.js';
+import { BillingUnavailable, type BillingEvent, type BillingProvider, type CustomerDetails } from './billing.js';
 import { BillingEvents, type ReconcileReport, type WebhookOutcome } from './billing-events.js';
 import { IneligibleAssignee, MAX_CUSTOM_ACTIONS, MemberChangeRefused, WebappConflict, type ActionPatch, type AuditActor, type AuditRecord,
-  type BillingApplyOutcome, type CheckoutSessionRecord, type CustomActionRecord,
-  type DeletionRequestRecord, type InvitationRecord, type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord,
+  type BillingApplyOutcome, type CheckoutSessionRecord, type CheckoutUiMode, type CustomActionRecord,
+  type DeletionRequestRecord, type InvitationRecord, type MembershipRecord, type OrgAnalysisRecord, type OrganizationRecord, type OrgProfileRecord,
   type PlanRecord, type WebappConflictReason, type WebappRepository } from './types.js';
 
 const STATUS = { invalid_request: 400, unauthorized: 401, payment_required: 402, forbidden: 403, not_found: 404, conflict: 409, gone: 410,
@@ -68,6 +68,23 @@ async function orIneligible<T>(write: Promise<T>): Promise<T> {
     throw error;
   }
 }
+
+/** The pre-checkout's profile as its row (DN-13 §19): written once, with the organization, by the person who creates it. */
+const profileRecord = (orgId: string, userId: string, profile: OrgProfileInput, at: string): OrgProfileRecord => ({ org_id: orgId,
+  contact_name: profile.contactName, contact_role: profile.contactRole, contact_phone: profile.phone ?? null, legal_name: profile.legalName,
+  ein: profile.ein ?? null, address_line1: profile.billingAddress.line1, address_city: profile.billingAddress.city,
+  address_state: profile.billingAddress.state, address_postal_code: profile.billingAddress.postalCode, address_country: 'US',
+  attorney_range: profile.attorneyRange, practice_states: [...profile.practiceStates], created_by: userId, created_at: at, updated_at: at });
+/**
+ * Who the organization's Stripe customer is: the firm's legal name, phone, address and EIN when it gave its profile, so Checkout asks
+ * none of it again (DN-13 §19); otherwise its name, as before. The email is always the payer's, the one Checkout shows.
+ */
+const customerDetails = (org: OrganizationRecord, payer: AppUser, profile: OrgProfileRecord | null): CustomerDetails => profile
+  ? { orgId: org.id, name: profile.legal_name, email: payer.email, phone: profile.contact_phone, ein: profile.ein,
+    address: { line1: profile.address_line1, city: profile.address_city, state: profile.address_state, postalCode: profile.address_postal_code } }
+  : { orgId: org.id, name: org.name, email: payer.email };
+/** A Checkout session the organization may be sent to: Stripe's page (hosted) or the client secret ARCA's page mounts (embedded). */
+type OpenCheckout = { sessionId: string; url: string | null; clientSecret: string | null };
 
 const CLAIM_TTL_MS = 24 * 60 * 60 * 1000;
 const INVITATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -317,15 +334,19 @@ export class WebappService {
     }
   }
 
-  /** Step 2 of the claim: the organization, its owner and the analysis are written together, or nothing is. */
-  async createOrganization(user: AppUser, req: CreateOrgRequest): Promise<OrgView> {
+  /**
+   * Step 2 of the claim: the organization, its owner, the analysis and, from the pre-checkout, the firm profile (DN-13 §19) are written
+   * together, or nothing is. The profile stays out of the audit row, which every owner and admin reads.
+   */
+  async createOrganization(user: AppUser, req: CreateOrgWithProfileRequest): Promise<OrgView> {
     const { idHash, scan, assessmentId } = await this.redeemable(user, req.claimId);
     const at = this.timestamp();
     const org: OrganizationRecord = { id: randomUUID(), name: req.name, domain: scan.canonical_domain, billing_status: 'pending_payment',
       deleted_at: null, created_by: user.userId, created_at: at };
     await this.ensureProfile(user);
     await orConflict(this.repo.createOrganization(org, { org_id: org.id, user_id: user.userId, role: 'owner', invited_by: null, created_at: at },
-      { org_id: org.id, scan_id: scan.scan_id, assessment_id: assessmentId, claimed_by: user.userId, claimed_at: at }));
+      { org_id: org.id, scan_id: scan.scan_id, assessment_id: assessmentId, claimed_by: user.userId, claimed_at: at },
+      req.profile ? profileRecord(org.id, user.userId, req.profile, at) : null));
     // Spent only once the organization exists: a creation that fails does not burn the ticket.
     await this.repo.markClaimTicketUsed(idHash, at);
     await this.audit(user.userId, org.id, 'org.created', org.id, { name: org.name, scanId: scan.scan_id }, 'member');
@@ -467,6 +488,23 @@ export class WebappService {
    * organization's billing work runs one at a time, so two clicks never open two sessions. 502 when Stripe does not answer.
    */
   async checkout(actor: AppUser, orgId: string, planCode: string): Promise<{ url: string }> {
+    const { url } = await this.openCheckout(actor, orgId, planCode, 'hosted');
+    if (!url) throw new Error('A hosted checkout without a URL');
+    return { url };
+  }
+
+  /**
+   * Checkout embedded in ARCA's page (DN-13 §19), under the same rules as the hosted one: one open session per organization, whatever
+   * its kind, so asking for the other kind expires the open one first. The client secret is never stored: an open session's is read
+   * again from Stripe.
+   */
+  async embeddedCheckout(actor: AppUser, orgId: string, planCode: string): Promise<EmbeddedCheckoutResponse> {
+    const { sessionId, clientSecret } = await this.openCheckout(actor, orgId, planCode, 'embedded');
+    if (!clientSecret) throw new Error('An embedded checkout without a client secret');
+    return { clientSecret, sessionId };
+  }
+
+  private async openCheckout(actor: AppUser, orgId: string, planCode: string, uiMode: CheckoutUiMode): Promise<OpenCheckout> {
     const { org } = await this.authorize(actor, orgId, 'billing.manage', { payment: false });
     return this.billingEvents.forOrg(org.id, async () => {
       // Read again in the organization's turn: a webhook or a return may have paid it meanwhile. A second checkout would start a
@@ -481,35 +519,46 @@ export class WebappService {
       const at = this.timestamp();
       const open = await this.repo.getOpenCheckoutSession(org.id, at);
       if (open) {
-        const reused = await this.reuseCheckout(org.id, open, plan.code);
-        if (reused) return { url: reused };
+        const reused = await this.reuseCheckout(org.id, open, plan.code, uiMode);
+        if (reused) return reused;
       }
       const customerId = await this.billingCustomer(current, actor);
       // What came before this session keeps its idempotency key apart from a session closed in the same minute (DN-13 §6.2).
       const after = open?.id ?? (await this.repo.getSubscription(org.id))?.subscription_id ?? null;
-      const created = await orUnavailable(this.deps.billing.createCheckout({ orgId: org.id, customerId, plan, after,
-        successUrl: `${this.appBaseUrl}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${this.appBaseUrl}/app/billing` }));
+      const created: OpenCheckout & { expiresAt: string } = uiMode === 'embedded'
+        ? { url: null, ...await orUnavailable(this.deps.billing.createEmbeddedCheckout({ orgId: org.id, customerId, plan, after,
+          returnUrl: `${this.appBaseUrl}/app/billing/return?session_id={CHECKOUT_SESSION_ID}` })) }
+        : { clientSecret: null, ...await orUnavailable(this.deps.billing.createCheckout({ orgId: org.id, customerId, plan, after,
+          successUrl: `${this.appBaseUrl}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${this.appBaseUrl}/app/billing` })) };
       const stored = await this.repo.addCheckoutSession({ id: created.sessionId, org_id: org.id, plan_code: plan.code, url: created.url,
-        status: 'open', created_by: actor.userId, expires_at: created.expiresAt, created_at: at }, at);
+        status: 'open', created_by: actor.userId, expires_at: created.expiresAt, created_at: at, ui_mode: uiMode }, at);
       if (stored.id !== created.sessionId) {
         // Another process stored its session first: that one is the organization's, and this one must not be paid.
         await this.deps.billing.expireCheckout(created.sessionId).catch(() => undefined);
-        return { url: stored.url };
+        const clientSecret = stored.ui_mode === 'embedded' ? (await orUnavailable(this.deps.billing.checkoutState(stored.id)))?.clientSecret ?? null : null;
+        // Of the other kind, the caller cannot use it: one more click, after it, decides (reuseCheckout).
+        if (stored.ui_mode !== uiMode || (uiMode === 'hosted' ? !stored.url : !clientSecret)) {
+          throw fail('conflict', 'Another checkout of this organization was just opened; try again');
+        }
+        return { sessionId: stored.id, url: stored.url, clientSecret };
       }
       await this.audit(actor.userId, org.id, 'billing.checkout_started', created.sessionId, { planCode: plan.code }, 'member');
-      return { url: created.url };
+      return { sessionId: created.sessionId, url: created.url, clientSecret: created.clientSecret };
     });
   }
 
   /**
-   * The open session's URL while Stripe still holds it open for this plan. Otherwise it is closed here as Stripe says and null comes
-   * back, so a new one opens; or, when it was paid, its subscription is applied and an organization that now pays gets the 409.
+   * The open session again while Stripe still holds it open for this plan and this kind of Checkout (an embedded one with the client
+   * secret Stripe gives back). Otherwise it is closed here as Stripe says and null comes back, so a new one opens; or, when it was
+   * paid, its subscription is applied and an organization that now pays gets the 409.
    */
-  private async reuseCheckout(orgId: string, open: CheckoutSessionRecord, planCode: string): Promise<string | null> {
+  private async reuseCheckout(orgId: string, open: CheckoutSessionRecord, planCode: string, uiMode: CheckoutUiMode): Promise<OpenCheckout | null> {
     let checkout = await orUnavailable(this.deps.billing.checkoutState(open.id));
     if (checkout?.status === 'open') {
-      if (open.plan_code === planCode) return open.url;
-      // Another plan: the open one is closed first, so the organization never holds two that could both be paid.
+      const same = open.plan_code === planCode && open.ui_mode === uiMode;
+      if (same && uiMode === 'hosted' && open.url) return { sessionId: open.id, url: open.url, clientSecret: null };
+      if (same && uiMode === 'embedded' && checkout.clientSecret) return { sessionId: open.id, url: null, clientSecret: checkout.clientSecret };
+      // Another plan or another kind: the open one is closed first, so the organization never holds two that could both be paid.
       if (await orUnavailable(this.deps.billing.expireCheckout(open.id)) === 'expired') {
         await this.repo.closeCheckoutSession(open.id, 'expired');
         return null;
@@ -528,11 +577,19 @@ export class WebappService {
     return null;
   }
 
-  /** The organization's Stripe customer: the one stored, or a new one named after the organization, with the payer's email. */
+  /**
+   * The organization's Stripe customer: the one stored, brought up to the firm profile when there is one (DN-13 §19), or a new one
+   * made from it; without a profile, a new one named after the organization, with the payer's email, as before.
+   */
   private async billingCustomer(org: OrganizationRecord, payer: AppUser): Promise<string> {
+    const profile = await this.repo.getOrgProfile(org.id);
+    const details = customerDetails(org, payer, profile);
     const stored = await this.repo.getBillingCustomer(org.id);
-    if (stored) return stored.customer_id;
-    const { customerId } = await orUnavailable(this.deps.billing.ensureCustomer({ orgId: org.id, name: org.name, email: payer.email }));
+    if (stored) {
+      if (profile) await orUnavailable(this.deps.billing.updateCustomer(stored.customer_id, details));
+      return stored.customer_id;
+    }
+    const { customerId } = await orUnavailable(this.deps.billing.ensureCustomer(details));
     return (await this.repo.addBillingCustomer({ org_id: org.id, customer_id: customerId, livemode: this.deps.billing.mode === 'live',
       created_at: this.timestamp() })).customer_id;
   }

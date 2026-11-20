@@ -107,7 +107,10 @@ describe('mock billing', () => {
     expect(first.url).toBe(`${APP}/app/billing/mock-checkout?session=${first.sessionId}`);
     expect(first.expiresAt).toBe('2026-10-25T13:00:00.000Z');
     expect(await billing.checkoutState(first.sessionId)).toEqual({ sessionId: first.sessionId, orgId: 'org_1', customerId, subscriptionId: null,
-      status: 'open', livemode: false });
+      status: 'open', livemode: false, uiMode: 'hosted', clientSecret: null });
+    // An embedded one (DN-13 §19) is read back with its client secret, as Stripe's is.
+    const embedded = await billing.createEmbeddedCheckout({ orgId: 'org_4', customerId: 'cus_mock_4', plan: monthly, returnUrl: urls.successUrl });
+    expect(await billing.checkoutState(embedded.sessionId)).toMatchObject({ uiMode: 'embedded', clientSecret: embedded.clientSecret, status: 'open' });
 
     const paid = billing.pay(first.sessionId);
     expect(paid).toEqual({ id: expect.any(String), type: 'checkout.completed', orgId: 'org_1', status: 'active', planCode: 'monthly',

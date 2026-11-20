@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  ACTION_STATUSES, AUDIT_ACTOR_KINDS, ActionItemView, ActionPlanResponse, ActivityActor, ActivityEventView, ActivityPage,
+  ACTION_STATUSES, ATTORNEY_RANGES, AUDIT_ACTOR_KINDS, ActionItemView, CheckoutSessionRequest, CreateOrgWithProfileRequest,
+  EmbeddedCheckoutResponse, ORG_CONTACT_ROLES, OrgProfileInput, US_STATES, ActionPlanResponse, ActivityActor, ActivityEventView, ActivityPage,
   AdminAuditEventView, AdminAuditPage, AdminMetricsView, AdminOrgDetailView, AdminOrgView, AnalysisView, AttachAnalysisRequest, BILLING_STATUSES,
   BillingSyncRequest, BillingView,
   CheckoutRequest, ClaimResponse, CreateActionRequest, CreateClaimRequest, CreateOrgRequest, DeletionRequestBody, DeletionRequestView,
@@ -577,5 +578,83 @@ describe('billing with Stripe (DN-13 §7.6, new in 0.5.0)', () => {
       expect(BillingSyncRequest.safeParse({ sessionId }).success, sessionId).toBe(false);
     }
     expect(BillingSyncRequest.safeParse({ sessionId: 'cs_test_a1', orgId: 'x' }).success).toBe(false);
+  });
+});
+
+describe('the pre-checkout: the firm profile and the embedded Checkout (DN-13 §19, new in 0.5.0)', () => {
+  const profile = {
+    contactName: 'Ana Smith', contactRole: 'managing_partner', phone: '+1 (305) 555-0100', legalName: 'Smith & Co LLP', ein: '12-3456789',
+    billingAddress: { line1: '100 Main St', city: 'Miami', state: 'FL', postalCode: '33101' }, attorneyRange: '6-20', practiceStates: ['FL', 'NY'],
+  };
+
+  it('lists the roles, the attorney ranges and the 50 states and DC the form offers', () => {
+    expect(ORG_CONTACT_ROLES).toEqual(['managing_partner', 'partner', 'office_manager', 'other']);
+    expect(ATTORNEY_RANGES).toEqual(['1', '2-5', '6-20', '21-50', '50+']);
+    expect(US_STATES).toHaveLength(51);
+    expect(new Set(US_STATES).size).toBe(51);
+    expect(US_STATES).toEqual(expect.arrayContaining(['AL', 'CA', 'DC', 'FL', 'NY', 'TX', 'WY']));
+  });
+
+  it('OrgProfileInput takes the firm profile, trimmed, with the EIN written as Stripe expects it', () => {
+    expect(OrgProfileInput.parse(profile)).toEqual(profile);
+    const loose = OrgProfileInput.parse({ ...profile, contactName: '  Ana Smith ', legalName: ' Smith & Co LLP  ', ein: '123456789',
+      billingAddress: { ...profile.billingAddress, line1: ' 100 Main St ', city: ' Miami ', postalCode: '33101-1234' } });
+    expect(loose).toMatchObject({ contactName: 'Ana Smith', legalName: 'Smith & Co LLP', ein: '12-3456789',
+      billingAddress: { line1: '100 Main St', city: 'Miami', postalCode: '33101-1234' } });
+  });
+
+  it('OrgProfileInput leaves the phone and the EIN optional, and a blank one reads as none', () => {
+    const { phone: _phone, ein: _ein, ...required } = profile;
+    expect(OrgProfileInput.parse(required)).toEqual(required);
+    expect(OrgProfileInput.parse({ ...required, phone: null, ein: null })).toEqual({ ...required, phone: null, ein: null });
+    expect(OrgProfileInput.parse({ ...required, phone: '  ', ein: '' })).toEqual({ ...required, phone: null, ein: null });
+  });
+
+  it('OrgProfileInput refuses what Stripe or an invoice could not take', () => {
+    const refused: Array<[string, unknown]> = [
+      ['no name', { ...profile, contactName: ' ' }],
+      ['a name too long', { ...profile, contactName: 'a'.repeat(121) }],
+      ['an unknown role', { ...profile, contactRole: 'associate' }],
+      ['a phone with letters', { ...profile, phone: 'call me' }],
+      ['a phone too short', { ...profile, phone: '555-0100' }],
+      ['a phone longer than Stripe keeps', { ...profile, phone: '+1 305 555 0100 0000 0000' }],
+      ['no legal name', { ...profile, legalName: '' }],
+      ['an EIN of 8 digits', { ...profile, ein: '12-345678' }],
+      ['an EIN with letters', { ...profile, ein: 'AB-CDEFGHI' }],
+      ['no street', { ...profile, billingAddress: { ...profile.billingAddress, line1: '' } }],
+      ['no city', { ...profile, billingAddress: { ...profile.billingAddress, city: ' ' } }],
+      ['a state that is not one', { ...profile, billingAddress: { ...profile.billingAddress, state: 'ZZ' } }],
+      ['a lowercase state', { ...profile, billingAddress: { ...profile.billingAddress, state: 'fl' } }],
+      ['a ZIP of 4 digits', { ...profile, billingAddress: { ...profile.billingAddress, postalCode: '3310' } }],
+      ['another country', { ...profile, billingAddress: { ...profile.billingAddress, country: 'CA' } }],
+      ['an unknown range', { ...profile, attorneyRange: '100+' }],
+      ['no practice state', { ...profile, practiceStates: [] }],
+      ['a practice state twice', { ...profile, practiceStates: ['FL', 'FL'] }],
+      ['an unknown practice state', { ...profile, practiceStates: ['FL', 'PR'] }],
+      ['a field it does not know', { ...profile, website: 'smith.law' }],
+    ];
+    for (const [why, value] of refused) expect(OrgProfileInput.safeParse(value).success, why).toBe(false);
+  });
+
+  it('CreateOrgWithProfileRequest is the old request with an optional profile, so callers without one keep working', () => {
+    expect(CreateOrgWithProfileRequest.parse({ name: 'Smith & Co', claimId: 'cl_1' })).toEqual({ name: 'Smith & Co', claimId: 'cl_1' });
+    expect(CreateOrgWithProfileRequest.parse({ name: 'Smith & Co', claimId: 'cl_1', profile })).toEqual({ name: 'Smith & Co', claimId: 'cl_1', profile });
+    expect(CreateOrgWithProfileRequest.safeParse({ name: 'Smith & Co', claimId: 'cl_1', profile: { ...profile, legalName: '' } }).success).toBe(false);
+    expect(CreateOrgWithProfileRequest.safeParse({ name: 'Smith & Co', claimId: 'cl_1', extra: true }).success).toBe(false);
+    // The schema 0.4.0 callers parse with is untouched.
+    expect(CreateOrgRequest.safeParse({ name: 'Smith & Co', claimId: 'cl_1', profile }).success).toBe(false);
+  });
+
+  it('CheckoutSessionRequest asks for the hosted page by default or the embedded one, and EmbeddedCheckoutResponse is strict', () => {
+    expect(CheckoutSessionRequest.parse({ planCode: 'monthly' })).toEqual({ planCode: 'monthly' });
+    expect(CheckoutSessionRequest.parse({ planCode: 'annual', uiMode: 'embedded' })).toEqual({ planCode: 'annual', uiMode: 'embedded' });
+    expect(CheckoutSessionRequest.parse({ planCode: 'annual', uiMode: 'hosted' })).toEqual({ planCode: 'annual', uiMode: 'hosted' });
+    expect(CheckoutSessionRequest.safeParse({ planCode: 'annual', uiMode: 'embedded_page' }).success).toBe(false);
+    expect(CheckoutSessionRequest.safeParse({ planCode: '', uiMode: 'embedded' }).success).toBe(false);
+    expect(CheckoutRequest.safeParse({ planCode: 'monthly', uiMode: 'embedded' }).success).toBe(false);
+    const embedded = { clientSecret: 'cs_test_a1_secret_b2', sessionId: 'cs_test_a1' };
+    expect(EmbeddedCheckoutResponse.parse(embedded)).toEqual(embedded);
+    expect(EmbeddedCheckoutResponse.safeParse({ ...embedded, url: 'https://checkout.stripe.com' }).success).toBe(false);
+    expect(EmbeddedCheckoutResponse.safeParse({ ...embedded, clientSecret: '' }).success).toBe(false);
   });
 });
