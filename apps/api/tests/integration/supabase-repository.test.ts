@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createClient } from '@supabase/supabase-js';
-import { SupabaseRepository } from '../../src/repositories/supabase.js';
+import { RAW_EVIDENCE_WRITE_TIMEOUT_MS, STORAGE_TIMEOUT_MS, SupabaseRepository, storageTimeoutMs } from '../../src/repositories/supabase.js';
 
 describe('Supabase Data API adapter', () => {
-  function setup(handler: (url: URL, init?: RequestInit) => Response) {
+  function setup(handler: (url: URL, init?: RequestInit) => Response, options: { rawRecheckDelayMs?: number } = {}) {
     const request = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => handler(new URL(String(input)), init));
     const client = createClient('https://fixture.supabase.co', 'sb_secret_fixture', {
       auth: { persistSession: false, autoRefreshToken: false }, global: { fetch: request },
     });
-    return { repository: new SupabaseRepository(client), request };
+    return { repository: new SupabaseRepository(client, options), request };
   }
   it('queries original completed and partial evidence within the domain cache TTL', async () => {
     const { repository } = setup(url => {
@@ -63,6 +63,66 @@ describe('Supabase Data API adapter', () => {
       return new Response(null, { status: 201 });
     });
     await repository.saveRaw(raw);
+  });
+  describe('raw evidence writes whose answer is lost (DN-12 §15.5)', () => {
+    const raw = { scan_id: 'sc_test', source: 'website' as const, raw_content: '{"pages":[]}', content_hash: 'b'.repeat(64),
+      fetched_at: '2026-11-20T00:00:00.000Z' };
+    /** A storage that stores a POST or not, answers it or not, and answers the check that follows with what it holds. */
+    function storage(script: Array<{ store: boolean; answer: 'ok' | 'timeout' | 'error' | 'refused' }>) {
+      const rows: unknown[] = [];
+      let posts = 0;
+      const { repository, request } = setup((url, init) => {
+        expect(url.pathname).toBe('/rest/v1/scan_raw_data');
+        if (init?.method === 'POST') {
+          const step = script[posts++]!;
+          if (step.store) rows.push(JSON.parse(String(init.body)));
+          if (step.answer === 'timeout') throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+          if (step.answer === 'error') return Response.json({ code: '57014', message: 'canceling statement' }, { status: 500 });
+          if (step.answer === 'refused') return Response.json({ code: '42501', message: 'permission denied' }, { status: 403 });
+          return new Response(null, { status: 201 });
+        }
+        // The check reads ids only, never the content, by scan, source and content hash.
+        expect(url.searchParams.get('select')).toBe('scan_id');
+        expect(Object.fromEntries(url.searchParams)).toMatchObject({ scan_id: 'eq.sc_test', source: 'eq.website',
+          content_hash: `eq.${'b'.repeat(64)}`, limit: '1' });
+        return Response.json(rows.length ? [{ scan_id: 'sc_test' }] : []);
+      }, { rawRecheckDelayMs: 0 });
+      const posted = () => request.mock.calls.filter(([, init]) => init?.method === 'POST').length;
+      return { repository, rows, posted };
+    }
+
+    it('takes a write the database stored before the client stopped waiting for its answer as done', async () => {
+      const { repository, rows, posted } = storage([{ store: true, answer: 'timeout' }]);
+      await expect(repository.saveRaw(raw)).resolves.toBeUndefined();
+      expect(rows).toHaveLength(1);
+      expect(posted()).toBe(1);
+    });
+
+    it('writes once more when the row is not there after a lost answer, and only once', async () => {
+      const lost = storage([{ store: false, answer: 'timeout' }, { store: true, answer: 'ok' }]);
+      await expect(lost.repository.saveRaw(raw)).resolves.toBeUndefined();
+      expect(lost.rows).toHaveLength(1);
+      const failing = storage([{ store: false, answer: 'error' }, { store: false, answer: 'timeout' }]);
+      await expect(failing.repository.saveRaw(raw)).rejects.toThrow('Unable to save evidence');
+      expect(failing.posted()).toBe(2);
+    });
+
+    it('does not write again what the database refused', async () => {
+      const { repository, posted } = storage([{ store: false, answer: 'refused' }]);
+      await expect(repository.saveRaw(raw)).rejects.toThrow('Unable to save evidence');
+      expect(posted()).toBe(1);
+    });
+
+    it('gives the raw evidence write longer than any other storage request', () => {
+      const base = 'https://fixture.supabase.co/rest/v1';
+      expect(storageTimeoutMs(`${base}/scan_raw_data`, { method: 'POST' })).toBe(RAW_EVIDENCE_WRITE_TIMEOUT_MS);
+      expect(storageTimeoutMs(new URL(`${base}/scan_raw_data?columns=scan_id`), { method: 'post' })).toBe(RAW_EVIDENCE_WRITE_TIMEOUT_MS);
+      expect(storageTimeoutMs(`${base}/scan_raw_data?select=scan_id`, { method: 'GET' })).toBe(STORAGE_TIMEOUT_MS);
+      expect(storageTimeoutMs(`${base}/scans`, { method: 'POST' })).toBe(STORAGE_TIMEOUT_MS);
+      expect(storageTimeoutMs(`${base}/scans`)).toBe(STORAGE_TIMEOUT_MS);
+      expect(RAW_EVIDENCE_WRITE_TIMEOUT_MS).toBeGreaterThanOrEqual(30_000);
+      expect(STORAGE_TIMEOUT_MS).toBe(5_000);
+    });
   });
   it('distinguishes database errors from an absent record', async () => {
     const { repository } = setup(() => Response.json({ code: '42501', message: 'permission denied' }, { status: 403 }));

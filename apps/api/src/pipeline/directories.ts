@@ -1,9 +1,9 @@
-import { unknownAttorney, Attorney, type AttorneyMatch, type DirectoryQuery, type DirectorySource, type SourceResult,
-  type SourceStatus } from '@arca/contracts';
+import { unknownAttorney, Attorney, type AttorneyMatch, type DirectoryQuery, type DirectorySource, type EvidenceReference,
+  type SourceResult, type SourceStatus } from '@arca/contracts';
 import { z } from 'zod';
 import { ApifyClientError, type ApifyRunKind, type ApifyRunMetadata, type ApifyRunResult } from './apify-client.js';
 import { normalizeName, stableSample, matchAttorney } from './matching.js';
-import { compareText, validDate } from '@arca/scoring';
+import { admissionsReference, compareText, firmEmailReference, stateCode, validDate } from '@arca/scoring';
 
 export const BAR_ACTOR = 'scrapers_lat/florida-bar-lawyers-scraper';
 export const AVVO_ACTOR = 'scrapers_lat/avvo-lawyers-scraper';
@@ -101,6 +101,55 @@ export function parseAvvo(raw: unknown): Attorney | null {
     topAward: text(row.topAward), phone: availableText(row.phone), addressStreet: availableText(row.addressStreet),
     yearsLicensed: Number.isInteger(row.yearsLicensed) ? number(row.yearsLicensed) : null,
     licensedSince: text(row.licensedSince), profileUrl: text(row.profileUrl) });
+}
+/**
+ * The bar admissions of the Avvo profiles a lookup returned, for the profiles the matches accept or keep as candidates:
+ * one reference per profile, its states as codes (`AVVO_ADMISSIONS_KEY`, DN-12 §15). The Attorney record has no field for
+ * them (the contract stays as it is, D6), so they are read from the raw answer the source stored. An admission whose
+ * jurisdiction is not a US state or DC is left out, and so is a profile with none left.
+ */
+export function avvoAdmissions(rawContent: string | null, matches: AttorneyMatch[] | null): EvidenceReference[] {
+  const profiles = new Set((matches ?? []).flatMap(match => [match.attorney, ...(match.candidates ?? [])])
+    .map(person => person?.profileUrl).filter((url): url is string => Boolean(url)));
+  let queries: unknown;
+  try { queries = rawContent === null ? null : (JSON.parse(rawContent) as { queries?: unknown }).queries; } catch { return []; }
+  const states = new Map<string, Set<string>>();
+  for (const query of Array.isArray(queries) ? queries : []) {
+    const items = (query as { items?: unknown } | null)?.items;
+    for (const item of Array.isArray(items) ? items : []) {
+      const row = item !== null && typeof item === 'object' ? item as Record<string, unknown> : {};
+      const profile = text(row.profileUrl), admissions = Array.isArray(row.barAdmissions) ? row.barAdmissions : [];
+      if (!profile || !profiles.has(profile)) continue;
+      const codes = admissions.map(admission => text((admission as Record<string, unknown> | null)?.jurisdiction))
+        .map(jurisdiction => jurisdiction ? stateCode(jurisdiction) : null).filter((code): code is string => code !== null);
+      if (codes.length) states.set(profile, new Set([...(states.get(profile) ?? []), ...codes]));
+    }
+  }
+  return [...states].sort(([a], [b]) => compareText(a, b)).map(([profile, codes]) => admissionsReference(profile, codes));
+}
+/**
+ * The Bar records of the profiles the matches accept or keep as candidates whose email is at the firm's own domain: one
+ * reference per profile (`BAR_FIRM_EMAIL_KEY`, DN-12 §15.5), the excerpt the domain. Only the part after the "@" is
+ * compared, and no address is returned, stored or logged: the Attorney record has no field for it (D6), so it is read
+ * from the raw answer the source stored, as `avvoAdmissions` does.
+ */
+export function barFirmEmails(rawContent: string | null, matches: AttorneyMatch[] | null, canonicalDomain: string): EvidenceReference[] {
+  const domain = canonicalDomain.trim().toLowerCase().replace(/^www\./, '');
+  const profiles = new Set((matches ?? []).flatMap(match => [match.attorney, ...(match.candidates ?? [])])
+    .map(person => person?.profileUrl).filter((url): url is string => Boolean(url)));
+  let queries: unknown;
+  try { queries = rawContent === null ? null : (JSON.parse(rawContent) as { queries?: unknown }).queries; } catch { return []; }
+  const found = new Set<string>();
+  for (const query of Array.isArray(queries) ? queries : []) {
+    const items = (query as { items?: unknown } | null)?.items;
+    for (const item of Array.isArray(items) ? items : []) {
+      const row = item !== null && typeof item === 'object' ? item as Record<string, unknown> : {};
+      const profile = text(row.profileUrl), email = text(row.email);
+      if (!profile || !profiles.has(profile) || !email) continue;
+      if (email.slice(email.lastIndexOf('@') + 1).toLowerCase() === domain) found.add(profile);
+    }
+  }
+  return [...found].sort(compareText).map(profile => firmEmailReference(profile, domain));
 }
 function firmKey(value: string) { return value.toLowerCase().replace(/\b(p\.?\s*a\.?|llp|pllc|llc|inc)\b/g, '').replace(/[^a-z0-9]/g, ''); }
 const providerError = (item: unknown) => {

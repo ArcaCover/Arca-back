@@ -4,7 +4,8 @@
 - **Estado:** hecho en las dos ramas, sin publicar. Cada arreglo tiene su sección (§3 a §8); la verificación
   conjunta en mock está en §10. La §12 (2026-11-12) trata la evidencia insuficiente y la §13 los arreglos tras dos scans en vivo de una firma grande
   que dieron scores distintos. La §14 (2026-11-17) sustituye a D4: una web ilegible, por cualquier causa del sitio,
-  es confianza baja y no alto riesgo.
+  es confianza baja y no alto riesgo. La §15 (2026-11-20) deja fuera de las reglas del Florida Bar a los abogados
+  con licencia solo en otros estados.
 - **Repos:** `Arca-back` y `Arca-front`, rama `fix/live-scan-findings` en ambos
 - **Parte de:** DN-07 de crawl (§6, robots y web ilegible), DN-09 (modos), DN-10 y DN-11 (webapp)
 
@@ -1461,3 +1462,226 @@ Solo mock: ninguna llamada a OpenAI, Apify, Supabase ni a webs reales (`/__debug
 - **Resultados guardados con D4.** Ningún entorno desplegado tiene esta rama ni D4 (no están en `main`), así que no
   hay assessments antiguos con el flag y el 30/70 que atender. Si los hubiera, la pantalla de resultados ya no
   enseña el aviso de web para ellos (solo mira `LAYER1_UNAVAILABLE`).
+
+## 15. Abogados con licencia fuera de Florida (2026-11-20)
+
+Rama `fix/multi-state-attorneys` en los dos repos: el back cortado de `origin/main` (producción) y el front de
+`feat/unreachable-website-layer2` (lo que corre en producción). Decisión **[Jesús]**: solo cuentan para las reglas
+del Florida Bar los abogados de Florida; los que tienen licencia o base fuera de Florida quedan **fuera de
+cobertura**: ni suman ni restan, y las pantallas lo dicen. Si no se puede saber el estado de la mayoría, B3 queda
+desconocido en vez de penalizar. Fuera de alcance: consultar los colegios de otros estados.
+
+### 15.1 Qué pasó
+
+Scan de producción `sc_8bf75c9366254eda8558eb921178d552` de `lemonlawgrouppartners.com` (2026-11-18, PARTIAL,
+score 19, CRITICAL): una firma nacional de lemon law con oficinas en más de 20 ciudades de Florida. La web lista 14
+abogados y, junto a cada uno, los estados en los que tiene licencia ("Each attorney's licensed states are shown by
+their name"): tres con Florida (Hegedus FL · GA · MI, Siegel FL · MN · MO · NM, Barnett FL) y once solo en otros
+estados. El Bar aceptó a Hegedus (exacto), a Siegel y a Matthew Foster (cross-ref). B3 = 3/14 = 0,214 → −5 y
+`LOW_BAR_CONSISTENCY`; con B2 = 0 por una amonestación pública real de Siegel (2021 y 2024, se mantiene),
+Professional Standing quedó en 0/30. La penalización medía que once abogados de Texas, Ohio o Nueva York no están
+en el registro de Florida, que es justo lo esperado.
+
+Avvo (nacional) devuelve en cada perfil `barAdmissions` (`[{ jurisdiction: "Florida", since: "2017" }]`), además de
+`licenseState` y la dirección. Lo confirman el crudo de ese scan y los E2E de septiembre. El `Attorney` del contrato
+no tiene campo para ello.
+
+### 15.2 Qué se decidió
+
+1. **Jurisdicción por abogado** (`attorneyJurisdictions` en `@arca/scoring`, `jurisdiction.ts`), para cada nombre de
+   la web y del Bar, frente al estado del registro (`barJurisdiction`, hoy FL):
+   - `IN_STATE` si el Bar lo aceptó (un match **prueba** la licencia allí) o si la web o el perfil de Avvo aceptado
+     nombran ese estado entre los suyos;
+   - `OUT_OF_STATE` si la web o Avvo dan estados y ninguno es Florida;
+   - `UNKNOWN` sin evidencia.
+2. **Las reglas del Bar, solo sobre los esperados en Florida.** Las búsquedas del Bar de los abogados
+   `OUT_OF_STATE` se apartan antes de B1, B2 (lado Bar), B3, B4, `PARTIAL_ATTORNEY_DATA`, `NON_ACTIVE_ATTORNEY` y la
+   parte del Bar de `AMBIGUOUS_IDENTITY_MATCH` (un homónimo en Florida de un abogado de Texas no vuelve ambigua la
+   búsqueda). Como un match siempre prueba Florida, solo se apartan búsquedas sin match. La lista de auditoría
+   (`signals.bar.attorneys`) las conserva todas. Avvo es nacional y no cambia: la reputación, y su cruce
+   disciplinario en B2 sigue contando a todos (una sanción real no se esconde por ser de otro estado).
+3. **B3 = matches del Bar / abogados esperados en Florida** (los buscados menos los `OUT_OF_STATE`). **[mía]** Los
+   `UNKNOWN` cuentan como esperados en Florida: el registro y las oficinas son de Florida, y es lo que se hacía hasta
+   ahora. Pero **en cuanto hay algún abogado fuera de Florida** la firma ya no se presume toda de Florida, y B3 queda
+   **desconocido** (null: sin puntos ni `LOW_BAR_CONSISTENCY`) si los esperados son menos de 2
+   (`MIN_IN_STATE_ATTORNEYS`) o si los de estado desconocido superan a los de Florida conocidos. Sin ningún abogado
+   fuera de Florida, B3 se calcula **como antes**: un despacho de Florida cuya web no dice estados y cuyos abogados
+   no aparecen en el Bar sigue con −5, que es justo la señal que B3 busca. Por eso la regla de "la mayoría
+   desconocida" solo actúa en firmas que muestran abogados de fuera; aplicarla a todas habría dejado sin B3 a casi
+   cualquier despacho de Florida, porque pocas webs dicen estados.
+4. **Cómo se dice.** Flag `ATTORNEYS_OUTSIDE_FLORIDA` (texto libre del contrato) cuando hay abogados fuera de Florida
+   y el Bar respondió. La cuenta va en el `reason` de la regla B3, también texto libre: "Measured on the 4 attorneys
+   expected in Florida; 10 of 14 website attorneys are licensed outside Florida and were not scored against the
+   Florida Bar" (o "Too few attorneys with a known Florida licence to compare with the Florida Bar; …" cuando B3
+   queda desconocido). `outsideBarState(preScore)` la lee; el front tiene su copia (`attorneysOutsideFlorida`).
+   `/score` pinta una línea bajo las barras ("Professional Standing covers Florida only. 10 of your 14 attorneys are
+   licensed outside Florida, so they were not scored against the Florida Bar.") y el PDF del Quick Scan la misma en
+   tercera persona entre sus notas. Con el flag, la tarjeta B3 dice "75% of the firm's Florida attorneys matched a
+   Florida Bar record". Sin la cuenta legible, las dos dicen la frase sin número.
+
+**Sin cambios en `packages/contracts/src` (D6).** El front de producción parsea con la 0.4.0 estricta; los datos van
+en campos libres que ya existían:
+
+| Dato | Dónde | Quién lo escribe |
+|---|---|---|
+| Estados que la web muestra por abogado | `website.provenance.attorney_states`, una referencia por abogado: `"Full Name: FL, GA"` | Extracción (`attorney-states.ts`) |
+| Admisiones de los perfiles de Avvo | `website.provenance.avvo_bar_admissions`, una por perfil: `sourceUrl` = perfil, `"FL, GA"` | Pipeline, tras los directorios, desde el crudo de Avvo (`avvoAdmissions`) |
+| Que hay abogados fuera de Florida | `preScore.flags`: `ATTORNEYS_OUTSIDE_FLORIDA` | Scoring |
+| Cuántos | `reason` de la regla B3 | Scoring |
+
+La segunda fila es un atajo: son datos de Avvo en la procedencia de la web, porque el `Attorney` estricto no tiene
+dónde llevarlos. Lo limpio sería un campo `barAdmissions` en `Attorney` en la próxima versión del contrato, con el
+front pasado a ella antes de que el back lo emita. El registro crudo de la web que se guarda no lleva esa clave: el
+pipeline la añade solo a la evidencia que se puntúa. La cuenta leída de una frase es frágil por la misma razón; un
+campo numérico vendría con ese mismo contrato.
+
+### 15.3 Cómo se lee la web **[mía]**
+
+Por regla, sin el modelo, sobre las páginas que leyó la extracción salvo noticias y blog (`attorney-states.ts`):
+
+- **Tarjeta de roster:** el nombre, un título que termina en un rol jurídico (attorney, partner, associate, counsel,
+  litigation, shareholder, principal, founder, member, esq.) y códigos de dos letras separados por `·`, `•`, `|`,
+  `/` o coma. Todos deben ser de un estado (o DC); el rol evita leer "Jane Roe, PA" (professional association) o "MD"
+  como estados. Es el formato de lemonlawgrouppartners.com, donde las tarjetas llegan pegadas ("Jason S.
+  HegedusManaging Partner FL · GA · MIMelinda…").
+- **Página de perfil del propio abogado** (su dirección nombra su apellido y otro de sus nombres,
+  `/attorney/adam-mott/`): "licensed to practice law in Texas and Virginia", "admitted in Ohio", "member of the
+  Florida Bar", "State Bar of Texas", "Florida Bar No.", "Bar Admissions: …" y la cabecera "Licensed to Practice Law
+  in:" con un estado por línea debajo. Solo cuentan nombres completos de estado (un "IN" u "OK" suelto es una
+  palabra), y las admisiones ante tribunales federales ("Southern District of New York") no son licencias.
+
+Una referencia por abogado, en la primera página (orden de código) que mostró estados, con la unión de todos.
+`EXTRACTION_VERSION` pasa a `agentic-signals-v8`: los análisis guardados con la v7 no traen la clave y no se
+reutilizan (§4.3), así que cada firma paga una extracción nueva la primera vez.
+
+### 15.4 Lo que no se hizo
+
+- **Ahorrar las búsquedas del Bar de los abogados que la web pone fuera de Florida.** Es sencillo pero no seguro: la
+  regla "un match del Bar prueba Florida" ya no podría actuar sobre ellos, y una web podría apartar del Bar a un
+  abogado de Florida sancionado listándolo en otro estado. Una búsqueda dirigida del Bar cuesta poco (USD 0,10 de
+  reserva, a menudo nada: en el re-scan de §15.7 las 13 salieron de la caché de consultas).
+- ~~**Matthew Foster.**~~ **Arreglado en §15.5.** La web lo pone en NY · CT, pero el cruce Bar–Avvo aceptó a "Matthew
+  Kevin Foster" de Tallahassee, de otro despacho, porque los dos directorios coinciden en nombre y año de admisión
+  (1994) sin nada que lo ate a la firma. Por el punto 1 contaba como de Florida y aportaba a B4 (17,2 años de media en
+  vez de ~9,7). Era un fallo del cruce entre directorios (aceptar sin vínculo con la firma), no de esta regla.
+- ~~**Mark Barnett.**~~ **Arreglado en §15.5.** La web dice FL y Avvo tiene a "Mark Stephen Barnett" en el teléfono de
+  la firma con licencia de Florida de 2007, pero el Bar lo trae como `Mark Stephen Barnett "Marcus"` y el apodo entre
+  comillas rompía la comparación de apellido del cruce. Contaba como esperado en Florida sin match (B1 desconocido).
+- **Firmas multiestado cuya web no da estados** y sin perfiles de Avvo aceptados con admisiones: siguen como antes
+  (todos esperados en Florida), con su −5.
+
+### 15.5 Identidad, apodos y crudo de la web (2026-11-20)
+
+Misma rama. Los dos pendientes de identidad de §15.4 y el "Unable to save evidence" del re-scan de §15.7. Sin cambios
+en `packages/contracts/src` (D6) ni en el front.
+
+**1. Un registro necesita un vínculo con esta firma cuando el nombre no basta** (`reconcileBarMatches` y
+`reconcileAvvoMatches` en `@arca/scoring`, con `firmTies`). Que Bar y Avvo coincidan en nombre y año (DN-06) sitúa a
+una persona, no a la firma. **[mía]**
+- *Vínculo fuerte*: el registro del Bar nombra la firma (sin "The", "&"/"and", "Law Firm", P.A., P.L., P.C., LLP…), su
+  email está en el dominio canónico de la firma, o tiene el teléfono o la calle de la firma; o el perfil de Avvo con
+  el que coincide está en la firma.
+- *Vínculo por lugar*: ciudad o condado verificados, o una ciudad con oficina de la web, **solo si deja a ese registro
+  como el único** de los homónimos. Lemon Law Group Partners tiene oficina en Tampa y en Tallahassee, donde están dos
+  de los tres Matthew Foster: la ciudad no distingue a ninguno.
+- Con **varios registros del Bar** para el nombre, el cruce con Avvo exige un vínculo. Si la **web lista al abogado
+  solo fuera de Florida**, se exige uno fuerte, y un match exacto sin él se retira. Sin ninguna de las dos cosas, nada
+  cambia: un exacto único se acepta como hoy, y un único por el cruce también (Briana Mauri, DN-06).
+- Avvo igual: un perfil confirmado solo porque un registro del Bar coincide, entre varios perfiles del nombre, necesita
+  que ese registro esté vinculado. Si no, Avvo aceptaba al Foster de Tallahassee y su admisión (FL) lo hacía de Florida.
+- El email no sale del crudo del Bar: el pipeline compara solo el dominio (`barFirmEmails`) y pasa el perfil en
+  `website.provenance.bar_firm_email` (sourceUrl = perfil del Bar, excerpt = dominio), como las admisiones de Avvo
+  (§15.2), y no en el registro guardado de la web. Las ciudades con oficina (`florida_office_cities`) ya estaban en la
+  procedencia; ahora scoring las lee.
+
+**2. Apodos.** `normalizeName` quita los apodos entre comillas ("…", “…”, '…', ‘…’) y entre paréntesis; el apóstrofo de
+O'Neil se queda y la tolerancia del segundo nombre no cambia. Barnett coincide ahora con el perfil de Avvo en el
+teléfono de la firma (2007).
+
+**3. Crudo de la web.**
+- *Qué se guarda* (`stored-pages.ts`, `pageFormat: "readable-html-v1"`): de cada página el texto y, del HTML, solo lo
+  que lee el backend: primer título, primer h1, metas, JSON-LD y enlaces (dirección y palabras), con `htmlChars` (el
+  tamaño entero). Topes: 100.000 caracteres de HTML y 100.000 de texto por página, 1.500.000 en total, con `truncated`
+  si cortan. Nadie lee las páginas del registro: la extracción y la clave de §4.3 leen el crawl en memoria, y la
+  reutilización lee `analysis`. Leídas por el corpus, las páginas guardadas dan los mismos segmentos, enlaces y
+  `corpusFingerprint` (comprobado en los dos crudos de producción y en el replay). Los registros anteriores, con el
+  HTML entero y sin `pageFormat`, se leen igual. `EXTRACTION_VERSION` no cambia: el análisis es el mismo y subirla
+  haría pagar una extracción nueva por firma.
+- *Cómo se escribe*: el POST a `scan_raw_data` tiene 60 s (lo demás sigue con 5 s). Si la respuesta se pierde (timeout,
+  red, 5xx) se busca la fila por scan, fuente y hash del contenido, al momento y a los 2 s; si está, cuenta como
+  guardada, y si no, se escribe una vez más. Un 4xx no se repite. Sin migración: la tabla no tiene clave única por
+  `(scan_id, source)`, por eso se mira antes de escribir otra vez.
+
+| Registro de la web de lemonlawgrouppartners.com | Antes | Ahora |
+|---|---|---|
+| Producción, 2026-11-18 (`sc_8bf75c…`) | 13,2 MB | 1,38 MB |
+| Re-scan de §15.7, 2026-11-20 (el que no se pudo guardar) | 13,9 MB | 1,58 MB |
+
+Las páginas pasan de ~12,8 MB a ~1 MB; el resto es el análisis y los intentos del modelo, que se guardan como antes.
+
+**Sobre la evidencia de producción** (replay sin red, `tmp/replay-scan.ts`, estados leídos con §15.3): Foster queda sin
+match y fuera de Florida, Barnett con match `cross_ref`. B3 3/3 = 1 (+5), B1 verdadero (+12), B4 12,9 años (+3):
+Professional Standing 20/30 en vez de 3/30. Reputation baja de 13 a 0: los 13 venían sobre todo del perfil de Avvo del
+otro Matthew Foster. Total **26** (EXPOSED) en vez de 22. Sigue `COMMERCIAL_DECISION_BLOCKED` por
+`AMBIGUOUS_IDENTITY_MATCH`, que da Avvo, nacional (§15.2): Adam Mott ya era ambiguo y Foster ahora también.
+
+Tests (vistos fallar antes del cambio, salvo el del registro antiguo, que guarda lo que ya funcionaba):
+`packages/scoring/tests/firm-ties.test.ts` (la forma de Foster con y
+sin estados, vínculo por firma, email, teléfono de Avvo, ciudad única, exacto contradicho, orden, apodos); la
+fixture `multiState` con los tres homónimos y Barr (`"Marc"`) en `multi-state.test.ts`, `determinism.test.ts` y
+`report.test.ts`; `bar-firm-email.test.ts`; `stored-pages.test.ts` (forma de lemonlaw de >12 MB guardada en <1,5 MB
+con la misma lectura); `sources.test.ts` (registro antiguo reutilizado); `replay-determinism.test.ts` (las páginas
+guardadas dan la misma clave); `supabase-repository.test.ts` (respuesta perdida con la fila guardada, segundo intento,
+4xx, plazos). Back `npm run typecheck` sin errores y `npm test` 1488 de 1488 en 78 ficheros (`infra/aws` no corre en
+un worktree). Sin scans en vivo.
+
+### 15.6 Tests
+
+Cada test de comportamiento se vio fallar antes del cambio (siete de `multi-state.test.ts` con el `score.ts`
+anterior; los de extracción, Avvo, PDF y front sin la implementación).
+
+- `packages/scoring/tests/multi-state.test.ts`: la forma de lemonlawgrouppartners.com con nombres sintéticos (B3 0,75
+  → 0, el flag, sin `LOW_BAR_CONSISTENCY`, la cuenta, la amonestación intacta, B4 y la lista de auditoría); sin
+  estados en la web, como antes (−5); mayoría desconocida y menos de dos esperados → B3 null; el match del Bar manda;
+  los homónimos de un abogado de fuera no dan ambigüedad; admisiones de Avvo solo del perfil aceptado; Florida entre
+  otros estados cuenta como Florida; sin registro o sin Bar, nada. Lectura de estados y referencias.
+- `determinism.test.ts`: la misma firma en 500 órdenes, con la procedencia barajada (`reorder` ahora la baraja).
+- `apps/api/tests/unit/attorney-states.test.ts`: tarjetas de roster pegadas, perfil en prosa y en lista, frases de
+  colegios, tribunales federales, falsos positivos (`PA`, `MD`, "University of Florida"), vínculo con el perfil.
+- `agentic-fixed-evidence.test.ts`: la extracción guarda `attorney_states`, nunca desde noticias; versión v8.
+- `avvo-admissions.test.ts`: lectura del crudo de Avvo y, de punta a punta por el pipeline, B3 sobre los de Florida.
+- `report.test.ts`: la línea del PDF con y sin cuenta, una sola vez, y la tarjeta B3.
+- Front: `lib/api/adapt.test.ts`, `lib/signals-view.test.ts`, `lib/scan-flow.test.tsx`.
+
+### 15.7 Verificación (2026-11-20)
+
+| Comprobación | Resultado |
+|---|---|
+| Back `npm run typecheck` | Sin errores |
+| Back `npm test` | 1451 de 1451 en 75 ficheros (`infra/aws` no corre en un worktree) |
+| Front `typecheck`, `lint` | Sin errores; los 6 avisos conocidos |
+| Front `npm test` | 972 de 972 en 48 ficheros |
+| Front `npm run build` | `[check-no-debug] 0 debug leak(s)` |
+
+**Re-scan en vivo** (`live-debug` desde el worktree, caché de scans apagada, techos por defecto: Apify USD 2, OpenAI
+30), `sc_7695dff4d9254ea189a5737962a54866`:
+
+- Terminó **FAILED** con "Unable to save evidence". Los tres registros crudos sí quedaron guardados (la web pesa 13,9
+  MB): el cliente de almacenamiento da 5 s a cada petición y la subida desde esta máquina tardó más, así que abortó
+  después de que Supabase ya hubiera insertado. Es el límite de ese cliente con esta conexión, no de esta rama; en
+  EC2 el mismo registro de 13,2 MB se guardó en producción.
+- Línea de coste: Apify USD 0,556 cobrados (5 búsquedas nuevas de Avvo; las 13 del Bar salieron de la caché de
+  consultas), 8 búsquedas de Avvo rechazadas por el techo de USD 2 (cada una reserva USD 0,40); OpenAI 11 peticiones,
+  88.116 tokens de entrada y 20.702 de salida (extracción nueva por la v8).
+- La extracción v8 leyó los estados de los 13 abogados que esta vez aceptó (Antranig Garibian no salió en el roster):
+  los mismos de la web, con Siegel FL, MN, MO, NH, NM.
+- Reproducido sin red con el código de la rama sobre ese crudo (`tmp/replay-scan.ts`, no versionado): B3 2/3 = 0,67
+  → 0, 10 de 13 fuera de Florida, sin `LOW_BAR_CONSISTENCY` ni la ambigüedad de los homónimos; total 6, porque con 8
+  de 13 búsquedas de Avvo rechazadas Reputation cayó de 13 a 0. Con la regla anterior, la misma evidencia también da
+  6 (B3 desconocido por la búsqueda ambigua de un abogado de fuera).
+
+**Antes y después sobre la evidencia de producción.** El mismo replay sobre el crudo completo del scan del
+2026-11-18 (estados leídos de sus páginas con la regla de §15.3) reproduce exactamente el 19 guardado con la regla
+anterior, y con esta rama da **22**: B3 0,75 → 0 en vez de −5, Professional Standing 3/30, sin
+`LOW_BAR_CONSISTENCY`, con `ATTORNEYS_OUTSIDE_FLORIDA` y "10 of 14". Sigue CRITICAL (< 25): la gobernanza de IA
+(35 puntos) es desconocida.

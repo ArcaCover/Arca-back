@@ -8,3 +8,4 @@ export * from './canonical.js';
 export * from './evaluate.js';
 export * from './layer2.js';
 export * from './website-outcome.js';
+export * from './jurisdiction.js';

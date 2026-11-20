@@ -5,6 +5,9 @@ import { disciplinaryEvidence, yearsSince } from './discipline.js';
 import { normalizeAreas, jaccard, PRACTICE_AREAS } from './areas.js';
 import { canonicalMatches, compareText } from './canonical.js';
 import { isWebsiteUnavailable, WEBSITE_UNAVAILABLE } from './website-outcome.js';
+import { normalizeName } from './matching.js';
+import { ATTORNEYS_OUTSIDE_FLORIDA, MIN_IN_STATE_ATTORNEYS, attorneyJurisdictions, outsideSentence, stateName,
+  type Jurisdiction } from './jurisdiction.js';
 
 function uniqueMatches(matches: AttorneyMatch[] | null): AttorneyMatch[] | null {
   if (matches === null) return null;
@@ -24,16 +27,34 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
   const usable = (name: keyof ScoringInput['sources']) => ['ok', 'partial'].includes(input.sources[name].status);
   const website = (usable('website') ? input.website : null) ?? unknownWebsite();
   // Which of two matches for one person is kept, and the order of the attorneys in the result, follow this fixed order.
-  const bar = uniqueMatches(canonicalMatches(usable('bar') ? input.bar : null));
+  const allBar = uniqueMatches(canonicalMatches(usable('bar') ? input.bar : null));
   const avvo = uniqueMatches(canonicalMatches(usable('avvo') ? input.avvo : null));
+  // Only attorneys licensed in the registry's state count for the Bar rules (DN-12 §15). One the site or the accepted Avvo
+  // profile shows licensed only elsewhere is outside coverage: their lookup is set aside, so it neither adds nor subtracts.
+  // A Bar match always proves the licence, so only unmatched lookups are set aside. The audit list keeps every lookup.
+  const state = input.barJurisdiction ?? null;
+  const jurisdictions = state ? attorneyJurisdictions({ website, bar: allBar, avvo, state }) : new Map<string, Jurisdiction>();
+  const jurisdiction = (match: AttorneyMatch) => jurisdictions.get(normalizeName(match.searchedName)) ?? 'UNKNOWN';
+  const outside = [...jurisdictions.values()].filter(value => value === 'OUT_OF_STATE').length;
+  const bar = allBar?.filter(match => jurisdiction(match) !== 'OUT_OF_STATE') ?? null;
   const barPeople = bar?.map(match => match.attorney) ?? [];
   const avvoPeople = avvo?.map(match => match.attorney) ?? [];
   const allActive = allKnownTrue(barPeople.map(person => !person || person.barStatus === null || person.barStatus === 'UNKNOWN' ? null : person.barStatus === 'active'));
-  const searched = input.sources.bar.attorneysSearched;
+  const lookups = input.sources.bar.attorneysSearched;
+  const searched = lookups == null ? lookups : Math.max(0, lookups - ((allBar?.length ?? 0) - (bar?.length ?? 0)));
   // Failed or ambiguous name lookups do not assert absence from the registry.
-  const consistency = input.sources.bar.status === 'ok' && searched != null && searched > 0 &&
-    bar !== null && bar.every(match => match.matchConfidence !== 'firm_fallback' && !match.ambiguous)
-    ? barPeople.filter(Boolean).length / searched : null;
+  const measurable = input.sources.bar.status === 'ok' && searched != null && searched > 0 &&
+    bar !== null && bar.every(match => match.matchConfidence !== 'firm_fallback' && !match.ambiguous);
+  // A firm with attorneys licensed elsewhere is not presumed to keep the rest in the registry's state: B3 stays unknown
+  // when fewer than two are expected there, or when most of those have no known state.
+  const inState = bar?.filter(match => jurisdiction(match) === 'IN_STATE').length ?? 0;
+  const tooUnknown = outside > 0 && searched != null && (searched < MIN_IN_STATE_ATTORNEYS || searched - inState > inState);
+  const consistency = measurable && !tooUnknown ? barPeople.filter(Boolean).length / searched! : null;
+  const outsideNote = state && outside > 0 && usable('bar') ? outsideSentence(outside, jurisdictions.size, state) : null;
+  const consistencyReason = outsideNote === null ? undefined : `${consistency !== null
+    ? `Measured on the ${searched} attorneys expected in ${stateName(state!)}`
+    : measurable ? `Too few attorneys with a known ${stateName(state!)} licence to compare with the ${stateName(state!)} Bar`
+      : 'Evidence unavailable or ambiguous'}; ${outsideNote}`;
   const experience = mean(barPeople.map(person => yearsSince(person?.admissionDate ?? null, input.now)));
   const avvoAreasKnown = avvoPeople.some(person => person?.practiceAreas !== null && person?.practiceAreas !== undefined);
   const avvoAreas = avvoAreasKnown ? normalizeAreas(avvoPeople.flatMap(person => person?.practiceAreas ?? [])) : null;
@@ -58,7 +79,7 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
   const categories = {
     aiGovernance: aiGovernance(website),
     professionalStanding: professionalStanding({ allActive, cleanRecord: disciplinary.cleanRecord, consistency,
-      experience, sanctionPenalty: disciplinary.penalty }),
+      experience, sanctionPenalty: disciplinary.penalty, consistencyReason }),
     reputation: reputation(rep), firmMaturity: firmMaturity(website, agreement, input.now),
   };
   const activeInvestigation = disciplinary.overrides.some(override => override.id === 'ACTIVE_INVESTIGATION');
@@ -76,6 +97,7 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
     avvoPeople.some(person => !person || [person.avvoRating, person.reviewCount, person.averageReviewRating,
       person.awardsCount ?? person.awards, person.practiceAreas].some(value => value === null))) flags.push('PARTIAL_ATTORNEY_DATA');
   if (consistency !== null && consistency < .5) flags.push('LOW_BAR_CONSISTENCY');
+  if (outsideNote !== null) flags.push(ATTORNEYS_OUTSIDE_FLORIDA);
   if (Object.values(categories).some(category => category.status !== 'KNOWN')) flags.push('INCOMPLETE_EVIDENCE');
   if (disciplinary.uncertain) flags.push('DISCIPLINARY_DETAILS_UNKNOWN');
   if ([...(bar ?? []), ...(avvo ?? [])].some(match => match.ambiguous)) flags.push('AMBIGUOUS_IDENTITY_MATCH');
@@ -103,7 +125,7 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
     bar: { B1_allActive: allActive, B2_worstDisciplinary: disciplinary.worstSeverity,
       // Experience grows a little every day. Reported to one decimal so the result does not change
       // daily; the B4 rule above still reads the exact average.
-      B3_consistency: consistency, B4_avgExperience: oneDecimal(experience), attorneys: bar },
+      B3_consistency: consistency, B4_avgExperience: oneDecimal(experience), attorneys: allBar },
     avvo: { A1_avgRating: rep.rating, A1_ratingLevel: ratingLevel, A2_practiceAreas: avvoAreas,
       A3_avgReviewRating: rep.reviewRating, A3_totalReviews: rep.reviewCount, A6_hasAwards: rep.awards,
       A6_awardsCount: awardCount, A6_topAward: topAward, A8_disciplined: disciplined },

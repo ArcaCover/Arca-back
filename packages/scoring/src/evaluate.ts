@@ -2,6 +2,7 @@ import { Layer1Evidence, type SourceStatus } from '@arca/contracts';
 import { scoreEvidence } from './score.js';
 import { independentlyConfirmed, reconcileAvvoMatches, reconcileBarMatches } from './matching.js';
 import { canonicalIdentity, canonicalMatches, canonicalSource } from './canonical.js';
+import { firmTies } from './jurisdiction.js';
 
 /**
  * Deterministic Layer 1 boundary. It knows structured evidence, never crawlers,
@@ -15,9 +16,12 @@ export function evaluateLayer1Evidence(rawEvidence: Layer1Evidence) {
     bar: canonicalMatches(parsed.bar), avvo: canonicalMatches(parsed.avvo) };
   // Let either directory corroborate a longer legal name. A profile may use a personal address and omit
   // the current firm, while Bar and Avvo still agree on full name plus address, phone or admission year.
-  const provisionalAvvo = reconcileAvvoMatches(evidence.avvo, evidence.bar, evidence.identity);
-  const bar = reconcileBarMatches(evidence.bar, evidence.identity, provisionalAvvo);
-  const avvo = reconcileAvvoMatches(evidence.avvo, bar, evidence.identity);
+  // When several records fit a name, or the site lists the attorney only in other states, that agreement is not
+  // enough: the record must also be tied to this firm (DN-12 §15.5).
+  const ties = firmTies(evidence.website, evidence.barJurisdiction ?? null);
+  const provisionalAvvo = reconcileAvvoMatches(evidence.avvo, evidence.bar, evidence.identity, ties);
+  const bar = reconcileBarMatches(evidence.bar, evidence.identity, provisionalAvvo, ties);
+  const avvo = reconcileAvvoMatches(evidence.avvo, bar, evidence.identity, ties);
   // Each directory reported its status before this cross-check, so it can still say NO_MATCH or
   // TRUNCATED about a person the other directory has just confirmed. Settle those two verdicts here.
   const settle = (status: SourceStatus, matches: typeof bar, other: typeof bar): SourceStatus => {

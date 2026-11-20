@@ -4,8 +4,33 @@ import { ACTIVE_APIFY_STATUSES, RAW_MARKER, SPEND_CEILING_STATUS } from './types
 import type { ScanRepository, ScanRecord, RawRecord, RawReference, ReserveApifyRun, ApifyRunReservation, ApifyRunRecord,
   ApifyRunUpdate, ApifySpendRecord } from './types.js';
 
+/** How long the storage client waits for one request. */
+export const STORAGE_TIMEOUT_MS = 5_000;
+/**
+ * How long it waits for a raw evidence write (DN-12 §15.5). A website record used to be megabytes and took longer than
+ * STORAGE_TIMEOUT_MS to upload from a slow link: the client gave up after the database had stored it, and the scan ended
+ * FAILED. Records are smaller now, but the upload still depends on the link.
+ */
+export const RAW_EVIDENCE_WRITE_TIMEOUT_MS = 60_000;
+/** Writes of one raw record at most: the first, and one more when the row is not there after a lost answer. */
+const RAW_WRITE_ATTEMPTS = 2;
+/** How long to wait, after a lost answer, before looking again whether the row arrived. */
+const RAW_RECHECK_DELAY_MS = 2_000;
+
+/** The time a storage request may take: a raw evidence write gets RAW_EVIDENCE_WRITE_TIMEOUT_MS, anything else STORAGE_TIMEOUT_MS. */
+export function storageTimeoutMs(input: string | URL | Request, init?: RequestInit): number {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  const method = (init?.method ?? (typeof input === 'object' && 'method' in input ? input.method : 'GET')).toUpperCase();
+  let path = '';
+  try { path = new URL(url).pathname; } catch { /* not a URL the client builds */ }
+  return method === 'POST' && path.endsWith('/rest/v1/scan_raw_data') ? RAW_EVIDENCE_WRITE_TIMEOUT_MS : STORAGE_TIMEOUT_MS;
+}
+
 export class SupabaseRepository implements ScanRepository {
-  constructor(private readonly client: SupabaseClient) {}
+  private readonly rawRecheckDelayMs: number;
+  constructor(private readonly client: SupabaseClient, options: { rawRecheckDelayMs?: number } = {}) {
+    this.rawRecheckDelayMs = options.rawRecheckDelayMs ?? RAW_RECHECK_DELAY_MS;
+  }
   async create(scan: ScanRecord) {
     const { error } = await this.client.from('scans').insert(scan);
     if (error) throw new Error('Unable to create scan', { cause: error });
@@ -27,12 +52,33 @@ export class SupabaseRepository implements ScanRepository {
     if (error) throw new Error('Unable to read cache', { cause: error });
     return data;
   }
+  /**
+   * Stores a raw record once. A write whose answer is lost (the client stopped waiting, the link dropped, a 5xx) may
+   * still have been stored: the row is looked for by scan, source and content hash, now and once more after a pause,
+   * and a row found is the write done. Only then is it written again, once. A write the database refused (4xx) is not
+   * repeated. The table has no unique key on (scan_id, source), so the look comes before any second write.
+   */
   async saveRaw(record: RawRecord) {
-    const { error } = await this.client.from('scan_raw_data').insert(record);
-    if (error) throw new Error('Unable to save evidence', { cause: error });
+    let failure: unknown = null;
+    for (let attempt = 1; attempt <= RAW_WRITE_ATTEMPTS; attempt++) {
+      const { error, status } = await this.client.from('scan_raw_data').insert(record);
+      if (!error) return;
+      failure = error;
+      if (await this.rawStored(record)) return;
+      if (status > 0 && status < 500) break;
+      await new Promise(resolve => setTimeout(resolve, this.rawRecheckDelayMs));
+      if (await this.rawStored(record)) return;
+    }
+    throw new Error('Unable to save evidence', { cause: failure });
   }
-  // The database searches the content and returns ids only: a website record is megabytes, and the storage
-  // client gives every request five seconds.
+  /** Whether the raw record is stored. A look that fails says no. */
+  private async rawStored(record: RawRecord): Promise<boolean> {
+    const { data, error } = await this.client.from('scan_raw_data').select('scan_id').eq('scan_id', record.scan_id)
+      .eq('source', record.source).eq('content_hash', record.content_hash).limit(1);
+    return !error && (data?.length ?? 0) > 0;
+  }
+  // The database searches the content and returns ids only: a website record is large (megabytes before DN-12 §15.5),
+  // and the storage client gives every read STORAGE_TIMEOUT_MS.
   async findRaw(domain: string, source: SourceName, marker: string, since: string, limit: number): Promise<RawReference[]> {
     if (!RAW_MARKER.test(marker)) throw new Error('Invalid raw evidence marker');
     const { data, error } = await this.client.from('scan_raw_data')
@@ -90,8 +136,10 @@ export class SupabaseRepository implements ScanRepository {
 }
 export function createStorageClient(url: string, key: string) {
   return createClient(url, key, { auth: { persistSession: false, autoRefreshToken: false },
-    global: { fetch: (input, init) => fetch(input, { ...init,
-      signal: init?.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000) }) } });
+    global: { fetch: (input, init) => {
+      const timeout = AbortSignal.timeout(storageTimeoutMs(input, init));
+      return fetch(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
+    } } });
 }
 export function createRepository(url: string, key: string) {
   return new SupabaseRepository(createStorageClient(url, key));

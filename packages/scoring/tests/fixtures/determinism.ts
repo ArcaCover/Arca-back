@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { Layer1Evidence, unknownAttorney, unknownWebsite, type Attorney, type AttorneyMatch, type WebsiteData } from '@arca/contracts';
-import { stableSample } from '../../src/index.js';
+import { ATTORNEY_STATES_KEY, attorneyStatesReference, stableSample } from '../../src/index.js';
 
 export const OBSERVED_AT = '2026-11-09T10:00:00.000Z';
 type Sources = Layer1Evidence['sources'];
@@ -165,8 +165,9 @@ export function firmFallback(observedAt = OBSERVED_AT): Layer1Evidence {
  * Two Avvo lookups whose searched names normalise to the same person ('Ana Perez Ana Perez', a name the site printed
  * twice, and 'Ana Pérez'), each confirmed by a different address, against one ambiguous Bar lookup ('Ana Perez Esq.')
  * with two namesakes. The Bar cross-check takes the first Avvo lookup for that name, so it accepts whichever namesake
- * the first lookup points to, and the two were admitted fifteen years apart. Only a fixed order of the lookups,
- * before the cross-check, keeps the result from following the order the provider answered in.
+ * the first lookup points to when that one is at the firm (the first is at the firm's street; DN-12 §15.5), and the two
+ * were admitted fifteen years apart. Only a fixed order of the lookups, before the cross-check, keeps the result from
+ * following the order the provider answered in.
  */
 export function sharedSearchedName(observedAt = OBSERVED_AT): Layer1Evidence {
   const bar = (barNumber: string, addressStreet: string, admissionDate: string) => person('Ana Perez', { barNumber, barStatus: 'active',
@@ -175,7 +176,7 @@ export function sharedSearchedName(observedAt = OBSERVED_AT): Layer1Evidence {
     profileUrl: `https://avvo.example/${slug}`, avvoRating, reviewCount: 5, averageReviewRating: 4.5, practiceAreas: ['Immigration'],
     hasDisciplinaryHistory: false });
   const status = { status: 'ok' as const, dataStatus: 'PRESENT' as const, durationMs: 1, attorneysSearched: 1, attorneysFound: 1 };
-  return evidence('perezlegal.example', website({ firm_name: 'Perez Legal', city: 'Miami',
+  return evidence('perezlegal.example', website({ firm_name: 'Perez Legal', city: 'Miami', address_street: '1 Bay Street',
     team_members: [{ full_name: 'Ana Perez', title: 'Attorney' }], team_size: 1, practice_areas: ['Immigration'] }),
   [{ searchedName: 'Ana Perez Esq.', matchConfidence: 'no_match', attorney: null, ambiguous: true,
     candidates: [bar('500001', '1 Bay Street', '2005-03-01'), bar('500002', '9 Ocean Drive', '2020-03-01')] }],
@@ -183,6 +184,78 @@ export function sharedSearchedName(observedAt = OBSERVED_AT): Layer1Evidence {
     { searchedName: 'Ana Pérez', matchConfidence: 'exact_name', ambiguous: false, attorney: avvo('ana-perez-2', '9 Ocean Drive', 6.2) }],
   { website: { status: 'ok', dataStatus: 'PRESENT', durationMs: 1, pagesCrawled: 3 }, bar: status, avvo: { ...status, attorneysSearched: 2 } },
   observedAt);
+}
+
+/**
+ * The shape of lemonlawgrouppartners.com (production scan of 2026-11-18): a national firm with offices in Florida whose
+ * site lists 14 attorneys and the states each one is licensed in. Three list Florida: the Florida Bar matches one exactly,
+ * one through the cross-check (with a real public reprimand) and the third once his quoted nickname is read as one
+ * ("Marc"), through the Avvo profile at the firm's phone. The Bar and Avvo also hold three and three namesakes of an
+ * attorney the site lists in New York and Connecticut; one of each was admitted the same year at another firm in
+ * Tallahassee, one of the firm's office cities, and nothing ties them to this firm (DN-12 §15.5). The other ten are
+ * licensed elsewhere and the Bar has no record of them. `withStates: false` is the same firm read from a site that shows
+ * no states. Synthetic names.
+ */
+export function multiState(observedAt = OBSERVED_AT, { withStates = true } = {}): Layer1Evidence {
+  const firm = 'Harbor Lemon Partners', domain = 'harborlemon.example';
+  const listed: Array<[string, string[]]> = [['Jordan S. Hale', ['FL', 'GA', 'MI']], ['Blake R. Stone', ['FL', 'MN', 'MO', 'NM']],
+    ['Morgan Barr', ['FL']], ['Mason Fox', ['NY', 'CT']], ['Sasha Mills', ['GA', 'SC']], ['Steven Moray', ['IA', 'MO', 'NE']],
+    ['Shawn Reed', ['OH']], ['Kathryn B. Adams', ['CA', 'MI']], ['Jeff Chase', ['OK']], ['Jay Chandler', ['NJ', 'PA']],
+    ['J. Mason Dale III', ['AL']], ['Edward L. Ewing Jr.', ['MI']], ['Arno Garber', ['NY', 'PA', 'NJ']], ['Adam Mott', ['TX', 'VA']]];
+  const names = listed.map(([name]) => name);
+  const hale = person('Jordan S. Hale', { barNumber: '700001', barStatus: 'active', admissionDate: '2017-02-20', city: 'N Miami Beach',
+    firmName: '', hasDisciplinaryHistory: null, disciplinaryActions: null });
+  const stone = person('Blake Richard Stone', { barNumber: '700002', barStatus: 'active', admissionDate: '2017-03-27',
+    city: 'North Miami Beach', firmName: 'Stone Bankruptcy Group', hasDisciplinaryHistory: true,
+    disciplinaryActions: [{ severity: 'public_reprimand', date: null,
+      description: 'Public Reprimand - with Conditions 09/15/2021; Public Reprimand 06/27/2024' }] });
+  const fox = (middle: string, barNumber: string, admissionDate: string, city: string, county: string, firmName: string) =>
+    person(`Mason ${middle} Fox`, { barNumber, barStatus: 'active', admissionDate, city, county, firmName });
+  const foxes = [fox('Hollister', '700005', '2013-04-18', 'Greenwich', 'Non-Florida', 'Focus Partners Wealth'),
+    fox('James', '700006', '1984-01-05', 'Tampa', 'Hillsborough', 'Allen Dell P A'),
+    fox('Kevin', '700003', '1994-09-21', 'Tallahassee', 'Leon', 'Brooks, LeBoeuf, Fox, Gwartney, P.A.')];
+  const barr = person('Morgan Stephen Barr "Marc"', { barNumber: '700004', barStatus: 'active', admissionDate: '2007-06-21',
+    city: 'Jacksonville', firmName: 'The Barr Law Firm, PLLC' });
+  // The Bar returns Stone and Barr as candidates only; the cross-check with the Avvo profile (admission year) accepts them.
+  const candidate = (searchedName: string, attorney: Attorney): AttorneyMatch =>
+    ({ searchedName, matchConfidence: 'no_match', ambiguous: false, attorney: null, candidates: [attorney] });
+  const bar = names.map((searchedName): AttorneyMatch => searchedName === 'Jordan S. Hale'
+    ? { searchedName, matchConfidence: 'exact', ambiguous: false, attorney: hale }
+    : searchedName === 'Blake R. Stone' ? candidate(searchedName, stone)
+      : searchedName === 'Mason Fox' ? { searchedName, matchConfidence: 'no_match', ambiguous: true, attorney: null, candidates: foxes }
+        : searchedName === 'Morgan Barr' ? candidate(searchedName, barr)
+          : { searchedName, matchConfidence: 'no_match', ambiguous: false, attorney: null });
+  const rated = (name: string, slug: string, avvoRating: number, reviewCount: number, fields: Partial<Attorney> = {}) => person(name, {
+    profileUrl: `https://avvo.example/${slug}`, avvoRating, reviewCount, averageReviewRating: 4.4, awardsCount: 1,
+    topAward: 'Clients Choice', practiceAreas: ['Lemon law'], hasDisciplinaryHistory: false, firmName: firm, ...fields });
+  const namesake = (middle: string, licensedSince: string, city: string) => person(`Mason ${middle} Fox`, { licensedSince, city,
+    firmName: `Mason ${middle} Fox`, profileUrl: `https://avvo.example/mason-${middle.toLowerCase()}-fox` });
+  const accepted = ['Jordan S. Hale', 'Blake R. Stone', 'Mason Fox', 'Morgan Barr', 'Jay Chandler', 'Steven Moray'];
+  const avvo: AttorneyMatch[] = [
+    { searchedName: 'Jordan S. Hale', matchConfidence: 'exact_name', ambiguous: false, attorney: rated('Jordan Hale', 'hale', 6.5, 20) },
+    { searchedName: 'Blake R. Stone', matchConfidence: 'exact_name', ambiguous: false,
+      attorney: rated('Blake Richard Stone', 'stone', 5.2, 6, { licensedSince: '2017', hasDisciplinaryHistory: true }) },
+    { searchedName: 'Mason Fox', matchConfidence: 'no_match', ambiguous: true, attorney: null,
+      candidates: [namesake('Wallace', '1992', 'Indianapolis'), namesake('Kevin', '1994', 'Tallahassee'), namesake('Thomas', '2008', 'New York')] },
+    // At the firm's phone, so Avvo's own answer already accepted it.
+    { searchedName: 'Morgan Barr', matchConfidence: 'fuzzy', ambiguous: false, attorney: rated('Morgan Stephen Barr', 'barr', 7.1, 2,
+      { licensedSince: '2007', firmName: 'Morgan Stephen Barr', city: 'North Miami Beach', phone: '(888) 555-0610' }) },
+    { searchedName: 'Jay Chandler', matchConfidence: 'exact_name', ambiguous: false, attorney: rated('Jay W Chandler', 'chandler', 5.8, 12) },
+    { searchedName: 'Steven Moray', matchConfidence: 'exact_name', ambiguous: false, attorney: rated('Steven Moray', 'moray', 6.1, 8) },
+    ...names.filter(name => !accepted.includes(name))
+      .map((searchedName): AttorneyMatch => ({ searchedName, matchConfidence: 'no_match', ambiguous: false, attorney: null }))];
+  const team = `https://${domain}/attorney/jeff-chase/`;
+  return evidence(domain, website({ firm_name: firm, address_street: '3323 NE 163rd St, Suite 301', phone: '(888) 555-0610',
+    team_members: names.map((full_name, i) => ({ full_name, title: i === 0 ? 'Managing Partner' : 'Attorney' })),
+    team_page_quality: 'detailed', website_quality: 'robust', privacy_policy: { found: true, mentions_client_data: null },
+    provenance: { florida_office_cities: ['Miami', 'Tampa', 'Orlando', 'Tallahassee', 'Jacksonville'].map(city =>
+      ({ sourceUrl: `https://${domain}/locations/${city.toLowerCase()}/`, excerpt: city, method: 'derived' as const })),
+    ...(withStates ? { [ATTORNEY_STATES_KEY]: listed.map(([name, states]) => attorneyStatesReference(name, states, team)) } : {}) } }),
+  bar, avvo,
+  { website: { status: 'ok', dataStatus: 'PRESENT', durationMs: 1, pagesCrawled: 19 },
+    bar: { status: 'ok', dataStatus: 'PRESENT', durationMs: 1, attorneysSearched: names.length, attorneysFound: 3 },
+    avvo: { status: 'partial', dataStatus: 'PRESENT', durationMs: 1, attorneysSearched: names.length, attorneysFound: 3, code: 'TRUNCATED',
+      reason: 'One or more targeted lookups were incomplete; raw responses retained' } }, observedAt);
 }
 
 /** A seeded generator, so a failing permutation can be reproduced from its seed. */
@@ -212,6 +285,8 @@ export function reorder(source: Layer1Evidence, random: () => number): Layer1Evi
     site.firm_aliases = list(site.firm_aliases) ?? null;
     site.ai_in_services.tools_mentioned = list(site.ai_in_services.tools_mentioned) ?? null;
     site.ai_blog_posts.titles = list(site.ai_blog_posts.titles) ?? null;
+    // The extraction and the pipeline write provenance references in a fixed order, but scoring must not rely on it.
+    for (const key of Object.keys(site.provenance)) site.provenance[key] = shuffle(site.provenance[key]!, random);
   }
   copy.identity.attorneyNames = shuffle(copy.identity.attorneyNames, random);
   copy.identity.aliases = shuffle(copy.identity.aliases, random);

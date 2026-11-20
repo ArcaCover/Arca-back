@@ -1,7 +1,18 @@
 import type { Attorney, AttorneyMatch, DirectoryQuery, FirmIdentity } from '@arca/contracts';
 
+/**
+ * A name without the nickname a directory adds to it: `Mark Stephen Barnett "Marcus"` (straight or curly quotes),
+ * `William 'Bill' Jones`, `Robert (Bob) Smith`. A single-quoted word counts only when the quotes stand on their own, so
+ * the apostrophe of O'Neil or D'Angelo stays. A name that is nothing but quotes is kept as it is.
+ */
+function withoutNicknames(name: string): string {
+  const stripped = name.replace(/"[^"]*"|\u201c[^\u201d]*\u201d|\u201e[^\u201c\u201d]*[\u201c\u201d]|\([^)]*\)/g, ' ')
+    .replace(/(^|\s)['\u2018][^'\u2018\u2019\s][^'\u2018\u2019]*['\u2019](?=[\s,]|$)/g, '$1 ');
+  return /[a-z]/i.test(stripped.normalize('NFKD')) ? stripped : name;
+}
+
 export function normalizeName(name: string): string {
-  const normalized = name.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+  const normalized = withoutNicknames(name).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
     .replace(/\b(?:esq\.?|j\.?\s*d\.?|jr\.?|iii|ph\.?\s*d\.?)\b/g, '')
     .replace(/[^a-z\s'-]/g, ' ').replace(/\s+/g, ' ').trim();
   const parts = normalized.split(' ');
@@ -48,8 +59,11 @@ type IdentityContext = Pick<DirectoryQuery, 'firmName' | 'aliases' | 'city' | 'c
   Pick<FirmIdentity, 'firmName' | 'aliases' | 'city' | 'county' | 'addressStreet' | 'phone'>;
 const clean = (value: string | null | undefined) => value?.normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
   .toLowerCase().replace(/[^a-z0-9]/g, '') || null;
+// A firm's name without what the same firm is written with or without: "The", "&" or "and", "Law Firm", P.A., P.L.,
+// P.C., LLP and the like. "Fox & Lemon, LLP" and "Fox and Lemon Law Firm" are one firm.
 const firmCore = (value: string | null | undefined) => value?.normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
-  .toLowerCase().replace(/\b(?:law|legal|firm|office|offices|attorney|attorneys|lawyer|lawyers|p\.?a\.?|llp|pllc|llc|inc|mr|ms)\b/g, ' ')
+  .toLowerCase().replace(/&/g, ' ')
+  .replace(/\b(?:the|and|law|legal|firm|office|offices|attorney|attorneys|lawyer|lawyers|p\.?\s*[alc]\.?|llp|pllc|llc|inc|mr|ms)\b/g, ' ')
   .replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, '') || null;
 const sameFirm = (left: string | null | undefined, right: string | null | undefined) => {
   const a = clean(left), b = clean(right), coreA = firmCore(left), coreB = firmCore(right);
@@ -144,47 +158,105 @@ export function independentlyConfirmed(match: AttorneyMatch, other: AttorneyMatc
 
 const asContext = (value: string | null | IdentityContext): IdentityContext => typeof value === 'object' && value !== null
   ? value : { firmName: value, aliases: [], city: null, county: null, addressStreet: null, phone: null };
+
+/**
+ * What the scan knows that can tie a directory record to this firm beyond the person's name (DN-12 §15.5). Built from the
+ * website data by `firmTies`; scoring never sees an email address, only the Bar profiles the pipeline found at the firm's
+ * domain.
+ * - `officeCities`: the cities the site lists offices in.
+ * - `emailProfiles`: Bar profile URLs whose email is at the firm's own domain.
+ * - `licensedElsewhere`: normalized names the site lists as licensed only outside the registry's state.
+ */
+export type FirmTies = { officeCities: ReadonlySet<string>; emailProfiles: ReadonlySet<string>; licensedElsewhere: ReadonlySet<string> };
+export const NO_FIRM_TIES: FirmTies = { officeCities: new Set(), emailProfiles: new Set(), licensedElsewhere: new Set() };
+
+const firmsOf = (context: IdentityContext) => [context.firmName, ...(context.aliases ?? [])];
+/** Tied to the person at this firm: the record names the firm, its email is at the firm's domain, or it has the firm's phone or street. */
+function strongTie(record: Attorney, context: IdentityContext, ties: FirmTies): boolean {
+  return firmTie(record, context, ties) || sameKnown(record.phone, context.phone ?? null) ||
+    sameKnown(record.addressStreet, context.addressStreet ?? null);
+}
+/** The record names this firm, or the Bar has its email at the firm's domain. */
+const firmTie = (record: Attorney, context: IdentityContext, ties: FirmTies) =>
+  firmsOf(context).some(firm => sameFirm(record.firmName, firm)) || (record.profileUrl !== null && ties.emailProfiles.has(record.profileUrl));
+/** In the firm's verified city or county, or in a city the site lists an office in. */
+const placed = (record: Attorney, context: IdentityContext, ties: FirmTies) => sameKnown(record.county, context.county ?? null) ||
+  sameKnown(record.city, context.city ?? null) || [...ties.officeCities].some(city => sameKnown(record.city, city));
+/**
+ * Tied to this firm among the records a name fits: strongly, or by place when the place singles it out. A firm with
+ * twenty offices has namesakes in several of them; then the city says nothing. `strongOnly` when the site contradicts.
+ */
+function tiedAmong(record: Attorney, among: Attorney[], context: IdentityContext, ties: FirmTies, strongOnly: boolean): boolean {
+  if (strongTie(record, context, ties)) return true;
+  return !strongOnly && placed(record, context, ties) && among.filter(other => placed(other, context, ties)).length === 1;
+}
+
+/**
+ * Settles the Bar lookups that a name alone did not. Two directories agreeing on a name and an admission year place a
+ * person, not a firm: when several Bar records fit the name, or the site lists the attorney only in other states, the
+ * record accepted must be tied to this firm (`tiedAmong`), or the Avvo profile it agrees with must be at the firm. A site
+ * that lists the attorney only elsewhere also takes back an exact match nothing ties to the firm. Without either, a
+ * unique record is accepted as before.
+ */
 export function reconcileBarMatches(bar: AttorneyMatch[] | null, identity: string | null | IdentityContext,
-  avvo: AttorneyMatch[] | null = null): AttorneyMatch[] | null {
+  avvo: AttorneyMatch[] | null = null, ties: FirmTies = NO_FIRM_TIES): AttorneyMatch[] | null {
   if (bar === null) return null;
   const context = asContext(identity);
   return bar.map(match => {
-    if (match.attorney && ['exact', 'firm_fallback'].includes(match.matchConfidence)) return match;
+    const elsewhere = ties.licensedElsewhere.has(normalizeName(match.searchedName));
+    const avvoMatch = avvo?.find(item => normalizeName(item.searchedName) === normalizeName(match.searchedName));
+    const counterpart = avvoMatch?.attorney ?? null;
+    const atFirmOnAvvo = (record: Attorney) => counterpart !== null && crossDirectoryIdentity(record, counterpart) &&
+      strongTie(counterpart, context, ties);
+    if (match.attorney && ['exact', 'firm_fallback'].includes(match.matchConfidence)) {
+      if (!elsewhere || match.matchConfidence === 'firm_fallback' || strongTie(match.attorney, context, ties) ||
+        atFirmOnAvvo(match.attorney)) return match;
+      return { searchedName: match.searchedName, attorney: null, matchConfidence: 'no_match', ambiguous: false,
+        candidates: [match.attorney] };
+    }
     const candidates = candidatesForSupport(match);
-    const firmMatches = candidates.filter(candidate => [context.firmName, ...(context.aliases ?? [])]
-      .some(firm => sameFirm(candidate.firmName, firm)));
+    const firmMatches = candidates.filter(candidate => firmTie(candidate, context, ties));
     if (firmMatches.length === 1) return { searchedName: match.searchedName, attorney: firmMatches[0]!,
       matchConfidence: 'cross_ref', ambiguous: false };
-    const avvoMatch = avvo?.find(item => normalizeName(item.searchedName) === normalizeName(match.searchedName));
-    const crossMatches = candidates.filter(candidate => (avvoMatch?.attorney ? [avvoMatch.attorney] : [])
+    const crossMatches = candidates.filter(candidate => (counterpart ? [counterpart] : [])
       .some(other => crossDirectoryIdentity(candidate, other)));
-    if (crossMatches.length === 1) return { searchedName: match.searchedName, attorney: crossMatches[0]!,
-      matchConfidence: 'cross_ref', ambiguous: false };
+    const needsTie = elsewhere || candidates.length > 1;
+    if (crossMatches.length === 1 && (!needsTie || tiedAmong(crossMatches[0]!, candidates, context, ties, elsewhere) ||
+      atFirmOnAvvo(crossMatches[0]!))) {
+      return { searchedName: match.searchedName, attorney: crossMatches[0]!, matchConfidence: 'cross_ref', ambiguous: false };
+    }
     const countyMatches = candidates.filter(candidate => sameKnown(candidate.county, context.county ?? null) ||
       sameKnown(candidate.city, context.city ?? null));
-    if (countyMatches.length === 1) return { searchedName: match.searchedName, attorney: countyMatches[0]!,
-      matchConfidence: 'county_match', ambiguous: false };
+    if (countyMatches.length === 1 && (!elsewhere || strongTie(countyMatches[0]!, context, ties))) {
+      return { searchedName: match.searchedName, attorney: countyMatches[0]!, matchConfidence: 'county_match', ambiguous: false };
+    }
     return { searchedName: match.searchedName, attorney: null, matchConfidence: 'no_match',
       ambiguous: candidates.length > 1 || firmMatches.length > 1 || crossMatches.length > 1 || countyMatches.length > 1,
       ...(candidates.length ? { candidates } : {}) };
   });
 }
 
+/**
+ * Settles the Avvo lookups that a name alone did not. A profile at the firm (its name, street or phone) is confirmed. A
+ * profile confirmed only because a Bar record agrees on name and year is, when several profiles fit the name or the site
+ * lists the attorney only elsewhere, confirmed only if that Bar record is tied to this firm (`tiedAmong`).
+ */
 export function reconcileAvvoMatches(avvo: AttorneyMatch[] | null, bar: AttorneyMatch[] | null,
-  identity: string | null | IdentityContext): AttorneyMatch[] | null {
+  identity: string | null | IdentityContext, ties: FirmTies = NO_FIRM_TIES): AttorneyMatch[] | null {
   if (avvo === null) return null;
   const context = asContext(identity);
   return avvo.map(match => {
     if (match.attorney && ['exact', 'exact_name'].includes(match.matchConfidence)) {
       return { ...match, matchConfidence: 'exact_name' as const, candidates: undefined };
     }
+    const elsewhere = ties.licensedElsewhere.has(normalizeName(match.searchedName));
     const candidates = candidatesForSupport(match);
     const barMatch = bar?.find(item => normalizeName(item.searchedName) === normalizeName(match.searchedName));
     const barCandidates = barMatch ? candidatesForSupport(barMatch) : [];
-    const confirmed = candidates.filter(candidate =>
-      barCandidates.some(barCandidate => crossDirectoryIdentity(candidate, barCandidate)) ||
-      [context.firmName, ...(context.aliases ?? [])].some(firm => sameFirm(candidate.firmName, firm)) ||
-      sameKnown(candidate.addressStreet, context.addressStreet ?? null) || sameKnown(candidate.phone, context.phone ?? null));
+    const needsTie = elsewhere || candidates.length > 1;
+    const confirmed = candidates.filter(candidate => strongTie(candidate, context, ties) ||
+      barCandidates.some(barCandidate => crossDirectoryIdentity(candidate, barCandidate) &&
+        (!needsTie || tiedAmong(barCandidate, barCandidates, context, ties, elsewhere))));
     if (confirmed.length === 1) return { searchedName: match.searchedName, attorney: confirmed[0]!,
       matchConfidence: 'cross_ref', ambiguous: false };
     return { searchedName: match.searchedName, attorney: null, matchConfidence: 'no_match',

@@ -773,7 +773,9 @@ describe('website extraction', () => {
     const result = await source.run('firm.com', new AbortController().signal);
     expect(result.data).toBeNull();
     expect(result.status.status).toBe('error');
-    expect(JSON.parse(result.rawContent!).pages).toEqual(pages);
+    // The text as read and the parts of the HTML the backend reads (none in this body), with the full HTML's length.
+    expect(JSON.parse(result.rawContent!)).toMatchObject({ pageFormat: 'readable-html-v1',
+      pages: [{ url: 'https://firm.com/', text: 'Firm', html: '', htmlChars: '<body>Firm</body>'.length }] });
   });
   it('extracts conservative structured evidence without OpenAI', async () => {
     const provider = new RuleBasedEvidenceProvider();
@@ -924,6 +926,21 @@ describe('website signal reuse', () => {
     // The reused record says whose analysis it holds and how old it is.
     expect(second.stored.reuse).toMatchObject({ key: first.stored.reuse.key, from: 'sc_1', analyzedAt: '2026-11-01T10:00:00.000Z' });
     expect(first.stored.reuse).toMatchObject({ from: null, pages: 2 });
+  });
+
+  it('still reuses a record stored before the compact pages, with the full HTML and no page format', async () => {
+    const s = setup();
+    const first = await s.scan();
+    expect(first.stored.pageFormat).toBe('readable-html-v1');
+    // The record as it was written until DN-12 §15.5: every page with its whole HTML.
+    const old = s.repository.raw.find(record => record.scan_id === first.scanId)!;
+    const { pageFormat: _format, ...rest } = first.stored;
+    old.raw_content = JSON.stringify({ ...rest, pages: site() });
+    s.advance(DAY);
+    const second = await s.scan();
+    expect(s.extract).toHaveBeenCalledTimes(1);
+    expect(second.result.data).toEqual(first.result.data);
+    expect(second.stored.reuse).toMatchObject({ key: first.stored.reuse.key, from: first.scanId });
   });
 
   it('extracts again when a page reads differently', async () => {

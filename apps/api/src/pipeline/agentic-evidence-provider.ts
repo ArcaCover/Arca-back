@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import OpenAI from 'openai';
 import { SignalExtraction, SignalReview, WebsiteData, type Claim, type EvidenceReference, type GroundingReport } from '@arca/contracts';
-import { compareText } from '@arca/scoring';
+import { ATTORNEY_STATES_KEY, compareText } from '@arca/scoring';
 import { classifyRole, personEvidence } from './attorney-roles.js';
 import type { CrawledPage, CrawlResult } from './crawler.js';
 import { isCareersPath } from './crawl-order.js';
@@ -16,6 +16,7 @@ import { DERIVED_FIELDS, deriveTeamPageQuality, deriveWebsiteQuality, type TeamP
 import { PAGE_CLASSIFICATION_PROMPT, PAGE_TYPE_VOTES, PageClassification, acquisitionFloor, heuristicPageType, majorityPageTypes,
   pageCandidates, serializeCandidates, type PageCandidate, type PageType } from './page-types.js';
 import { FLORIDA_OFFICES_KEY, LARGE_FIRM_ATTORNEYS, LARGE_FIRM_KEY, NEWS_ONLY_TEAM_KEY } from './firm-identity.js';
+import { attorneyStates } from './attorney-states.js';
 import type { WebsiteEvidenceProvider } from './website-evidence-provider.js';
 import { DEFAULT_SIGNAL_LLM_MODEL, openAiEndpoint, type LlmEndpoint } from './llm-endpoint.js';
 import { scanMeter } from './scan-cost.js';
@@ -23,7 +24,8 @@ import { scanMeter } from './scan-cost.js';
 // v6: the fixed evidence steps (sitemap, AI, people and offices pages, AI search) run before the claim rounds.
 // v7: ai_blog_posts is derived from the firm's own AI publications the scan knows of when no claim was accepted, and a
 // careers page is never the people directory (DN-12 §13.8).
-export const EXTRACTION_VERSION = 'agentic-signals-v7';
+// v8: the states the site shows each attorney licensed in are recorded in the provenance (DN-12 §15).
+export const EXTRACTION_VERSION = 'agentic-signals-v8';
 export const MAX_AGENT_ROUNDS = 3;
 /** Bounded so one flaky call cannot loop forever; each phase gets its own budget of attempts. */
 export const MAX_TRANSIENT_ATTEMPTS = 3;
@@ -620,6 +622,9 @@ export class AgenticEvidenceProvider implements WebsiteEvidenceProvider {
     if (stated) accepted.provenance[LARGE_FIRM_KEY] = references(stated);
     const offices = floridaOfficeCities(crawl.pages, discovered);
     if (offices.length) accepted.provenance[FLORIDA_OFFICES_KEY] = offices.map(({ city: _city, ...reference }) => reference);
+    // Where each accepted attorney is licensed, as the site shows it: the Bar rules count only those in its state.
+    const states = attorneyStates(crawl.pages.filter(page => !isNewsUrl(page.url) && typeOf(page.url) !== 'blog'), accepted.team_members ?? []);
+    if (states.length) accepted.provenance[ATTORNEY_STATES_KEY] = states;
     const urls = [...new Set([...crawl.pages.map(page => page.url), ...corpus.links.map(link => link.url), ...candidates.map(item => item.url)])];
     const team = deriveTeamPageQuality(crawl, pageTypes, accepted.team_members);
     const website = deriveWebsiteQuality(urls, pageTypes, accepted, team.value);
