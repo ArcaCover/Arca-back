@@ -1609,7 +1609,8 @@ solo hosts locales).
 `WEBAPP_PROVIDERS=real` ya arranca (clave de test, correo en memoria); producción con la webapp encendida sigue sin arrancar mientras
 falte el remitente de SES, y ahora además exige que cada plan activo tenga su precio de Stripe. **No se llamó a la API de Stripe**:
 no hay productos, precios, clientes ni webhooks creados, y `npm run stripe:catalog -- --apply` no se ha ejecutado (lo aprueba el
-founder aparte). Tampoco se instaló la CLI de Stripe.
+founder aparte). Tampoco se instaló la CLI de Stripe. (Eso era al cerrar la fase 3; la primera prueba real en modo test, con el
+catálogo de test creado, es §18.10.)
 
 ### 18.1 Ficheros
 
@@ -1815,7 +1816,91 @@ claves leídas con `Read-Host -AsSecureString` (§9.3), nunca escritas en la lí
   `sync` y la espera de §6.3.
 - **T18:** contratos 0.5.0 con `EnrollRequest`, `EnrollResponse`, `BillingView` y `BillingSyncRequest` (y `emailSent` y `DebugModeResponse`).
 - **T19:** `/__debug/mode` con `webapp` y `billing`; panel y franja.
-- **La prueba real en modo test** (§18.8), que necesita la clave, el catálogo aprobado y la CLI de Stripe; y la suite de conformidad
-  contra Supabase local en cuanto Docker vuelva.
+- ~~La prueba real en modo test~~: hecha el 2026-11-20 (§18.10). Queda la suite de conformidad contra Supabase local en cuanto Docker
+  vuelva, y las decisiones que abrió esa prueba (§18.10.4).
 - Programar la reconciliación diaria y las alarmas de los logs `[billing]` (T26); encontrar la organización de una disputa leyendo el cargo.
 - El remitente de SES (`RealWebappAdapters.sesSendEmail`), sin el cual producción con la webapp encendida no arranca.
+
+### 18.10 Primera prueba real en modo test (2026-11-20)
+
+La de §18.8, hecha de punta a punta con Stripe en **modo test** y el proyecto de Supabase compartido de `.env.local` ("Arca-base", el
+de producción, que Jesús eligió usar para desarrollo; los datos de prueba se borran después). Sin front: un script de scratch (no
+versionado) monta el back con `compose()` en `live-debug`, `WEBAPP_PROVIDERS=real`, el repositorio, la auth JWT y el admin de Supabase
+reales, el `StripeBillingProvider` real con la clave restringida `rk_test_…`, correo en memoria y **fuentes de scan simuladas** (sin
+Apify ni OpenAI: se cargó el entorno como `live` con claves ficticias y después se cambió `sourceMode` a `mock`). La CLI de Stripe
+1.55.8 hizo `stripe listen --latest --events <los de §18.8> --forward-to http://127.0.0.1:8080/billing/webhook`; su `whsec_` pasó al
+proceso de la API sin imprimirse. La sesión de Supabase se sacó con el admin de Auth (`generateLink` + `verifyOtp`, sin correo: el SMTP
+del plan gratuito no manda a direcciones arbitrarias), con emails `e2e-<marca de tiempo>@arca.example`. El pago, con la tarjeta de
+prueba `4242 4242 4242 4242` en la página de Checkout de test de Stripe, abierta con Playwright sin cabeza.
+
+#### 18.10.1 Qué se hizo y qué pasó
+
+| Paso | Resultado |
+|---|---|
+| 1. `npm run stripe:catalog` (ensayo) y `-- --apply` | **Bien.** Product `arca`, `price_1Udm71…` (`arca_monthly`, 499 USD/mes) y `price_1Udm72…` (`arca_annual`, 4.990 USD/año); `plans` con sus ids. Una segunda pasada no crea nada |
+| 2. Configuración del portal (API, no el panel) | **Bien, con un ajuste.** `bpc_1Udm8M…`, `is_default: true` (la primera configuración de la cuenta queda por defecto). Stripe **no deja** activar el cambio de plan sin "actualizar método de pago", así que va encendido; cancelar al final del periodo y cambio entre los dos prices como §6.4; historial de facturas y datos del cliente, apagados en esta prueba |
+| 3. API + `stripe listen` | **Bien.** Línea de arranque `webapp=real stripe=test email=memory` |
+| 4. Scan simulado (`robust.arca.example`) → `POST /claims` → `POST /auth/enroll` → sesión → `POST /orgs` | **Bien.** 201, `pending_payment`, `paidAccess: false` |
+| 5. `POST /orgs/:id/billing/checkout` | **Falló** la primera vez: 500 (§18.10.2). Tras el arreglo: 200; un segundo clic devuelve la misma URL y no crea otra sesión |
+| 5. Pagar con 4242 | **Bien.** `checkout.session.completed`, `invoice.paid` y `customer.subscription.created` → 200 `applied`; `GET /orgs/:id` → `active`, `paidAccess: true`; auditoría `billing.checkout_started`, `billing.event_applied` ×3 y `billing.invoice_paid` (49900 USD) |
+| 5. `POST /orgs/:id/billing/sync` ×2 con el `cs_test_…` | **Bien.** Las dos 200 `active`; la primera audita `checkout.sync` una vez, la segunda es duplicado |
+| 6. Portal → cancelar al final del periodo | **Bien.** `customer.subscription.updated` → `applied`; `GET /orgs/:id/billing` → `cancelAtPeriodEnd: true` (sigue `active`). "Don't cancel subscription" lo devuelve a `false` |
+| 7. Entrega duplicada | **Bien, por otro camino.** `stripe events resend` lo rechazó la clave restringida (le falta `webhook_write`, que no se concedió). Se leyeron los eventos reales con `events.retrieve`, se firmaron con el mismo secreto de `stripe listen` y se entregaron dos veces cada uno (`checkout.session.completed`, `invoice.paid`, `customer.subscription.updated`): seis 200 `duplicate`, ninguna auditoría nueva. Una firma con otro secreto → 400 `invalid_signature` |
+| 8. Test clock: renovación | **Bien.** Segunda organización con su cliente en un test clock (fila de `billing_customers` escrita antes del primer checkout); pagar, adelantar 31 días → `invoice.paid` y `customer.subscription.updated` `applied`, fin de periodo 2027-01-20 |
+| 8. Test clock: pago fallido | **Bien.** Tarjeta `4000 0000 0000 0341` añadida desde el portal como predeterminada (y quitado por API el método que Checkout fija en la suscripción), adelantar 31 días → `invoice.payment_failed` `applied` → `past_due`, `paidAccess: true` (DN-10 §4.5) |
+| 12. `reconcileBilling()` | **Bien.** `{ checked: 2, mismatched: 0, applied: 0, failed: 0 }` |
+
+Ningún webhook respondió otra cosa que 200; ningún `failed` en los logs `[billing]`.
+
+#### 18.10.2 Lo que se rompió y su arreglo
+
+**Managed Payments.** La cuenta de Stripe tiene **Managed Payments** (Stripe como *merchant of record*) activado por defecto, y con él
+Stripe rechaza `allowed_payment_method_types` (400: "cannot be used with Managed Payments"). El back lo trataba como error de la petición
+y `POST /billing/checkout` respondía 500. Arreglo (commit `7a45af9`): la sesión pasa `managed_payments: { enabled: false }`, porque ARCA
+es quien vende y los impuestos siguen siendo F3; así no depende del valor por defecto de la cuenta. El Stripe falso de las pruebas ahora
+se comporta como esa cuenta (rechaza la lista de métodos sin la bandera) y el test de parámetros exactos espera la bandera; los dos
+ficheros fallaron primero (19 tests) y pasan con el arreglo.
+
+#### 18.10.3 Pruebas
+
+`npm run typecheck` limpio. `npm test`: **1631 pasan, 53 se saltan**, ninguno falla (87 ficheros, 2 saltados), en dos pasadas seguidas.
+Una primera pasada dio un fallo suelto que no se repitió en las dos siguientes (no se identificó el fichero).
+
+#### 18.10.4 Lo que la prueba deja para decidir
+
+1. **Un solo modo de Stripe por base.** `plans.stripe_price_id` y `stripe_product_id` guardan **un** id por plan, sin modo. La base
+   compartida tiene ahora los de **test**. Producción con `WEBAPP_ENABLED=true` y una clave live pasaría la guarda de arranque (solo mira
+   que haya id) y cada checkout fallaría con "No such price" (500). En el lanzamiento (T23), `npm run stripe:catalog -- --apply
+   --allow-live` contra esa base crea el catálogo live y **sobrescribe** los ids de test (no archiva los de test, que no ve con la clave
+   live); desde ese momento el `live-debug` real sobre la misma base deja de poder cobrar en test. Opciones: (a) la base de desarrollo
+   aparte de §5.2 (`Arca-dev`), que es lo que la nota pedía; (b) columnas por modo (`stripe_price_id_test`/`_live`) o resolver el precio
+   por `lookup_key` en el modo de la clave; (c) como mínimo, que la guarda de arranque compruebe en Stripe que cada `stripe_price_id`
+   existe en el modo de la clave. `subscriptions`, `billing_customers` y los eventos ya llevan `livemode`.
+2. **Adaptive Pricing está activado en la cuenta.** Desde Colombia, Checkout ofreció pagar en **COP** (1.777.400,27 COP al mes, con el
+   cambio de Stripe) y lo dejó seleccionado; la sesión y la factura quedan en USD (49900) y el portal dice "Charged in COP". Para despachos
+   de EE. UU. no cambia nada, pero es una decisión del founder: dejarlo, apagarlo en el panel o pasar `adaptive_pricing: { enabled: false }`
+   en la sesión.
+3. **Managed Payments** (§18.10.2) es una alternativa real a F3 (Stripe cobraría y declararía los impuestos como vendedor). El back lo
+   apaga explícitamente hasta que el founder decida; si se elige, cambia el checkout (sin lista de métodos) y quién factura.
+4. **Permisos de la clave restringida.** Para esta prueba hizo falta escritura en Products, Prices y Customer portal (catálogo y portal) y
+   en test clocks; `stripe events resend` necesita además `webhook_write`, que no hace falta en producción. §6.7 sigue valiendo para la
+   clave live.
+5. **Configuración del portal:** Stripe obliga a "actualizar método de pago" si se permite cambiar de plan. La de test se creó por API
+   (`bpc_1Udm8M…`); la de live (T23) puede hacerse igual o en el panel.
+
+#### 18.10.5 Datos de prueba creados (para borrarlos)
+
+Supabase (proyecto compartido): organizaciones `edd4b058-abea-4219-adc8-bc2650bcb794` y `c72deeee-824a-4754-b18b-3401dafad29a`; usuarios de
+Auth `fb1c187f-7c91-4f35-861f-a9d64139258f` y `c5b7ff6f-2cc2-4b66-ad6a-1db2fbaf55c6` (`e2e-1795159422259@arca.example`,
+`e2e-1795160146820@arca.example`); scans `sc_e2b604fac1ff4f4ea229ddecdb30d70c`, `sc_19dc0dc49e454a2d806cc3a997405391` y
+`sc_d0d3ea6837f14ea09e20a02a0a755b5f`; con sus perfiles, membresías, `org_analyses`, `claim_tickets`, `subscriptions`, `billing_customers`,
+`checkout_sessions`, auditoría y 15 filas de `stripe_events`. Los ids de Stripe de `plans` son los de test (§18.10.4, punto 1).
+
+Stripe (test): product `arca` y sus dos prices; portal `bpc_1Udm8MEw83ixrW1LTNwzfS19`; clientes `cus_Vf6NHrLxDbvnKT` y `cus_Vf6ZTtKE5OAf2p`
+(este en el test clock `clock_1UdmMYEw83ixrW1LKCI0DigN`); suscripciones `sub_1UdmEFEw83ixrW1LgeLdQiqU` (activa, renueva en test el
+2026-12-20) y `sub_1UdmN3Ew83ixrW1LtZgR4eHH` (`past_due`, en el reloj); checkouts `cs_test_a0wHS6…` y `cs_test_a0OjeA…`.
+
+El borrado está preparado y **sin ejecutar** en dos scripts de scratch (no versionados): un SQL para el editor de Supabase, en una
+transacción que comprueba los ids y emails antes de borrar y apaga las guardas de solo-añadir y de último owner solo dentro de ella, y un
+script de Stripe en ensayo por defecto (`--apply` cancela, borra el cliente y el test clock; `--catalog` archiva además el catálogo y
+desactiva el portal).
