@@ -1559,19 +1559,83 @@ reutilizan (§4.3), así que cada firma paga una extracción nueva la primera ve
 - **Ahorrar las búsquedas del Bar de los abogados que la web pone fuera de Florida.** Es sencillo pero no seguro: la
   regla "un match del Bar prueba Florida" ya no podría actuar sobre ellos, y una web podría apartar del Bar a un
   abogado de Florida sancionado listándolo en otro estado. Una búsqueda dirigida del Bar cuesta poco (USD 0,10 de
-  reserva, a menudo nada: en el re-scan de §15.6 las 13 salieron de la caché de consultas).
-- **Matthew Foster.** La web lo pone en NY · CT, pero el cruce Bar–Avvo aceptó a "Matthew Kevin Foster" de
-  Tallahassee, de otro despacho, porque los dos directorios coinciden en nombre y año de admisión (1994) sin nada que
-  lo ate a la firma. Por el punto 1 cuenta como de Florida y aporta a B4 (17,2 años de media en vez de ~9,7). Es un
-  fallo del cruce entre directorios (aceptar sin vínculo con la firma), no de esta regla; queda pendiente.
-- **Mark Barnett.** La web dice FL y Avvo tiene a "Mark Stephen Barnett" en la dirección de la firma con licencia de
-  Florida de 2007, pero el Bar lo trae como `Mark Stephen Barnett "Marcus"` y el apodo entre comillas rompe la
-  comparación de apellido del cruce. Cuenta como esperado en Florida sin match (B1 desconocido). Quitar los apodos en
-  `normalizeName` lo arreglaría, pero cambia el matching de todas las firmas; queda pendiente.
+  reserva, a menudo nada: en el re-scan de §15.7 las 13 salieron de la caché de consultas).
+- ~~**Matthew Foster.**~~ **Arreglado en §15.5.** La web lo pone en NY · CT, pero el cruce Bar–Avvo aceptó a "Matthew
+  Kevin Foster" de Tallahassee, de otro despacho, porque los dos directorios coinciden en nombre y año de admisión
+  (1994) sin nada que lo ate a la firma. Por el punto 1 contaba como de Florida y aportaba a B4 (17,2 años de media en
+  vez de ~9,7). Era un fallo del cruce entre directorios (aceptar sin vínculo con la firma), no de esta regla.
+- ~~**Mark Barnett.**~~ **Arreglado en §15.5.** La web dice FL y Avvo tiene a "Mark Stephen Barnett" en el teléfono de
+  la firma con licencia de Florida de 2007, pero el Bar lo trae como `Mark Stephen Barnett "Marcus"` y el apodo entre
+  comillas rompía la comparación de apellido del cruce. Contaba como esperado en Florida sin match (B1 desconocido).
 - **Firmas multiestado cuya web no da estados** y sin perfiles de Avvo aceptados con admisiones: siguen como antes
   (todos esperados en Florida), con su −5.
 
-### 15.5 Tests
+### 15.5 Identidad, apodos y crudo de la web (2026-11-20)
+
+Misma rama. Los dos pendientes de identidad de §15.4 y el "Unable to save evidence" del re-scan de §15.7. Sin cambios
+en `packages/contracts/src` (D6) ni en el front.
+
+**1. Un registro necesita un vínculo con esta firma cuando el nombre no basta** (`reconcileBarMatches` y
+`reconcileAvvoMatches` en `@arca/scoring`, con `firmTies`). Que Bar y Avvo coincidan en nombre y año (DN-06) sitúa a
+una persona, no a la firma. **[mía]**
+- *Vínculo fuerte*: el registro del Bar nombra la firma (sin "The", "&"/"and", "Law Firm", P.A., P.L., P.C., LLP…), su
+  email está en el dominio canónico de la firma, o tiene el teléfono o la calle de la firma; o el perfil de Avvo con
+  el que coincide está en la firma.
+- *Vínculo por lugar*: ciudad o condado verificados, o una ciudad con oficina de la web, **solo si deja a ese registro
+  como el único** de los homónimos. Lemon Law Group Partners tiene oficina en Tampa y en Tallahassee, donde están dos
+  de los tres Matthew Foster: la ciudad no distingue a ninguno.
+- Con **varios registros del Bar** para el nombre, el cruce con Avvo exige un vínculo. Si la **web lista al abogado
+  solo fuera de Florida**, se exige uno fuerte, y un match exacto sin él se retira. Sin ninguna de las dos cosas, nada
+  cambia: un exacto único se acepta como hoy, y un único por el cruce también (Briana Mauri, DN-06).
+- Avvo igual: un perfil confirmado solo porque un registro del Bar coincide, entre varios perfiles del nombre, necesita
+  que ese registro esté vinculado. Si no, Avvo aceptaba al Foster de Tallahassee y su admisión (FL) lo hacía de Florida.
+- El email no sale del crudo del Bar: el pipeline compara solo el dominio (`barFirmEmails`) y pasa el perfil en
+  `website.provenance.bar_firm_email` (sourceUrl = perfil del Bar, excerpt = dominio), como las admisiones de Avvo
+  (§15.2), y no en el registro guardado de la web. Las ciudades con oficina (`florida_office_cities`) ya estaban en la
+  procedencia; ahora scoring las lee.
+
+**2. Apodos.** `normalizeName` quita los apodos entre comillas ("…", “…”, '…', ‘…’) y entre paréntesis; el apóstrofo de
+O'Neil se queda y la tolerancia del segundo nombre no cambia. Barnett coincide ahora con el perfil de Avvo en el
+teléfono de la firma (2007).
+
+**3. Crudo de la web.**
+- *Qué se guarda* (`stored-pages.ts`, `pageFormat: "readable-html-v1"`): de cada página el texto y, del HTML, solo lo
+  que lee el backend: primer título, primer h1, metas, JSON-LD y enlaces (dirección y palabras), con `htmlChars` (el
+  tamaño entero). Topes: 100.000 caracteres de HTML y 100.000 de texto por página, 1.500.000 en total, con `truncated`
+  si cortan. Nadie lee las páginas del registro: la extracción y la clave de §4.3 leen el crawl en memoria, y la
+  reutilización lee `analysis`. Leídas por el corpus, las páginas guardadas dan los mismos segmentos, enlaces y
+  `corpusFingerprint` (comprobado en los dos crudos de producción y en el replay). Los registros anteriores, con el
+  HTML entero y sin `pageFormat`, se leen igual. `EXTRACTION_VERSION` no cambia: el análisis es el mismo y subirla
+  haría pagar una extracción nueva por firma.
+- *Cómo se escribe*: el POST a `scan_raw_data` tiene 60 s (lo demás sigue con 5 s). Si la respuesta se pierde (timeout,
+  red, 5xx) se busca la fila por scan, fuente y hash del contenido, al momento y a los 2 s; si está, cuenta como
+  guardada, y si no, se escribe una vez más. Un 4xx no se repite. Sin migración: la tabla no tiene clave única por
+  `(scan_id, source)`, por eso se mira antes de escribir otra vez.
+
+| Registro de la web de lemonlawgrouppartners.com | Antes | Ahora |
+|---|---|---|
+| Producción, 2026-11-18 (`sc_8bf75c…`) | 13,2 MB | 1,38 MB |
+| Re-scan de §15.7, 2026-11-20 (el que no se pudo guardar) | 13,9 MB | 1,58 MB |
+
+Las páginas pasan de ~12,8 MB a ~1 MB; el resto es el análisis y los intentos del modelo, que se guardan como antes.
+
+**Sobre la evidencia de producción** (replay sin red, `tmp/replay-scan.ts`, estados leídos con §15.3): Foster queda sin
+match y fuera de Florida, Barnett con match `cross_ref`. B3 3/3 = 1 (+5), B1 verdadero (+12), B4 12,9 años (+3):
+Professional Standing 20/30 en vez de 3/30. Reputation baja de 13 a 0: los 13 venían sobre todo del perfil de Avvo del
+otro Matthew Foster. Total **26** (EXPOSED) en vez de 22. Sigue `COMMERCIAL_DECISION_BLOCKED` por
+`AMBIGUOUS_IDENTITY_MATCH`, que da Avvo, nacional (§15.2): Adam Mott ya era ambiguo y Foster ahora también.
+
+Tests (vistos fallar antes del cambio, salvo el del registro antiguo, que guarda lo que ya funcionaba):
+`packages/scoring/tests/firm-ties.test.ts` (la forma de Foster con y
+sin estados, vínculo por firma, email, teléfono de Avvo, ciudad única, exacto contradicho, orden, apodos); la
+fixture `multiState` con los tres homónimos y Barr (`"Marc"`) en `multi-state.test.ts`, `determinism.test.ts` y
+`report.test.ts`; `bar-firm-email.test.ts`; `stored-pages.test.ts` (forma de lemonlaw de >12 MB guardada en <1,5 MB
+con la misma lectura); `sources.test.ts` (registro antiguo reutilizado); `replay-determinism.test.ts` (las páginas
+guardadas dan la misma clave); `supabase-repository.test.ts` (respuesta perdida con la fila guardada, segundo intento,
+4xx, plazos). Back `npm run typecheck` sin errores y `npm test` 1488 de 1488 en 78 ficheros (`infra/aws` no corre en
+un worktree). Sin scans en vivo.
+
+### 15.6 Tests
 
 Cada test de comportamiento se vio fallar antes del cambio (siete de `multi-state.test.ts` con el `score.ts`
 anterior; los de extracción, Avvo, PDF y front sin la implementación).
@@ -1589,7 +1653,7 @@ anterior; los de extracción, Avvo, PDF y front sin la implementación).
 - `report.test.ts`: la línea del PDF con y sin cuenta, una sola vez, y la tarjeta B3.
 - Front: `lib/api/adapt.test.ts`, `lib/signals-view.test.ts`, `lib/scan-flow.test.tsx`.
 
-### 15.6 Verificación (2026-11-20)
+### 15.7 Verificación (2026-11-20)
 
 | Comprobación | Resultado |
 |---|---|
