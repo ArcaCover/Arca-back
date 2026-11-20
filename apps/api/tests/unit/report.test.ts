@@ -116,7 +116,7 @@ describe('Quick Scan Report content', () => {
   });
 });
 
-// The live scan of lemonlawgrouppartners.com: ten of the fourteen attorneys are licensed outside Florida (DN-12 §15).
+// The live scan of lemonlawgrouppartners.com: eleven of the fourteen attorneys are licensed outside Florida (DN-12 §15, §15.5).
 function multiStateResult() {
   return Layer1Result.parse({ scanId: 'sc_multistate', domain: 'harborlemon.example', email: 'owner@harborlemon.example',
     ...evaluateLayer1Evidence(multiState()), meta: { scanDurationMs: 10, cached: false, completedAt: '2026-11-18T23:10:55.852Z' } });
@@ -125,7 +125,7 @@ function multiStateResult() {
 describe('Quick Scan Report for a firm with attorneys licensed outside Florida', () => {
   it('says once that Professional Standing covers Florida only, and how many attorneys it left out', () => {
     const html = renderQuickScanHtml(multiStateResult(), 'PARTIAL');
-    expect(html).toContain('Professional Standing covers Florida only. 10 of the firm&#39;s 14 attorneys are licensed outside '
+    expect(html).toContain('Professional Standing covers Florida only. 11 of the firm&#39;s 14 attorneys are licensed outside '
       + 'Florida, so they were not scored against the Florida Bar.');
     expect(html.match(/covers Florida only/g)).toHaveLength(1);
     expect(FLORIDA_ONLY_NOTE({ outside: 10, total: 14 })).toBe('Professional Standing covers Florida only. 10 of the '
@@ -134,8 +134,8 @@ describe('Quick Scan Report for a firm with attorneys licensed outside Florida',
 
   it('names the Florida attorneys in the bar-record finding', () => {
     const html = renderQuickScanHtml(multiStateResult(), 'PARTIAL');
-    expect(html).toContain('75% of the firm&#39;s Florida attorneys matched a Florida Bar record');
-    expect(html).not.toContain('75% of the firm&#39;s attorneys matched a bar record');
+    expect(html).toContain('100% of the firm&#39;s Florida attorneys matched a Florida Bar record');
+    expect(html).not.toContain('100% of the firm&#39;s attorneys matched a bar record');
   });
 
   it('keeps its words without a count, and says nothing for a firm without the flag', () => {

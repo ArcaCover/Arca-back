@@ -51,7 +51,7 @@ describe('Layer 1 gives one result for one set of evidence', () => {
 
   it('cross-checks the Bar against the same Avvo lookup whichever order two lookups for one name arrive in', () => {
     // 'Ana Perez Ana Perez' and 'Ana Pérez' normalise to the Bar's 'Ana Perez Esq.'. The cross-check takes the first
-    // of them, so without one fixed order before it the Bar namesake accepted (admitted 2005 or 2020) follows the provider.
+    // of them, so without one fixed order before it whether the Bar namesake at the firm's street is accepted follows the provider.
     const evidence = sharedSearchedName(), [first, second] = evidence.avvo!;
     const swapped = { ...evidence, avvo: [second!, first!] };
     const expected = evaluateLayer1Evidence(evidence);

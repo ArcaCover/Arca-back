@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import { Layer1Evidence, Layer1Result, type Layer1Pipeline, type WebsiteSource, type DirectorySource, type SourceResult,
   type SourceName, type PipelineResult, type WebsiteData, type AttorneyMatch } from '@arca/contracts';
-import { AVVO_ADMISSIONS_KEY, evaluateLayer1Evidence, isWebsiteUnavailable } from '@arca/scoring';
-import { avvoAdmissions } from './directories.js';
+import { AVVO_ADMISSIONS_KEY, BAR_FIRM_EMAIL_KEY, evaluateLayer1Evidence, isWebsiteUnavailable } from '@arca/scoring';
+import { avvoAdmissions, barFirmEmails } from './directories.js';
 import { normalizeDomain } from './domain-resolution.js';
 import { buildFirmIdentity, directoryScope } from './firm-identity.js';
 import type { ScanRepository } from '../repositories/types.js';
@@ -80,10 +80,13 @@ export class InProcessPipeline implements Layer1Pipeline {
         persistenceTimer = setTimeout(() => reject(new Error('Raw evidence persistence deadline reached')), Math.max(1, budget - (now() - start)));
       })]); } finally { clearTimeout(persistenceTimer); }
       // The bar admissions of the Avvo profiles join the website's provenance, where scoring reads which attorneys the
-      // Bar rules cover (DN-12 §15). The website's own stored record is left as the site gave it.
+      // Bar rules cover (DN-12 §15), and so do the Bar records whose email is at the firm's domain, which tie a record to
+      // the firm (§15.5). The website's own stored record is left as the site gave it.
       const admissions = website.data ? avvoAdmissions(avvo.rawContent, avvo.data) : [];
-      const websiteData = website.data && admissions.length
-        ? { ...website.data, provenance: { ...website.data.provenance, [AVVO_ADMISSIONS_KEY]: admissions } } : website.data;
+      const emails = website.data ? barFirmEmails(bar.rawContent, bar.data, input.canonicalDomain) : [];
+      const websiteData = website.data && (admissions.length || emails.length) ? { ...website.data, provenance: {
+        ...website.data.provenance, ...(admissions.length ? { [AVVO_ADMISSIONS_KEY]: admissions } : {}),
+        ...(emails.length ? { [BAR_FIRM_EMAIL_KEY]: emails } : {}) } } : website.data;
       const evidence = Layer1Evidence.parse({ identity, website: websiteData, bar: bar.data, avvo: avvo.data,
         sources: { website: website.status, bar: bar.status, avvo: avvo.status }, observedAt: fetchedAt,
         barJurisdiction: jurisdiction });

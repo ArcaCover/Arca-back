@@ -1,6 +1,6 @@
 import type { AttorneyMatch, EvidenceReference, PreScore, WebsiteData } from '@arca/contracts';
 import { compareText } from './canonical.js';
-import { normalizeName } from './matching.js';
+import { normalizeName, type FirmTies } from './matching.js';
 
 /**
  * Where each attorney is licensed, and so which of them the Bar registry can speak for (DN-12 §15).
@@ -15,6 +15,16 @@ import { normalizeName } from './matching.js';
  */
 export const ATTORNEY_STATES_KEY = 'attorney_states';
 export const AVVO_ADMISSIONS_KEY = 'avvo_bar_admissions';
+/**
+ * Two more provenance keys the identity cross-check reads (DN-12 §15.5), through `firmTies`:
+ * - FIRM_OFFICE_CITIES_KEY: one reference per Florida city the site lists an office in, the excerpt the city. The website
+ *   extraction writes it (DN-06 §10).
+ * - BAR_FIRM_EMAIL_KEY: one reference per Bar record whose email is at the firm's own domain, sourceUrl the Bar profile and
+ *   the excerpt the domain. The pipeline writes it after the directories answered; the address itself never leaves the
+ *   Bar's raw answer.
+ */
+export const FIRM_OFFICE_CITIES_KEY = 'florida_office_cities';
+export const BAR_FIRM_EMAIL_KEY = 'bar_firm_email';
 /**
  * Flag: some of the firm's attorneys are licensed only outside the state of the Bar registry the scan reads (Florida,
  * the only one wired). They neither add to nor subtract from the Bar rules. The B3 rule's reason says how many.
@@ -72,6 +82,11 @@ export function admissionsReference(profileUrl: string, states: Iterable<string>
   return { sourceUrl: profileUrl, excerpt: codes(states), method: 'provider' };
 }
 
+/** The reference the pipeline writes for one Bar record whose email is at the firm's domain: the profile and the domain. */
+export function firmEmailReference(profileUrl: string, domain: string): EvidenceReference {
+  return { sourceUrl: profileUrl, excerpt: domain, method: 'provider' };
+}
+
 const stateList = (text: string): string[] | null => {
   const parts = text.split(',').map(part => part.trim());
   return parts.length && parts.every(part => /^[A-Z]{2}$/.test(part) && part in STATES) ? parts : null;
@@ -126,6 +141,19 @@ export function attorneyJurisdictions(input: { website: Pick<WebsiteData, 'prove
     result.set(name, matched.has(name) || states.has(input.state) ? 'IN_STATE' : states.size ? 'OUT_OF_STATE' : 'UNKNOWN');
   }
   return result;
+}
+
+/**
+ * What can tie a directory record to this firm, read from the website data (DN-12 §15.5): its office cities, the Bar
+ * profiles at its email domain, and the attorneys its site lists only outside `state` (none without a state).
+ */
+export function firmTies(website: Pick<WebsiteData, 'provenance'> | null, state: string | null): FirmTies {
+  const provenance = website?.provenance ?? {};
+  const officeCities = new Set((provenance[FIRM_OFFICE_CITIES_KEY] ?? []).map(reference => reference.excerpt?.trim() ?? '').filter(Boolean));
+  const emailProfiles = new Set((provenance[BAR_FIRM_EMAIL_KEY] ?? []).map(reference => reference.sourceUrl));
+  const licensedElsewhere = new Set(state === null ? [] : [...readAttorneyStates(website)]
+    .filter(([, states]) => states.size > 0 && !states.has(state)).map(([name]) => name).sort(compareText));
+  return { officeCities, emailProfiles, licensedElsewhere };
 }
 
 /** A state's full name from its code; the code itself when it is not a state. */

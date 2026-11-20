@@ -12,27 +12,49 @@ const withStates = (evidence: Layer1Evidence, listed: Array<[string, string[]]>)
     attorneyStatesReference(name, states, 'https://harborlemon.example/attorneys/'));
   return copy;
 };
+/** The same firm with no Florida namesake of the attorney the site lists in New York: his lookup simply finds nobody. */
+const withoutNamesakes = (evidence: Layer1Evidence) => ({ ...evidence, bar: evidence.bar!.map(match => match.searchedName === 'Mason Fox'
+  ? { searchedName: match.searchedName, matchConfidence: 'no_match' as const, ambiguous: false, attorney: null } : match) });
 
 describe('attorneys licensed outside Florida (lemonlawgrouppartners.com, 2026-11-18)', () => {
   it('scores the Florida Bar rules on the attorneys expected in Florida only', () => {
     const result = evaluateLayer1Evidence(multiState());
-    // Three attorneys the site lists in Florida, and one the Florida Bar matched although the site lists him elsewhere.
-    expect(result.signals.bar.B3_consistency).toBe(.75);
-    expect(rule(result, 'B3').points).toBe(0);
+    // The three attorneys the site lists in Florida, all matched (one once his quoted nickname reads as one).
+    expect(result.signals.bar.B3_consistency).toBe(1);
+    expect(rule(result, 'B3').points).toBe(5);
     expect(result.preScore.flags).toContain(ATTORNEYS_OUTSIDE_FLORIDA);
     expect(result.preScore.flags).not.toContain('LOW_BAR_CONSISTENCY');
-    expect(rule(result, 'B3').reason).toContain('10 of 14 website attorneys are licensed outside Florida');
-    expect(outsideBarState(result.preScore)).toEqual({ outside: 10, total: 14 });
+    expect(rule(result, 'B3').reason).toContain('11 of 14 website attorneys are licensed outside Florida');
+    expect(outsideBarState(result.preScore)).toEqual({ outside: 11, total: 14 });
   });
 
   it('keeps the real public reprimand of a Florida attorney', () => {
     const result = evaluateLayer1Evidence(multiState());
     expect(result.signals.bar.B2_worstDisciplinary).toBe('public_reprimand');
     expect(rule(result, 'B2_clean').points).toBe(0);
-    // A Florida attorney the Bar did not match still leaves "every attorney active" unknown.
-    expect(result.signals.bar.B1_allActive).toBeNull();
+    // Every attorney expected in Florida was matched and is active.
+    expect(result.signals.bar.B1_allActive).toBe(true);
     expect(rule(result, 'B4').points).toBe(3);
-    expect(result.preScore.categories.professionalStanding.score).toBe(3);
+    expect(result.preScore.categories.professionalStanding.score).toBe(20);
+  });
+
+  it('matches the Bar record whose quoted nickname used to hide the site\'s shorter name', () => {
+    const result = evaluateLayer1Evidence(multiState());
+    expect(result.signals.bar.attorneys?.find(match => match.searchedName === 'Morgan Barr'))
+      .toMatchObject({ matchConfidence: 'cross_ref', attorney: { barNumber: '700004' } });
+  });
+
+  it('does not take a Florida namesake for an attorney the site lists in other states', () => {
+    const result = evaluateLayer1Evidence(multiState());
+    const fox = result.signals.bar.attorneys?.find(match => match.searchedName === 'Mason Fox');
+    expect(fox).toMatchObject({ attorney: null, matchConfidence: 'no_match' });
+    expect(fox?.candidates).toHaveLength(3);
+    // B4 averages the three Florida attorneys (about 9.7, 9.6 and 19.4 years), not a namesake admitted in 1994.
+    expect(result.signals.bar.B4_avgExperience).toBe(12.9);
+    // His Bar namesakes are set aside with him, so B3 is measured. Avvo is national: its namesakes of him stay an
+    // ambiguity, as for any attorney (the real scan had one already, for Adam Mott).
+    expect(result.signals.bar.B3_consistency).not.toBeNull();
+    expect(result.preScore.flags).toContain('AMBIGUOUS_IDENTITY_MATCH');
   });
 
   it('keeps the audit list of every lookup, the out-of-state ones included', () => {
@@ -41,7 +63,7 @@ describe('attorneys licensed outside Florida (lemonlawgrouppartners.com, 2026-11
   });
 
   it('treats the attorneys of a site that shows no states as expected in Florida, as before', () => {
-    const result = evaluateLayer1Evidence(multiState(undefined, { withStates: false }));
+    const result = evaluateLayer1Evidence(withoutNamesakes(multiState(undefined, { withStates: false })));
     expect(result.signals.bar.B3_consistency).toBeCloseTo(3 / 14);
     expect(rule(result, 'B3').points).toBe(-5);
     expect(rule(result, 'B3').reason).toBe('Evaluated from observed evidence');
@@ -50,13 +72,21 @@ describe('attorneys licensed outside Florida (lemonlawgrouppartners.com, 2026-11
     expect(outsideBarState(result.preScore)).toBeNull();
   });
 
+  it('leaves the namesakes of an attorney ambiguous when the site shows no states and nothing ties one to the firm', () => {
+    // Two of the three sit in office cities of the firm (Tampa, Tallahassee), so the city singles out neither.
+    const result = evaluateLayer1Evidence(multiState(undefined, { withStates: false }));
+    expect(result.signals.bar.attorneys?.find(match => match.searchedName === 'Mason Fox')).toMatchObject({ attorney: null, ambiguous: true });
+    expect(result.signals.bar.B3_consistency).toBeNull();
+    expect(result.preScore.flags).toContain('AMBIGUOUS_IDENTITY_MATCH');
+  });
+
   it('leaves B3 unknown when most attorneys expected in Florida have no known state', () => {
     // Two Florida attorneys, both matched; five with no state; seven licensed elsewhere.
     const evidence = withStates(multiState(undefined, { withStates: false }), [['Jordan S. Hale', ['FL']], ['Blake R. Stone', ['FL']],
       ...['Sasha Mills', 'Steven Moray', 'Shawn Reed', 'Kathryn B. Adams', 'Jeff Chase', 'Jay Chandler', 'Adam Mott']
         .map((name): [string, string[]] => [name, ['GA']])]);
     const result = evaluateLayer1Evidence(evidence);
-    // In scope: Hale, Stone, Fox (matched, so Florida) and Barr, Dale, Ewing, Garber (unknown): 3 known, 4 unknown.
+    // In scope: Hale, Stone, Barr (matched, so Florida) and Fox, Dale, Ewing, Garber (unknown): 3 known, 4 unknown.
     expect(result.signals.bar.B3_consistency).toBeNull();
     expect(rule(result, 'B3').points).toBeNull();
     expect(rule(result, 'B3').reason).toContain('7 of 14 website attorneys are licensed outside Florida');
@@ -75,12 +105,17 @@ describe('attorneys licensed outside Florida (lemonlawgrouppartners.com, 2026-11
     expect(result.preScore.flags).toContain(ATTORNEYS_OUTSIDE_FLORIDA);
   });
 
-  it('counts an attorney the Florida Bar matched as a Florida attorney whatever the site lists', () => {
-    const result = evaluateLayer1Evidence(multiState());
+  it('counts an attorney the Florida Bar matched to this firm as a Florida attorney whatever the site lists', () => {
+    const evidence = multiState();
+    // The Tallahassee namesake's Bar record names this firm: that ties it, and a Bar match proves the Florida licence.
+    evidence.bar = evidence.bar!.map(match => match.searchedName !== 'Mason Fox' ? match : { ...match,
+      candidates: match.candidates!.map(person => person.barNumber === '700003' ? { ...person, firmName: 'Harbor Lemon Partners, P.A.' } : person) });
+    const result = evaluateLayer1Evidence(evidence);
     expect(result.signals.bar.attorneys?.find(match => match.searchedName === 'Mason Fox')?.attorney?.barNumber).toBe('700003');
-    // 3 matches over Hale, Stone, Barr and Fox: Fox stays in the denominator and in B4.
-    expect(result.signals.bar.B3_consistency).toBe(.75);
-    expect(result.signals.bar.B4_avgExperience).toBeGreaterThan(10);
+    // 4 matches over Hale, Stone, Barr and Fox: Fox stays in the denominator and in B4.
+    expect(result.signals.bar.B3_consistency).toBe(1);
+    expect(outsideBarState(result.preScore)).toEqual({ outside: 10, total: 14 });
+    expect(result.signals.bar.B4_avgExperience).toBeGreaterThan(17);
   });
 
   it('does not let an out-of-state attorney\'s namesakes in the Florida Bar make the lookups ambiguous', () => {
@@ -90,8 +125,8 @@ describe('attorneys licensed outside Florida (lemonlawgrouppartners.com, 2026-11
     evidence.bar = evidence.bar!.map(match => match.searchedName === 'Adam Mott'
       ? { ...match, ambiguous: true, candidates: [namesake('800001', 'Miami'), namesake('800002', 'Tampa')] } : match);
     const result = evaluateLayer1Evidence(evidence);
-    expect(result.signals.bar.B3_consistency).toBe(.75);
-    expect(result.preScore.flags).not.toContain('AMBIGUOUS_IDENTITY_MATCH');
+    expect(result.signals.bar.B3_consistency).toBe(1);
+    expect(result.preScore.flags).toEqual(evaluateLayer1Evidence(multiState()).preScore.flags);
   });
 
   it('reads the bar admissions of an accepted Avvo profile when the site shows no states', () => {
@@ -103,7 +138,7 @@ describe('attorneys licensed outside Florida (lemonlawgrouppartners.com, 2026-11
       admissionsReference('https://avvo.example/unrelated', ['TX'])];
     const result = evaluateLayer1Evidence(evidence);
     expect(outsideBarState(result.preScore)).toEqual({ outside: 2, total: 14 });
-    // In scope: 12, of which Hale, Stone and Fox are known Floridians and 9 are unknown: too unknown to compare.
+    // In scope: 12, of which Hale, Stone and Barr are known Floridians and 9 are unknown: too unknown to compare.
     expect(result.signals.bar.B3_consistency).toBeNull();
     expect(result.preScore.flags).toContain(ATTORNEYS_OUTSIDE_FLORIDA);
   });
@@ -116,7 +151,7 @@ describe('attorneys licensed outside Florida (lemonlawgrouppartners.com, 2026-11
   });
 
   it('changes nothing for a Bar of no known state', () => {
-    const evidence = { ...multiState(), barJurisdiction: null };
+    const evidence = { ...withoutNamesakes(multiState()), barJurisdiction: null };
     const result = evaluateLayer1Evidence(evidence);
     expect(result.signals.bar.B3_consistency).toBeCloseTo(3 / 14);
     expect(result.preScore.flags).not.toContain(ATTORNEYS_OUTSIDE_FLORIDA);

@@ -1,14 +1,15 @@
 import { FirmIdentity, type WebsiteData } from '@arca/contracts';
-import { compareText, stableSample } from '@arca/scoring';
+import { FIRM_OFFICE_CITIES_KEY, compareText, stableSample } from '@arca/scoring';
 
 /**
  * Provenance keys the website extraction writes about where to look a firm up (DN-06 §10). They are evidence, not
- * WebsiteData fields: the contract stays as it is (DN-12 D6) and scoring never reads them.
+ * WebsiteData fields: the contract stays as it is (DN-12 D6). Scoring reads only the office cities, to tie a directory
+ * record to the firm (DN-12 §15.5).
  * - FLORIDA_OFFICES_KEY: one reference per Florida city the site lists an office in; the excerpt is the city.
  * - LARGE_FIRM_KEY: the site states an attorney count above LARGE_FIRM_ATTORNEYS; the excerpt quotes it.
  * - NEWS_ONLY_TEAM_KEY: every attorney name was cited from news, press or blog pages only.
  */
-export const FLORIDA_OFFICES_KEY = 'florida_office_cities';
+export const FLORIDA_OFFICES_KEY = FIRM_OFFICE_CITIES_KEY;
 export const LARGE_FIRM_KEY = 'large_firm';
 export const NEWS_ONLY_TEAM_KEY = 'team_members_news_only';
 /** Above this many attorneys a name sample from the website says little about the firm's Florida licences. */
