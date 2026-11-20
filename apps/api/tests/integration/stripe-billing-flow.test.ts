@@ -426,6 +426,22 @@ describe('the daily reconciliation (DN-13 §9.5)', () => {
     expect(await s.service.reconcileBilling()).toEqual({ checked: 0, mismatched: 0, applied: 0, failed: 0 });
     error.mockRestore();
   });
+
+  it('counts a subscription it could not read as failed, under the line the alarm watches, and leaves the summary to its scheduler', async () => {
+    const s = await scene();
+    const paid = await s.paidOrg();
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    s.stripe.event('customer.subscription.updated', paid.subscription);
+    s.stripe.failNext(call => call.method === 'GET' && call.path === `/v1/subscriptions/${paid.subscription.id}`);
+    expect(await s.service.reconcileBilling()).toEqual({ checked: 1, mismatched: 0, applied: 0, failed: 1 });
+    expect(error.mock.calls.map(call => call.join(' ')))
+      .toContain(`[billing] reconcile failed for subscription ${paid.subscription.id} (BillingUnavailable)`);
+    // One line per run, written by the schedule (reconcile-schedule.ts) with the report's counts.
+    expect(log.mock.calls.flat().join(' ')).not.toMatch(/\[billing\] reconcile/);
+    error.mockRestore();
+    log.mockRestore();
+  });
 });
 
 describe('prices and deletions at Stripe (DN-13 §6.1, §6.9)', () => {

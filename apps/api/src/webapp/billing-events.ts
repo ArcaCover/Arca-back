@@ -179,7 +179,8 @@ export class BillingEvents {
   /**
    * The daily reconciliation (DN-13 §9.5): every subscription Stripe changed in the last 48 hours is read again and compared with the
    * row the back holds; one that disagrees is logged (`[billing] reconcile mismatch`) and applied by the webhook's path, under an id
-   * that names what was seen, so the same disagreement is applied (and audited) once. Scheduling it is the caller's.
+   * that names what was seen, so the same disagreement is applied (and audited) once. A subscription it cannot read is counted as
+   * failed and logged (`[billing] reconcile failed for subscription …`). server.ts schedules it daily (reconcile-schedule.ts).
    */
   async reconcile(options: { windowMs?: number } = {}): Promise<ReconcileReport> {
     const report: ReconcileReport = { checked: 0, mismatched: 0, applied: 0, failed: 0 };
@@ -209,10 +210,10 @@ export class BillingEvents {
         });
       } catch (error) {
         report.failed++;
-        console.error(`[billing] reconcile of subscription ${subscriptionId} failed (${error instanceof Error ? error.name : 'unknown error'})`);
+        console.error(`[billing] reconcile failed for subscription ${subscriptionId} (${error instanceof Error ? error.name : 'unknown error'})`);
       }
     }
-    console.log(`[billing] reconcile checked ${report.checked} mismatched ${report.mismatched} applied ${report.applied} failed ${report.failed}`);
+    // The line with the counts is the scheduler's (reconcile-schedule.ts), one per run.
     return report;
   }
 
