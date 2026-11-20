@@ -3,8 +3,9 @@
 - **Fecha:** 2026-11-17
 - **Estado (2026-11-19):** en implementación en la rama `feat/real-accounts`. Fase 1 hecha (datos: T3, T4 y T12, §12.1).
   De la fase 2, hechas T6 y T10 (§16) y la parte del back de T7 y T11 (§17); falta el front (T9) y la configuración de
-  `Arca-dev` (T8). La migración nueva solo se ha aplicado a Supabase local; a ninguna base real. No hay cuentas, claves ni
-  webhooks creados, y producción sigue en 501.
+  `Arca-dev` (T8). De la fase 3 (2026-11-20), hechas en el back T13 (el código), T14, T15 y T17 (§18); faltan el front (T16) y la
+  prueba real en modo test. Las migraciones nuevas solo se han aplicado a Supabase local y a PGlite; a ninguna base real. No hay
+  cuentas, claves, productos, precios ni webhooks creados en Stripe, y producción sigue en 501.
   Las migraciones de esta nota necesitan la aprobación del founder antes de tocar cualquier base (§5.2).
 - **Repos:** `Arca-back` (casi todo el peso) y `Arca-front`. La nota vive en la rama `docs/auth-billing-design`,
   creada desde `fix/score-stability`.
@@ -816,6 +817,10 @@ front parsea estricto). `DebugModeResponse` gana campos obligatorios: solo afect
 nuevas de `webapp.ts`. `DELETE /me` no tiene cuerpo ni respuesta (204), así que no añade esquema. Ningún esquema que el
 front ya parsea cambió. Salen con 0.5.0 (T18).
 
+**También en `packages/contracts/src` (fase 3, §18.5), sin publicar:** `BillingView` (la tabla de arriba) y `BillingSyncRequest`
+(`{ sessionId }`, solo ids `cs_test_…` o `cs_live_…`), exportaciones nuevas de `webapp.ts`. `POST /orgs/:id/billing/sync` responde con el
+`OrgView` de siempre.
+
 **Orden** (el de DN-11, guardado en la memoria del proyecto):
 1. Se fusiona el PR del back, con todo detrás de `WEBAPP_ENABLED=false`: producción sigue en 501.
 2. Se crea el tag `contracts-v0.5.0`; `contracts-release.yml` publica el `.tgz`.
@@ -1132,11 +1137,11 @@ aprobaciones).
 | T10 | `Mailer` + correo de invitación (§4.6). **Hecha en el back, sin el SDK de SES (§16.2)** | 2 · auth | 1,5 | T2 |
 | T11 | `DELETE /me` + RPC + pantalla en settings (§4.8). **Back hecho (§17)**; la pantalla va con el front (T9) | 2 · auth | 1,5 | T4 |
 | T12 | ✅ Script `admin:grant` (§4.5). Hecho en la fase 1: §12.1 | 2 · auth | 0,5 | T4 |
-| T13 | Catálogo de Stripe en test; `plans` con `stripe_price_id`; cambio de precio desde `/admin` (§6.1) | 3 · cobro | 1,5 | T4 |
-| T14 | `StripeBillingProvider`: cliente, checkout, portal, sync, cancelar (§6.2–§6.4, §6.10) | 3 · cobro | 2 | T13 |
-| T15 | Webhook: firma, traductor, RPC `apply_billing_state`, cola por organización (§6.5, §6.6) | 3 · cobro | 2,5 | T14 |
+| T13 | Catálogo de Stripe en test; `plans` con `stripe_price_id`; cambio de precio desde `/admin` (§6.1). **Código hecho (§18)**; falta correr `stripe:catalog -- --apply` con la aprobación | 3 · cobro | 1,5 | T4 |
+| T14 | ✅ `StripeBillingProvider`: cliente, checkout, portal, sync, cancelar (§6.2–§6.4, §6.10). Hecho: §18 | 3 · cobro | 2 | T13 |
+| T15 | ✅ Webhook: firma, traductor, RPC `apply_billing_state`, cola por organización (§6.5, §6.6), reconciliación sin programar. Hecho: §18 | 3 · cobro | 2,5 | T14 |
 | T16 | Front: `GET /orgs/:id/billing`, `/app/billing` real, `/app/billing/return`, portal (§8.1) | 3 · cobro | 1,5 | T14 |
-| T17 | Caddy: ruta del webhook con su límite de cuerpo (§9.2) | 3 · cobro | 0,5 | — |
+| T17 | ✅ Caddy: ruta del webhook con su límite de cuerpo (§9.2). Hecho: §18 | 3 · cobro | 0,5 | — |
 | T18 | Contratos 0.5.0 y publicación (§7.6) | 4 · integración | 0,5 | T6–T16 |
 | T19 | `/__debug/mode` con `webapp` y `billing`; panel y franja (§8.4) | 4 · integración | 1 | T18 |
 | T20 | E2E en `live-debug` real + suite de Stripe con test clocks (§11) | 4 · integración | 3 | T9–T19 |
@@ -1597,3 +1602,220 @@ solo hosts locales).
 - Reiniciar Supabase local para aplicar el `config.toml` nuevo, y entonces la prueba de §17.7 entra con el código del correo.
 - El barrido de usuarios de Auth huérfanos (§17.5, punto 3), con la limpieza de T27.
 - La pantalla "Delete my account" (parte de T11 en el front).
+
+## 18. Fase 3 en el back: T13 (código), T14, T15 y T17 (2026-11-20)
+
+**Hecho** en `feat/real-accounts`, commit `48344da`. Producción sigue en 501 (`WEBAPP_ENABLED=false`). `live-debug` con
+`WEBAPP_PROVIDERS=real` ya arranca (clave de test, correo en memoria); producción con la webapp encendida sigue sin arrancar mientras
+falte el remitente de SES, y ahora además exige que cada plan activo tenga su precio de Stripe. **No se llamó a la API de Stripe**:
+no hay productos, precios, clientes ni webhooks creados, y `npm run stripe:catalog -- --apply` no se ha ejecutado (lo aprueba el
+founder aparte). Tampoco se instaló la CLI de Stripe.
+
+### 18.1 Ficheros
+
+| Fichero | Qué |
+|---|---|
+| `apps/api/package.json`, `package-lock.json` | `stripe` **23.1.0**, versión exacta, publicada el 2026-10-29 (más de dos semanas antes de instalarla) |
+| `apps/api/src/webapp/stripe.ts` | **nuevo**: `StripeBillingProvider`, `STRIPE_API_VERSION = '2026-10-28.endive'`, `stripeClient`, `providerEventOf` (evento → organización, cliente, suscripción), `subscriptionOf`, y las piezas del catálogo (`catalogProduct`, `catalogPrice`, `createCatalogPrice`, `retirePrice`) |
+| `apps/api/src/webapp/billing-events.ts` | **nuevo**: `BillingEvents` (webhook, vuelta del checkout, reconciliación), `billingStatusFor` (§6.6), `KeyedQueue` (una tarea por organización a la vez), `WebhookRejected` |
+| `apps/api/src/webapp/billing.ts` | La interfaz `BillingProvider` de §6.10 (con `expireCheckout`, `recentSubscriptionIds`, `mode`, `webhooks`, `needsCatalogPrice`), `ProviderSubscription`, `ProviderCheckout`, `ProviderEvent`, `BillingUnavailable`; `MockBillingProvider` la implementa entera |
+| `apps/api/src/webapp/service.ts` | `checkout` (una sesión abierta por organización), `syncCheckout`, `billingView`, `portal` con cliente, `billingWebhook`, `reconcileBilling`; `updatePlan` crea el Price nuevo; aprobar un borrado cancela la suscripción viva; código `billing_unavailable` (502); `ACTOR_KIND_OF_ACTION` con las acciones de cobro de §10.5 |
+| `apps/api/src/webapp/routes.ts` | `GET /orgs/:id/billing`, `POST /orgs/:id/billing/sync`, `POST /billing/webhook` real; límites de §7.4 para checkout, portal y sync |
+| `apps/api/src/webapp/types.ts`, `in-memory.ts`, `supabase.ts` | `PlanRecord` con `stripe_product_id` y `stripe_price_id`; `SubscriptionRecord` con lo que Stripe dijo (`provider_status`, `price_id`, `cancel_at_period_end`, `current_period_start`, `livemode`); `BillingCustomerRecord`, `CheckoutSessionRecord`; métodos nuevos del repositorio: `isBillingEventProcessed`, `closeBillingEvent`, `getBillingCustomer`, `findBillingCustomer`, `addBillingCustomer`, `getOpenCheckoutSession`, `getCheckoutSession`, `addCheckoutSession`, `closeCheckoutSession` |
+| `supabase/migrations/20261120000000_billing_events.sql` | **nueva**: la RPC `close_billing_event` (§18.4, punto 2), solo para `service_role` |
+| `apps/api/src/webapp/stripe-catalog.ts`, `apps/api/scripts/stripe-catalog.ts`, `package.json` | **nuevos**: `npm run stripe:catalog` (§18.6) |
+| `apps/api/src/webapp/real-adapters.ts`, `apps/api/src/compose.ts` | `billing: config => new StripeBillingProvider(config)` en la costura; guarda de precios de catálogo al arrancar; `compose` devuelve `reconcileBilling` |
+| `apps/api/src/webapp/plans.ts`, `apps/api/src/config/env.ts` | La semilla con los ids de Stripe a `null`; `stripeKeyMode` exportada para el script |
+| `packages/contracts/src/webapp.ts` | `BillingView` y `BillingSyncRequest`, exportaciones nuevas (§18.5) |
+| `deploy/Caddyfile`, `deploy/render-env.py` | T17 y la parte de §9.1 de `render-env.py` (§18.3) |
+
+### 18.2 Rutas
+
+| Ruta | Quién | Respuestas |
+|---|---|---|
+| `GET /orgs/:id/billing` | cualquier miembro, sin exigir pago | 200 `BillingView`: `{ billingStatus, plan, currentPeriodEnd, cancelAtPeriodEnd, manageable }` |
+| `POST /orgs/:id/billing/checkout { planCode }` | `billing.manage`, sin exigir pago | 200 `{ url }` (la misma mientras la sesión siga abierta en Stripe); 409 si ya paga, si el plan no tiene precio de Stripe, o si un pago sigue confirmándose (3-D Secure); 429 pasadas 10 por hora y organización; 502 `billing_unavailable` |
+| `POST /orgs/:id/billing/portal` | `billing.manage`, sin exigir pago | 200 `{ url }`; 409 sin cliente de Stripe todavía (§6.4); 429 (10/h); 502 |
+| `POST /orgs/:id/billing/sync { sessionId }` | `billing.manage`, sin exigir pago | 200 `OrgView` tal como queda; 400 si el id no es `cs_test_…`/`cs_live_…`; 404 si la sesión no existe o es de otra organización; 429 (30/h); 502 |
+| `POST /billing/webhook` | público, sin CORS ni sesión | 200 `{ received: true, outcome }` (`applied`, `recorded`, `duplicate`, `ignored`, `unknown_org`, `duplicate_subscription`, `stale_subscription`); 400 `invalid_signature` o `livemode_mismatch`; 500 para que Stripe reintente. Con el proveedor simulado sigue en 501 |
+| `PUT /admin/plans/:code` | admin de plataforma | Un importe, moneda o intervalo nuevo crea el Price antes de tocar la tabla; 502 sin escribir nada si Stripe falla |
+
+Los límites se cuentan **después** de autorizar, con el id de la organización ya leído: nadie de fuera puede gastar los de otra.
+
+### 18.3 Cómo funciona
+
+**Checkout (§6.2).** Todo el trabajo de cobro de una organización (checkout, vuelta, webhook, reconciliación) pasa por una cola en
+memoria por organización (`KeyedQueue`), así dos clics o dos owners nunca abren dos sesiones. Dentro de su turno: se vuelve a leer la
+organización (409 si ya paga); si hay una sesión abierta y sin vencer en `checkout_sessions`, se pregunta a Stripe por ella: abierta y
+del mismo plan → su URL; abierta y de otro plan → se expira en Stripe y se abre otra; pagada → su suscripción se aplica por el camino de
+la vuelta y, si la organización ya paga, 409. Si no, cliente de `billing_customers` (o uno nuevo, `idempotencyKey: customer:<orgId>`),
+`checkout.sessions.create` con los parámetros de la tabla de §6.2 (sin impuestos, cupones ni prueba: F3, F4), `expires_at` a una hora,
+`success_url = ${APP_BASE_URL}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, y se guarda la sesión. Si otro proceso guardó la
+suya antes (el índice único de sesiones abiertas), se expira la nuestra en Stripe y se devuelve la suya. Se audita
+`billing.checkout_started` (el owner, como miembro).
+
+**Webhook (§6.5).** Cuerpo crudo (`arrayBuffer`) → `stripe.webhooks.constructEvent` con `STRIPE_WEBHOOK_SECRET` y la tolerancia de
+5 minutos medida con el reloj del proceso → `livemode` contra el modo de la clave → si el tipo no está en la lista, 200 `ignored` sin
+registrar → si el evento ya está procesado, 200 `duplicate` **sin leer Stripe** → organización por `metadata.org_id` (sesión,
+suscripción o `parent.subscription_details.metadata` de la factura) o, si no, por `billing_customers`; sin organización,
+`close_billing_event` con `last_error = 'unknown_org'` → en el turno de la organización: los eventos de suscripción
+(`checkout.session.completed`, `customer.subscription.created/updated/deleted`, `invoice.paid`, `invoice.payment_failed`) **leen la
+suscripción en Stripe** y la aplican con `apply_billing_state`; `checkout.session.expired`, `invoice.payment_action_required`,
+`charge.refunded` y `charge.dispute.created` se registran con `close_billing_event` y su auditoría. Logs:
+`[billing] event <id> <tipo> <resultado>` y `[billing] event <id> <tipo> failed (<nombre del error>)`, sin emails ni importes de tarjeta.
+
+**Estado (§6.6).** `billingStatusFor`: `active`/`trialing` → `active`; `past_due` → `past_due`; `unpaid`, `paused`, `canceled` y
+cualquier estado desconocido → `canceled`; `incomplete` → `pending_payment` si nunca pagó, si no sin cambio; `incomplete_expired` →
+`pending_payment` si nunca pagó, si no `canceled`. "Nunca pagó" es `billing_status = pending_payment`. Una suscripción distinta de la
+viva que no da acceso se mapea siempre a un estado sin acceso, para que `apply_billing_state` la trate como vieja y no como cobro doble.
+El plan se saca de `plan_code` en los metadatos del Price (todos los Prices que crea ARCA lo llevan), si no del plan cuyo
+`stripe_price_id` coincide, y si no del único plan activo de ese intervalo.
+
+**Vuelta del checkout (§6.3).** `checkout.sessions.retrieve`; si su `client_reference_id` no es la organización, 404. Cierra la sesión
+como diga Stripe y aplica su suscripción por el mismo camino, con el id de evento `sync:<sesión>:<estado de Stripe>`: repetir la vuelta
+sin novedades es un duplicado; un estado nuevo se aplica.
+
+**Reconciliación (§9.5).** `reconcileBilling()` lista los eventos de Stripe de las últimas 48 h de los tipos de suscripción, lee cada
+suscripción que nombran, la compara con la fila guardada (`provider_status`, fin de periodo, `cancel_at_period_end`, `billing_status`) y,
+si no coincide, registra `[billing] reconcile mismatch org <id> subscription <id>` y la aplica con un id que nombra lo que vio
+(`reconcile:<sub>:<estado>:<fin>:<cancelación>`), así la misma discrepancia se aplica y audita una sola vez. Devuelve
+`{ checked, mismatched, applied, failed }`. `compose` la expone como `reconcileBilling`; **programarla** (un temporizador diario en
+el proceso de producción) queda para T26.
+
+**Precio desde `/admin` (§6.1).** Un importe, moneda o intervalo nuevo: se busca un Price activo con la `lookup_key` del plan y esos
+valores (un reintento lo encuentra); si no, se crea en el mismo Product con `transfer_lookup_key: true`, `plan_code` en los metadatos e
+`idempotencyKey: price:<plan>:<price anterior>:<importe>:<moneda>:<intervalo>`; el anterior se archiva (`active: false`, sin bloquear
+si falla) y después se actualiza `plans`. Los suscriptores siguen con su precio (F2).
+
+**Borrado aprobado (§6.9).** Si la organización tiene una suscripción no cancelada, `subscriptions.cancel` inmediata, sin reembolso
+(F8). La revisión ya está escrita, así que un fallo de Stripe no la deshace: se registra `[billing] failed to cancel subscription …` para
+que una persona la cancele en el panel. El webhook que llega después mueve `billing_status`.
+
+**Caddy (T17, §9.2).** `handle /billing/webhook` con `request_body { max_size 1MB }`; `handle` con `max_size 32KB` para todo lo demás; el
+`reverse_proxy` con sus health checks en un snippet `(api)` que importan los dos. Fuera de los dos `handle` no queda ningún límite que
+cortase antes el del webhook. `basic_auth` de `/docs` y las cabeceras no cambian.
+
+**`render-env.py` (§9.1).** Con `WEBAPP_ENABLED=true` en `production.env`, `STRIPE_SECRET_KEY` y `STRIPE_WEBHOOK_SECRET` pasan a ser
+parámetros obligatorios de `/arca/prod`; un despliegue sin ellos se niega en el host y los nombra, sin imprimir valores.
+
+### 18.4 Desviaciones respecto a la nota
+
+1. **Versión de API `2026-10-28.endive`**, no `2025-03-31.basil`: es la que fija el SDK 23.1.0. Lo que §6.5 cuenta de basil sigue
+   valiendo (periodo en `items.data[]`, suscripción de una factura en `parent.subscription_details`). La constante está escrita en el
+   código y tipada contra el SDK: subir el SDK sin revisar falla el typecheck. El traductor acepta además la forma antigua de la factura
+   (suscripción arriba), por si un endpoint o `stripe listen` usan una versión anterior de la cuenta.
+2. **RPC nueva `close_billing_event`** (migración `20261120000000_billing_events.sql`), que §5.4 no listaba: registra como procesado,
+   en una transacción con su auditoría, un evento que no mueve ninguna suscripción (reembolso, disputa, checkout expirado, organización
+   desconocida). Sin ella, esos eventos solo podían registrarse en dos pasos.
+3. **Clave de idempotencia del checkout:** la de §6.2 (`checkout:<org>:<plan>:<minuto>`) más lo que vino antes (la sesión que sustituye o
+   la última suscripción) cuando lo hay. Con la clave por minuto sola, un checkout nuevo en el mismo minuto que uno cerrado recibía de
+   Stripe la sesión vieja. Además, si Stripe devuelve una sesión que no está `open`, el back se niega a entregarla.
+4. **Sesión abierta de otro plan:** §6.2 decía devolver su URL; se expira en Stripe y se abre la del plan pedido, para que nunca haya dos
+   sesiones pagables. Y una sesión que Stripe ya da por pagada se aplica (vuelta) en vez de abrir otra.
+5. **Solo tarjeta con `allowed_payment_method_types: ['card']`**: el SDK 23 quitó `payment_method_types` de `Checkout.SessionCreateParams`.
+6. **Respuesta del webhook** `{ received: true, outcome }`, y un 400 con código propio `livemode_mismatch` además de `invalid_signature`.
+7. **`billing.invoice_paid` y `billing.payment_failed`** se auditan justo después de `apply_billing_state`, no dentro de su transacción
+   (la firma de la RPC de la fase 1 no lleva auditoría extra). Si el proceso cae entre los dos, falta esa línea; el estado está aplicado.
+8. **Disputas:** el objeto de la disputa no trae cliente, así que no se audita en la organización: se registra `[billing] dispute …` en el
+   log (para la alarma de §9.5) y el evento queda procesado como `unknown_org`. Leer el cargo para encontrar la organización queda pendiente.
+9. **Cancelar al aprobar un borrado** solo si hay suscripción viva (antes se llamaba siempre), y un fallo de Stripe no da 5xx (§18.3).
+10. **`billing.checkout_started` se audita como `member`** (lo hace el owner), no como `system` como el resto de §10.5.
+11. **Guarda de precios:** producción con la webapp encendida no arranca si un plan activo no tiene `stripe_price_id` (§5.3); `live-debug`
+    real solo avisa (`[billing] the active plans … have no stripe_price_id`) y el checkout de esos planes responde 409.
+12. **`GET /orgs/:id/billing`** (que §12 pone en T16) está hecho en el back: el front de T16 solo tiene que leerlo.
+13. **El simulado pasa por las mismas tablas:** el checkout de `mock` y `live-debug` simulado crea cliente y sesión en el repositorio en
+    memoria; un segundo clic devuelve la misma página de pago simulada; el portal simulado responde 409 hasta el primer checkout; el pago
+    simulado cierra su sesión. `POST /__debug/billing/pay` no cambia.
+14. **`success_url`** pasa a `/app/billing/return?session_id=…` también en el simulado (que no la usa): esa página es de T16.
+15. **`caddy validate` no se corrió:** no hay binario de Caddy en el portátil, Docker no respondía y no se descargan imágenes. El test lee
+    la estructura del Caddyfile (§18.7); `caddy validate` queda para el primer `npm run test:container` o el despliegue.
+16. **La suite de conformidad contra Supabase local no se corrió:** Docker Desktop no respondía (`supabase status` no encontró el demonio)
+    y no se arrancó nada. Los métodos nuevos del repositorio pasan la suite en memoria y sobre PGlite con las nueve migraciones.
+
+### 18.5 Contratos
+
+Exportaciones **nuevas** de `packages/contracts/src/webapp.ts`, sin publicar (salen con 0.5.0, T18): `BillingView`
+(`{ billingStatus, plan: PlanView | null, currentPeriodEnd: string | null, cancelAtPeriodEnd: boolean, manageable: boolean }`, estricto) y
+`BillingSyncRequest` (`{ sessionId }`, solo `cs_test_…` o `cs_live_…`). `POST /orgs/:id/billing/sync` responde con el `OrgView` de siempre
+y el webhook no es un contrato del front. Ningún esquema que el front ya parsea cambió.
+
+### 18.6 `npm run stripe:catalog`
+
+`npm run stripe:catalog [-- --apply] [--allow-live]`. Lee `STRIPE_SECRET_KEY`, `SUPABASE_URL` y `SUPABASE_SECRET_KEY` (o
+`SUPABASE_SERVICE_ROLE_KEY`) del entorno o de `.env.local`, como `admin:grant`. Asegura el Product `arca` ("ARCA") y, por cada plan de
+`plans.ts`, un Price recurrente activo con la `lookup_key` `arca_<código>`, `plan_code` en los metadatos y el importe, moneda e intervalo de
+la tabla `plans` (los de ejemplo: 499 USD/mes y 4.990 USD/año, salvo que un admin los cambiara). Un Price que ya coincide se reutiliza; uno
+con otro importe recibe un Price nuevo que se queda con la `lookup_key`, y el viejo se archiva. Después escribe `stripe_product_id` y
+`stripe_price_id` en `plans`.
+
+- **Por defecto es un ensayo:** solo lee (Products y Prices) y dice qué crearía y escribiría.
+- `--apply` crea y escribe; exige la base (`SUPABASE_*`), y lo comprueba antes de llamar a Stripe.
+- Una clave **live** se rechaza sin `--allow-live`, antes de llamar a Stripe (el catálogo live es T23, del founder).
+- Imprime el modo, el host de Supabase, ids e importes; **nunca una clave** (los mensajes de error de Stripe se imprimen con la clave tapada).
+- Es idempotente: una segunda pasada no crea nada.
+- La clave restringida necesita escritura en Products y Prices (además de los permisos de §6.7).
+
+### 18.7 Pruebas
+
+Sin red: el SDK real con un `fetch` inyectado (`Stripe.createFetchHttpClient`) que hace de un Stripe pequeño
+(`apps/api/tests/fixtures/stripe.ts`), con objetos tipados contra los tipos del SDK de la versión fijada (un campo que se mueva rompe el
+typecheck del fixture) y claves de idempotencia que repiten la primera respuesta, como Stripe. Escritas antes que el código; fallaron
+primero (módulos inexistentes, y el Caddyfile y `render-env.py` sin el cambio).
+
+| Fichero | Tests | Qué fija |
+|---|---|---|
+| `apps/api/tests/unit/stripe-billing.test.ts` | 13 | Versión fijada en el SDK y en cada petición; cliente con su clave de idempotencia; parámetros exactos del checkout; replay de la misma sesión; leer, expirar y "ya pagada"; portal; cancelar dos veces; estado con el periodo del elemento; 5xx y red → `BillingUnavailable`, 4xx → error normal; firma válida, cuerpo re-serializado, otro secreto, sin cabecera, basura, caducada (6 min) y en tolerancia (4 min); traducción de cada evento, factura antigua incluida; suscripciones cambiadas desde una fecha; precio nuevo con la `lookup_key`, el viejo archivado y el reintento sin escribir; producto creado si falta; la clave nunca sale fuera de la cabecera |
+| `apps/api/tests/integration/stripe-billing-flow.test.ts` | 19 | Servicio, rutas y proveedor real sobre el Stripe falso: tabla de §6.6; una sesión por organización (dos clics a la vez, dos owners); sesión vencida y cambio de plan; 409 pagada, sin precio; 502 sin escribir; vuelta (antes y después de pagar, idempotente, de otra organización, inexistente, mal formada); portal 409 sin cliente; `BillingView` de owner y viewer; webhook: firma mala, ausente, falsa y caducada (400 sin escribir), otro modo, tipo ignorado, duplicado sin leer Stripe, organización desconocida; **eventos desordenados resueltos leyendo Stripe**; **incomplete → active → past_due → unpaid → active → canceled** y volver a pagar; **suscripción doble** (no se aplica, se audita y se avisa); fallo a mitad → 500 y el reintento aplica; **serialización por organización** (la segunda entrega no lee Stripe hasta que acaba la primera); factura pagada, acción requerida, reembolso, disputa y checkout expirado; **reconciliación** (corrige lo perdido, deja lo que coincide, una sola vez, solo 48 h); precio desde `/admin` (502 sin tocar la tabla, Price nuevo, el siguiente checkout lo cobra); borrado aprobado cancela en Stripe |
+| `apps/api/tests/unit/stripe-catalog.test.ts` | 6 | Banderas; ensayo sin escrituras; `--apply` crea producto y precios y escribe ids; idempotente; importe cambiado → Price nuevo con la `lookup_key`; clave live y `--apply` sin base rechazados antes de llamar a Stripe; no imprime la clave |
+| `apps/api/tests/conformance/webapp-repository.ts` | +4 (y 2 ampliados), ×3 destinos | Ids de Stripe del plan (únicos); campos crudos de la suscripción; un cliente por organización; una sesión abierta por organización, vencimiento y cierre; `close_billing_event` una vez, con su auditoría, y `isBillingEventProcessed` |
+| `apps/api/tests/unit/deploy-caddy.test.ts` | 4 | 1 MB en `/billing/webhook`, 32 KB en el resto, ningún límite fuera de los dos `handle`, health checks, cabeceras y `basic_auth` |
+| `apps/api/tests/unit/render-env.test.ts` | 3 | Con la webapp apagada no pide Stripe; encendida, se niega y nombra cada secreto que falta sin imprimir valores; con los dos, los escribe escapados (corre `deploy/render-env.py` con el Python del sistema; se salta si no hay) |
+| `apps/api/tests/integration/compose.test.ts` | +3 y ampliados | La costura entrega `StripeBillingProvider`; producción sin precios no arranca y `live-debug` avisa; el webhook da 501 con el simulado y 400 sin firma con el real; lo que se entrega hoy solo echa en falta el remitente de SES |
+| `packages/contracts/tests/webapp.test.ts` | +2 | `BillingView` y `BillingSyncRequest` |
+| Otros ajustados | — | `webapp-service`, `webapp-auth-billing`, `webapp` (rutas nuevas en el recorrido de rutas y la matriz de roles; `billing.checkout_started` en la auditoría), `webapp-database`, `real-accounts-database` (`close_billing_event` en la lista de RPC sin acceso para `anon`/`authenticated`) |
+
+`npm run typecheck` limpio. `npm test` completo una vez: **1631 pasan, 53 se saltan** (las suites contra un Supabase real, sin sus
+variables), ninguno falla (87 ficheros, 2 saltados).
+
+### 18.8 Cómo hacer la prueba real en modo test
+
+Necesita, del founder o de Jesús: la cuenta de Stripe en modo test, una clave restringida `rk_test_…` con los permisos de §6.7 más
+escritura en Products, el portal configurado en el panel de test, y la aprobación para crear el catálogo. Todo en PowerShell, con las
+claves leídas con `Read-Host -AsSecureString` (§9.3), nunca escritas en la línea de comandos.
+
+1. **Base:** Supabase local (`supabase start`, después `supabase migration up` para aplicar `20261120000000_billing_events.sql`) o
+   `Arca-dev` con las nueve migraciones (T5). `SUPABASE_URL` y `SUPABASE_SECRET_KEY` apuntando a ella.
+2. **Clave:** `STRIPE_SECRET_KEY` = la `rk_test_…`.
+3. **Catálogo:** `npm run stripe:catalog` (ensayo) y, con el visto bueno, `npm run stripe:catalog -- --apply`. Comprobar en el panel de test
+   el Product `arca` y los Prices `arca_monthly` y `arca_annual`.
+4. **Portal (panel de test → Settings → Billing → Customer portal):** guardar una configuración con la tabla de §6.4 (cambio de plan entre
+   los dos Prices, cancelar al final del periodo). Sin una configuración guardada, Stripe rechaza la sesión y `POST /billing/portal` responde 500.
+5. **Webhook local:** instalar la CLI de Stripe, `stripe login`, y
+   `stripe listen --latest --forward-to http://127.0.0.1:8080/billing/webhook --events checkout.session.completed,checkout.session.expired,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,invoice.paid,invoice.payment_failed,invoice.payment_action_required,charge.refunded,charge.dispute.created`.
+   Copiar el `whsec_…` que imprime a `STRIPE_WEBHOOK_SECRET` (con `Read-Host -AsSecureString`). `--latest` da los objetos en una versión
+   igual o posterior a la fijada; el back solo saca ids de ellos y lee el estado con la suya.
+6. **Arrancar:** `$env:WEBAPP_PROVIDERS = 'real'` y `npm run stack -- live-debug`. La línea de arranque dice
+   `webapp=real stripe=test email=memory`.
+7. **Cuenta y organización** (sin el front de T9, a mano): con Supabase local, `POST /claims` con el token de un scan terminado →
+   `POST /auth/enroll` → `signInWithOtp` y el código de Mailpit (`http://127.0.0.1:54324`) → `POST /orgs` con el `access_token`, como en
+   `real-accounts-supabase.test.ts`.
+8. **Pagar:** `POST /orgs/<id>/billing/checkout { "planCode": "monthly" }` → abrir la URL → tarjeta `4242 4242 4242 4242`, cualquier fecha
+   futura, cualquier CVC → Stripe vuelve a `/app/billing/return?session_id=…` (la página es de T16; basta con copiar el `session_id`).
+   `stripe listen` muestra `checkout.session.completed` → 200 `applied`. `GET /orgs/<id>` → `paidAccess: true`.
+9. **Vuelta:** `POST /orgs/<id>/billing/sync { "sessionId": "cs_test_…" }` → `OrgView` activo (idempotente).
+10. **Portal:** `POST /orgs/<id>/billing/portal` → abrir la URL → cancelar al final del periodo → el webhook deja
+    `GET /orgs/<id>/billing` con `cancelAtPeriodEnd: true`.
+11. **Renovaciones y fallos:** test clocks de Stripe (§11) sobre un cliente de prueba; `stripe trigger` sirve para ver la firma y el 200,
+    pero sus objetos no llevan `org_id` y acaban en `unknown_org`.
+12. **Reconciliación:** sin programar todavía; para probarla, llamar a `reconcileBilling()` de `compose` desde un script o un test manual.
+
+### 18.9 Pendiente
+
+- **T16** (front): `/app/billing` real con `GET /orgs/:id/billing`, "Pay" y "Manage subscription", y la página `/app/billing/return` con
+  `sync` y la espera de §6.3.
+- **T18:** contratos 0.5.0 con `EnrollRequest`, `EnrollResponse`, `BillingView` y `BillingSyncRequest` (y `emailSent` y `DebugModeResponse`).
+- **T19:** `/__debug/mode` con `webapp` y `billing`; panel y franja.
+- **La prueba real en modo test** (§18.8), que necesita la clave, el catálogo aprobado y la CLI de Stripe; y la suite de conformidad
+  contra Supabase local en cuanto Docker vuelva.
+- Programar la reconciliación diaria y las alarmas de los logs `[billing]` (T26); encontrar la organización de una disputa leyendo el cargo.
+- El remitente de SES (`RealWebappAdapters.sesSendEmail`), sin el cual producción con la webapp encendida no arranca.
