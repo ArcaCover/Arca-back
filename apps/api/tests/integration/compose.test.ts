@@ -230,7 +230,8 @@ describe('compose: the webapp providers', () => {
     const authAdmin = new InMemoryAuthAdmin();
     return { repository, billing, authAdmin, seam: { repository: vi.fn((_client: unknown) => repository),
       authAdmin: vi.fn((_client: unknown) => authAdmin), billing: vi.fn((_config: unknown) => billing),
-      sesSendEmail: vi.fn(async (_input: unknown) => ({ MessageId: 'ses-1' })), fetchJwks: project.fetchJwks } };
+      sesSendEmail: vi.fn(async (_input: unknown) => ({ MessageId: 'ses-1' })), fetchJwks: project.fetchJwks,
+      resendFetch: vi.fn(async (_url: string, _init: RequestInit) => new Response(JSON.stringify({ id: 'resend-1' }), { status: 200 })) } };
   }
   const me = async (app: { request: (path: string, init?: RequestInit) => Response | Promise<Response> }, token: string) =>
     app.request('/me', { headers: { Authorization: `Bearer ${token}` } });
@@ -245,7 +246,7 @@ describe('compose: the webapp providers', () => {
     // Invitations go to memory, for the tests and the debug panel; the response still carries the link.
     expect(tools.webapp!.mailer).toBeInstanceOf(MemoryMailer);
     expect(deps.webapp!.service).toBeInstanceOf(MailingWebappService);
-    for (const factory of [seam.repository, seam.authAdmin, seam.billing, seam.sesSendEmail, project.fetchJwks]) expect(factory).not.toHaveBeenCalled();
+    for (const factory of [seam.repository, seam.authAdmin, seam.billing, seam.sesSendEmail, seam.resendFetch, project.fetchJwks]) expect(factory).not.toHaveBeenCalled();
     expect(composed.banner).not.toContain('webapp=real');
     expect((await debugPost(composed.app, '/__debug/auth/login', { email: 'owner@firm.com' })).status).toBe(200);
     // A debug reset forgets the invitations held in memory with the rest of the simulated webapp.
@@ -301,7 +302,7 @@ describe('compose: the webapp providers', () => {
       const response = await me(composed.app, await project.accessToken());
       expect(response.status).toBe(501);
       expect(await response.json()).toEqual({ error: 'not_configured', message: expect.any(String) });
-      for (const factory of [seam.repository, seam.authAdmin, seam.billing, seam.sesSendEmail, project.fetchJwks]) expect(factory).not.toHaveBeenCalled();
+      for (const factory of [seam.repository, seam.authAdmin, seam.billing, seam.sesSendEmail, seam.resendFetch, project.fetchJwks]) expect(factory).not.toHaveBeenCalled();
       // The routes of DN-13 T7 and T11 too.
       for (const [method, path] of [['POST', '/auth/enroll'], ['DELETE', '/me']] as const) {
         const off = await composed.app.request(path, { method, body: method === 'POST' ? '{"claimId":"x"}' : undefined,
@@ -347,6 +348,65 @@ describe('compose: the webapp providers', () => {
     expect(seam.sesSendEmail).toHaveBeenCalledTimes(1);
     expect(seam.sesSendEmail.mock.calls[0]![0]).toMatchObject({ FromEmailAddress: FROM, Destination: { ToAddresses: ['new@firm.com'] } });
     expect(JSON.stringify(seam.sesSendEmail.mock.calls[0]![0])).toContain(view.inviteUrl);
+  });
+
+  /** Signs in the project's owner, gives them a paid organization in the seam's repository and invites new@firm.com. */
+  async function inviteThrough(composed: Awaited<ReturnType<typeof compose>>, repository: InMemoryWebappRepository,
+    project: Awaited<ReturnType<typeof supabaseProject>>) {
+    const token = await project.accessToken();
+    const orgId = '0d9c1f9e-8b7a-4c6d-9e5f-4a3b2c1d0e0f', at = new Date().toISOString();
+    await repository.createOrganization({ id: orgId, name: 'Robust Law LLP', domain: 'robust.example', billing_status: 'active', deleted_at: null,
+      created_by: USER_ID, created_at: at }, { org_id: orgId, user_id: USER_ID, role: 'owner', invited_by: null, created_at: at }, null);
+    const invited = await composed.app.request(`/orgs/${orgId}/invitations`, { method: 'POST', body: JSON.stringify({ email: 'new@firm.com', role: 'member' }),
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
+    expect(invited.status).toBe(201);
+    return await invited.json() as { id: string; inviteUrl: string };
+  }
+
+  it('production with EMAIL_PROVIDER=resend sends invitations through Resend\'s API and needs no SES sender (F11)', async () => {
+    const project = await supabaseProject();
+    const { repository, seam } = adapters(project);
+    const composed = await compose(loadEnv({ ...launch, EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' }), undefined,
+      { ...seam, sesSendEmail: undefined });
+    expect(composed.banner).toBe('[api] MODE=production sources=live storage=supabase webapp=real stripe=live email=resend');
+    const view = await inviteThrough(composed, repository, project);
+    expect(seam.resendFetch).toHaveBeenCalledTimes(1);
+    const [url, init] = seam.resendFetch.mock.calls[0]!;
+    expect(url).toBe('https://api.resend.com/emails');
+    expect(init.headers).toMatchObject({ Authorization: 'Bearer re_fixture_123', 'Idempotency-Key': `invitation-${view.id}` });
+    const body = JSON.parse(init.body as string) as { from: string; to: string[]; subject: string; text: string };
+    expect(body).toMatchObject({ from: FROM, to: ['new@firm.com'], subject: "You're invited to join Robust Law LLP on ARCA" });
+    expect(body.text).toContain(view.inviteUrl);
+  });
+
+  it('live-debug on the real providers keeps invitations in memory unless it opts into Resend for a real test', async () => {
+    const project = await supabaseProject();
+    const { repository, seam } = adapters(project);
+    const memory = await compose(loadEnv({ ...realLiveDebug, RESEND_API_KEY: 're_fixture_123' }), undefined, seam);
+    expect(memory.banner).toContain('email=memory');
+    await inviteThrough(memory, repository, project);
+    expect(seam.resendFetch).not.toHaveBeenCalled();
+
+    const { repository: second, seam: opted } = adapters(project);
+    const resend = await compose(loadEnv({ ...realLiveDebug, EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' }), undefined, opted);
+    expect(resend.banner).toContain('webapp=real stripe=test email=resend');
+    const view = await inviteThrough(resend, second, project);
+    expect(opted.resendFetch).toHaveBeenCalledTimes(1);
+    expect(opted.resendFetch.mock.calls[0]![1].headers).toMatchObject({ 'Idempotency-Key': `invitation-${view.id}` });
+    expect(opted.sesSendEmail).not.toHaveBeenCalled();
+  });
+
+  it('keeps the invitation when Resend fails, and answers as before', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const project = await supabaseProject();
+    const { repository, seam } = adapters(project);
+    const resendFetch = vi.fn(async (_url: string, _init: RequestInit) => { throw new TypeError('fetch failed'); });
+    const composed = await compose(loadEnv({ ...launch, EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' }), undefined,
+      { ...seam, resendFetch });
+    const view = await inviteThrough(composed, repository, project);
+    expect(view.inviteUrl).toMatch(/^https:\/\/arcacover\.com\/app\/invite\//);
+    expect(resendFetch).toHaveBeenCalledTimes(2);
+    expect(error.mock.calls.flat().map(String)).toContain(`[mail] invitation ${view.id} was created but its email was not sent (NetworkError)`);
   });
 
   it('refuses to start the real webapp while an adapter of the seam is missing', async () => {

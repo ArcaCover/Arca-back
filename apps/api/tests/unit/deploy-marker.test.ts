@@ -28,6 +28,12 @@ describe('deploy/production.env', () => {
     expect(env.has('WEBAPP_PROVIDERS')).toBe(false);
   });
 
+  it('sends the webapp\'s invitations through Resend from the verified domain, with the key kept in SSM (DN-13 §9.1)', () => {
+    expect(env.get('EMAIL_PROVIDER')).toBe('resend');
+    expect(env.get('EMAIL_FROM')).toBe('ARCA <no-reply@arcacover.com>');
+    expect(env.has('RESEND_API_KEY')).toBe(false);
+  });
+
   it('is read as an env file, not as an empty one', () => {
     // A parser that found nothing would pass the ARCA_MODE check vacuously.
     expect(env.size).toBeGreaterThan(5);

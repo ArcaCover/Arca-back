@@ -24,7 +24,7 @@ import { InMemoryAuthAdmin } from './webapp/auth-admin.js';
 import { MockBillingProvider } from './webapp/billing.js';
 import { InMemoryWebappRepository } from './webapp/in-memory.js';
 import { MailingWebappService } from './webapp/invitation-email.js';
-import { MemoryMailer, SesMailer } from './webapp/mailer.js';
+import { MemoryMailer, ResendMailer, SesMailer } from './webapp/mailer.js';
 import { DEFAULT_PLANS } from './webapp/plans.js';
 import { REAL_WEBAPP_ADAPTERS, type RealWebappAdapters, type StorageClient } from './webapp/real-adapters.js';
 import type { ReconcileReport } from './webapp/billing-events.js';
@@ -68,7 +68,8 @@ async function realWebapp(env: ReturnType<typeof loadEnv>, adapters: RealWebappA
   await auth.checkSigningKeys();
   const billing = adapters.billing!({ secretKey: env.STRIPE_SECRET_KEY!, webhookSecret: env.STRIPE_WEBHOOK_SECRET!, mode: env.stripeMode!,
     appBaseUrl: env.APP_BASE_URL });
-  const mailer = env.emailProvider === 'ses' ? new SesMailer(adapters.sesSendEmail!) : new MemoryMailer();
+  const mailer = env.emailProvider === 'ses' ? new SesMailer(adapters.sesSendEmail!)
+    : env.emailProvider === 'resend' ? new ResendMailer(env.RESEND_API_KEY!, { fetch: adapters.resendFetch }) : new MemoryMailer();
   // One service-role client for the data and the Auth admin API.
   const client = deps.client();
   const repository = adapters.repository!(client);

@@ -23,14 +23,17 @@ export type RealWebappAdapters = {
   billing?: (config: { secretKey: string; webhookSecret: string; mode: 'live' | 'test'; appBaseUrl: string }) => BillingProvider;
   /** SES v2 SendEmail, needed only with EMAIL_PROVIDER=ses. See `SesMailer` for the wiring with `@aws-sdk/client-sesv2`. */
   sesSendEmail?: SesSendEmail;
+  /** The fetch ResendMailer posts with (EMAIL_PROVIDER=resend); the default is the global fetch. The tests inject one. */
+  resendFetch?: typeof fetch;
   /** Where SupabaseJwtAuth reads the project's JWKS; the default reads it over HTTP. The tests inject one. */
   fetchJwks?: JwksFetcher;
 };
 
 /**
- * What ships today: the Supabase repository (T4), the Auth admin (T7) and the Stripe provider (T14). The SES sender is still
- * missing, so production with WEBAPP_ENABLED=true and EMAIL_PROVIDER=ses refuses to start; live-debug with WEBAPP_PROVIDERS=real
- * (memory email by default) starts.
+ * What ships today: the Supabase repository (T4), the Auth admin (T7) and the Stripe provider (T14). Resend needs nothing here
+ * (its key comes from the environment), so production with WEBAPP_ENABLED=true and EMAIL_PROVIDER=resend starts. The SES sender is
+ * still missing, so with EMAIL_PROVIDER=ses (the alternative) it refuses to start; live-debug with WEBAPP_PROVIDERS=real (memory
+ * email by default) starts.
  */
 export const REAL_WEBAPP_ADAPTERS: Readonly<RealWebappAdapters> = Object.freeze({
   repository: client => new SupabaseWebappRepository(client),
