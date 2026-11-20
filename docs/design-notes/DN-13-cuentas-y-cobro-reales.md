@@ -890,15 +890,16 @@ mientras staging no tenga su propia API. La webapp real se prueba en local con `
 | `STRIPE_SECRET_KEY` | **sí** | SSM `/arca/prod/STRIPE_SECRET_KEY` (clave restringida live) | terminal o `.env.local` (test) |
 | `STRIPE_WEBHOOK_SECRET` | **sí** | SSM `/arca/prod/STRIPE_WEBHOOK_SECRET` | el que imprime `stripe listen` |
 | `STRIPE_ALLOW_TEST_MODE` | no | solo para un ensayo en el host | — |
-| `EMAIL_FROM` | no | `production.env`: `ARCA <no-reply@arcacover.com>` | igual o buzón de pruebas |
-| `EMAIL_PROVIDER` | no | `ses` (o el de F11) | `memory` |
-| Credencial del correo | según F11 | Con SES: **ninguna**, permiso `ses:SendEmail` en el rol de la instancia, limitado a la identidad `arcacover.com`. Con otro proveedor: SSM `/arca/prod/EMAIL_API_KEY` | — |
+| `EMAIL_FROM` | no | `production.env`: `ARCA <no-reply@arcacover.com>` (escrito) | igual o buzón de pruebas |
+| `EMAIL_PROVIDER` | no | `production.env`: `resend` (F11, §16.4). `ses` queda como alternativa | `memory`; `resend` en `live-debug` real para una prueba de verdad |
+| `RESEND_API_KEY` | **sí** | SSM `/arca/prod/RESEND_API_KEY` (`scripts/arca-webapp-secrets.ps1`), clave `re_…` con acceso de envío al dominio `arcacover.com` | terminal o `.env.local`, solo para esa prueba |
+| Credencial de SES (si se usa) | — | **Ninguna**: permiso `ses:SendEmail` en el rol de la instancia, limitado a la identidad `arcacover.com` | — |
 | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | ya existen | Ya en SSM; la clave secreta pasa a usarse también para la API de administración de Auth | Las de `Arca-dev` |
 
 No hacen falta `SUPABASE_JWT_SECRET` ni una URL de JWKS: el JWKS sale de `SUPABASE_URL` (§4.4).
 
 `deploy/render-env.py`: si `production.env` tiene `WEBAPP_ENABLED=true`, añade `STRIPE_SECRET_KEY` y
-`STRIPE_WEBHOOK_SECRET` a los parámetros obligatorios (y `EMAIL_API_KEY` si el proveedor lo pide), como ya hace con
+`STRIPE_WEBHOOK_SECRET` a los parámetros obligatorios (y `RESEND_API_KEY` si `EMAIL_PROVIDER=resend`), como ya hace con
 `OPENAI_API_KEY`. Un despliegue sin ellos se niega en el host con un mensaje que los nombra.
 
 `infra/aws` (CDK): si F11 = SES, la identidad de dominio, el permiso de envío del rol de la instancia y un tema SNS para
@@ -1288,7 +1289,7 @@ leer y escribir los campos nuevos de `subscriptions` desde el webhook real (T15)
 | F8 | Reembolsos | Ninguno / prorrateados / a criterio | A criterio, escrito en los términos; al aprobar un borrado, cancelación inmediata sin reembolso salvo excepción |
 | F9 | Proyectos de Supabase | Uno compartido / dos (producción y `Arca-dev`) | Dos |
 | F10 | Plan de Supabase de producción | Gratuito (se pausa) / de pago | De pago antes del primer cliente |
-| F11 | Proveedor de correo | Amazon SES / Postmark / Resend | SES (ya en AWS, sin credenciales con el rol de la instancia) |
+| F11 | Proveedor de correo | Amazon SES / Postmark / Resend | **Decidido: Resend** (§16.4), para el SMTP de Supabase Auth y para las invitaciones de la API; SES queda como alternativa |
 | F12 | Quién paga y datos de factura | Solo el owner (hoy) / también admin; email de facturación propio; NIF | Solo el owner; dirección y NIF obligatorios en Checkout |
 | F13 | Retención y privacidad | Años de conservación tras un borrado; textos de privacidad y términos; acuerdos de tratamiento con Supabase, Stripe y AWS | 7 años y revisión de un abogado (§4.8) |
 | F14 | Sesiones y MFA | Duración de la sesión; MFA obligatoria u opcional para owners | 7 días de inactividad, 30 de máximo; MFA obligatoria para ARCA y opcional para clientes |
@@ -1437,6 +1438,45 @@ Sin red, sin Supabase, Stripe ni AWS reales. Se escribieron antes que el código
 
 `npm run typecheck` limpio. `npm test` completo: 1437 de 1438; fallaron `infra/aws/lib/arca-demo-stack.test.ts` (no hay
 `aws-cdk-lib` en un worktree, esperado) y, una vez, un test de `crawler.test.ts` por carga, que pasa solo (29 de 29).
+
+### 16.4 F11 decidido: Resend (2026-11-20)
+
+**F11 es Resend**, para los dos correos: Supabase Auth ya manda los códigos de acceso por el SMTP de Resend desde
+`ARCA <no-reply@arcacover.com>` (dominio verificado en Resend, DKIM y SPF en el DNS de Vercel), y ahora la API manda las
+invitaciones por la API HTTP de Resend con el mismo remitente. SES queda como alternativa (`EMAIL_PROVIDER=ses`), con su remitente
+todavía sin cablear. Hecho en `feat/resend-mailer`.
+
+- **`ResendMailer`** (`apps/api/src/webapp/mailer.ts`): `POST https://api.resend.com/emails` con `fetch`, sin SDK; `Authorization:
+  Bearer RESEND_API_KEY`, `User-Agent` (Resend responde 403 sin él) y JSON `{ from, to: [to], subject, text, html }`. Tiempo máximo
+  de 5 s por intento.
+- **Un envío por invitación:** el correo lleva `Idempotency-Key: invitation-<id>` (Resend la guarda 24 h). Solo un mensaje con clave
+  se reintenta, una vez y con el mismo cuerpo, tras un tiempo agotado, un fallo de red o un 5xx; si el primer intento llegó, el
+  segundo no manda otro. Un 4xx, un límite de peticiones o una cuota agotada no se reintentan. Reinvitar crea otra invitación, con
+  otro id: otro correo.
+- **Fallos:** como con SES, el error se nombra por el tipo de Resend (`validation_error`, `rate_limit_exceeded`), por
+  `resend_http_<estado>` si la respuesta no es su JSON, o por `TimeoutError` y `NetworkError`; nunca con el mensaje de Resend, que
+  puede citar la dirección. El registro sigue siendo `[mail] invitation <id> was created but its email was not sent (<tipo>)`, y la
+  invitación no se deshace.
+- **Entorno** (`apps/api/src/config/env.ts`): `EMAIL_PROVIDER` admite `resend`; `RESEND_API_KEY` es obligatoria con él y debe empezar
+  por `re_` (el mensaje nunca la repite). Producción con la webapp encendida sigue pidiendo `EMAIL_FROM` explícito y `APP_BASE_URL`
+  `https`, y ahora acepta `resend` (con clave) o `ses` (con remitente en la costura, que comprueba `compose`); `memory` se niega.
+  Por defecto: `memory` en los modos de debug y `ses` en producción si no se dice nada (`production.env` dice `resend`). La webapp
+  simulada solo usa `memory`; `live-debug` con `WEBAPP_PROVIDERS=real` puede elegir `resend` para una prueba real.
+- **Costura:** `RealWebappAdapters.resendFetch` (opcional; por defecto el `fetch` global) para los tests. `REAL_WEBAPP_ADAPTERS` no
+  cambia: con `EMAIL_PROVIDER=resend` producción ya tiene todas sus piezas.
+- **Despliegue:** `deploy/production.env` con `EMAIL_PROVIDER=resend` y `EMAIL_FROM=ARCA <no-reply@arcacover.com>`
+  (`WEBAPP_ENABLED` sigue en `false`). `deploy/render-env.py` exige `/arca/prod/RESEND_API_KEY` cuando la webapp está encendida y el
+  proveedor es `resend`. El script de SSM pasa a llamarse `scripts/arca-webapp-secrets.ps1` y pide también `RESEND_API_KEY` (oculta,
+  con prefijo `re_`, Enter conserva la guardada; `-Only RESEND_API_KEY` pide solo esa; `-Status` la lista);
+  `scripts/arca-billing-secrets.ps1` sigue funcionando y reenvía al nuevo.
+- **Pruebas** (con `fetch` inyectado, sin llamar a Resend): 17 nuevas en `mailer.test.ts` (forma de la petición, clave de
+  idempotencia, reintentos, tiempo agotado, errores sin datos personales, invitación que sobrevive a un rechazo), `env.test.ts`
+  (guardas), `compose.test.ts` (producción y `live-debug` con Resend, fallo de red), `render-env.test.ts` y `deploy-marker.test.ts`.
+
+**Prueba real desde `live-debug`:** los pasos 1 a 8 de §18.8 (invitar exige una organización pagada) con, además,
+`$env:EMAIL_PROVIDER = 'resend'` y `$env:RESEND_API_KEY` leída con `Read-Host -AsSecureString`; la línea de arranque dice
+`webapp=real stripe=test email=resend`. Una invitación (`POST /orgs/<id>/invitations`) a un buzón propio manda un correo real desde
+`no-reply@arcacover.com`; en el panel de Resend (Emails) aparece con su estado.
 
 ## 17. Implementación de T7 y T11 en el back (2026-11-19)
 
@@ -1819,7 +1859,8 @@ claves leídas con `Read-Host -AsSecureString` (§9.3), nunca escritas en la lí
 - ~~La prueba real en modo test~~: hecha el 2026-11-20 (§18.10). Queda la suite de conformidad contra Supabase local en cuanto Docker
   vuelva, y las decisiones que abrió esa prueba (§18.10.4).
 - Programar la reconciliación diaria y las alarmas de los logs `[billing]` (T26); encontrar la organización de una disputa leyendo el cargo.
-- El remitente de SES (`RealWebappAdapters.sesSendEmail`), sin el cual producción con la webapp encendida no arranca.
+- ~~El remitente de SES (`RealWebappAdapters.sesSendEmail`), sin el cual producción con la webapp encendida no arranca.~~ Ya no
+  bloquea: producción manda con Resend (§16.4); el remitente de SES solo hace falta si se vuelve a SES.
 
 ### 18.10 Primera prueba real en modo test (2026-11-20)
 
