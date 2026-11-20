@@ -522,13 +522,13 @@ export class WebappService {
         const reused = await this.reuseCheckout(org.id, open, plan.code, uiMode);
         if (reused) return reused;
       }
-      const customerId = await this.billingCustomer(current, actor);
+      const { customerId, prefilled } = await this.billingCustomer(current, actor);
       // What came before this session keeps its idempotency key apart from a session closed in the same minute (DN-13 §6.2).
       const after = open?.id ?? (await this.repo.getSubscription(org.id))?.subscription_id ?? null;
       const created: OpenCheckout & { expiresAt: string } = uiMode === 'embedded'
-        ? { url: null, ...await orUnavailable(this.deps.billing.createEmbeddedCheckout({ orgId: org.id, customerId, plan, after,
+        ? { url: null, ...await orUnavailable(this.deps.billing.createEmbeddedCheckout({ orgId: org.id, customerId, plan, after, prefilled,
           returnUrl: `${this.appBaseUrl}/app/billing/return?session_id={CHECKOUT_SESSION_ID}` })) }
-        : { clientSecret: null, ...await orUnavailable(this.deps.billing.createCheckout({ orgId: org.id, customerId, plan, after,
+        : { clientSecret: null, ...await orUnavailable(this.deps.billing.createCheckout({ orgId: org.id, customerId, plan, after, prefilled,
           successUrl: `${this.appBaseUrl}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${this.appBaseUrl}/app/billing` })) };
       const stored = await this.repo.addCheckoutSession({ id: created.sessionId, org_id: org.id, plan_code: plan.code, url: created.url,
         status: 'open', created_by: actor.userId, expires_at: created.expiresAt, created_at: at, ui_mode: uiMode }, at);
@@ -581,17 +581,19 @@ export class WebappService {
    * The organization's Stripe customer: the one stored, brought up to the firm profile when there is one (DN-13 §19), or a new one
    * made from it; without a profile, a new one named after the organization, with the payer's email, as before.
    */
-  private async billingCustomer(org: OrganizationRecord, payer: AppUser): Promise<string> {
+  private async billingCustomer(org: OrganizationRecord, payer: AppUser): Promise<{ customerId: string; prefilled: boolean }> {
     const profile = await this.repo.getOrgProfile(org.id);
     const details = customerDetails(org, payer, profile);
+    // With the profile the customer holds the billing address, so Checkout need not ask for it.
+    const prefilled = profile !== null;
     const stored = await this.repo.getBillingCustomer(org.id);
     if (stored) {
       if (profile) await orUnavailable(this.deps.billing.updateCustomer(stored.customer_id, details));
-      return stored.customer_id;
+      return { customerId: stored.customer_id, prefilled };
     }
     const { customerId } = await orUnavailable(this.deps.billing.ensureCustomer(details));
-    return (await this.repo.addBillingCustomer({ org_id: org.id, customer_id: customerId, livemode: this.deps.billing.mode === 'live',
-      created_at: this.timestamp() })).customer_id;
+    return { customerId: (await this.repo.addBillingCustomer({ org_id: org.id, customer_id: customerId, livemode: this.deps.billing.mode === 'live',
+      created_at: this.timestamp() })).customer_id, prefilled };
   }
 
   /** 409 until the organization is a Stripe customer, which its first checkout makes it (DN-13 §6.4). */

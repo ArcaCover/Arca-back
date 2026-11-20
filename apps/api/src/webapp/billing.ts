@@ -84,11 +84,12 @@ export interface BillingProvider {
    * within a minute is the same session (DN-13 §6.2); `after` names what came before this one (the session it replaces, or the
    * subscription it follows), so a deliberate new session is never a replay of a closed one.
    */
-  createCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; successUrl: string; cancelUrl: string; after?: string | null })
-    : Promise<{ sessionId: string; url: string; expiresAt: string }>;
+  createCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; successUrl: string; cancelUrl: string; after?: string | null;
+    /** The customer already holds the billing address (the firm profile): Checkout does not ask for it again. */
+    prefilled?: boolean }): Promise<{ sessionId: string; url: string; expiresAt: string }>;
   /** The same session embedded in ARCA's page (DN-13 §19): a client secret instead of a URL, and one return URL for every outcome. */
-  createEmbeddedCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; returnUrl: string; after?: string | null })
-    : Promise<{ sessionId: string; clientSecret: string; expiresAt: string }>;
+  createEmbeddedCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; returnUrl: string; after?: string | null;
+    prefilled?: boolean }): Promise<{ sessionId: string; clientSecret: string; expiresAt: string }>;
   /** Closes an open checkout so it can no longer be paid; says `complete` when the customer paid it first. */
   expireCheckout(sessionId: string): Promise<'expired' | 'complete'>;
   createPortal(input: { customerId: string; returnUrl: string }): Promise<{ url: string }>;

@@ -128,7 +128,8 @@ describe('Checkout embedded in the pre-checkout (DN-13 §19)', () => {
     const [create] = s.sessionCreates();
     expect(create!.form).toMatchObject({ ui_mode: 'embedded_page', return_url: RETURN, customer: customer!.id, client_reference_id: o.org.id,
       adaptive_pricing: { enabled: 'false' }, managed_payments: { enabled: 'false' }, allowed_payment_method_types: { 0: 'card' },
-      billing_address_collection: 'required' });
+      // The firm's address is on the customer: Checkout asks only what the card needs, and never offers Link or its bank option.
+      billing_address_collection: 'auto', wallet_options: { link: { display: 'never' } } });
     expect(create!.form).not.toHaveProperty('success_url');
     expect(create!.form).not.toHaveProperty('cancel_url');
     expect(await s.repository.getCheckoutSession(checkout.sessionId)).toMatchObject({ ui_mode: 'embedded', url: null, status: 'open', plan_code: 'monthly' });
@@ -195,6 +196,8 @@ describe('Checkout embedded in the pre-checkout (DN-13 §19)', () => {
     const [customer] = [...s.stripe.customers.values()];
     expect(customer).toMatchObject({ name: 'Smith & Co LLP', email: 'ana@smith.law', phone: null, address: null });
     expect(s.stripe.taxIds(customer!.id)).toEqual([]);
+    // No address on the customer: Checkout asks for it.
+    expect(s.sessionCreates()[0]!.form).toMatchObject({ billing_address_collection: 'required' });
   });
 
   it('asks for billing.manage like the hosted checkout, and refuses an unknown kind of Checkout', async () => {

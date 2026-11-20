@@ -662,7 +662,7 @@ describe('deletion and the platform admin', () => {
     const createCheckout = vi.spyOn(s.billing, 'createCheckout');
     await s.service.checkout(owner, org.id, 'monthly');
     // The new amount is a new catalog price (DN-13 §6.1), here the simulated provider's.
-    expect(createCheckout).toHaveBeenCalledWith({ orgId: org.id, customerId: expect.stringMatching(/^cus_mock_/), after: null,
+    expect(createCheckout).toHaveBeenCalledWith({ orgId: org.id, customerId: expect.stringMatching(/^cus_mock_/), after: null, prefilled: false,
       plan: { code: 'monthly', name: 'Monthly (example price)', amount_cents: 1000, currency: 'usd', interval: 'month', active: true,
         stripe_product_id: 'prod_mock', stripe_price_id: expect.stringMatching(/^price_mock_/) },
       successUrl: `${APP}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${APP}/app/billing` });

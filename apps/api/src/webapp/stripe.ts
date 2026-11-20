@@ -203,7 +203,8 @@ export class StripeBillingProvider implements BillingProvider {
     }
   }
 
-  async createCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; successUrl: string; cancelUrl: string; after?: string | null }) {
+  async createCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; successUrl: string; cancelUrl: string; after?: string | null;
+    prefilled?: boolean }) {
     const session = await this.openSession(input, { success_url: input.successUrl, cancel_url: input.cancelUrl },
       `checkout:${input.orgId}:${input.plan.code}:${Math.floor(this.now() / 60_000)}${input.after ? `:${input.after}` : ''}`);
     if (!session.url) throw new Error('Stripe returned a checkout session without a URL');
@@ -215,7 +216,8 @@ export class StripeBillingProvider implements BillingProvider {
    * coming back to `returnUrl` (with {CHECKOUT_SESSION_ID}) instead of the success and cancel pages. Its idempotency key names the
    * mode, so a hosted session asked for in the same minute is another one.
    */
-  async createEmbeddedCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; returnUrl: string; after?: string | null }) {
+  async createEmbeddedCheckout(input: { orgId: string; customerId: string; plan: PlanRecord; returnUrl: string; after?: string | null;
+    prefilled?: boolean }) {
     const session = await this.openSession(input, { ui_mode: 'embedded_page', return_url: input.returnUrl },
       `checkout:${input.orgId}:${input.plan.code}:embedded:${Math.floor(this.now() / 60_000)}${input.after ? `:${input.after}` : ''}`);
     if (!session.client_secret) throw new Error('Stripe returned an embedded checkout session without a client secret');
@@ -223,7 +225,7 @@ export class StripeBillingProvider implements BillingProvider {
   }
 
   /** What every subscription Checkout of ARCA carries (DN-13 §6.2), hosted or embedded; `page` is where it is paid and where it ends. */
-  private async openSession(input: { orgId: string; customerId: string; plan: PlanRecord },
+  private async openSession(input: { orgId: string; customerId: string; plan: PlanRecord; prefilled?: boolean },
     page: Pick<Stripe.Checkout.SessionCreateParams, 'ui_mode' | 'success_url' | 'cancel_url' | 'return_url'>,
     idempotencyKey: string): Promise<Stripe.Checkout.Session> {
     const price = input.plan.stripe_price_id;
@@ -236,7 +238,9 @@ export class StripeBillingProvider implements BillingProvider {
       metadata: { org_id: input.orgId }, subscription_data: { metadata: { org_id: input.orgId } },
       ...(page.success_url ? { success_url: page.success_url, cancel_url: page.cancel_url } : {}),
       ...(page.return_url ? { return_url: page.return_url } : {}),
-      billing_address_collection: 'required', customer_update: { name: 'auto', address: 'auto' },
+      // A customer that already holds the firm's billing address (the pre-checkout's profile, DN-13 §19) is not asked for it again:
+      // Checkout then asks only what the card itself needs. Without one, the address is required, as §6.2 says.
+      billing_address_collection: input.prefilled ? 'auto' : 'required', customer_update: { name: 'auto', address: 'auto' },
       // Card only for now (DN-13 §6.2, F5): an asynchronous method would need the async_payment events and a state in between.
       allowed_payment_method_types: ['card'],
       // ARCA is the seller (taxes are F3). An account can have Managed Payments (Stripe as merchant of record) on by default, and
@@ -245,6 +249,8 @@ export class StripeBillingProvider implements BillingProvider {
       // Always charged and shown in USD (decision of 2026-11-20): an account with Adaptive Pricing on offered the visitor their
       // local currency (COP in the first test-mode run). Explicit here so a change in the dashboard cannot turn it back on.
       adaptive_pricing: { enabled: false },
+      // Card only also means no Link: the first real embedded run showed Link's bank payment beside the card (DN-13 §19.9).
+      wallet_options: { link: { display: 'never' } },
       expires_at: nowS + CHECKOUT_TTL_S,
       // Taxes (F3), promotion codes and a trial (F4) wait for the founder's decisions.
     }, { idempotencyKey }));

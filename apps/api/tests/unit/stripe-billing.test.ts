@@ -58,7 +58,8 @@ describe('StripeBillingProvider', () => {
       line_items: { 0: { price: plan.stripe_price_id, quantity: '1' } }, metadata: { org_id: ORG }, subscription_data: { metadata: { org_id: ORG } },
       success_url: `${APP}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancel_url: `${APP}/app/billing`,
       billing_address_collection: 'required', customer_update: { name: 'auto', address: 'auto' }, allowed_payment_method_types: { 0: 'card' },
-      managed_payments: { enabled: 'false' }, adaptive_pricing: { enabled: 'false' }, expires_at: String(Math.floor(T0 / 1000) + 3600) });
+      managed_payments: { enabled: 'false' }, adaptive_pricing: { enabled: 'false' }, wallet_options: { link: { display: 'never' } },
+      expires_at: String(Math.floor(T0 / 1000) + 3600) });
     // The same click in the same minute is the same session.
     expect(await provider.createCheckout({ orgId: ORG, customerId, plan,
       successUrl: `${APP}/app/billing/return?session_id={CHECKOUT_SESSION_ID}`, cancelUrl: `${APP}/app/billing` })).toEqual(checkout);
@@ -109,25 +110,30 @@ describe('StripeBillingProvider', () => {
     it('opens an embedded Checkout: ui_mode embedded_page, the return URL, card only, USD, no Managed Payments, and a client secret', async () => {
       const { stripe, provider, plan } = setup();
       const { customerId } = await provider.ensureCustomer(details);
-      const checkout = await provider.createEmbeddedCheckout({ orgId: ORG, customerId, plan, returnUrl: RETURN });
+      // The customer holds the firm's address (prefilled), so Checkout asks only what the card itself needs (§19.4).
+      const checkout = await provider.createEmbeddedCheckout({ orgId: ORG, customerId, plan, returnUrl: RETURN, prefilled: true });
       expect(checkout).toEqual({ sessionId: expect.stringMatching(/^cs_test_/), clientSecret: expect.stringMatching(/^cs_test_\w+_secret_\w+$/),
         expiresAt: new Date(T0 + 60 * 60 * 1000).toISOString() });
       const call = stripe.calls.at(-1)!;
       expect(call.idempotencyKey).toBe(`checkout:${ORG}:monthly:embedded:${Math.floor(T0 / 60_000)}`);
       expect(call.form).toEqual({ mode: 'subscription', ui_mode: 'embedded_page', customer: customerId, client_reference_id: ORG,
         line_items: { 0: { price: plan.stripe_price_id, quantity: '1' } }, metadata: { org_id: ORG }, subscription_data: { metadata: { org_id: ORG } },
-        return_url: RETURN, billing_address_collection: 'required', customer_update: { name: 'auto', address: 'auto' },
+        return_url: RETURN, billing_address_collection: 'auto', customer_update: { name: 'auto', address: 'auto' },
         allowed_payment_method_types: { 0: 'card' }, managed_payments: { enabled: 'false' }, adaptive_pricing: { enabled: 'false' },
-        expires_at: String(Math.floor(T0 / 1000) + 3600) });
+        wallet_options: { link: { display: 'never' } }, expires_at: String(Math.floor(T0 / 1000) + 3600) });
       // No page of its own: Stripe gives it no URL, and its client secret is read back with the session.
       expect(stripe.sessions.get(checkout.sessionId)).toMatchObject({ ui_mode: 'embedded_page', url: null });
       expect(await provider.checkoutState(checkout.sessionId)).toEqual({ sessionId: checkout.sessionId, orgId: ORG, customerId, subscriptionId: null,
         status: 'open', livemode: false, uiMode: 'embedded', clientSecret: checkout.clientSecret });
       // The same request in the same minute is the same session; a hosted one in that minute is another.
-      expect(await provider.createEmbeddedCheckout({ orgId: ORG, customerId, plan, returnUrl: RETURN })).toEqual(checkout);
+      expect(await provider.createEmbeddedCheckout({ orgId: ORG, customerId, plan, returnUrl: RETURN, prefilled: true })).toEqual(checkout);
+      // Without an address on the customer, Checkout asks for it, as the hosted page always did.
+      await provider.createEmbeddedCheckout({ orgId: '00000000-0000-4000-8000-000000000002', customerId, plan, returnUrl: RETURN });
+      expect(stripe.calls.at(-1)!.form).toMatchObject({ billing_address_collection: 'required' });
       const hosted = await provider.createCheckout({ orgId: ORG, customerId, plan, successUrl: RETURN, cancelUrl: `${APP}/app/billing` });
       expect(hosted.sessionId).not.toBe(checkout.sessionId);
-      expect(stripe.sessions.size).toBe(2);
+      // Three: the prefilled one, the one of another organization without an address, and the hosted one.
+      expect(stripe.sessions.size).toBe(3);
       await expect(provider.createEmbeddedCheckout({ orgId: ORG, customerId, plan: { ...plan, stripe_price_id: null }, returnUrl: RETURN }))
         .rejects.toThrow(/no Stripe price/);
     });
