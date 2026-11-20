@@ -8,6 +8,8 @@ import { AgenticEvidenceProvider } from '../../src/pipeline/agentic-evidence-pro
 import { ApifyClient } from '../../src/pipeline/apify-client.js';
 import { ApifyDirectorySource } from '../../src/pipeline/directories.js';
 import type { CrawledPage } from '../../src/pipeline/crawler.js';
+import { corpusFingerprint } from '../../src/pipeline/evidence-corpus.js';
+import { STORED_PAGE_FORMAT } from '../../src/pipeline/stored-pages.js';
 import { canonicalJson, replayAccess, replayApify, replayModel, type ApifyRecording, type ModelRecordings } from '../fixtures/replay/replay.js';
 import { ACCESS_PAGES, DOMAIN, PAGES, SITEMAP, withChangedText, withHtmlNoise } from '../fixtures/replay/harbor-vale/site.js';
 import { scriptedModel } from '../fixtures/replay/harbor-vale/scripted-model.js';
@@ -100,6 +102,15 @@ describe('the real pipeline replayed from recordings', () => {
     // What does differ is the account of the run itself: nothing was paid for the second time.
     expect(a.outcome.result.sources.bar).toMatchObject({ cachedRuns: 0 });
     expect(c.outcome.result.sources.bar).toMatchObject({ cachedRuns: 2, costUsd: 0 });
+  });
+
+  it('stores pages that read as the crawl did, so the record replays to the same reuse key (DN-12 §15.5)', async () => {
+    const repository = new InMemoryRepository();
+    const a = await scan(repository);
+    const stored = JSON.parse((await repository.rawOf(a.outcome.result.scanId, 'website'))!.raw_content);
+    expect(stored.pageFormat).toBe(STORED_PAGE_FORMAT);
+    expect(stored.pages.map((page: { url: string }) => page.url)).toEqual(PAGES.map(page => page.url));
+    expect(corpusFingerprint({ pages: stored.pages, partial: false })).toBe(corpusFingerprint({ pages: PAGES, partial: false }));
   });
 
   it('still reuses the signals when the HTML of every page changed but nothing it says did', async () => {

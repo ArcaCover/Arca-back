@@ -8,6 +8,7 @@ import type { ScanRepository } from '../repositories/types.js';
 import { OpenAIEvidenceProvider, type WebsiteEvidenceProvider } from './website-evidence-provider.js';
 import type OpenAI from 'openai';
 import { scanMeter } from './scan-cost.js';
+import { STORED_PAGE_FORMAT, storedPages } from './stored-pages.js';
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 type Crawl = (domain: string, signal: AbortSignal, robots: RobotsCache) => Promise<CrawlResult>;
@@ -63,7 +64,10 @@ export class WebsiteExtractionSource implements WebsiteSource {
     // One robots cache for the whole scan: the crawl and every page, document or sitemap the extraction asks for share it.
     const robots = createRobotsCache();
     const crawl = await this.crawl(domain, signal, robots);
-    const base = { provider: this.provider.id, version: this.provider.version, pages: crawl.pages, issues: crawl.issues ?? [],
+    // The record keeps each page's text and the parts of its HTML the backend reads, not the full HTML (DN-12 §15.5).
+    // Everything below, the extraction and the reuse key included, reads `crawl` itself.
+    const base = { provider: this.provider.id, version: this.provider.version, pageFormat: STORED_PAGE_FORMAT,
+      pages: storedPages(crawl.pages), issues: crawl.issues ?? [],
       // How the sitemap read that seeded the crawl went: a crawl that started from other pages is explained by it.
       ...(crawl.sitemap ? { sitemap: crawl.sitemap } : {}) };
     if (!crawl.pages.length) {
