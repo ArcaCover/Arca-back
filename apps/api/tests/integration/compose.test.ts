@@ -169,7 +169,7 @@ describe('compose', () => {
     const body = await (await app.request('/__debug/mode')).json();
     expect(DebugModeResponse.parse(body)).toEqual({ mode: 'mock', sourceMode: 'mock', storageBackend: 'memory',
       websiteEvidenceProvider: 'mock', assessmentPlanner: 'rules', signalLlmModel: null,
-      inUse: { openai: false, apify: false, supabase: false } });
+      inUse: { openai: false, apify: false, supabase: false }, webapp: 'simulated', billing: 'simulated' });
     for (const secret of ['sk-x', 'sb_secret_x', 'apify_x', 'x.supabase.co']) expect(JSON.stringify(body)).not.toContain(secret);
   });
 
@@ -189,7 +189,7 @@ describe('compose', () => {
     const body = await (await app.request('/__debug/mode')).json();
     expect(DebugModeResponse.parse(body)).toEqual({ mode: 'live-debug', sourceMode: 'live', storageBackend: 'supabase',
       websiteEvidenceProvider: provider, assessmentPlanner: planner, signalLlmModel: model,
-      inUse: { openai, apify: true, supabase: true } });
+      inUse: { openai, apify: true, supabase: true }, webapp: 'simulated', billing: 'simulated' });
     for (const secret of ['sk-x', 'sb_secret_x', 'apify_x', 'x.supabase.co']) expect(JSON.stringify(body)).not.toContain(secret);
   });
 });
@@ -279,6 +279,12 @@ describe('compose: the webapp providers', () => {
     expect((await composed.app.request('/__debug/reset', { method: 'POST', headers: { [DEBUG_REQUEST_HEADER]: '1' } })).status).toBe(200);
     expect(composed.banner).toBe('[api] MODE=live-debug sources=live storage=supabase webapp=real stripe=test email=memory '
       + '(debug routes on 127.0.0.1 only) spend guards: Apify ceiling USD 2 per 24 h, OpenAI cap 30 requests per scan');
+    // DN-13 §8.4, T19: the panel and the strip read the providers from the back, as words: never a key, its prefix or a URL.
+    const mode = await (await composed.app.request('/__debug/mode')).json();
+    expect(DebugModeResponse.parse(mode)).toMatchObject({ mode: 'live-debug', webapp: 'real', billing: 'test' });
+    for (const secret of ['rk_test', 'rk_', 'whsec', 'sb_secret', 'x.supabase.co', 'sk-x', 'apify_x']) {
+      expect(JSON.stringify(mode), secret).not.toContain(secret);
+    }
 
     const signedIn = await me(composed.app, await project.accessToken('Owner@Firm.com'));
     expect(signedIn.status).toBe(200);
@@ -288,6 +294,13 @@ describe('compose: the webapp providers', () => {
     expect((await me(composed.app, mockToken)).status).toBe(401);
     // The key set was read once, at start, and kept.
     expect(project.fetchJwks).toHaveBeenCalledTimes(1);
+  });
+
+  // loadEnv already stops a live key in a debug mode (DN-13 §16.1); the mode route still never calls a live webapp a test one.
+  it('refuses to describe a debug back whose real webapp would bill in live mode', async () => {
+    const project = await supabaseProject();
+    const { seam } = adapters(project);
+    await expect(compose({ ...loadEnv(realLiveDebug), stripeMode: 'live' }, undefined, seam)).rejects.toThrow(/Stripe test key only/);
   });
 
   it('production keeps answering 501 while WEBAPP_ENABLED is not true, and builds nothing of the seam', async () => {
@@ -329,6 +342,8 @@ describe('compose: the webapp providers', () => {
       appBaseUrl: 'https://arcacover.com' });
     expect(composed.banner).toBe('[api] MODE=production sources=live storage=supabase webapp=real stripe=live email=ses');
     for (const path of ['/__debug/auth/login', '/__debug/billing/pay', '/__debug/mode']) expect((await debugPost(composed.app, path)).status, path).toBe(404);
+    // Production never says which providers it runs (DN-09 §7, DN-13 T19): the mode route does not exist there.
+    expect((await composed.app.request('/__debug/mode')).status).toBe(404);
     // CORS stays exact.
     const preflight = await composed.app.request('/orgs', { method: 'OPTIONS', headers: { Origin: 'http://localhost:3000',
       'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type, authorization' } });

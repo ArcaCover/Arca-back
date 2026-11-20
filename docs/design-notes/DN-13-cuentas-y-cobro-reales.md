@@ -1144,7 +1144,7 @@ aprobaciones).
 | T16 | Front: `GET /orgs/:id/billing`, `/app/billing` real, `/app/billing/return`, portal (§8.1) | 3 · cobro | 1,5 | T14 |
 | T17 | ✅ Caddy: ruta del webhook con su límite de cuerpo (§9.2). Hecho: §18 | 3 · cobro | 0,5 | — |
 | T18 | Contratos 0.5.0 y publicación (§7.6) | 4 · integración | 0,5 | T6–T16 |
-| T19 | `/__debug/mode` con `webapp` y `billing`; panel y franja (§8.4) | 4 · integración | 1 | T18 |
+| T19 | `/__debug/mode` con `webapp` y `billing`; panel y franja (§8.4). **Hecha (§20)**, sin publicar contratos | 4 · integración | 1 | T18 |
 | T20 | E2E en `live-debug` real + suite de Stripe con test clocks (§11) | 4 · integración | 3 | T9–T19 |
 | T21 | SSM (`STRIPE_*`), `render-env.py`, `production.env` con `WEBAPP_ENABLED=false`, CDK si SES (§9.1) | 5 · producción | 0,5 | T20 |
 | T22 | **Aprobación del founder** y aplicación de las migraciones a producción (§5.2) | 5 · founder | 0,5 | T21 |
@@ -1855,7 +1855,7 @@ claves leídas con `Read-Host -AsSecureString` (§9.3), nunca escritas en la lí
 - **T16** (front): `/app/billing` real con `GET /orgs/:id/billing`, "Pay" y "Manage subscription", y la página `/app/billing/return` con
   `sync` y la espera de §6.3.
 - **T18:** contratos 0.5.0 con `EnrollRequest`, `EnrollResponse`, `BillingView` y `BillingSyncRequest` (y `emailSent` y `DebugModeResponse`).
-- **T19:** `/__debug/mode` con `webapp` y `billing`; panel y franja.
+- ~~**T19:** `/__debug/mode` con `webapp` y `billing`; panel y franja.~~ Hecha (§20).
 - ~~La prueba real en modo test~~: hecha el 2026-11-20 (§18.10). Queda la suite de conformidad contra Supabase local en cuanto Docker
   vuelva, y las decisiones que abrió esa prueba (§18.10.4).
 - Programar la reconciliación diaria y las alarmas de los logs `[billing]` (T26); encontrar la organización de una disputa leyendo el cargo.
@@ -2110,3 +2110,39 @@ del formulario son número, caducidad, CVC, titular, país y ZIP.
 - Stripe (test): clientes `cus_VfEiY9xU9G0JR9`, `cus_VfEjKmYd1kdRjz`, `cus_VfEpAGaKouF2T5` y `cus_VfEqLeQUb06Y0g` (los cuatro con
   `us_ein`); suscripciones `sub_1UduLeEw83ixrW1L5oRinyBM` y `sub_1UduNUEw83ixrW1LF2TG39GG` (activas, renuevan el 2026-12-20); sesiones
   `cs_test_a0KJ8ijs…` y `cs_test_a0RoXkzG…` (pagadas) y `cs_test_a0cyCIgr…` y `cs_test_a0Av2ear…` (abiertas, vencen a la hora).
+
+## 20. T19: `/__debug/mode` dice qué webapp hay (2026-11-20)
+
+Rama `feat/t19-debug-mode` en los dos repos (sale de `feat/real-accounts`). Producción no cambia: sigue sin construir las
+herramientas de debug y `/__debug/mode` da 404 (con la webapp apagada y encendida; test nuevo para `GET` con `WEBAPP_ENABLED=true`).
+
+- **Contrato** (`packages/contracts/src/debug.ts`, sale con 0.5.0, sin publicar ni etiquetar): `DebugModeResponse` gana dos campos
+  obligatorios, `webapp: 'simulated' | 'real'` y `billing: 'simulated' | 'test'`, como pedía §7.6. **No hay `live`:** una clave live
+  detiene cualquier modo de debug al arrancar (§16.1), así que el contrato de debug no puede ni decirlo. Solo la palabra del modo,
+  nunca la clave ni su prefijo.
+- **Back** (`compose.ts`, `debugWebapp`): `mock` y `live-debug` simulado → `simulated`/`simulated`; `live-debug` con
+  `WEBAPP_PROVIDERS=real` → `real`/`test`, leído de `env.webapp` y `env.stripeMode`. Si un `stripeMode` distinto de `test` llegara
+  a un modo de debug (no puede, por la guarda de `loadEnv`), el arranque se niega en vez de describirlo.
+- **Front:** la franja y el panel leen los dos campos del back, no la variable. Franja: `MOCK · no real APIs · in-memory data`
+  (igual), `LIVE DEBUG · real scans · simulated accounts & billing` (igual) y `LIVE DEBUG · real scans · real accounts · Stripe test`
+  (nueva, 53 caracteres, una línea a 390 px). Sin "(Arca-dev)" de §8.4: el back no sabe a qué proyecto apunta su URL (§3.2).
+  Si las cuentas del build (`NEXT_PUBLIC_WEBAPP_ENABLED`) y las del back no coinciden, la franja dice
+  `ACCOUNTS MISMATCH · front=real, back=simulated` (o al revés) con el aspecto de un modo desalineado: el back rechaza los tokens
+  del otro tipo y nadie podría entrar. El panel gana la fila "Webapp": `Webapp: simulated · billing simulated` con una línea sobre
+  la memoria, o `Webapp: real · Stripe test` con la tarjeta 4242, el enlace a las tarjetas de test de Stripe, el enlace a
+  `stripe listen` y la orden `stripe listen --forward-to <API>/billing/webhook`; en rojo, el desacuerdo y qué variable cambiar.
+  El login y el pago simulados del panel ya solo existían en `mock`, así que no hubo nada que esconder en `live-debug` real.
+- **Front sin 0.5.0:** el esquema de 0.4.0 es estricto y llamaría "otra forma" a la respuesta nueva, así que el front la lee con
+  `lib/debug/mode-contract.ts` (los dos campos a mano, el resto con el esquema de 0.4.0), como `enroll-contract.ts`. Con 0.5.0 pasa
+  a reexportar `DebugModeResponse`. Un front de antes de este cambio ve a un back nuevo como `MODE MISMATCH · … back unreachable or
+  production`: solo afecta a los modos de debug en local.
+- **Pruebas** (escritas antes y vistas fallar): back, `packages/contracts/tests/debug.test.ts` (+2) y `compose.test.ts` (los cinco
+  casos de `/__debug/mode` con los campos, `live-debug` real con `real`/`test` y sin secretos ni prefijos en el cuerpo, producción
+  encendida en 404, y la negativa a describir un modo live); front, `mode-contract`, `mode-check`, `ModeBanner`, `StatePanel`,
+  `DebugRoot` y los marcadores nuevos del chequeo de fugas (`ACCOUNTS MISMATCH`, la etiqueta real y `stripe listen --forward-to`).
+  `npm run typecheck` limpio; `npm test` 1679 pasan y 54 se saltan (`infra/aws`, que necesita `npm ci` en `infra/aws`, pasa 7 de 7).
+- **Visto en el navegador** (Chromium sin cabeza, back en `mock` en el 8091 y front en el 3011): franja y fila "Webapp" en `mock`.
+  Los estados reales se vieron con un stub local que solo responde `/__debug/mode` con la forma de `live-debug` real (no había claves
+  de Stripe ni de Supabase en el worktree): franja real y franja de desacuerdo, de 24 px en 1280 y en 390.
+- **Pendiente:** publicar 0.5.0 (T18) y cambiar `mode-contract.ts` por la reexportación; el buzón en memoria (§16.2) sigue sin ruta
+  ni contrato.

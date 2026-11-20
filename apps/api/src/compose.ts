@@ -93,6 +93,17 @@ async function requireCatalogPrices(env: ReturnType<typeof loadEnv>, repository:
   console.warn(`[billing] ${message}; until then their checkout answers 409`);
 }
 
+/**
+ * What /__debug/mode says of the webapp (DN-13 §8.4, T19): the simulated one bills through the simulated checkout, the real one
+ * through Stripe in the key's mode. Only the mode word leaves, never the key. A live key never reaches a debug mode (loadEnv stops
+ * it), and the debug contract cannot even say `live`: were one to get here, the start is refused rather than described.
+ */
+function debugWebapp(env: ReturnType<typeof loadEnv>): { webapp: 'simulated' | 'real'; billing: 'simulated' | 'test' } {
+  if (env.webapp !== 'real') return { webapp: 'simulated', billing: 'simulated' };
+  if (env.stripeMode !== 'test') throw new Error('A debug mode runs the real webapp on a Stripe test key only (DN-13 §3.2)');
+  return { webapp: 'real', billing: 'test' };
+}
+
 /** A scan still RUNNING past this point outlived its pipeline budget: a restart cut it short. */
 export const interruptedBefore = (pipelineTimeoutMs: number) => new Date(Date.now() - pipelineTimeoutMs - 120_000).toISOString();
 
@@ -168,11 +179,12 @@ export async function compose(env: ReturnType<typeof loadEnv>,
     pipelineTimeoutMs: env.PIPELINE_TIMEOUT_MS,
     // What this process built, so the label cannot lie (DN-09 4): a key sitting in .env.local is not a service in use.
     // Enums, booleans and a model name only, never a key or a URL (DN-09 7). storageBackend is where scans and assessments
-    // live; the contract has no field for the webapp, which is simulated in memory in both of these modes.
+    // live; webapp and billing say which webapp was built and what bills it (DN-13 §8.4, T19).
     describe: { mode, sourceMode: env.sourceMode, storageBackend: env.storageBackend, websiteEvidenceProvider: evidence,
       assessmentPlanner: assessmentAgent ? 'agent' : 'rules', signalLlmModel,
       inUse: { openai: evidence === 'agentic' || evidence === 'openai' || assessmentAgent !== undefined, apify: apify !== null,
-        supabase: storageClient !== null } },
+        supabase: storageClient !== null },
+      ...debugWebapp(env) },
     // Only mock keeps its durable side in memory. Supabase is never cleared by a reset.
     clearDurableMemory: durable instanceof InMemoryRepository && durableAssessments instanceof InMemoryAssessmentRepository
       ? () => { durable.clear(); durableAssessments.clear(); } : undefined }) : undefined;
