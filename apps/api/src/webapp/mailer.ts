@@ -1,5 +1,8 @@
-/** One transactional email: one sender, one recipient (DN-13 §4.6). */
-export type EmailMessage = { from: string; to: string; subject: string; text: string; html?: string };
+/**
+ * One transactional email: one sender, one recipient (DN-13 §4.6). `idempotencyKey` names the email, not the attempt: a provider
+ * that supports it (Resend) sends a retried message once.
+ */
+export type EmailMessage = { from: string; to: string; subject: string; text: string; html?: string; idempotencyKey?: string };
 
 /** Where the back sends its own emails. Today only invitations; the sign-in codes are Supabase's (DN-13 §4.9). */
 export interface Mailer {
@@ -45,5 +48,78 @@ export class SesMailer implements Mailer {
     await this.sendEmail({ FromEmailAddress: message.from, Destination: { ToAddresses: [message.to] },
       ...(this.options.configurationSetName ? { ConfigurationSetName: this.options.configurationSetName } : {}),
       Content: { Simple: { Subject: { Data: message.subject, Charset: 'UTF-8' }, Body: body } } });
+  }
+}
+
+export const RESEND_EMAILS_URL = 'https://api.resend.com/emails';
+const RESEND_TIMEOUT_MS = 5_000;
+// Resend's error types are snake_case words (validation_error, rate_limit_exceeded); anything else is not trusted as a name.
+const RESEND_ERROR_TYPE = /^[a-z][a-z_]{0,63}$/;
+
+/**
+ * A send Resend did not accept. Its `name` is what the log prints, like the error codes of SES: Resend's error type
+ * (`validation_error`, `rate_limit_exceeded`), `resend_http_<status>` for an answer that is not Resend's JSON, or `TimeoutError` and
+ * `NetworkError` when no answer came (`status` null). The message never carries Resend's own message, which can quote the address.
+ */
+export class ResendError extends Error {
+  constructor(readonly status: number | null, name: string, message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = name;
+  }
+}
+
+/**
+ * Resend (F11), over its HTTP API with plain fetch: `POST /emails` with the API key as a Bearer token. Supabase Auth already sends
+ * its sign-in codes through Resend's SMTP from the same verified domain, arcacover.com (DN-13 §4.9, §9.1).
+ *
+ * A message with an `idempotencyKey` goes out with it as `Idempotency-Key` (Resend keeps it 24 hours), and only such a message is
+ * retried, once, with the same body, after a timeout, a network failure or a 5xx: if the first try did reach Resend, the second
+ * returns the same email instead of sending another. A 4xx, a rate limit or a spent quota is not retried.
+ */
+export class ResendMailer implements Mailer {
+  readonly timeoutMs: number;
+  private readonly fetch: typeof fetch;
+  private readonly attempts: number;
+
+  constructor(private readonly apiKey: string, options: { fetch?: typeof fetch; timeoutMs?: number; attempts?: number } = {}) {
+    this.fetch = options.fetch ?? globalThis.fetch;
+    this.timeoutMs = options.timeoutMs ?? RESEND_TIMEOUT_MS;
+    this.attempts = options.attempts ?? 2;
+  }
+
+  async send(message: EmailMessage) {
+    const headers: Record<string, string> = { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json',
+      // Resend refuses a request without one (403); the SDKs send their own.
+      'User-Agent': 'arca-api' };
+    if (message.idempotencyKey) headers['Idempotency-Key'] = message.idempotencyKey;
+    const body = JSON.stringify({ from: message.from, to: [message.to], subject: message.subject, text: message.text,
+      ...(message.html !== undefined ? { html: message.html } : {}) });
+    const attempts = message.idempotencyKey ? this.attempts : 1;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.post(headers, body);
+      } catch (error) {
+        const transient = error instanceof ResendError && (error.status === null || error.status >= 500);
+        if (!transient || attempt >= attempts) throw error;
+      }
+    }
+  }
+
+  private async post(headers: Record<string, string>, body: string): Promise<void> {
+    let response: Response;
+    try {
+      response = await this.fetch(RESEND_EMAILS_URL, { method: 'POST', headers, body, signal: AbortSignal.timeout(this.timeoutMs) });
+    } catch (error) {
+      const timedOut = error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError');
+      throw timedOut ? new ResendError(null, 'TimeoutError', `Resend did not answer within ${this.timeoutMs} ms`, { cause: error })
+        : new ResendError(null, 'NetworkError', 'Resend could not be reached', { cause: error });
+    }
+    if (response.ok) {
+      await response.text().catch(() => undefined);
+      return;
+    }
+    const type = await response.json().then((answer: unknown) => (answer as { name?: unknown } | null)?.name, () => undefined);
+    const name = typeof type === 'string' && RESEND_ERROR_TYPE.test(type) ? type : `resend_http_${response.status}`;
+    throw new ResendError(response.status, name, `Resend refused the email: ${response.status} ${name}`);
   }
 }

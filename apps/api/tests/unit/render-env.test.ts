@@ -53,4 +53,25 @@ describe.skipIf(!python)('deploy/render-env.py', () => {
     expect(lines).toContain('STRIPE_WEBHOOK_SECRET=whsec_x');
     expect(lines).toContain('WEBAPP_ENABLED=true');
   });
+
+  it('needs the Resend key only when the webapp is on and sends through Resend', () => {
+    // Off, Resend's key is not asked for, whatever the provider.
+    expect(render('ARCA_DEPLOYMENT=aws\nWEBAPP_ENABLED=false\nEMAIL_PROVIDER=resend\n', BASE).status).toBe(0);
+    // On with SES (or no provider: SES is the default), there is no key to ask for.
+    for (const provider of ['', 'EMAIL_PROVIDER=ses\n']) {
+      const result = render(`ARCA_DEPLOYMENT=aws\nWEBAPP_ENABLED=true\n${provider}`, { ...BASE, ...STRIPE });
+      expect(result.status, result.stderr).toBe(0);
+    }
+    const resend = 'ARCA_DEPLOYMENT=aws\nWEBAPP_ENABLED=true\nEMAIL_PROVIDER=resend\nEMAIL_FROM=ARCA <no-reply@arcacover.com>\n';
+    const missing = render(resend, { ...BASE, ...STRIPE });
+    expect(missing.status).toBe(4);
+    expect(missing.stderr).toContain('Missing parameters under /arca/prod: RESEND_API_KEY');
+    const none = render(resend, BASE);
+    expect(none.stderr).toContain('STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, RESEND_API_KEY');
+    const result = render(resend, { ...BASE, ...STRIPE, RESEND_API_KEY: 're_x_y' });
+    expect(result.status, result.stderr).toBe(0);
+    const lines = result.stdout.split(/\r?\n/);
+    expect(lines).toContain('RESEND_API_KEY=re_x_y');
+    expect(lines).toContain('EMAIL_FROM=ARCA <no-reply@arcacover.com>');
+  });
 });

@@ -17,7 +17,7 @@ const longDate = (iso: string) => new Date(iso).toLocaleDateString('en-US', { ti
  * who invites (their email: there is no name to show), the role, the link and when it expires.
  */
 export function invitationEmail(input: { to: string; from: string; orgName: string; inviterEmail: string; role: InvitableRole;
-  inviteUrl: string; expiresAt: string }): EmailMessage {
+  inviteUrl: string; expiresAt: string; invitationId: string }): EmailMessage {
   const org = oneLine(input.orgName), inviter = oneLine(input.inviterEmail), role = ROLE_PHRASE[input.role];
   const expires = longDate(input.expiresAt);
   const text = [
@@ -36,7 +36,9 @@ export function invitationEmail(input: { to: string; from: string; orgName: stri
     `<p>The link expires on ${expires}. You will sign in with a code we send to this address.</p>`,
     "<p>If you weren't expecting this invitation, you can ignore this email.</p>",
   ].join('\n');
-  return { from: input.from, to: input.to, subject: `You're invited to join ${org} on ARCA`, text, html };
+  // One invitation, one email: a reinvitation is a new invitation with its own id, and so its own email.
+  return { from: input.from, to: input.to, subject: `You're invited to join ${org} on ARCA`, text, html,
+    idempotencyKey: `invitation-${input.invitationId}` };
 }
 
 /**
@@ -54,7 +56,8 @@ export class MailingWebappService extends WebappService {
     try {
       const org = await this.orgView(actor, orgId);
       await this.mail.mailer.send(invitationEmail({ to: invitation.email, from: this.mail.from, orgName: org.name,
-        inviterEmail: actor.email, role: invitation.role, inviteUrl: invitation.inviteUrl!, expiresAt: invitation.expiresAt }));
+        inviterEmail: actor.email, role: invitation.role, inviteUrl: invitation.inviteUrl!, expiresAt: invitation.expiresAt,
+        invitationId: invitation.id }));
     } catch (error) {
       const reason = error instanceof Error ? error.name : 'unknown error';
       console.error(`[mail] invitation ${invitation.id} was created but its email was not sent (${reason})`);

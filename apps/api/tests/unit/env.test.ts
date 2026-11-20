@@ -257,6 +257,7 @@ describe('webapp providers (DN-13 §7.1)', () => {
     expect(() => loadEnv({ ...launch, APP_BASE_URL: 'http://arcacover.com' })).toThrow('APP_BASE_URL');
     // Invitations kept in memory would vanish: production never sends to it.
     expect(() => loadEnv({ ...launch, EMAIL_PROVIDER: 'memory' })).toThrow('EMAIL_PROVIDER');
+    expect(() => loadEnv({ ...launch, EMAIL_PROVIDER: 'memory', RESEND_API_KEY: 're_fixture_123' })).toThrow('EMAIL_PROVIDER');
     // The webapp's data lives in Supabase, next to the scans it claims.
     expect(() => loadEnv({ ...launch, STORAGE_BACKEND: 'memory' })).toThrow('STORAGE_BACKEND=supabase');
     expect(() => loadEnv({ ...launch, SUPABASE_SECRET_KEY: 'sb_publishable_fixture' })).toThrow('server secret');
@@ -305,6 +306,44 @@ describe('webapp providers (DN-13 §7.1)', () => {
     expect(() => loadEnv({ ...base, ARCA_MODE: 'mock', EMAIL_PROVIDER: 'ses' })).toThrow('EMAIL_PROVIDER');
     expect(() => loadEnv({ ...liveDebug, EMAIL_PROVIDER: 'ses' })).toThrow('EMAIL_PROVIDER');
     expect(loadEnv({ ...liveDebug, EMAIL_PROVIDER: 'memory' }).emailProvider).toBe('memory');
+  });
+
+  it('sends production\'s invitations through Resend with its API key (F11)', () => {
+    const resend = { ...launch, EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' };
+    expect(loadEnv(resend)).toMatchObject({ webapp: 'real', emailProvider: 'resend', RESEND_API_KEY: 're_fixture_123',
+      emailFrom: 'ARCA <no-reply@arcacover.com>' });
+    expect(loadEnv({ ...resend, RESEND_API_KEY: ' re_fixture_123 ' }).RESEND_API_KEY).toBe('re_fixture_123');
+    // The production guards still hold with Resend.
+    const { EMAIL_FROM: _from, ...noFrom } = resend;
+    expect(() => loadEnv(noFrom)).toThrow('EMAIL_FROM');
+    expect(() => loadEnv({ ...resend, APP_BASE_URL: 'http://arcacover.com' })).toThrow('APP_BASE_URL');
+    // SES stays the alternative, and the default when nothing is said.
+    expect(loadEnv({ ...launch, RESEND_API_KEY: 're_fixture_123' }).emailProvider).toBe('ses');
+    expect(() => loadEnv({ ...launch, EMAIL_PROVIDER: 'postmark' })).toThrow();
+  });
+
+  it('refuses Resend without its key, or with something that is not a Resend key, never printing it', () => {
+    const resend = { ...launch, EMAIL_PROVIDER: 'resend' };
+    expect(() => loadEnv(resend)).toThrow('RESEND_API_KEY is required');
+    expect(() => loadEnv({ ...resend, RESEND_API_KEY: '' })).toThrow('RESEND_API_KEY is required');
+    for (const key of ['sk_live_fixture', 'whsec_fixture', 're_', 're_with space', 'RE_fixture']) {
+      let failure: unknown;
+      try { loadEnv({ ...resend, RESEND_API_KEY: key }); } catch (error) { failure = error; }
+      expect(failure, key).toBeInstanceOf(Error);
+      expect((failure as Error).message, key).toContain('RESEND_API_KEY');
+      if (key.length > 3) expect((failure as Error).message, key).not.toContain(key);
+    }
+    // A key sitting in the environment while another provider sends is not checked, and not used.
+    expect(loadEnv({ ...liveDebug, RESEND_API_KEY: 'whatever' }).emailProvider).toBe('memory');
+  });
+
+  it('keeps the debug modes on memory, and lets only live-debug on the real providers opt into Resend', () => {
+    const real = { ...liveDebug, ...stripeTest, WEBAPP_PROVIDERS: 'real' };
+    expect(loadEnv({ ...real, RESEND_API_KEY: 're_fixture_123' }).emailProvider).toBe('memory');
+    expect(loadEnv({ ...real, EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' }).emailProvider).toBe('resend');
+    expect(() => loadEnv({ ...real, EMAIL_PROVIDER: 'resend' })).toThrow('RESEND_API_KEY');
+    expect(() => loadEnv({ ...liveDebug, EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' })).toThrow('EMAIL_PROVIDER');
+    expect(() => loadEnv({ ...base, ARCA_MODE: 'mock', EMAIL_PROVIDER: 'resend', RESEND_API_KEY: 're_fixture_123' })).toThrow('EMAIL_PROVIDER');
   });
 
   it('takes a sender with or without a display name, never a header in disguise', () => {

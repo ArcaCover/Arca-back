@@ -7,7 +7,7 @@ import type { AppUser } from '../../src/webapp/auth.js';
 import { MockBillingProvider } from '../../src/webapp/billing.js';
 import { InMemoryWebappRepository } from '../../src/webapp/in-memory.js';
 import { MailingWebappService, invitationEmail } from '../../src/webapp/invitation-email.js';
-import { MemoryMailer, SesMailer, type EmailMessage, type Mailer } from '../../src/webapp/mailer.js';
+import { MemoryMailer, RESEND_EMAILS_URL, ResendMailer, SesMailer, type EmailMessage, type Mailer } from '../../src/webapp/mailer.js';
 import { DEFAULT_PLANS } from '../../src/webapp/plans.js';
 import { WebappFailure } from '../../src/webapp/service.js';
 
@@ -50,13 +50,115 @@ describe('SesMailer', () => {
   });
 });
 
+describe('ResendMailer', () => {
+  const KEY = 're_fixture_123';
+  const keyed: EmailMessage = { ...message, idempotencyKey: 'invitation-0d9c1f9e-8b7a-4c6d-9e5f-4a3b2c1d0e0f' };
+  type Call = [string, RequestInit];
+  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+  const answering = (...responses: Array<Response | Error>) => {
+    const queue = [...responses];
+    return vi.fn(async (_url: string, _init: RequestInit) => {
+      const next = queue.shift() ?? json(200, { id: 'extra' });
+      if (next instanceof Error) throw next;
+      return next;
+    });
+  };
+  const calls = (fetch: ReturnType<typeof answering>) => fetch.mock.calls as unknown as Call[];
+
+  it('posts one email to Resend, with the key, a User-Agent and the idempotency key of the message', async () => {
+    const fetch = answering(json(200, { id: 'resend-1' }));
+    await new ResendMailer(KEY, { fetch }).send(keyed);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [url, init] = calls(fetch)[0]!;
+    expect(url).toBe('https://api.resend.com/emails');
+    expect(RESEND_EMAILS_URL).toBe(url);
+    expect(init.method).toBe('POST');
+    expect(init.headers).toEqual({ Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', 'User-Agent': 'arca-api',
+      'Idempotency-Key': keyed.idempotencyKey });
+    expect(JSON.parse(init.body as string)).toEqual({ from: FROM, to: ['new@firm.com'], subject: 'Hello', text: 'Plain', html: '<p>Plain</p>' });
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('sends text only when the message has no HTML, and no idempotency header when it has no key', async () => {
+    const fetch = answering(json(200, { id: 'resend-1' }));
+    await new ResendMailer(KEY, { fetch }).send({ ...message, html: undefined });
+    const [, init] = calls(fetch)[0]!;
+    expect(init.headers).not.toHaveProperty('Idempotency-Key');
+    expect(JSON.parse(init.body as string)).toEqual({ from: FROM, to: ['new@firm.com'], subject: 'Hello', text: 'Plain' });
+  });
+
+  it('names a refusal by Resend\'s error type, without the address, the key or Resend\'s message, and does not retry it', async () => {
+    const fetch = answering(json(422, { statusCode: 422, name: 'validation_error', message: 'Invalid `to` field: new@firm.com' }));
+    const failure = await new ResendMailer(KEY, { fetch }).send(keyed).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).name).toBe('validation_error');
+    expect((failure as { status?: number }).status).toBe(422);
+    for (const secret of ['new@firm.com', KEY]) expect(`${(failure as Error).message} ${(failure as Error).stack}`).not.toContain(secret);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    // A rate limit or a spent quota is not retried either: the retry would hit the same wall.
+    const limited = answering(json(429, { statusCode: 429, name: 'rate_limit_exceeded', message: 'Too many requests' }));
+    await expect(new ResendMailer(KEY, { fetch: limited }).send(keyed)).rejects.toMatchObject({ name: 'rate_limit_exceeded', status: 429 });
+    expect(limited).toHaveBeenCalledTimes(1);
+  });
+
+  it('names an answer that is not Resend\'s JSON by its status', async () => {
+    // Cloudflare in front of Resend answers 403 "error code: 1010" to a request without a User-Agent.
+    const fetch = answering(new Response('error code: 1010', { status: 403 }));
+    await expect(new ResendMailer(KEY, { fetch }).send(keyed)).rejects.toMatchObject({ name: 'resend_http_403', status: 403 });
+    const odd = answering(json(400, { name: 'Bcc: x@y.co\r\n' }));
+    await expect(new ResendMailer(KEY, { fetch: odd }).send(keyed)).rejects.toMatchObject({ name: 'resend_http_400' });
+  });
+
+  it('retries a server error once with the same body and idempotency key, so Resend sends it at most once', async () => {
+    const fetch = answering(json(500, { statusCode: 500, name: 'application_error', message: 'x' }), json(200, { id: 'resend-1' }));
+    await new ResendMailer(KEY, { fetch }).send(keyed);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    const [first, second] = calls(fetch);
+    expect(second![1].body).toBe(first![1].body);
+    expect((second![1].headers as Record<string, string>)['Idempotency-Key']).toBe(keyed.idempotencyKey);
+
+    const down = answering(json(503, { name: 'service_unavailable' }), json(503, { name: 'service_unavailable' }));
+    await expect(new ResendMailer(KEY, { fetch: down }).send(keyed)).rejects.toMatchObject({ name: 'service_unavailable', status: 503 });
+    expect(down).toHaveBeenCalledTimes(2);
+  });
+
+  it('never retries a message without an idempotency key: the first try may have been sent', async () => {
+    const fetch = answering(json(500, { name: 'application_error' }), json(200, { id: 'resend-1' }));
+    await expect(new ResendMailer(KEY, { fetch }).send(message)).rejects.toMatchObject({ name: 'application_error' });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up on a Resend that does not answer in time, and on one it cannot reach', async () => {
+    const hanging = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init.signal!.addEventListener('abort', () => reject(init.signal!.reason));
+    }));
+    const started = Date.now();
+    await expect(new ResendMailer(KEY, { fetch: hanging, timeoutMs: 20 }).send(keyed)).rejects.toMatchObject({ name: 'TimeoutError', status: null });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    // The retry carries the same key: if the first try did reach Resend, the second sends nothing new.
+    expect(hanging).toHaveBeenCalledTimes(2);
+
+    const unreachable = answering(new TypeError('fetch failed'), new TypeError('fetch failed'));
+    await expect(new ResendMailer(KEY, { fetch: unreachable }).send(keyed)).rejects.toMatchObject({ name: 'NetworkError', status: null });
+    expect(unreachable).toHaveBeenCalledTimes(2);
+    const recovered = answering(new TypeError('fetch failed'), json(200, { id: 'resend-1' }));
+    await expect(new ResendMailer(KEY, { fetch: recovered }).send(keyed)).resolves.toBeUndefined();
+  });
+
+  it('defaults to a short timeout', () => {
+    expect(new ResendMailer(KEY).timeoutMs).toBeLessThanOrEqual(10_000);
+  });
+});
+
 describe('the invitation email (DN-13 §4.6)', () => {
   const invite = { to: 'new@firm.com', from: FROM, orgName: 'Robust Law LLP', inviterEmail: 'owner@firm.com', role: 'admin' as const,
-    inviteUrl: `${APP}/app/invite/tok_abc`, expiresAt: '2026-11-25T12:00:00.000Z' };
+    inviteUrl: `${APP}/app/invite/tok_abc`, expiresAt: '2026-11-25T12:00:00.000Z', invitationId: 'inv-1' };
 
   it('names the organization, who invites and the role, and carries the link and its expiry', () => {
     const email = invitationEmail(invite);
     expect(email).toMatchObject({ from: FROM, to: 'new@firm.com', subject: "You're invited to join Robust Law LLP on ARCA" });
+    // One invitation, one email: a retried send of the same invitation carries the same key.
+    expect(email.idempotencyKey).toBe('invitation-inv-1');
     expect(email.text).toContain('owner@firm.com invited you to join Robust Law LLP on ARCA as an admin.');
     expect(email.text).toContain(`${APP}/app/invite/tok_abc`);
     expect(email.text).toContain('November 25, 2026');
@@ -97,8 +199,25 @@ describe('MailingWebappService', () => {
     expect(Object.keys(view).sort()).toEqual(['email', 'expiresAt', 'id', 'inviteUrl', 'role']);
     expect(view.inviteUrl).toMatch(/^https:\/\/arcacover\.com\/app\/invite\/[A-Za-z0-9_-]{43}$/);
     expect(mailer.sent).toEqual([invitationEmail({ to: 'new@firm.com', from: FROM, orgName: 'Robust Law LLP', inviterEmail: 'owner@firm.com',
-      role: 'member', inviteUrl: view.inviteUrl!, expiresAt: view.expiresAt })]);
+      role: 'member', inviteUrl: view.inviteUrl!, expiresAt: view.expiresAt, invitationId: view.id })]);
+    expect(mailer.sent[0]!.idempotencyKey).toBe(`invitation-${view.id}`);
     expect(await repository.listInvitations(orgId)).toHaveLength(1);
+  });
+
+  it('keeps the invitation when Resend refuses the email, and logs only the invitation id and Resend\'s error type', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const fetch = vi.fn(async (_url: string, _init: RequestInit) => new Response(JSON.stringify({ statusCode: 403, name: 'validation_error',
+      message: 'The arcacover.com domain is not verified. new@firm.com' }), { status: 403 }));
+    const { repository, service, orgId } = await paidOrganization(new ResendMailer('re_fixture_123', { fetch }));
+    const view = await service.invite(owner, orgId, { email: 'new@firm.com', role: 'member' });
+    expect(view.inviteUrl).toBeDefined();
+    expect((await repository.listInvitations(orgId)).map(invitation => invitation.id)).toEqual([view.id]);
+    const sent = JSON.parse((fetch.mock.calls[0]![1] as RequestInit).body as string) as { text: string };
+    expect(sent.text).toContain(view.inviteUrl!);
+    expect((fetch.mock.calls[0]![1] as RequestInit).headers).toMatchObject({ 'Idempotency-Key': `invitation-${view.id}` });
+    expect(error).toHaveBeenCalledTimes(1);
+    const logged = error.mock.calls.flat().map(String).join(' ');
+    expect(logged).toBe(`[mail] invitation ${view.id} was created but its email was not sent (validation_error)`);
   });
 
   it('keeps the invitation when the email cannot be sent, and logs no address or link', async () => {

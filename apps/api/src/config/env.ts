@@ -46,9 +46,12 @@ const EnvSchema = z.object({
   STRIPE_WEBHOOK_SECRET: z.preprocess(blankAsUnset, z.string().trim().optional()),
   // Lets production run on a test key, for a rehearsal on the host before the launch. It never lets a live key run elsewhere.
   STRIPE_ALLOW_TEST_MODE: z.preprocess(blankAsUnset, z.enum(['true', 'false']).default('false')),
-  // How the back sends its own emails (invitations, DN-13 §4.6). memory keeps them in the process; ses is production's.
-  EMAIL_PROVIDER: z.preprocess(blankAsUnset, z.enum(['memory', 'ses']).optional()),
+  // How the back sends its own emails (invitations, DN-13 §4.6). memory keeps them in the process (the debug modes' default);
+  // resend sends through Resend's API (production's, F11), ses through Amazon SES (the alternative, and production's default).
+  EMAIL_PROVIDER: z.preprocess(blankAsUnset, z.enum(['memory', 'ses', 'resend']).optional()),
   EMAIL_FROM: z.preprocess(blankAsUnset, z.string().trim().optional()),
+  // Resend's API key (re_…), read only with EMAIL_PROVIDER=resend. In production it lives in SSM, /arca/prod/RESEND_API_KEY.
+  RESEND_API_KEY: z.preprocess(blankAsUnset, z.string().trim().optional()),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
   // Actor runs in flight at once, across every scan. The account allows 32 jobs and 64 GB, and each
   // directory run takes 1 GB: 16 lets Bar and Avvo each run 8 lookups at once, half the account.
@@ -178,7 +181,7 @@ export function stripeKeyMode(key: string): 'live' | 'test' {
 /**
  * Which webapp this process serves (DN-13 §3.2, §7.1): none (production's 501), the simulated one (memory, MockAppAuth,
  * MockBillingProvider) or the real one (Supabase, Stripe, a real mailer). Every combination that would mix them, or put a live
- * key where it does not belong, stops the start.
+ * key where it does not belong, stops the start. SES also needs a sender in the seam, which compose checks (RealWebappAdapters).
  */
 function webappProviders(env: z.infer<typeof EnvSchema>, mode: z.infer<typeof EnvSchema>['ARCA_MODE'], storageBackend: 'memory' | 'supabase') {
   const keyMode = env.STRIPE_SECRET_KEY === undefined ? null : stripeKeyMode(env.STRIPE_SECRET_KEY);
@@ -200,6 +203,11 @@ function webappProviders(env: z.infer<typeof EnvSchema>, mode: z.infer<typeof En
   if (webapp === 'simulated' && emailProvider !== 'memory') {
     throw new Error(`EMAIL_PROVIDER=${emailProvider} needs the real webapp: the simulated one keeps its emails in memory`);
   }
+  if (emailProvider === 'resend') {
+    if (!env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is required with EMAIL_PROVIDER=resend');
+    // Never echoes the value: a key typed into the wrong variable is still a secret.
+    if (!/^re_[A-Za-z0-9_-]+$/.test(env.RESEND_API_KEY)) throw new Error('RESEND_API_KEY must be a Resend API key (re_…)');
+  }
   if (webapp === 'real') {
     if (storageBackend !== 'supabase') {
       throw new Error('The real webapp keeps its data in Supabase, next to the scans it claims: it requires STORAGE_BACKEND=supabase');
@@ -211,7 +219,9 @@ function webappProviders(env: z.infer<typeof EnvSchema>, mode: z.infer<typeof En
       if (keyMode === 'test' && env.STRIPE_ALLOW_TEST_MODE !== 'true') {
         throw new Error('Production refuses a Stripe test key: set STRIPE_ALLOW_TEST_MODE=true only for a rehearsal on the host');
       }
-      if (emailProvider !== 'ses') throw new Error('EMAIL_PROVIDER=memory would drop every invitation email: production sends with ses');
+      if (emailProvider === 'memory') {
+        throw new Error('EMAIL_PROVIDER=memory would drop every invitation email: production sends with resend (or ses)');
+      }
       if (env.EMAIL_FROM === undefined) throw new Error('EMAIL_FROM is required when production switches the webapp on');
       // The default is the local front: invitation links and Stripe's return URLs would send customers to localhost.
       if (!/^https:\/\//i.test(env.APP_BASE_URL)) {
