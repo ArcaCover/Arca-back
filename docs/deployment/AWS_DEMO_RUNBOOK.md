@@ -176,7 +176,11 @@ The stack change is not deployed by a merge to `main`; it needs, in this order:
    ```
 
 2. `cdk diff` and `cdk deploy` as in step 3. They add the log group, the host's permission to
-   write to it, the filters, the alarms and the topic; the host is not replaced.
+   write to it, the filters, the alarms and the topic; the host is not replaced, because its image
+   is pinned (`HOST_AMI_ID` in `infra/aws/lib/arca-demo-stack.ts`). Before that pin, the stack asked
+   for the latest Amazon Linux 2023 image at every deploy, and `cdk diff` on 2026-11-27 showed it
+   would replace the host. If `cdk diff` ever shows `AWS::EC2::Instance ... replace`, stop: a
+   replacement takes the API down, deletes the host's disk and needs the image deployed again.
 3. The **next** activation of the API (a merge to `main`, or the workflow with `image_tag` set to
    the SHA already deployed) finds the log group and passes `deploy/compose.cloudwatch.yaml` to
    compose: from then on the API logs to CloudWatch. Until the group is reachable, `activate.sh`

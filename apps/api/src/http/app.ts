@@ -26,6 +26,8 @@ export type AppDeps = {
   clientIp: (request: Request) => string;
   assessmentRepository?: AssessmentRepository; assessmentAgent?: AssessmentAgent; assessmentPlanningTimeoutMs?: number;
   assessmentMaxWritesPerMinute?: number;
+  /** Layer 2's bank for new assessments; the default is the demo bank the older tests drive (compose.ts passes the env's). */
+  assessmentEngine?: 'underwriting' | 'demo'; underwritingBookingUrl?: string;
   limiter?: ScanLimiter; now?: () => number; scanCacheTtlMs?: number; partialRepairCooldownMs?: number;
   /** Turns the report's HTML into a PDF. Without it the report endpoint answers 503. */
   renderReport?: (html: string) => Promise<Uint8Array<ArrayBuffer>>;
@@ -206,7 +208,10 @@ export function createApp(deps: AppDeps) {
   if (!assessmentRepository) throw new Error('An assessment repository is required with durable scan storage');
   const assessments = new AssessmentService({ repository: assessmentRepository, now, agent: deps.assessmentAgent,
     agentFor: debug ? scanId => debug.assessmentAgentFor(scanId) : undefined,
-    planningTimeoutMs: deps.assessmentPlanningTimeoutMs, maxWritesPerMinute: deps.assessmentMaxWritesPerMinute });
+    planningTimeoutMs: deps.assessmentPlanningTimeoutMs, maxWritesPerMinute: deps.assessmentMaxWritesPerMinute,
+    engine: deps.assessmentEngine ?? 'demo',
+    // The debug modes keep the underwriter's audit in the result, for the State panel; production never sends it to a firm.
+    underwriting: { bookingUrl: deps.underwritingBookingUrl, exposeAudit: !!debug } });
   app.route('/', assessmentRoutes({ scans: deps.repository, repository: assessmentRepository, service: assessments, sessionSecret: deps.sessionSecret,
     renderReport: deps.renderReport, reportFault: debug ? scanId => debug.reportFault(scanId) : undefined }));
   // The webapp's own limits (DN-13 §7.4), which the debug reset forgets with the scan limiter's.

@@ -35,6 +35,11 @@ const encoded = (relativePath: string) => Buffer.from(readFileSync(path.join(rep
 export const SECRETS_PATH = '/arca/prod';
 export const GITHUB_DEPLOY_ROLE_NAME = 'arca-github-deploy';
 // The API container's logs (Docker's awslogs driver, deploy/compose.cloudwatch.yaml). deploy/activate.sh names it too.
+// The host's Amazon Linux 2023 image, pinned. "The latest image" resolves at every deploy, and a newer one replaces the
+// instance: the API goes down, the host's disk is deleted and the image has to be deployed again. Moving to a newer image
+// is a deliberate change of this id, which replaces the host on the next cdk deploy.
+export const HOST_AMI_ID = 'ami-065101b35d4f06f41';
+
 export const API_LOG_GROUP_NAME = '/arca/api';
 export const BILLING_METRIC_NAMESPACE = 'ARCA/Billing';
 
@@ -138,7 +143,7 @@ export class ArcaDemoStack extends cdk.Stack {
       vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM),
-      machineImage: ec2.MachineImage.latestAmazonLinux2023({ cpuType: ec2.AmazonLinuxCpuType.X86_64 }),
+      machineImage: ec2.MachineImage.genericLinux({ 'us-east-1': HOST_AMI_ID }),
       securityGroup,
       role,
       userData,

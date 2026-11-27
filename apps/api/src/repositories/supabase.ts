@@ -1,5 +1,6 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
+import { LAYER1_SCORING_VERSION } from '@arca/scoring';
 import { ACTIVE_APIFY_STATUSES, RAW_MARKER, SPEND_CEILING_STATUS } from './types.js';
 import type { ScanRepository, ScanRecord, RawRecord, RawReference, ReserveApifyRun, ApifyRunReservation, ApifyRunRecord,
   ApifyRunUpdate, ApifySpendRecord } from './types.js';
@@ -48,6 +49,8 @@ export class SupabaseRepository implements ScanRepository {
     const { data, error } = await this.client.from('scans').select('*').eq('canonical_domain', domain)
       .eq('cached', false).in('status', ['COMPLETED', 'PARTIAL']).gte('completed_at', since)
       .eq('result->meta->>contractVersion', LAYER1_CONTRACT_VERSION)
+      // A scan scored under other rules is not reused, even inside its seven days (DN-14 §3 decision 14).
+      .eq('result->meta->>scoringVersion', LAYER1_SCORING_VERSION)
       .order('completed_at', { ascending: false }).limit(1).maybeSingle();
     if (error) throw new Error('Unable to read cache', { cause: error });
     return data;

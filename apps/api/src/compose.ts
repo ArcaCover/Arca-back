@@ -212,7 +212,7 @@ export async function compose(env: ReturnType<typeof loadEnv>,
     webapp: webapp && { service: webapp.service, auth: webapp.auth },
     pipeline: new InProcessPipeline({ ...sources, repository, timeoutMs: env.PIPELINE_TIMEOUT_MS }),
     sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
-    renderReport: renderPdf,
+    renderReport: renderPdf, assessmentEngine: env.ASSESSMENT_ENGINE, underwritingBookingUrl: env.UNDERWRITING_BOOKING_URL,
     scanCacheTtlMs: env.SCAN_CACHE_TTL_MS, partialRepairCooldownMs: env.SCAN_PARTIAL_REPAIR_COOLDOWN_MS,
     clientIp: request => clientIps.get(request) ?? 'unknown' });
   // `overridden` also lists defaults mock replaced, so it says what changed, not what was set.

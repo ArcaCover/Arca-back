@@ -23,7 +23,7 @@ describe('three-source orchestration', () => {
     const start = Date.now();
     const result = await pipeline.run({ scanId: 'sc_mock', canonicalDomain: 'robust.arca.example', email: 'owner@robust.arca.example' });
     expect(result.status).toBe('COMPLETED');
-    expect(result.result.preScore.total).toBe(82);
+    expect(result.result.preScore.total).toBe(86.29);
     expect(result.result.preScore.confidence).toBe('HIGH');
     expect(repository.raw.map(record => record.source).sort()).toEqual(['avvo', 'bar', 'website']);
     expect(repository.raw.every(record => /^[a-f0-9]{64}$/.test(record.content_hash))).toBe(true);
@@ -222,8 +222,8 @@ describe('three-source orchestration', () => {
     const pipeline = new InProcessPipeline({ ...mockSources(), repository: new InMemoryRepository() });
     const minimal = await pipeline.run({ scanId: 'sc_minimal', canonicalDomain: 'minimal.arca.example', email: 'owner@minimal.arca.example' });
     const sanctioned = await pipeline.run({ scanId: 'sc_sanctioned', canonicalDomain: 'sanctioned.arca.example', email: 'owner@sanctioned.arca.example' });
-    expect(minimal.result.preScore.total).toBe(25);
-    expect(sanctioned.result.preScore.total).toBe(72);
+    expect(minimal.result.preScore.total).toBe(24.83);
+    expect(sanctioned.result.preScore.total).toBe(74.62);
     expect(sanctioned.result.preScore.decision).toBe('REFERRAL_SENIOR');
   });
   it('returns the same domain assessment for corporate and personal requesters', async () => {
