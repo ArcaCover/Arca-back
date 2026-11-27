@@ -60,7 +60,9 @@ services:
     mem_limit: 384m
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "arca"]
+      # Over TCP: during the first boot the entrypoint runs a socket-only server for the init scripts, and a socket check
+      # would call it healthy while 00-roles.sh is still migrating.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "arca"]
       interval: 10s
       timeout: 3s
       retries: 10

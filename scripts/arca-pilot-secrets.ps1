@@ -39,10 +39,13 @@ function New-ServiceRoleJwt([string]$secret) {
   return "$header.$payload.$signature"
 }
 function Test-Parameter([string]$name) {
+  # Windows PowerShell turns aws's stderr into a terminating error under Stop; the exit code says what happened.
+  $ErrorActionPreference = 'Continue'
   aws ssm get-parameter --profile $AwsProfile --region $Region --name "$path/$name" --query Parameter.Name --output text 2>$null | Out-Null
   return $LASTEXITCODE -eq 0
 }
 function Set-Parameter([string]$name, [string]$value, [switch]$Always) {
+  $ErrorActionPreference = 'Continue'
   if (-not $Always -and -not $Force -and (Test-Parameter $name)) { Write-Host "  kept    $path/$name (already set; -Force replaces it)"; return }
   # The value goes through a temporary file, never the command line, so it shows in no process list or history.
   $file = New-TemporaryFile
@@ -61,6 +64,7 @@ function Read-Key([string]$name) {
   return $plain.Trim()
 }
 function Get-ProdKey([string]$name) {
+  $ErrorActionPreference = 'Continue'
   $value = aws ssm get-parameter --profile $AwsProfile --region $Region --name "/arca/prod/$name" --with-decryption --query Parameter.Value --output text
   if ($LASTEXITCODE -ne 0 -or -not $value) { throw "Could not read /arca/prod/$name" }
   return $value
