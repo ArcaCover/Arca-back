@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
-import { API_LOG_GROUP_NAME, ArcaDemoStack, BILLING_ALARMS } from './arca-demo-stack.js';
+import { API_LOG_GROUP_NAME, ArcaDemoStack, BILLING_ALARMS, HOST_AMI_ID } from './arca-demo-stack.js';
 
 const template = () => Template.fromStack(new ArcaDemoStack(new cdk.App(), 'TestStack', {
   env: { account: '111111111111', region: 'us-east-1' },
@@ -24,6 +24,12 @@ describe('AWS demo infrastructure', () => {
     output.hasResourceProperties('AWS::EC2::LaunchTemplate', {
       LaunchTemplateData: { MetadataOptions: { HttpTokens: 'required' } },
     });
+  });
+
+  it('pins the host image, so a newer Amazon Linux release never replaces the host on a deploy', () => {
+    const output = template();
+    output.hasResourceProperties('AWS::EC2::Instance', { ImageId: HOST_AMI_ID });
+    expect(JSON.stringify(output.toJSON().Parameters ?? {})).not.toContain('ami-amazon-linux');
   });
 
   it('exposes only web ports and retains the scanned ECR repository', () => {
