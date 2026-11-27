@@ -44,3 +44,26 @@
 		import api
 	}
 }
+
+# Pilot (live-debug, deploy/pilot): its own API container, reached over the arca-edge network. The API itself refuses every
+# request without the pilot access token, so this block adds no authentication of its own.
+{$PILOT_HOSTNAME} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		X-Robots-Tag "noindex, nofollow"
+		-Server
+	}
+
+	request_body {
+		max_size 32KB
+	}
+	reverse_proxy api-pilot:8080 {
+		health_uri /health
+		health_interval 15s
+		health_timeout 3s
+	}
+}

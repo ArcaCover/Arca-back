@@ -25,6 +25,18 @@ function render(productionEnv: string, secrets: Record<string, string>) {
 }
 
 describe.skipIf(!python)('deploy/render-env.py', () => {
+  it('renders pilot from /arca/pilot with its own secrets, and refuses a short access token (DN-14 §5)', () => {
+    const pilot = { SUPABASE_SECRET_KEY: 'jwt', SESSION_TOKEN_SECRET: 's'.repeat(40), APIFY_API_TOKEN: 'apify_x', OPENAI_API_KEY: 'sk-x',
+      PILOT_ACCESS_TOKEN: 't'.repeat(36), POSTGRES_PASSWORD: 'p', AUTHENTICATOR_PASSWORD: 'a', PGRST_JWT_SECRET: 'j'.repeat(64) };
+    const env = ['ARCA_DEPLOYMENT=aws-pilot', 'ARCA_MODE=live-debug', ''].join('\n');
+    const ok = render(env, pilot);
+    expect(ok.status).toBe(0);
+    expect(ok.stdout).toContain('PILOT_ACCESS_TOKEN=');
+    const missing = render(env, { ...pilot, PGRST_JWT_SECRET: '' });
+    expect(missing.status).not.toBe(0);
+    expect(missing.stderr).toContain('/arca/pilot');
+    expect(render(env, { ...pilot, PILOT_ACCESS_TOKEN: 'short' }).stderr).toContain('at least 32');
+  });
   it('needs no Stripe secret while the webapp is off', () => {
     for (const env of ['ARCA_DEPLOYMENT=aws\n', 'ARCA_DEPLOYMENT=aws\nWEBAPP_ENABLED=false\n']) {
       const result = render(env, BASE);

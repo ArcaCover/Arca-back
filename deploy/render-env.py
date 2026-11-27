@@ -11,6 +11,9 @@ import re
 import sys
 
 REQUIRED_SECRETS = ("SUPABASE_URL", "SUPABASE_SECRET_KEY", "SESSION_TOKEN_SECRET", "APIFY_API_TOKEN", "DOCS_AUTH_HASH")
+# Pilot (deploy/pilot/pilot.env, ARCA_DEPLOYMENT=aws-pilot): its own database's secrets and the access token, under /arca/pilot.
+PILOT_SECRETS = ("SUPABASE_SECRET_KEY", "SESSION_TOKEN_SECRET", "APIFY_API_TOKEN", "PILOT_ACCESS_TOKEN",
+                 "POSTGRES_PASSWORD", "AUTHENTICATOR_PASSWORD", "PGRST_JWT_SECRET")
 BCRYPT = re.compile(r"^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$")
 KEY = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
@@ -45,7 +48,9 @@ def main():
             fail(f"Parameter {parameter['Name']} is not named after an environment variable")
         secrets[key] = parameter["Value"]
 
-    required = list(REQUIRED_SECRETS)
+    pilot = settings.get("ARCA_DEPLOYMENT") == "aws-pilot"
+    path = "/arca/pilot" if pilot else "/arca/prod"
+    required = list(PILOT_SECRETS if pilot else REQUIRED_SECRETS)
     # Every extraction but 'rules' runs on OpenAI, and the API refuses to start without its key;
     # name the missing key here instead of leaving an unhealthy container to explain it.
     if settings.get("WEBSITE_EVIDENCE_PROVIDER", "agentic") != "rules":
@@ -58,12 +63,14 @@ def main():
             required.append("RESEND_API_KEY")
     missing = [key for key in required if not secrets.get(key)]
     if missing:
-        fail("Missing parameters under /arca/prod: " + ", ".join(missing))
+        fail(f"Missing parameters under {path}: " + ", ".join(missing))
     overlap = sorted(set(secrets) & (set(settings) | {"ARCA_IMAGE"}))
     if overlap:
-        fail("Defined both in production.env and in /arca/prod, keep one: " + ", ".join(overlap))
+        fail(f"Defined both in the env file and in {path}, keep one: " + ", ".join(overlap))
     # An unusable hash reaches Caddy truncated and leaves /docs open, so refuse the deploy instead.
-    if not BCRYPT.match(secrets["DOCS_AUTH_HASH"]):
+    if pilot and len(secrets["PILOT_ACCESS_TOKEN"]) < 32:
+        fail("/arca/pilot/PILOT_ACCESS_TOKEN must be at least 32 characters")
+    if not pilot and not BCRYPT.match(secrets["DOCS_AUTH_HASH"]):
         fail("/arca/prod/DOCS_AUTH_HASH must be the bcrypt hash printed by `caddy hash-password`")
 
     merged = {"ARCA_IMAGE": sys.argv[2], **settings, **secrets}

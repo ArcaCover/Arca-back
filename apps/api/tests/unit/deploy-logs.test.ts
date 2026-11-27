@@ -51,7 +51,8 @@ describe('API logs to CloudWatch (DN-13 §9.5, T26)', () => {
     expect(probe).toBeLessThan(script.indexOf('docker compose "${files[@]}" --env-file .env.demo config'));
     // The region the override interpolates travels in the rendered environment, before it replaces .env.demo.
     expect(script).toMatch(/printf 'ARCA_AWS_REGION=%s\\n' "\$region" >> "\$rendered"/);
-    expect(script.indexOf('ARCA_AWS_REGION')).toBeLessThan(script.indexOf('mv -f "$rendered"'));
+    // Production's own move: the pilot branch of activate.sh, above it, moves its own file.
+    expect(script.indexOf('ARCA_AWS_REGION')).toBeLessThan(script.indexOf('mv -f "$rendered" "$root/.env.demo"'));
   });
 
   it('ships the override inside the image, with the rest of the deploy payload', () => {

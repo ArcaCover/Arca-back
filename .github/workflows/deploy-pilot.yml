@@ -1,0 +1,112 @@
+# Deploys the pilot branch (live-debug, DN-14 §5) to the pilot project on the ARCA host: same ECR repository and the same
+# host bootstrap as production, but an image built with ARCA_TARGET=pilot, whose activate.sh only touches the arca-pilot
+# Compose project and reads /arca/pilot. Needs the stack's pilot permissions (cdk deploy of infra/aws) and the secrets of
+# scripts/arca-pilot-secrets.ps1; until then the deploy step fails at the role or at render-env.py, and production is untouched.
+name: Deploy pilot
+
+on:
+  push:
+    branches: [pilot]
+    paths:
+      - 'apps/**'
+      - 'packages/**'
+      - 'deploy/**'
+      - 'supabase/migrations/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig*.json'
+      - '.github/workflows/deploy-pilot.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-pilot
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: ArcaDemoStack
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run typecheck
+      - run: npm test
+
+  deploy:
+    needs: test
+    if: vars.AWS_DEPLOY_ROLE_ARN != '' && github.ref == 'refs/heads/pilot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: deploy-pilot-${{ github.run_id }}
+
+      - name: Read the stack outputs
+        id: stack
+        run: |
+          output() {
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+          }
+          echo "repository=$(output EcrRepositoryUri)" >> "$GITHUB_OUTPUT"
+          echo "instance=$(output InstanceId)" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push the pilot image
+        id: image
+        env:
+          REPOSITORY: ${{ steps.stack.outputs.repository }}
+        run: |
+          # Never the commit SHA: pilot and main often point at the same commit, and a pilot image under production's tag
+          # would be what a production rollback pulls. The host's bootstrap accepts only hex tags, so this is a hash too.
+          tag=$(printf 'pilot-%s' "$GITHUB_SHA" | sha1sum | cut -c1-40)
+          image="$REPOSITORY:$tag"
+          docker build --build-arg ARCA_TARGET=pilot --build-arg "VCS_REF=$GITHUB_SHA" \
+            --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -t "$image" .
+          docker push "$image"
+          echo "uri=$image" >> "$GITHUB_OUTPUT"
+          echo "Deploying pilot $image" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Activate the image on the host
+        env:
+          IMAGE: ${{ steps.image.outputs.uri }}
+          INSTANCE: ${{ steps.stack.outputs.instance }}
+        run: |
+          parameters=$(jq -cn --arg command "/opt/arca/deploy/deploy-image.sh '$IMAGE' '$AWS_REGION'" \
+            '{commands: [$command], executionTimeout: ["900"]}')
+          command_id=$(aws ssm send-command --instance-ids "$INSTANCE" --document-name AWS-RunShellScript \
+            --comment "Deploy pilot ${IMAGE##*:}" --parameters "$parameters" --query Command.CommandId --output text)
+          status=Pending
+          for _ in $(seq 1 180); do
+            sleep 5
+            status=$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in Pending|InProgress|Delayed) ;; *) break ;; esac
+          done
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text
+          if [ "$status" != Success ]; then echo "::error::Activation ended as $status"; exit 1; fi
+
+      - name: Check the pilot health endpoint
+        run: curl --fail --silent --show-error --retry 10 --retry-delay 6 --retry-all-errors "https://api-pilot.arcacover.com/health"

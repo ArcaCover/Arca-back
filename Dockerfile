@@ -45,6 +45,11 @@ COPY --from=build /app/packages/questions/dist ./packages/questions/dist
 # The deployment payload travels with the image it deploys: the host extracts it at deploy time,
 # so a rollback also restores that commit's compose file, Caddyfile and configuration.
 COPY compose.yaml deploy/Caddyfile deploy/production.env deploy/activate.sh deploy/render-env.py deploy/compose.cloudwatch.yaml ./deploy-payload/
+# Pilot's compose files and the migrations its local database applies; `target` tells activate.sh which one to run.
+ARG ARCA_TARGET=production
+COPY deploy/pilot ./deploy-payload/pilot
+COPY supabase/migrations ./deploy-payload/pilot/migrations
+RUN case "$ARCA_TARGET" in production|pilot) echo "$ARCA_TARGET" > ./deploy-payload/target ;; *) echo "ARCA_TARGET must be production or pilot" >&2; exit 1 ;; esac
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends dumb-init \

@@ -209,6 +209,15 @@ describe('ARCA_MODE', () => {
     expect(loadEnv({ ...base, SOURCE_MODE: 'mock', STORAGE_BACKEND: 'memory', ARCA_DEPLOYMENT: 'aws' })).toMatchObject({ mode: 'production' });
     expect(loadEnv({ ...base, ...database, ...liveKeys, ARCA_MODE: 'production', ARCA_DEPLOYMENT: 'aws' })).toMatchObject({ mode: 'production' });
   });
+  it('runs live-debug in the pilot deployment only, and only behind a long access token', () => {
+    const pilot = { ...base, ...database, ...liveKeys, ARCA_MODE: 'live-debug', ARCA_DEPLOYMENT: 'aws-pilot' };
+    expect(() => loadEnv(pilot)).toThrow(/PILOT_ACCESS_TOKEN/);
+    expect(() => loadEnv({ ...pilot, PILOT_ACCESS_TOKEN: 'short' })).toThrow(/PILOT_ACCESS_TOKEN/);
+    expect(loadEnv({ ...pilot, PILOT_ACCESS_TOKEN: 'x'.repeat(32) })).toMatchObject({ mode: 'live-debug' });
+    expect(() => loadEnv({ ...base, ARCA_MODE: 'mock', ARCA_DEPLOYMENT: 'aws-pilot', PILOT_ACCESS_TOKEN: 'x'.repeat(32) })).toThrow(/aws-pilot/);
+    expect(() => loadEnv({ ...base, ...database, ...liveKeys, ARCA_DEPLOYMENT: 'aws-pilot', PILOT_ACCESS_TOKEN: 'x'.repeat(32) })).toThrow(/aws-pilot/);
+    expect(listenHostname('live-debug', true)).toBeUndefined();
+  });
   it('listens on loopback only in debug modes', () => {
     expect(listenHostname('mock')).toBe('127.0.0.1');
     expect(listenHostname('live-debug')).toBe('127.0.0.1');

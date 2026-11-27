@@ -51,7 +51,7 @@ describe('AWS demo infrastructure', () => {
     expect(userData).not.toContain('.env.demo');
   });
 
-  it('lets only the main branch of one repository assume the GitHub deploy role', () => {
+  it('lets only the main and pilot branches of one repository assume the GitHub deploy role', () => {
     const output = template();
     output.resourceCountIs('AWS::IAM::OIDCProvider', 1);
     output.hasResourceProperties('AWS::IAM::Role', {
@@ -61,10 +61,12 @@ describe('AWS demo infrastructure', () => {
         Action: 'sts:AssumeRoleWithWebIdentity',
         Condition: { StringEquals: {
           'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-          // Classic and immutable subject formats, both pinned to main of this one repository.
+          // Classic and immutable subject formats, pinned to main (production) and pilot of this one repository.
           'token.actions.githubusercontent.com:sub': [
             'repo:ArcaCover/Arca-back:ref:refs/heads/main',
+            'repo:ArcaCover/Arca-back:ref:refs/heads/pilot',
             'repo:ArcaCover@317962260/Arca-back@1341243286:ref:refs/heads/main',
+            'repo:ArcaCover@317962260/Arca-back@1341243286:ref:refs/heads/pilot',
           ],
         } },
       })] },

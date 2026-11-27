@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { randomUUID } from 'node:crypto';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
@@ -20,6 +21,8 @@ import type { AppAuth } from '../webapp/auth.js';
 import { notConfiguredWebapp, webappRoutes } from '../webapp/routes.js';
 import type { WebappService } from '../webapp/service.js';
 
+/** The header that carries pilot's access token. */
+export const PILOT_TOKEN_HEADER = 'X-Arca-Pilot-Token';
 export type AppDeps = {
   pipeline: Layer1Pipeline; repository: ScanRepository; sessionSecret: string; corsOrigins: string[];
   domainResolver: DomainResolver;
@@ -29,6 +32,8 @@ export type AppDeps = {
   limiter?: ScanLimiter; now?: () => number; scanCacheTtlMs?: number; partialRepairCooldownMs?: number;
   /** Turns the report's HTML into a PDF. Without it the report endpoint answers 503. */
   renderReport?: (html: string) => Promise<Uint8Array<ArrayBuffer>>;
+  /** Pilot only: every request but /health and CORS preflights must carry it in X-Arca-Pilot-Token (DN-14 §5). */
+  pilotAccessToken?: string;
   /** Debug modes only. Without it there is no /__debug route, the scenario header is never read and CORS refuses it. */
   debug?: DebugTools;
   /**
@@ -48,13 +53,23 @@ export function createApp(deps: AppDeps) {
   const inFlightByDomain = new Map<string, Promise<PipelineResult>>();
   app.use('*', cors({ origin: origin => deps.corsOrigins.includes(origin) ? origin : null,
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowHeaders: debug ? ['Content-Type', 'Authorization', DEBUG_SCENARIO_HEADER, DEBUG_REQUEST_HEADER] : ['Content-Type', 'Authorization'],
+    allowHeaders: [...(debug ? ['Content-Type', 'Authorization', DEBUG_SCENARIO_HEADER, DEBUG_REQUEST_HEADER] : ['Content-Type', 'Authorization']),
+      ...(deps.pilotAccessToken ? [PILOT_TOKEN_HEADER] : [])],
     exposeHeaders: ['Retry-After', 'Content-Disposition'], maxAge: 86400 }));
   app.onError((error, c) => {
     console.error('[api] request failed', error.message);
     return c.json({ error: 'internal_error', message: 'Unexpected server error' }, 500);
   });
   app.get('/health', c => c.json({ status: 'ok' }));
+  if (deps.pilotAccessToken) {
+    const expected = createHash('sha256').update(deps.pilotAccessToken).digest();
+    app.use('*', async (c, next) => {
+      if (c.req.method === 'OPTIONS' || c.req.path === '/health') return next();
+      const given = createHash('sha256').update(c.req.header(PILOT_TOKEN_HEADER) ?? '').digest();
+      if (!timingSafeEqual(given, expected)) return c.json({ error: 'unauthorized', message: 'This API is private' }, 401);
+      return next();
+    });
+  }
   app.get('/openapi.json', c => c.json(buildOpenApiDocument()));
   app.get('/docs', swaggerUI({ url: '/openapi.json' }));
   app.post('/scan', async c => {

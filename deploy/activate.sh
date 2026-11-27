@@ -7,6 +7,36 @@ region="${2:?usage: activate.sh IMAGE REGION PAYLOAD_DIR}"
 payload="${3:?usage: activate.sh IMAGE REGION PAYLOAD_DIR}"
 root=/opt/arca
 
+# Production's Caddy and the pilot API meet on this network (deploy/pilot/compose.pilot.yaml). Created once, kept.
+docker network inspect arca-edge >/dev/null 2>&1 || docker network create arca-edge >/dev/null
+
+# An image built from the pilot branch (Dockerfile ARCA_TARGET=pilot) activates pilot, its own Compose project, and
+# never touches production's containers or its .env.demo.
+if [ "$(cat "$payload/target" 2>/dev/null || echo production)" = "pilot" ]; then
+  pilot="$root/pilot"
+  install -d -m 0755 "$pilot" "$pilot/db"
+  rendered="$(mktemp "$pilot/.env.XXXXXX")"
+  trap 'rm -f "$rendered"' EXIT
+  chmod 0600 "$rendered"
+  aws ssm get-parameters-by-path --region "$region" --path /arca/pilot --recursive --with-decryption --output json     | python3 "$payload/render-env.py" "$payload/pilot/pilot.env" "$image" > "$rendered"
+  install -m 0644 "$payload/pilot/compose.pilot.yaml" "$pilot/compose.pilot.yaml"
+  install -m 0644 "$payload/pilot/rest.Caddyfile" "$pilot/rest.Caddyfile"
+  install -m 0755 "$payload/pilot/db/00-roles.sh" "$pilot/db/00-roles.sh"
+  install -m 0755 "$payload/pilot/db/migrate.sh" "$pilot/db/migrate.sh"
+  rm -rf "$pilot/migrations" && cp -r "$payload/pilot/migrations" "$pilot/migrations"
+  mv -f "$rendered" "$pilot/.env.pilot"
+  trap - EXIT
+  cd "$pilot"
+  docker compose -f compose.pilot.yaml --env-file .env.pilot config --quiet
+  docker compose -f compose.pilot.yaml --env-file .env.pilot up --detach --remove-orphans --wait --wait-timeout 240 db
+  # A new migration in this image reaches pilot's database before the API that needs it starts.
+  docker compose -f compose.pilot.yaml --env-file .env.pilot exec -T db arca-migrate
+  docker compose -f compose.pilot.yaml --env-file .env.pilot up --detach --remove-orphans --wait --wait-timeout 240
+  docker image prune --all --force >/dev/null
+  echo "Deployed pilot $image"
+  exit 0
+fi
+
 # Render the environment first, into a temporary file: a missing or malformed secret stops the
 # deploy before anything running is touched.
 rendered="$(mktemp "$root/.env.XXXXXX")"
