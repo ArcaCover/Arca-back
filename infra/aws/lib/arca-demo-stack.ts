@@ -33,6 +33,8 @@ const repositoryRoot = path.resolve(currentDirectory, '../../..');
 const encoded = (relativePath: string) => Buffer.from(readFileSync(path.join(repositoryRoot, relativePath), 'utf8')).toString('base64');
 // Runtime secrets live here, one SecureString per environment variable.
 export const SECRETS_PATH = '/arca/prod';
+/** Pilot's secrets (DN-14 §5): its own database, its access token and its keys, apart from production's. */
+export const PILOT_SECRETS_PATH = '/arca/pilot';
 export const GITHUB_DEPLOY_ROLE_NAME = 'arca-github-deploy';
 // The API container's logs (Docker's awslogs driver, deploy/compose.cloudwatch.yaml). deploy/activate.sh names it too.
 // The host's Amazon Linux 2023 image, pinned. "The latest image" resolves at every deploy, and a newer one replaces the
@@ -118,8 +120,9 @@ export class ArcaDemoStack extends cdk.Stack {
     role.addToPolicy(new iam.PolicyStatement({ actions: ['logs:DescribeLogStreams'], resources: [apiLogs.logGroupArn] }));
     role.addToPolicy(new iam.PolicyStatement({
       actions: ['ssm:GetParametersByPath'],
-      resources: [this.formatArn({ service: 'ssm', resource: 'parameter', resourceName: SECRETS_PATH.slice(1) }),
-        this.formatArn({ service: 'ssm', resource: 'parameter', resourceName: `${SECRETS_PATH.slice(1)}/*` })],
+      resources: [SECRETS_PATH, PILOT_SECRETS_PATH].flatMap(path => [
+        this.formatArn({ service: 'ssm', resource: 'parameter', resourceName: path.slice(1) }),
+        this.formatArn({ service: 'ssm', resource: 'parameter', resourceName: `${path.slice(1)}/*` })]),
     }));
 
     // The host only gets the small bootstrap that pulls an image. Everything else it runs travels
@@ -182,13 +185,17 @@ export class ArcaDemoStack extends cdk.Stack {
       clientIds: ['sts.amazonaws.com'],
     });
     const [owner, name] = props.githubRepository.split('/');
-    const subjects = [`repo:${props.githubRepository}:ref:refs/heads/main`];
+    // main deploys production; pilot deploys the pilot project (deploy/pilot), which activate.sh keeps apart from production.
+    const branches = ['main', 'pilot'];
+    const subjects = branches.map(branch => `repo:${props.githubRepository}:ref:refs/heads/${branch}`);
     if (props.githubRepositoryIds) {
-      subjects.push(`repo:${owner}@${props.githubRepositoryIds.owner}/${name}@${props.githubRepositoryIds.repository}:ref:refs/heads/main`);
+      for (const branch of branches) {
+        subjects.push(`repo:${owner}@${props.githubRepositoryIds.owner}/${name}@${props.githubRepositoryIds.repository}:ref:refs/heads/${branch}`);
+      }
     }
     const deployRole = new iam.Role(this, 'GithubDeployRole', {
       roleName: GITHUB_DEPLOY_ROLE_NAME,
-      description: `Push images and activate them on the ARCA host, from ${props.githubRepository} main only`,
+      description: `Push images and activate them on the ARCA host, from ${props.githubRepository} main and pilot only`,
       maxSessionDuration: cdk.Duration.hours(1),
       assumedBy: new iam.WebIdentityPrincipal(github.oidcProviderArn, {
         StringEquals: {

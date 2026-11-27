@@ -13,7 +13,7 @@ const env = loadEnv();
 const { app, drain, recoverAssessments, repository, apify, banner, clientIps, reconcileBilling } = await compose(env);
 await recoverAssessments();
 // The debug modes listen on loopback only; production keeps every interface (DN-09 5.1).
-const server = serve({ port: env.PORT, hostname: listenHostname(env.mode), fetch: (request, bindings) => {
+const server = serve({ port: env.PORT, hostname: listenHostname(env.mode, env.ARCA_DEPLOYMENT === 'aws-pilot'), fetch: (request, bindings) => {
   const connection = bindings as HttpBindings;
   const remote = connection.incoming.socket.remoteAddress ?? 'unknown';
   const forwarded = request.headers.get('x-forwarded-for')?.split(',').map(value => value.trim()).filter(Boolean) ?? [];

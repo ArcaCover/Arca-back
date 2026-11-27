@@ -1,0 +1,117 @@
+# Pilot (live-debug) on the production host, as its own Compose project (`arca-pilot`), so a production deploy and its
+# --remove-orphans never touch it, and the other way round. Its data lives in a local Postgres behind PostgREST, the same
+# API Supabase exposes, so the API runs unchanged with SUPABASE_URL pointed here: pilot never writes to production's
+# database. Production's Caddy reaches the pilot API over the shared `arca-edge` network. See docs/deployment/ENVIRONMENTS.md.
+name: arca-pilot
+
+services:
+  api-pilot:
+    image: ${ARCA_IMAGE:?Set ARCA_IMAGE to an immutable ECR image tag}
+    env_file:
+      - .env.pilot
+    environment:
+      # PostgREST under /rest/v1, as Supabase serves it (rest-proxy below).
+      SUPABASE_URL: http://pilot-rest:8000
+    expose:
+      - "8080"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    shm_size: 512m
+    # The host is a t3.medium shared with production: pilot gets a hard ceiling, so a heavy pilot scan cannot starve it.
+    mem_limit: 1200m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      rest-proxy:
+        condition: service_started
+    networks:
+      default: {}
+      edge:
+        aliases: [api-pilot]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 3s
+      start_period: 20s
+      retries: 4
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  db:
+    image: postgres:16.6-alpine
+    environment:
+      POSTGRES_DB: arca
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      AUTHENTICATOR_PASSWORD: ${AUTHENTICATOR_PASSWORD:?Set AUTHENTICATOR_PASSWORD}
+    volumes:
+      - pilot_db:/var/lib/postgresql/data
+      - ./db/00-roles.sh:/docker-entrypoint-initdb.d/00-roles.sh:ro
+      - ./db/migrate.sh:/usr/local/bin/arca-migrate:ro
+      - ./migrations:/migrations:ro
+    mem_limit: 384m
+    restart: unless-stopped
+    healthcheck:
+      # Over TCP: during the first boot the entrypoint runs a socket-only server for the init scripts, and a socket check
+      # would call it healthy while 00-roles.sh is still migrating.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "arca"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  rest:
+    image: postgrest/postgrest:v12.2.3
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${AUTHENTICATOR_PASSWORD}@db:5432/arca
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${PGRST_JWT_SECRET:?Set PGRST_JWT_SECRET}
+      PGRST_DB_POOL: "5"
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: 96m
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # supabase-js calls <SUPABASE_URL>/rest/v1/...; PostgREST serves at its root.
+  rest-proxy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    volumes:
+      - ./rest.Caddyfile:/etc/caddy/Caddyfile:ro
+    networks:
+      default:
+        aliases: [pilot-rest]
+    depends_on:
+      - rest
+    mem_limit: 48m
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /config:rw,noexec,nosuid,size=4m
+      - /data:rw,noexec,nosuid,size=4m
+
+networks:
+  edge:
+    name: arca-edge
+    external: true
+
+volumes:
+  pilot_db:

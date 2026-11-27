@@ -13,6 +13,8 @@ const EnvSchema = z.object({
   ARCA_MODE: z.enum(ARCA_MODES).default('production'),
   // Set by deploy/production.env, which ships inside the image. Any value refuses the debug modes.
   ARCA_DEPLOYMENT: z.string().optional(),
+  // Pilot only (ARCA_DEPLOYMENT=aws-pilot): every request but /health must carry it in X-Arca-Pilot-Token.
+  PILOT_ACCESS_TOKEN: z.string().optional(),
   SOURCE_MODE: z.enum(['mock', 'live']).optional(),
   STORAGE_BACKEND: z.enum(['memory', 'supabase']).optional(),
   // Layer 2 is rules-only by default; mock mode also disables the optional agent.
@@ -100,7 +102,14 @@ const EnvSchema = z.object({
 export function loadEnv(source = process.env) {
   const env = EnvSchema.parse(source);
   const mode = env.ARCA_MODE;
-  if (mode !== 'production' && env.ARCA_DEPLOYMENT !== undefined) {
+  // A deployment runs production, with one exception: the pilot deployment (DN-14 §5), which runs live-debug and only behind
+  // its access token. Any other value with a debug mode refuses to start, so a copied file cannot open a debug mode in AWS.
+  if (env.ARCA_DEPLOYMENT === 'aws-pilot') {
+    if (mode !== 'live-debug') throw new Error(`ARCA_DEPLOYMENT=aws-pilot runs only ARCA_MODE=live-debug, not ${mode}`);
+    if ((env.PILOT_ACCESS_TOKEN?.trim().length ?? 0) < 32) {
+      throw new Error('ARCA_DEPLOYMENT=aws-pilot requires PILOT_ACCESS_TOKEN of at least 32 characters');
+    }
+  } else if (mode !== 'production' && env.ARCA_DEPLOYMENT !== undefined) {
     throw new Error(`ARCA_MODE=${mode} cannot start while ARCA_DEPLOYMENT is set: a deployment only runs production`);
   }
   // What the configuration alone would run with, before a mode touches it.

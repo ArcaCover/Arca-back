@@ -212,6 +212,7 @@ export async function compose(env: ReturnType<typeof loadEnv>,
     webapp: webapp && { service: webapp.service, auth: webapp.auth },
     pipeline: new InProcessPipeline({ ...sources, repository, timeoutMs: env.PIPELINE_TIMEOUT_MS }),
     sessionSecret: env.SESSION_TOKEN_SECRET, corsOrigins: env.corsOrigins,
+    pilotAccessToken: env.ARCA_DEPLOYMENT === 'aws-pilot' ? env.PILOT_ACCESS_TOKEN?.trim() : undefined,
     renderReport: renderPdf,
     scanCacheTtlMs: env.SCAN_CACHE_TTL_MS, partialRepairCooldownMs: env.SCAN_PARTIAL_REPAIR_COOLDOWN_MS,
     clientIp: request => clientIps.get(request) ?? 'unknown' });

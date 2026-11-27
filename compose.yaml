@@ -35,6 +35,7 @@ services:
       DEMO_HOSTNAME: ${DEMO_HOSTNAME:?Set DEMO_HOSTNAME to the public DNS name}
       DOCS_AUTH_USER: ${DOCS_AUTH_USER:?Set DOCS_AUTH_USER to the documentation user}
       DOCS_AUTH_HASH: ${DOCS_AUTH_HASH:?Set DOCS_AUTH_HASH to a bcrypt hash from caddy hash-password}
+      PILOT_HOSTNAME: ${PILOT_HOSTNAME:-pilot.invalid}
     ports:
       - "80:80"
       - "443:443"
@@ -52,11 +53,20 @@ services:
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
+    # The pilot API joins this network from its own project (deploy/pilot/compose.pilot.yaml).
+    networks:
+      - default
+      - edge
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
+
+networks:
+  edge:
+    name: arca-edge
+    external: true
 
 volumes:
   caddy_data:
