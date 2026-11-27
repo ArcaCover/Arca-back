@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { LAYER1_CONTRACT_VERSION, type Layer1Result, type RenderedQuestion } from '@arca/contracts';
+import { LAYER1_SCORING_VERSION } from '@arca/scoring';
 import { RoutingAssessmentRepository, RoutingScanRepository } from '../../src/debug/isolation.js';
 import { InMemoryRepository } from '../../src/repositories/in-memory.js';
 import type { RawRecord, ScanRecord } from '../../src/repositories/types.js';
@@ -73,7 +74,7 @@ describe('scan repository routing', () => {
     repository.isolate('sc_i');
     // A finished isolated scan of the same domain that the overlay itself would serve from its cache.
     await repository.create(scan('sc_i', { status: 'COMPLETED', completed_at: NOW,
-      result: { meta: { contractVersion: LAYER1_CONTRACT_VERSION } } as Layer1Result }));
+      result: { meta: { contractVersion: LAYER1_CONTRACT_VERSION, scoringVersion: LAYER1_SCORING_VERSION } } as Layer1Result }));
     await repository.saveRaw(raw('sc_i'));
     expect(await overlay.cached('firm.com', '2026-01-01T00:00:00.000Z')).not.toBeNull();
     expect(await repository.cached('firm.com', '2026-01-01T00:00:00.000Z')).toBeNull();

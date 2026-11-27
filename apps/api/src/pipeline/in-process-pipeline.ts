@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Layer1Evidence, Layer1Result, type Layer1Pipeline, type WebsiteSource, type DirectorySource, type SourceResult,
   type SourceName, type PipelineResult, type WebsiteData, type AttorneyMatch } from '@arca/contracts';
-import { AVVO_ADMISSIONS_KEY, BAR_FIRM_EMAIL_KEY, evaluateLayer1Evidence, isWebsiteUnavailable } from '@arca/scoring';
+import { AVVO_ADMISSIONS_KEY, BAR_FIRM_EMAIL_KEY, LAYER1_SCORING_VERSION, evaluateLayer1Evidence, isWebsiteUnavailable } from '@arca/scoring';
 import { avvoAdmissions, barFirmEmails } from './directories.js';
 import { normalizeDomain } from './domain-resolution.js';
 import { buildFirmIdentity, directoryScope } from './firm-identity.js';
@@ -95,7 +95,8 @@ export class InProcessPipeline implements Layer1Pipeline {
       const sources = assessment.sources;
       const result = Layer1Result.parse({ scanId: input.scanId, domain: input.canonicalDomain, email: input.email,
         ...assessment,
-        meta: { scanDurationMs: Math.max(0, now() - start), cached: false, completedAt: new Date(now()).toISOString() } });
+        meta: { scanDurationMs: Math.max(0, now() - start), cached: false, scoringVersion: LAYER1_SCORING_VERSION,
+          completedAt: new Date(now()).toISOString() } });
       const successful = Object.values(sources).filter(source => source.status === 'ok' || source.status === 'partial').length;
       // No usable source normally means there is nothing to report. A website the site kept us from reading, for any
       // cause on its side (a refusal, DNS, a refused connection, a timeout, a 5xx, robots.txt out of reach), is the

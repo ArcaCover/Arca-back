@@ -408,7 +408,9 @@ export function scoreUnderwriting({ config, layer1, answers: given, assessmentId
   const actionPlan = losses.flatMap(loss => {
     const category = categories.find(c => c.key === CATEGORY_KEY[loss.category])!;
     const gain = round2(Math.min(loss.lost, category.max - category.score));
-    return gain > 0 ? [{ id: `improve:${loss.id}`, domain: CATEGORY_KEY[loss.category], title: loss.why, detail: `Next step: ${loss.what}.`, pointsGain: gain }] : [];
+    // Every answer that lost points is a step, even where Layer 1 already fills the category: pointsGain is what the score
+    // would gain (0 there), and the practice is still the better one.
+    return [{ id: `improve:${loss.id}`, domain: CATEGORY_KEY[loss.category], title: loss.why, detail: `Next step: ${loss.what}.`, pointsGain: Math.max(0, gain) }];
   });
 
   let outcome: UnderwritingResult['outcome'];

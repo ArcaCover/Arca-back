@@ -47,7 +47,7 @@ function bestAnswer(question: RenderedQuestion): AnswerValue {
 describe('a firm whose website could not be read', () => {
   it('uses the contract the front has installed', () => {
     const contracts = JSON.parse(readFileSync(new URL('../../../../packages/contracts/package.json', import.meta.url), 'utf8'));
-    expect(contracts.version).toBe('0.5.0');
+    expect(contracts.version).toBe('0.6.0');
   });
 
   it.each([

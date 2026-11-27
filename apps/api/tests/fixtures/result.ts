@@ -1,5 +1,5 @@
 import { Layer1Result } from '@arca/contracts';
-import { category } from '@arca/scoring';
+import { LAYER1_SCORING_VERSION, category } from '@arca/scoring';
 export function fixtureResult(scanId = 'sc_fixture', email = 'user@firm.com'): Layer1Result {
   const unknown = category(35, [{ id: 'unknown', points: null, reason: 'Unknown' }]);
   return Layer1Result.parse({ scanId, domain: 'firm.com', email,
@@ -17,6 +17,6 @@ export function fixtureResult(scanId = 'sc_fixture', email = 'user@firm.com'): L
     },
     multipliers: { practiceArea: { area: null, value: 1, known: false }, jurisdiction: { state: null, value: 1, known: false }, size: { teamSize: null, value: 1, known: false } },
     sources: Object.fromEntries(['website', 'bar', 'avvo'].map(source => [source, { status: 'error', dataStatus: 'UNKNOWN', durationMs: 0 }])),
-    meta: { scanDurationMs: 10, cached: false, completedAt: new Date().toISOString() },
+    meta: { scanDurationMs: 10, cached: false, scoringVersion: LAYER1_SCORING_VERSION, completedAt: new Date().toISOString() },
   });
 }

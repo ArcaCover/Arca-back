@@ -1,4 +1,4 @@
-import { AssessmentResult, type AnswerValue, type Layer1Result } from '@arca/contracts';
+import { LegacyAssessmentResult, type AnswerValue, type Layer1Result } from '@arca/contracts';
 import { evaluateCondition, validateAnswer, type Answers, type Question, type QuestionBank } from '@arca/questions';
 import { restrictDecision, tierForScore } from './math.js';
 import { LAYER1_UNAVAILABLE, WEBSITE_UNAVAILABLE } from './website-outcome.js';
@@ -13,10 +13,11 @@ export function questionPoints(question:Question, answer:AnswerValue | undefined
   if (!answer || !validateAnswer(question,answer)) return 0;
   if (answer.kind === 'option') return Math.min(question.maxPoints,question.options!.find(o=>o.id===answer.optionId)!.points);
   if (answer.kind === 'options') return Math.min(question.maxPoints,answer.optionIds.reduce((sum,id)=>sum+question.options!.find(o=>o.id===id)!.points,0));
+  if (answer.kind === 'text') return 0;
   if (answer.kind === 'scale') return Math.min(question.maxPoints,question.scale!.points[Math.round((answer.value-question.scale!.min)/question.scale!.step)]!);
   return Math.min(question.maxPoints,question.number!.bands.find(b=>answer.value<=b.upTo)!.points);
 }
-function domainResults(bank:QuestionBank,answers:Answers): AssessmentResult['domains'] {
+function domainResults(bank:QuestionBank,answers:Answers): LegacyAssessmentResult['domains'] {
   return bank.domains.map(domain=>{
     const fixed = bank.questions.filter(q=>q.scored&&q.domain===domain.key);
     const maximum = fixed.reduce((sum,q)=>sum+q.maxPoints,0);
@@ -50,7 +51,7 @@ function betterAnswers(q:Question,answer:AnswerValue): Array<{answer:AnswerValue
 }
 export function scoreAssessment({assessmentId,layer1,bank,answers,completedAt}: {
   assessmentId:string;layer1:Layer1Result;bank:QuestionBank;answers:Answers;completedAt:string;
-}): AssessmentResult {
+}): LegacyAssessmentResult {
   const domains=domainResults(bank,answers);
   const layer2Score=round(domains.reduce((sum,d)=>sum+d.score*d.weight/100,0));
   // With the firm website unread, Layer 1 has no public evidence: a 0 there would only drag the composite down, so the
@@ -71,7 +72,7 @@ export function scoreAssessment({assessmentId,layer1,bank,answers,completedAt}: 
     q.contradicts?.filter(rule=>selected.includes(rule.option)&&evaluateCondition(rule.when,layer1,answers)).forEach(rule=>flags.add(rule.flag));
     if(q.id==='D3.1'&&answer.kind==='scale'&&answer.value===0) flags.add('NO_HUMAN_REVIEW');
   }
-  const actionPlan:AssessmentResult['actionPlan']=[];
+  const actionPlan:LegacyAssessmentResult['actionPlan']=[];
   for(const q of bank.questions.filter(q=>q.scored)) {
     const answer=answers[q.id];
     if(!answer||!validateAnswer(q,answer)) continue;
@@ -89,7 +90,7 @@ export function scoreAssessment({assessmentId,layer1,bank,answers,completedAt}: 
   // evidence. Fixture results never emit AUTO_BIND, even with a perfect demonstration score.
   const restrictions=layer1.preScore.overrides.filter(o=>['REFERRAL','REFERRAL_SENIOR','DECLINE'].includes(o.decision));
   const decision=restrictDecision('UNKNOWN',restrictions);
-  return AssessmentResult.parse({assessmentId,scanId:layer1.scanId,bankVersion:bank.bankVersion,bankStatus:'DEMO',
+  return LegacyAssessmentResult.parse({assessmentId,scanId:layer1.scanId,bankVersion:bank.bankVersion,bankStatus:'DEMO',
     scoringVersion:LAYER2_SCORING_VERSION,commercialDecisionBlocked:true,layer1Score,layer2Score,
     compositeScore,tier:tierForScore(compositeScore),decision,domains,flags:[...flags].sort(),actionPlan,completedAt});
 }

@@ -35,7 +35,8 @@ describe('attorneys licensed outside Florida (lemonlawgrouppartners.com, 2026-11
     // Every attorney expected in Florida was matched and is active.
     expect(result.signals.bar.B1_allActive).toBe(true);
     expect(rule(result, 'B4').points).toBe(3);
-    expect(result.preScore.categories.professionalStanding.score).toBe(20);
+    // 20 of the original 30, on bank 4.0's 35.
+    expect(result.preScore.categories.professionalStanding.score).toBe(23.33);
   });
 
   it('matches the Bar record whose quoted nickname used to hide the site\'s shorter name', () => {

@@ -50,7 +50,10 @@ function firstValidAnswer(question: RenderedQuestion): AnswerValue {
   if (question.type === 'multi_select') return { kind: 'options', optionIds: [question.options![0]!.id] };
   if (question.type === 'scale') return { kind: 'scale', value: question.scale!.min };
   if (question.type === 'number') return { kind: 'number', value: question.number!.min };
-  return { kind: 'option', optionId: question.options![0]!.id };
+  if (question.type === 'text') return { kind: 'text', value: 'A missed filing deadline.' };
+  // The second option where there is one: on bank 4.0 the first is the best answer, and an assessment answered at its best
+  // leaves no action plan for these tests to work on.
+  return { kind: 'option', optionId: (question.options![1] ?? question.options![0]!).id };
 }
 
 /** A finished scan of the anonymous funnel, through the real mock pipeline. */
@@ -69,7 +72,8 @@ async function scan(app: App, email = OWNER, scenario?: DebugScenarioInput) {
 async function completeAssessment(app: App, started: { scanId: string; sessionToken: string }) {
   const auth = { Authorization: `Bearer ${started.sessionToken}`, 'Content-Type': 'application/json' };
   const created = await app.request(`/scan/${started.scanId}/assessment`, { method: 'POST', headers: auth });
-  expect(created.status).toBe(202);
+  // Bank 4.0 has no planning step, so its assessment is READY at once (200); the demo bank plans first (202).
+  expect([200, 202]).toContain(created.status);
   const { assessmentId } = StartedAssessmentResponse.parse(await created.json());
   const view = async () => AssessmentView.parse(await (await app.request(`/assessment/${assessmentId}`, { headers: auth })).json());
   expect((await until(view, value => value.status !== 'PLANNING')).status).toBe('READY');
@@ -233,7 +237,8 @@ describe('the webapp API in mock', () => {
     const [analysis, ...rest] = z.array(AnalysisView).parse(analyses.body);
     expect(rest).toEqual([]);
     expect(analysis).toMatchObject({ scanId: started.scanId, domain: DOMAIN, scanStatus: 'COMPLETED' });
-    expect(analysis!.layer1.preScore.total).toBe(82);
+    // The robust mock on bank 4.0's scale (40/35/25, Reputation unscored).
+    expect(analysis!.layer1.preScore.total).toBe(86.29);
     expect(analysis!.assessment).not.toBeNull();
     expect(OrgView.parse((await s.call('GET', `/orgs/${org.id}`, { token: owner.token })).body))
       .toMatchObject({ billingStatus: 'active', paidAccess: true });
@@ -1101,7 +1106,7 @@ describe('live-debug: real scans, a simulated webapp held in memory', () => {
     const [analysis, ...rest] = z.array(AnalysisView).parse(analyses.body);
     expect(rest).toEqual([]);
     expect(analysis).toMatchObject({ scanId: started.scanId, domain: DOMAIN, scanStatus: 'COMPLETED' });
-    expect(analysis!.layer1.preScore.total).toBe(82);
+    expect(analysis!.layer1.preScore.total).toBe(86.29);
     expect(analysis!.assessment).not.toBeNull();
     expect((await s.actionPlan(owner.token, org.id)).source).toMatchObject({ scanId: started.scanId, domain: DOMAIN });
 

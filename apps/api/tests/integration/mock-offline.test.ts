@@ -49,6 +49,7 @@ function firstValidAnswer(question: RenderedQuestion): AnswerValue {
   if (question.type === 'multi_select') return { kind: 'options', optionIds: [question.options![0]!.id] };
   if (question.type === 'scale') return { kind: 'scale', value: question.scale!.min };
   if (question.type === 'number') return { kind: 'number', value: question.number!.min };
+  if (question.type === 'text') return { kind: 'text', value: 'A missed filing deadline.' };
   return { kind: 'option', optionId: question.options![0]!.id };
 }
 
@@ -78,7 +79,8 @@ describe('mock mode with the network cut off', () => {
     expect(poll.status).toBe('COMPLETED');
 
     const assessmentResponse = await app.request(`/scan/${started.scanId}/assessment`, { method: 'POST', headers: auth });
-    expect(assessmentResponse.status).toBe(202);
+    // Bank 4.0 has no planning step, so its assessment is READY at once (200); the demo bank plans first (202).
+    expect([200, 202]).toContain(assessmentResponse.status);
     const { assessmentId } = StartedAssessmentResponse.parse(await assessmentResponse.json());
     const view = () => app.request(`/assessment/${assessmentId}`, { headers: auth }).then(async response => {
       expect(response.status).toBe(200);

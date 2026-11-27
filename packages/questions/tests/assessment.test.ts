@@ -17,7 +17,8 @@ describe('fixed versioned demo bank',()=>{
     expect(DEMO_BANK.domains.reduce((n,d)=>n+d.weight,0)).toBe(100);
   });
   it('labels its domains as the contracts do, so the webapp and the assessment name them alike',()=>{
-    expect(Object.fromEntries(DEMO_BANK.domains.map(d=>[d.key,d.label]))).toEqual(DOMAIN_LABELS);
+    const demo=Object.fromEntries(DEMO_BANK.domains.map(d=>[d.key,d.label]));
+    expect(Object.fromEntries(Object.entries(DOMAIN_LABELS).filter(([key])=>key in demo))).toEqual(demo);
   });
   it.each([
     (bank:typeof DEMO_BANK)=>bank.questions.push(bank.questions[0]!),
