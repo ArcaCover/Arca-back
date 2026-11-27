@@ -1,3 +1,4 @@
+import { underwriting } from '@arca/questions';
 import { Layer1Result, unknownWebsite, type ScoringInput, type AttorneyMatch, type Signals, type PreScore } from '@arca/contracts';
 import { aiGovernance, reputation, professionalStanding, firmMaturity } from './categories.js';
 import { mean, oneDecimal, sum, allKnownTrue, anyKnownTrue, tierForScore, decisionForTier, restrictDecision } from './math.js';
@@ -22,6 +23,22 @@ function uniqueMatches(matches: AttorneyMatch[] | null): AttorneyMatch[] | null 
 }
 // Commercial factor per licensing jurisdiction. A state without an entry is reported but stays
 // neutral and unknown until a factor is set for it; see DN-01 on reviewing multiplier values.
+/**
+ * The Layer 1 scoring rules that produce a result. A scan cached under other rules is not reused (DN-14 §3 decision 14):
+ * change this whenever a rule, a weight or a maximum changes.
+ */
+export const LAYER1_SCORING_VERSION = 'layer1-scoring-2026-11-27-bank4';
+type RawCategory = ReturnType<typeof aiGovernance>;
+/**
+ * Bank 4.0 (rules §10): AI Governance, Professional Standing and Firm Maturity are rescaled from their original maximums
+ * (35/30/15) to the ones the config shares with Layer 2 (40/35/25). Each rule keeps its original points, so a reader can
+ * still trace them; only the category's score and maximum move. Reputation stays, unscored.
+ */
+function rescaled(category: RawCategory, key: 'aidg' | 'ps' | 'fm'): RawCategory {
+  const [to, from] = underwriting.UNDERWRITING_CONFIG.scoring.capa1_rescale_from_original[key];
+  if (category.max !== from) throw new Error(`Layer 1 category maximum ${category.max} is not the configured ${from}`);
+  return { ...category, max: to, score: category.score === null ? null : Math.round(category.score * to / from * 100) / 100 };
+}
 export const JURISDICTION_MULTIPLIERS: Readonly<Record<string, number>> = { FL: 1.25 };
 export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore' | 'signals' | 'multipliers'> {
   const usable = (name: keyof ScoringInput['sources']) => ['ok', 'partial'].includes(input.sources[name].status);
@@ -77,13 +94,14 @@ export function scoreEvidence(input: ScoringInput): Pick<Layer1Result, 'preScore
   const ratingLevel = ratingLevels.length && new Set(ratingLevels).size === 1 ? ratingLevels[0]! : null;
   const disciplined = anyKnownTrue(avvoPeople.map(person => person?.hasDisciplinaryHistory ?? null));
   const categories = {
-    aiGovernance: aiGovernance(website),
-    professionalStanding: professionalStanding({ allActive, cleanRecord: disciplinary.cleanRecord, consistency,
-      experience, sanctionPenalty: disciplinary.penalty, consistencyReason }),
-    reputation: reputation(rep), firmMaturity: firmMaturity(website, agreement, input.now),
+    aiGovernance: rescaled(aiGovernance(website), 'aidg'),
+    professionalStanding: rescaled(professionalStanding({ allActive, cleanRecord: disciplinary.cleanRecord, consistency,
+      experience, sanctionPenalty: disciplinary.penalty, consistencyReason }), 'ps'),
+    reputation: { ...reputation(rep), scored: false }, firmMaturity: rescaled(firmMaturity(website, agreement, input.now), 'fm'),
   };
   const activeInvestigation = disciplinary.overrides.some(override => override.id === 'ACTIVE_INVESTIGATION');
-  const total = activeInvestigation ? 0 : sum(Object.values(categories).map(category => category.score));
+  const scoredCategories = [categories.aiGovernance, categories.professionalStanding, categories.firmMaturity];
+  const total = activeInvestigation ? 0 : Math.round(sum(scoredCategories.map(category => category.score)) * 100) / 100;
   const tier = tierForScore(total);
   const okSources = Object.values(input.sources).filter(source => source.status === 'ok').length;
   const flags: string[] = [];

@@ -15,7 +15,9 @@ describe('Supabase Data API adapter', () => {
       expect(url.pathname).toBe('/rest/v1/scans');
       expect(Object.fromEntries(url.searchParams)).toMatchObject({ canonical_domain: 'eq.firm.com', cached: 'eq.false',
         status: 'in.(COMPLETED,PARTIAL)', completed_at: 'gte.2026-09-07T00:00:00.000Z',
-        'result->meta->>contractVersion': 'eq.layer1-2026-09-12-v2', order: 'completed_at.desc', limit: '1' });
+        'result->meta->>contractVersion': 'eq.layer1-2026-11-27-v3',
+        // A scan scored under other rules is not reused (DN-14 §3 decision 14).
+        'result->meta->>scoringVersion': 'eq.layer1-scoring-2026-11-27-bank4', order: 'completed_at.desc', limit: '1' });
       return Response.json([]);
     });
     expect(await repository.cached('firm.com', '2026-09-07T00:00:00.000Z')).toBeNull();

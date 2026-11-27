@@ -51,8 +51,25 @@ export function chooseAnswer(question: RenderedQuestion): AnswerValue {
     case 'number':
       if (!question.number) throw unanswerable(question);
       return { kind: 'number', value: question.number.min };
+    case 'text':
+      return { kind: 'text', value: 'A filing deadline missed because of a wrong date.' };
   }
 }
+
+/**
+ * The demo firm's answers on bank 4.0: a firm doing legal work with case software and research tools, well run with a few
+ * gaps, so the demo shows an indicative quote and an action plan with several steps. Any other question takes chooseAnswer.
+ */
+const DEMO_UNDERWRITING_ANSWERS: Record<string, AnswerValue> = {
+  G1: { kind: 'options', optionIds: ['G1-case-software', 'G1-legal-research'] },
+  G2: { kind: 'options', optionIds: ['G2-research', 'G2-drafting'] },
+  C1: { kind: 'options', optionIds: ['C1-none'] }, C2: { kind: 'option', optionId: 'C2-yes' },
+  F1: { kind: 'option', optionId: 'F1-6-15' }, F2: { kind: 'options', optionIds: ['F2-litigation'] },
+  C3: { kind: 'option', optionId: 'C3-nearmiss' }, 'PS-1': { kind: 'option', optionId: 'PS1-all' },
+  'P3-1': { kind: 'option', optionId: 'P31-most' }, 'P3-2': { kind: 'option', optionId: 'P32-always' },
+  'DG-1': { kind: 'option', optionId: 'DG1-agreement' }, 'P3-3': { kind: 'option', optionId: 'P33-partner' },
+};
+const demoAnswer = (question: RenderedQuestion) => DEMO_UNDERWRITING_ANSWERS[question.id] ?? chooseAnswer(question);
 
 /** One answer at a time, reading the follow-ups from each save, so the branch rules decide what appears, as for a person. */
 async function completeAssessment(assessments: AssessmentService, scan: ScanRecord): Promise<AssessmentResult> {
@@ -63,7 +80,7 @@ async function completeAssessment(assessments: AssessmentService, scan: ScanReco
     const pending = view.questions.find(question => !view.answers[question.id]);
     if (!pending) break;
     if (saved === MAX_ANSWERS) throw new Error(`Gave up after ${MAX_ANSWERS} answers with questions still pending`);
-    record = await assessments.save(record.id, pending.id, chooseAnswer(pending));
+    record = await assessments.save(record.id, pending.id, demoAnswer(pending));
   }
   return assessments.complete(record.id);
 }

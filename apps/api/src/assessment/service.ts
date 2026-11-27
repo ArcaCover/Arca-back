@@ -1,10 +1,19 @@
 import { randomUUID } from 'node:crypto';
-import { AssessmentResult, AssessmentView, type AnswerValue } from '@arca/contracts';
+import { AssessmentResult, AssessmentView, LegacyAssessmentResult, type AnswerValue, type RenderedQuestion } from '@arca/contracts';
 import { DEMO_BANK, collectEvidence, planAssessment, reconcileAnswers, renderQuestions, rulesPlan, skippedQuestions,
-  validateAnswer, visibleQuestions, type QuestionBank } from '@arca/questions';
+  underwriting, validateAnswer, visibleQuestions, type AgentPlan, type QuestionBank } from '@arca/questions';
 import { scoreAssessment } from '@arca/scoring';
 import type { ScanRecord } from '../repositories/types.js';
-import type { AnswerEvent, AssessmentRecord, AssessmentRepository, AssessmentUpdate } from './repository.js';
+import { isUnderwriting, type AnswerEvent, type AssessmentRecord, type AssessmentRepository, type AssessmentUpdate,
+  type UnderwritingSnapshot } from './repository.js';
+
+/** Where a firm books an underwriter when the outcome is not a quote, until a dedicated calendar exists (DN-14 §3 decision 5). */
+export const DEFAULT_BOOKING_URL = 'https://calendly.com/arcacover/discovery';
+export const UNDERWRITING_INTRO = 'A few short questions about how your firm works. Most take one tap, and you can review every answer before you finish.';
+// The record of a demo-bank assessment, which keeps the frozen bank and plan of the agent era.
+type LegacyRecord = AssessmentRecord & { bank_snapshot: QuestionBank; plan: AgentPlan | null };
+const legacy = (record: AssessmentRecord) => record as LegacyRecord;
+type UnderwritingRecord = AssessmentRecord & { bank_snapshot: UnderwritingSnapshot };
 
 export class AssessmentFailure extends Error {
   constructor(readonly code: 'scan_not_ready' | 'not_found' | 'invalid_answer' | 'not_visible' | 'incomplete' |
@@ -17,6 +26,14 @@ export type AssessmentServiceOptions = {
   agent?: AssessmentAgent; planningTimeoutMs?: number; maxWritesPerMinute?: number;
   /** Debug modes only: the agent for one scan's assessment, when it is not `agent`. */
   agentFor?: (scanId: string) => AssessmentAgent | undefined;
+  /**
+   * Which bank new assessments use. 'underwriting' is bank 4.0 (DN-14), what the app runs; 'demo' is the fixture bank the
+   * older tests drive. A stored assessment always continues on the bank it started with.
+   */
+  engine?: 'underwriting' | 'demo';
+  underwriting?: { config?: underwriting.UnderwritingConfig; bookingUrl?: string;
+    /** Debug modes only: the result keeps the underwriter's audit and summary, for the State panel. */
+    exposeAudit?: boolean };
 };
 const SESSION_TTL_MS = 86_400_000;
 const STALE_PLANNING_MS = 30_000;
@@ -37,9 +54,23 @@ export class AssessmentService {
     }
     const expiresAt = Date.parse(scan.created_at) + SESSION_TTL_MS;
     if (this.now() >= expiresAt) throw new AssessmentFailure('expired', 'This scan session has expired', 410);
-    const bank = structuredClone(this.options.bank ?? DEMO_BANK);
     const layer1 = structuredClone(scan.result);
     const assessmentId = `as_${randomUUID().replaceAll('-', '')}`;
+    if (this.options.engine === 'underwriting' && !this.options.bank) {
+      // No planning step: the selection is the config's, so the assessment is ready the moment it exists.
+      const config = structuredClone(this.config());
+      const facts = underwriting.layer1Facts(layer1, config);
+      const { selection } = underwriting.reconcile(config, facts, {});
+      const record = await this.options.repository.create({ id: assessmentId, scan_id: scan.scan_id,
+        revision: 0, status: 'READY', bank_version: config.bank_version, bank_snapshot: { engine: 'underwriting', config },
+        layer1_snapshot: layer1, evidence_snapshot: [], planner: 'rules', planner_model: null, prompt_version: null,
+        plan: { engine: 'underwriting', configVersion: config.config_version, intro: UNDERWRITING_INTRO },
+        rendered: selection.asked.map(id => underwriting.renderQuestion(config, facts, {}, id)), answers: {}, result: null,
+        attested_at: null, created_at: this.timestamp(), updated_at: this.timestamp(), expires_at: new Date(expiresAt).toISOString(),
+        completed_at: null, answer_write_count: 0 });
+      return this.active(record);
+    }
+    const bank = structuredClone(this.options.bank ?? DEMO_BANK);
     const record = await this.options.repository.create({ id: assessmentId, scan_id: scan.scan_id,
       revision: 0, status: 'PLANNING', bank_version: bank.bankVersion, bank_snapshot: bank, layer1_snapshot: layer1,
       evidence_snapshot: collectEvidence(layer1), planner: 'rules', planner_model: null, prompt_version: null,
@@ -79,11 +110,13 @@ export class AssessmentService {
     this.jobs.set(record.id, job);
     void job.finally(() => { if (this.jobs.get(record.id) === job) this.jobs.delete(record.id); });
   }
+  private config() { return this.options.underwriting?.config ?? underwriting.UNDERWRITING_CONFIG; }
   private async prepare(record: AssessmentRecord, recovery: boolean) {
+    if (isUnderwriting(record)) return;
     if (this.now() >= Date.parse(record.expires_at)) { await this.active(record).catch(error => {
       if (!(error instanceof AssessmentFailure && error.code === 'expired')) throw error;
     }); return; }
-    const { bank_snapshot: bank, layer1_snapshot: layer1, evidence_snapshot: evidence } = record;
+    const { bank_snapshot: bank, layer1_snapshot: layer1, evidence_snapshot: evidence } = legacy(record);
     const fallback = () => ({ plan: rulesPlan(bank, layer1, evidence), planner: 'rules' as const, model: null, promptVersion: null });
     let planned: Awaited<ReturnType<typeof planAssessment>>;
     let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -116,9 +149,16 @@ export class AssessmentService {
     await this.jobs.get(id);
     return this.get(id);
   }
-  private currentQuestions(record: AssessmentRecord) {
+  /** Bank 4.0's questions under the given answers, and those answers reconciled to them. */
+  private underwritingState(record: UnderwritingRecord, answers = record.answers) {
+    const config = record.bank_snapshot.config;
+    const facts = underwriting.layer1Facts(record.layer1_snapshot, config);
+    return { config, facts, ...underwriting.reconcile(config, facts, answers) };
+  }
+  private currentQuestions(record: AssessmentRecord): RenderedQuestion[] {
     if (!record.plan) return [];
-    const ids = visibleQuestions(record.bank_snapshot, record.plan, record.layer1_snapshot, record.answers).map(question => question.id);
+    const ids = isUnderwriting(record) ? this.underwritingState(record).selection.asked
+      : visibleQuestions(legacy(record).bank_snapshot, legacy(record).plan!, record.layer1_snapshot, record.answers).map(question => question.id);
     return ids.map(id => {
       const rendered = record.rendered.find(question => question.id === id);
       if (!rendered) throw new Error('Missing rendered assessment snapshot');
@@ -129,9 +169,10 @@ export class AssessmentService {
     const questions = this.currentQuestions(record);
     const answered = questions.filter(question => record.answers[question.id] !== undefined).length;
     return AssessmentView.parse({ assessmentId: record.id, scanId: record.scan_id, status: record.status,
-      bankVersion: record.bank_version, bankStatus: 'DEMO', planner: record.plan ? record.planner : null,
+      bankVersion: record.bank_version, bankStatus: isUnderwriting(record) ? 'PROVISIONAL' : 'DEMO', planner: record.plan ? record.planner : null,
       intro: record.plan?.intro ?? null, expiresAt: new Date(record.expires_at).toISOString(), sessionScope: 'CURRENT_TAB_24H',
-      questions, answers: record.answers, skipped: skippedQuestions(record.bank_snapshot, record.layer1_snapshot),
+      questions, answers: record.answers,
+      skipped: isUnderwriting(record) ? [] : skippedQuestions(legacy(record).bank_snapshot, record.layer1_snapshot),
       progress: { answered, total: questions.length }, estimatedMinutes: Math.ceil(Math.max(0, questions.length - answered) / 2) });
   }
   private checkWriteLimit(id: string) {
@@ -150,11 +191,13 @@ export class AssessmentService {
       if (record.status === 'COMPLETED') throw new AssessmentFailure('already_completed', 'This assessment is already complete');
       if (!record.plan || !['READY', 'IN_PROGRESS'].includes(record.status)) throw new AssessmentFailure('not_ready', 'The assessment is not ready');
       if (record.answer_write_count >= 1000) throw new AssessmentFailure('rate_limited', 'Assessment answer update limit reached', 429);
-      const question = visibleQuestions(record.bank_snapshot, record.plan, record.layer1_snapshot, record.answers).find(item => item.id === questionId);
+      if (isUnderwriting(record)) return this.saveUnderwriting(record, questionId, answer);
+      const { bank_snapshot: bank, plan } = legacy(record);
+      const question = visibleQuestions(bank, plan!, record.layer1_snapshot, record.answers).find(item => item.id === questionId);
       if (!question) throw new AssessmentFailure('not_visible', 'This question is not currently visible');
       if (!validateAnswer(question, answer)) throw new AssessmentFailure('invalid_answer', 'The answer is not valid for this question', 400);
-      const answers = reconcileAnswers(record.bank_snapshot, record.plan, record.layer1_snapshot, { ...record.answers, [questionId]: answer });
-      const shown = renderQuestions(record.bank_snapshot, record.plan, record.layer1_snapshot, answers, record.evidence_snapshot);
+      const answers = reconcileAnswers(bank, plan!, record.layer1_snapshot, { ...record.answers, [questionId]: answer });
+      const shown = renderQuestions(bank, plan!, record.layer1_snapshot, answers, record.evidence_snapshot);
       const rendered = [...record.rendered, ...shown.filter(item => !record.rendered.some(existing => existing.id === item.id))];
       const exact = record.rendered.find(item => item.id === questionId);
       if (!exact) throw new Error('Missing rendered answer snapshot');
@@ -169,26 +212,67 @@ export class AssessmentService {
         updated_at: this.timestamp() }, events };
     });
   }
+  /**
+   * Bank 4.0: the answer must be to a question asked now and one of its own options. A change to G1 or G2 can change the
+   * profile and so the questions: answers to questions no longer asked are invalidated, each with its event, and questions
+   * newly asked are rendered once and kept as rendered.
+   */
+  private saveUnderwriting(record: UnderwritingRecord, questionId: string, answer: AnswerValue): { update: AssessmentUpdate; events: AnswerEvent[] } {
+    const before = this.underwritingState(record);
+    if (!before.selection.asked.includes(questionId)) throw new AssessmentFailure('not_visible', 'This question is not currently visible');
+    if (!underwriting.validUnderwritingAnswer(before.config, questionId, answer)) throw new AssessmentFailure('invalid_answer', 'The answer is not valid for this question', 400);
+    const after = this.underwritingState(record, { ...before.answers, [questionId]: answer });
+    const answers = after.answers;
+    const rendered = [...record.rendered, ...after.selection.asked.filter(id => !record.rendered.some(item => item.id === id))
+      .map(id => underwriting.renderQuestion(after.config, after.facts, answers, id))];
+    const exact = rendered.find(item => item.id === questionId);
+    if (!exact) throw new Error('Missing rendered answer snapshot');
+    const events: AnswerEvent[] = [{ question_id: questionId, answer, kind: 'saved', suggested: false, rendered: exact, created_at: this.timestamp() }];
+    for (const oldId of Object.keys(record.answers)) if (answers[oldId] === undefined) {
+      const previous = record.rendered.find(item => item.id === oldId);
+      if (!previous) throw new Error('Missing invalidated answer snapshot');
+      events.push({ question_id: oldId, answer: null, kind: 'invalidated', suggested: false, rendered: previous, created_at: this.timestamp() });
+    }
+    return { update: { status: 'IN_PROGRESS', answers, rendered, answer_write_count: record.answer_write_count + 1,
+      updated_at: this.timestamp() }, events };
+  }
+  /** What the firm receives: bank 4.0's result without the underwriter's audit and summary, except in the debug modes. */
+  presented(result: AssessmentResult): AssessmentResult {
+    if (!('outcome' in result) || this.options.underwriting?.exposeAudit) return result;
+    return underwriting.publicResult(result);
+  }
   async complete(id: string): Promise<AssessmentResult> {
     const record = await this.mutate(id, current => {
       if (current.status === 'COMPLETED') return null;
       if (!current.plan || !['READY', 'IN_PROGRESS'].includes(current.status)) throw new AssessmentFailure('not_ready', 'The assessment is not ready');
-      const visible = visibleQuestions(current.bank_snapshot, current.plan, current.layer1_snapshot, current.answers);
-      if (visible.some(question => !current.answers[question.id] || !validateAnswer(question, current.answers[question.id]!))) {
-        throw new AssessmentFailure('incomplete', 'Answer every visible question before completing');
-      }
       const completedAt = this.timestamp();
-      const result = AssessmentResult.parse(scoreAssessment({ assessmentId: current.id, layer1: current.layer1_snapshot,
-        bank: current.bank_snapshot, answers: current.answers, completedAt }));
+      let result: AssessmentResult;
+      if (isUnderwriting(current)) {
+        const state = this.underwritingState(current);
+        if (state.selection.profile === null || state.selection.asked.some(id => !state.answers[id])) {
+          throw new AssessmentFailure('incomplete', 'Answer every visible question before completing');
+        }
+        result = AssessmentResult.parse(underwriting.scoreUnderwriting({ config: state.config, layer1: current.layer1_snapshot,
+          answers: state.answers, assessmentId: current.id, completedAt,
+          bookingUrl: this.options.underwriting?.bookingUrl ?? DEFAULT_BOOKING_URL }));
+      } else {
+        const { bank_snapshot: bank, plan } = legacy(current);
+        const visible = visibleQuestions(bank, plan!, current.layer1_snapshot, current.answers);
+        if (visible.some(question => !current.answers[question.id] || !validateAnswer(question, current.answers[question.id]!))) {
+          throw new AssessmentFailure('incomplete', 'Answer every visible question before completing');
+        }
+        result = LegacyAssessmentResult.parse(scoreAssessment({ assessmentId: current.id, layer1: current.layer1_snapshot,
+          bank, answers: current.answers, completedAt }));
+      }
       return { update: { status: 'COMPLETED', result, attested_at: completedAt, completed_at: completedAt, updated_at: completedAt }, events: [] };
     });
     if (!record.result) throw new Error('Completed assessment is missing its result');
-    return record.result;
+    return this.presented(record.result);
   }
   async result(id: string) {
     const record = await this.get(id);
     if (record.status !== 'COMPLETED' || !record.result) throw new AssessmentFailure('incomplete', 'Complete the assessment before requesting its result');
-    return record.result;
+    return this.presented(record.result);
   }
   private async mutate(id: string, build: (record: AssessmentRecord) => { update: AssessmentUpdate; events: AnswerEvent[] } | null) {
     for (let attempt = 0; attempt < 12; attempt++) {

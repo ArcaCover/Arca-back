@@ -3,6 +3,7 @@ import type { ScanRepository, ScanRecord, RawRecord, ApifyRunRecord, ReserveApif
   ApifyRunUpdate, ApifySpendRecord } from './types.js';
 import { RAW_MARKER } from './types.js';
 import { LAYER1_CONTRACT_VERSION, type SourceName } from '@arca/contracts';
+import { LAYER1_SCORING_VERSION } from '@arca/scoring';
 import { ACTIVE_APIFY_STATUSES, SPEND_CEILING_STATUS } from './types.js';
 
 export class InMemoryRepository implements ScanRepository {
@@ -26,7 +27,7 @@ export class InMemoryRepository implements ScanRepository {
   }
   async cached(domain: string, since: string) {
     return structuredClone([...this.scans.values()].filter(s => s.canonical_domain === domain && !s.cached &&
-      s.result?.meta.contractVersion === LAYER1_CONTRACT_VERSION &&
+      s.result?.meta.contractVersion === LAYER1_CONTRACT_VERSION && s.result.meta.scoringVersion === LAYER1_SCORING_VERSION &&
       (s.status === 'COMPLETED' || s.status === 'PARTIAL') && s.completed_at !== null && s.completed_at >= since)
       .sort((a, b) => b.completed_at!.localeCompare(a.completed_at!))[0] ?? null);
   }

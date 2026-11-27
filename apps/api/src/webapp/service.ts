@@ -5,6 +5,7 @@ import { can, canManageMember, hasPaidAccess, type ActionItemView, type ActionPl
   type DeletionRequestView, type EmbeddedCheckoutResponse, type EnrollRequest, type EnrollResponse, type OrgProfileInput,
   type InvitationView, type InviteRequest, type Layer1Result, type MeResponse, type MemberView, type OrgView, type Permission, type PlanView,
   type Role, type UpdateActionRequest, type UpdatePlanRequest } from '@arca/contracts';
+import { underwriting } from '@arca/questions';
 import type { AssessmentRepository } from '../assessment/repository.js';
 import { verifySessionToken } from '../auth/session-token.js';
 import type { ScanRecord, ScanRepository } from '../repositories/types.js';
@@ -936,7 +937,8 @@ export class WebappService {
   private async analysisView(analysis: OrgAnalysisRecord, scan: FinishedScan): Promise<AnalysisView> {
     const assessment = await this.deps.assessments.getByScan(scan.scan_id);
     return { scanId: scan.scan_id, domain: scan.canonical_domain, scanStatus: scan.status, claimedAt: iso(analysis.claimed_at), layer1: scan.result,
-      assessment: assessment?.status === 'COMPLETED' ? assessment.result : null };
+      // The firm's own members, never Arca's underwriters: bank 4.0's audit and summary stay out (DN-14).
+      assessment: assessment?.status === 'COMPLETED' && assessment.result ? ('outcome' in assessment.result ? underwriting.publicResult(assessment.result) : assessment.result) : null };
   }
 
   private async view(org: OrganizationRecord, role: Role): Promise<OrgView> {

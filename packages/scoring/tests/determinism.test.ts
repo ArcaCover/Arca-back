@@ -81,13 +81,13 @@ describe('thresholds do not depend on summation order', () => {
     const { preScore, signals } = evaluateLayer1Evidence(sevenAttorneys());
     expect(signals.avvo.A1_avgRating).toBe(8);
     expect(preScore.categories.reputation.rules.find(rule => rule.id === 'A1')?.points).toBe(9);
-    expect({ total: preScore.total, tier: preScore.tier }).toEqual({ total: 81, tier: 'FORTRESS' });
+    expect({ total: preScore.total, tier: preScore.tier }).toEqual({ total: 78, tier: 'FORTIFIED' });
     const random = seeded(12345);
     const tiers = new Set(Array.from({ length: 2000 }, () => {
       const result = evaluateLayer1Evidence(reorder(sevenAttorneys(), random)).preScore;
       return `${result.total} ${result.tier} ${result.decision}`;
     }));
-    expect([...tiers]).toEqual([`81 FORTRESS ${preScore.decision}`]);
+    expect([...tiers]).toEqual([`78 FORTIFIED ${preScore.decision}`]);
   });
   it('rates 2.2, 9.1 and 9.7 as an average of exactly 7 in every order', () => {
     const ratings = [2.2, 9.1, 9.7];
@@ -209,7 +209,8 @@ describe('date-driven values', () => {
     const tomorrow = evaluateLayer1Evidence(ratingBoundary('2026-11-10T10:00:00.000Z'));
     const b4 = (result: typeof today) => result.preScore.categories.professionalStanding.rules.find(rule => rule.id === 'B4')?.points;
     expect([b4(today), b4(tomorrow)]).toEqual([0, 3]);
-    expect(tomorrow.preScore.total).toBe(today.preScore.total! + 3);
+    // B4's 3 points, on Professional Standing's bank 4.0 maximum (35 of 30).
+    expect(tomorrow.preScore.total).toBe(Math.round((today.preScore.total! + 3 * 35 / 30) * 100) / 100);
     expect(tomorrow.signals).toEqual(today.signals);
   });
   it('still applies the experience rule at the real ten and three year thresholds', () => {

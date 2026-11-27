@@ -40,6 +40,10 @@ const EnvSchema = z.object({
   // webapp route answers 501. The debug modes always serve it: simulated by default, real only in live-debug with
   // WEBAPP_PROVIDERS=real. Never a JWT secret: Supabase tokens verify against the project's JWKS, derived from SUPABASE_URL.
   WEBAPP_ENABLED: z.preprocess(blankAsUnset, z.enum(['true', 'false']).default('false')),
+  // Layer 2's bank for new assessments (DN-14): bank 4.0's underwriting rules, or the old demo bank to fall back to.
+  ASSESSMENT_ENGINE: z.preprocess(blankAsUnset, z.enum(['underwriting', 'demo']).default('underwriting')),
+  // Where a firm books an underwriter when the outcome is not a quote (DN-14 §3 decision 5).
+  UNDERWRITING_BOOKING_URL: z.preprocess(blankAsUnset, z.string().trim().url().default('https://calendly.com/arcacover/discovery')),
   WEBAPP_PROVIDERS: z.preprocess(blankAsUnset, z.enum(['simulated', 'real']).optional()),
   // Stripe's mode comes from the key's prefix (DN-13 §6.7); StripeBillingProvider (webapp/stripe.ts) uses both with the real webapp.
   STRIPE_SECRET_KEY: z.preprocess(blankAsUnset, z.string().trim().optional()),

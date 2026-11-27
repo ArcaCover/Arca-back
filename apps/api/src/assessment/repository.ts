@@ -1,16 +1,21 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AnswerValue, AssessmentEvidence, AssessmentResult, AssessmentStatus, Layer1Result, RenderedQuestion } from '@arca/contracts';
-import type { QuestionBank, planAssessment } from '@arca/questions';
+import type { QuestionBank, planAssessment, underwriting } from '@arca/questions';
 
-export type AssessmentPlan = Awaited<ReturnType<typeof planAssessment>>['plan'];
+/** Bank 4.0 freezes its config in the record, as the demo bank froze itself: a stored assessment is replayed from it. */
+export type UnderwritingSnapshot = { engine: 'underwriting'; config: underwriting.UnderwritingConfig };
+export type UnderwritingPlan = { engine: 'underwriting'; configVersion: string; intro: string };
+export type AssessmentPlan = Awaited<ReturnType<typeof planAssessment>>['plan'] | UnderwritingPlan;
 export type AssessmentRecord = {
   id: string; scan_id: string; revision: number; status: AssessmentStatus;
-  bank_version: string; bank_snapshot: QuestionBank; layer1_snapshot: Layer1Result; evidence_snapshot: AssessmentEvidence[];
+  bank_version: string; bank_snapshot: QuestionBank | UnderwritingSnapshot; layer1_snapshot: Layer1Result; evidence_snapshot: AssessmentEvidence[];
   planner: 'agent' | 'rules'; planner_model: string | null; prompt_version: string | null;
   plan: AssessmentPlan | null; rendered: RenderedQuestion[]; answers: Record<string, AnswerValue>;
   result: AssessmentResult | null; attested_at: string | null; created_at: string; updated_at: string;
   expires_at: string; completed_at: string | null; answer_write_count: number;
 };
+export const isUnderwriting = (record: Pick<AssessmentRecord, 'bank_snapshot'>): record is AssessmentRecord & { bank_snapshot: UnderwritingSnapshot } =>
+  'engine' in record.bank_snapshot && record.bank_snapshot.engine === 'underwriting';
 export type AnswerEvent = {
   question_id: string; answer: AnswerValue | null; kind: 'saved' | 'invalidated';
   suggested: boolean; rendered: RenderedQuestion; created_at: string;

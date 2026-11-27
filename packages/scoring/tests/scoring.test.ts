@@ -13,7 +13,9 @@ describe('complete Layer 1 mathematics', () => {
     input.avvo![0]!.attorney!.awards = ['Award'];
     const { preScore, signals } = scoreEvidence(input);
     expect(preScore.total).toBe(100);
-    expect(Object.values(preScore.categories).map(c => c.score)).toEqual([35, 30, 20, 15]);
+    // Bank 4.0's maximums (40/35/25); Reputation keeps its 20 as context and adds nothing.
+    expect(Object.values(preScore.categories).map(c => c.score)).toEqual([40, 35, 20, 25]);
+    expect(preScore.categories.reputation.scored).toBe(false);
     expect(preScore.tier).toBe('FORTRESS');
     expect(signals.website).not.toHaveProperty('W10_domainType');
   });
@@ -31,7 +33,7 @@ describe('complete Layer 1 mathematics', () => {
     input.bar = input.bar!.map(match => ({ ...match, attorney: null, matchConfidence: 'no_match' as const }));
     expect(scoreEvidence(input).multipliers.jurisdiction).toEqual({ state: null, value: 1, known: false });
   });
-  it('scores the robust mock at 82 with the revised reputation table', () => { expect(scoreEvidence(robust()).preScore.total).toBe(82); });
+  it('scores the robust mock at 86.29 on the bank 4.0 scale', () => { expect(scoreEvidence(robust()).preScore.total).toBe(86.29); });
   it('forces score zero after an active-investigation override', () => {
     const input = robust(), before = scoreEvidence(input);
     input.bar![0]!.attorney!.activeInvestigation = true;
@@ -46,7 +48,7 @@ describe('complete Layer 1 mathematics', () => {
     input.bar![0]!.attorney!.hasDisciplinaryHistory = true;
     input.bar![0]!.attorney!.disciplinaryActions = [{ severity: 'public_reprimand', date: '2026-08-01', description: 'Confirmed' }];
     const result = scoreEvidence(input).preScore;
-    expect(result.total).toBe(72);
+    expect(result.total).toBe(74.62);
     expect(result.tier).toBe('FORTIFIED');
     expect(result.decision).toBe('REFERRAL_SENIOR');
   });
