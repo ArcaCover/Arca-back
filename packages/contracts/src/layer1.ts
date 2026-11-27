@@ -4,12 +4,19 @@ import { SourceStatus, WebsiteData, AttorneyMatch } from './sources.js';
 export const Tier = z.enum(['FORTRESS', 'FORTIFIED', 'GUARDED', 'EXPOSED', 'CRITICAL', 'UNKNOWN']);
 export const Decision = z.enum(['AUTO_BIND', 'AUTO_BIND_CONDITIONAL', 'REFERRAL', 'REFERRAL_SENIOR', 'DECLINE', 'UNKNOWN']);
 export const ScanStatus = z.enum(['RUNNING', 'COMPLETED', 'PARTIAL', 'FAILED']);
-export const LAYER1_CONTRACT_VERSION = 'layer1-2026-09-12-v2' as const;
+/**
+ * v3 (2026-11-27, bank 4.0): AI Governance 40, Professional Standing 35 and Firm Maturity 25 make the total; Reputation is
+ * still reported, with `scored: false`, and adds nothing. v2 results (35/30/20/15) stay readable as stored.
+ */
+export const LAYER1_CONTRACT_VERSION = 'layer1-2026-11-27-v3' as const;
+export const LAYER1_CONTRACT_VERSIONS = ['layer1-2026-09-12-v2', LAYER1_CONTRACT_VERSION] as const;
 const nullableNumber = z.number().finite().nullable();
 export const Rule = z.object({ id: z.string(), points: nullableNumber, reason: z.string() }).strict();
 export const Category = z.object({
-  score: z.number().min(0).max(35).nullable(), max: z.number().positive(),
+  score: z.number().min(0).max(40).nullable(), max: z.number().positive(),
   status: z.enum(['KNOWN', 'PARTIAL', 'UNKNOWN']), rules: z.array(Rule),
+  /** false: reported as context, not part of the total. Absent on v2 results, where every category counted. */
+  scored: z.boolean().optional(),
 }).strict();
 export const PreScore = z.object({
   total: z.number().min(0).max(100).nullable(),
@@ -66,7 +73,9 @@ export const Layer1Result = z.object({
   signals: Signals, multipliers: Multipliers,
   sources: z.object({ website: SourceStatus, bar: SourceStatus, avvo: SourceStatus }).strict(),
   meta: z.object({ scanDurationMs: z.number().int().nonnegative(), cached: z.boolean(),
-    reusedEvidence: z.boolean().default(false), contractVersion: z.literal(LAYER1_CONTRACT_VERSION).default(LAYER1_CONTRACT_VERSION),
+    reusedEvidence: z.boolean().default(false), contractVersion: z.enum(LAYER1_CONTRACT_VERSIONS).default(LAYER1_CONTRACT_VERSION),
+    /** The Layer 1 scoring rules that produced the result. A cached scan is reused only under the same rules. */
+    scoringVersion: z.string().min(1).optional(),
     completedAt: z.string().datetime() }).strict(),
 }).strict();
 export type Layer1Result = z.infer<typeof Layer1Result>;
